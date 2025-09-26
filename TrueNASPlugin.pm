@@ -118,8 +118,6 @@ sub properties {
         chap_user     => { type => 'string', optional => 1 },
         chap_password => { type => 'string', optional => 1 },
 
-        bwlimit       => { type => 'integer', optional => 1 },
-        nodes         => get_standard_option('pve-node-list', { optional => 1 }),
     };
 }
 
