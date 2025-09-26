@@ -8,6 +8,9 @@ use Digest::SHA qw(sha1);
 use IO::Socket::INET;
 use IO::Socket::SSL;
 use Time::HiRes qw(usleep);
+use Socket qw(inet_ntoa gethostbyname);
+use LWP::UserAgent;
+use HTTP::Request;
 
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
@@ -16,6 +19,7 @@ use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::Storage::Plugin);
 
 # ======== Definition ========
+
 sub api  { return 11; }                          # PVE storage plugin API version
 sub type { return 'truenasplugin'; }             # storage.cfg type
 
@@ -30,30 +34,30 @@ sub plugindata {
 
 sub properties {
     return {
-        # Transport selection
+        # Transport (default WS)
         api_transport => {
             description => "API transport: 'ws' (JSON-RPC over WebSocket) or 'rest'.",
             type        => 'string',
             optional    => 1,
         },
 
-        # Common connection opts
+        # Connection
         api_host => {
-            description => "TrueNAS hostname or IP (IPv4/IPv6/DNS).",
+            description => "TrueNAS hostname or IP.",
             type        => 'string',
             format      => 'pve-storage-server',
         },
         api_key  => {
-            description => "TrueNAS user-linked API key (Bearer / login_with_api_key).",
+            description => "TrueNAS user-linked API key.",
             type        => 'string',
         },
         api_scheme => {
-            description => "http/https (for REST) or ws/wss (for WebSocket). Defaults: wss for WS, https for REST.",
+            description => "wss/ws for WS, https/http for REST (defaults: wss/https).",
             type        => 'string',
             optional    => 1,
         },
         api_port => {
-            description => "Port (defaults: 443 for https/wss, 80 for http/ws).",
+            description => "Port (defaults: 443 for wss/https, 80 for ws/http).",
             type        => 'integer',
             optional    => 1,
         },
@@ -64,9 +68,17 @@ sub properties {
             default     => 0,
         },
 
+        # NEW: Prefer IPv4 for API connections
+        prefer_ipv4 => {
+            description => "Prefer IPv4 (A records) when resolving api_host.",
+            type        => 'boolean',
+            optional    => 1,
+            default     => 1,
+        },
+
         # Storage placement
         dataset => {
-            description => "Parent dataset for zvols, e.g. tank/proxmox.",
+            description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type        => 'string',
         },
         zvol_blocksize => {
@@ -75,7 +87,7 @@ sub properties {
             optional    => 1,
         },
 
-        # iSCSI target you maintain on TrueNAS
+        # iSCSI target on TrueNAS
         target_iqn => {
             description => "Shared iSCSI Target IQN on TrueNAS.",
             type        => 'string',
@@ -83,7 +95,7 @@ sub properties {
 
         # Initiator discovery/portals
         discovery_portal => {
-            description => "Primary SendTargets portal (IP[:port]; IPv6 allowed as [addr]:port).",
+            description => "Primary SendTargets portal (IP[:port]; IPv6 ok as [addr]:port).",
             type        => 'string',
         },
         portals => {
@@ -92,16 +104,20 @@ sub properties {
             optional    => 1,
         },
 
-        # initiator path selection
+        # Initiator pathing
         use_multipath => { type => 'boolean', optional => 1, default => 1  },
         use_by_path   => { type => 'boolean', optional => 1, default => 0  },
-        ipv6_by_path  => { type => 'boolean', optional => 1, default => 1  },
+        ipv6_by_path  => {
+            description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
+            type        => 'boolean',
+            optional    => 1,
+            default     => 0,   # default to IPv4 behavior
+        },
 
-        # optional CHAP (session)
-        chap_user     => { type => 'string',  optional => 1 },
-        chap_password => { type => 'string',  optional => 1 },
+        # Optional CHAP (session)
+        chap_user     => { type => 'string', optional => 1 },
+        chap_password => { type => 'string', optional => 1 },
 
-        # misc
         bwlimit       => { type => 'integer', optional => 1 },
         nodes         => get_standard_option('pve-node-list', { optional => 1 }),
     };
@@ -123,6 +139,9 @@ sub options {
         api_port      => { optional => 1, fixed => 1 },
         api_insecure  => { optional => 1, fixed => 1 },
 
+        # IPv4 preference (can be toggled)
+        prefer_ipv4   => { optional => 1 },
+
         dataset         => { fixed => 1 },
         zvol_blocksize  => { optional => 1, fixed => 1 },
         target_iqn      => { fixed => 1 },
@@ -141,13 +160,25 @@ sub options {
     };
 }
 
+# ======== DNS/IPv4 helper ========
+
+sub _host_ipv4($host) {
+    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
+    my @ent = gethostbyname($host);                 # A record lookup (IPv4)
+    if (@ent && defined $ent[4]) {
+        my $ip = inet_ntoa($ent[4]);
+        return $ip if $ip;
+    }
+    return $host; # fallback to original
+}
+
 # ======== REST Client (fallback) ========
 
 sub _ua($scfg) {
-    require LWP::UserAgent;
     my $ua = LWP::UserAgent->new(
-        timeout => 30, keep_alive => 1,
-        ssl_opts => {
+        timeout   => 30,
+        keep_alive=> 1,
+        ssl_opts  => {
             verify_hostname => !$scfg->{api_insecure},
             SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
         }
@@ -162,7 +193,7 @@ sub _rest_base($scfg) {
 }
 
 sub _rest_call($scfg, $method, $path, $payload=undef) {
-    my $ua = _ua($scfg);
+    my $ua  = _ua($scfg);
     my $url = _rest_base($scfg) . $path;
 
     my $req = HTTP::Request->new(uc($method) => $url);
@@ -179,18 +210,14 @@ sub _rest_call($scfg, $method, $path, $payload=undef) {
 }
 
 # ======== WebSocket JSON-RPC Client ========
-# Minimal WS client for TrueNAS JSON-RPC 2.0 at ws(s)://<host>/api/current
-# Auth: call 'auth.login_with_api_key', then invoke service methods. [2](https://github.com/truenas/api_client)
+# Connect to ws(s)://<host>/api/current; authenticate with auth.login_with_api_key. [2](https://github.com/proxmox/pve-storage/blob/master/src/PVE/Storage/Plugin.pm)
+
 sub _ws_defaults($scfg) {
     my $scheme = $scfg->{api_scheme};
-    if (!$scheme) {
-        # default to wss unless user said otherwise
-        $scheme = 'wss';
-    } elsif ($scheme =~ /^https$/i) {
-        $scheme = 'wss';
-    } elsif ($scheme =~ /^http$/i) {
-        $scheme = 'ws';
-    }
+    if (!$scheme) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^https$/i) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
+
     my $port = $scfg->{api_port} || (($scheme eq 'wss') ? 443 : 80);
     return ($scheme, $port);
 }
@@ -198,19 +225,21 @@ sub _ws_defaults($scfg) {
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{api_host};
-    my $path = '/api/current';  # official JSON-RPC WS endpoint [2](https://github.com/truenas/api_client)
+    my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;  # IPv4 preferred
+    my $path = '/api/current';
 
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
-            PeerHost => $host, PeerPort => $port,
-            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
-            SSL_hostname    => $host,
-            Timeout => 15,
+            PeerHost       => $peer,
+            PeerPort       => $port,
+            SSL_verify_mode=> $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_hostname   => $host,
+            Timeout        => 15,
         ) or die "wss connect failed: $SSL_ERROR\n";
     } else {
         $sock = IO::Socket::INET->new(
-            PeerHost => $host, PeerPort => $port, Proto => 'tcp', Timeout => 15,
+            PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
         ) or die "ws connect failed: $!\n";
     }
 
@@ -235,12 +264,11 @@ sub _ws_open($scfg) {
     }
     die "WebSocket handshake failed (no 101)" if $resp !~ m#^HTTP/1\.[01] 101#;
 
-    # Verify accept key
     my $accept = ($resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i) ? $1 : '';
     my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
     die "WebSocket handshake invalid accept key" if lc($accept) ne lc($expect);
 
-    # Authenticate using API key via JSON-RPC method auth.login_with_api_key [2](https://github.com/truenas/api_client)
+    # Authenticate using API key via JSON-RPC auth.login_with_api_key  [2](https://github.com/proxmox/pve-storage/blob/master/src/PVE/Storage/Plugin.pm)
     my $conn = { sock => $sock, next_id => 1 };
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
@@ -251,34 +279,26 @@ sub _ws_open($scfg) {
     return $conn;
 }
 
-# Send a JSON-RPC request and return the decoded result or die on error
 sub _ws_rpc($conn, $obj) {
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
-
-    # Read a single complete text frame
     my $resp = _ws_recv_text($conn->{sock});
     my $decoded = decode_json($resp);
-
     die "JSON-RPC error: ".encode_json($decoded->{error})
         if exists $decoded->{error};
-
     return $decoded->{result};
 }
 
-# --- WebSocket framing (simple, text only, no compression/fragmentation) ---
-
+# Simple text frames (no compression/fragmentation)
 sub _ws_send_text($sock, $payload) {
     my $fin_opcode = 0x81; # FIN + text
-    my $maskbit    = 0x80; # clients MUST mask
-
+    my $maskbit    = 0x80; # client masks
     my $len = length($payload);
     my $hdr = pack('C', $fin_opcode);
-
     my $lenfield;
-    if    ($len <= 125)         { $lenfield = pack('C', $maskbit | $len); }
-    elsif ($len <= 0xFFFF)      { $lenfield = pack('C n', $maskbit | 126, $len); }
-    else                        { $lenfield = pack('C Q>', $maskbit | 127, $len); }
+    if    ($len <= 125)    { $lenfield = pack('C', $maskbit | $len); }
+    elsif ($len <= 0xFFFF) { $lenfield = pack('C n', $maskbit | 126, $len); }
+    else                   { $lenfield = pack('C Q>', $maskbit | 127, $len); }
 
     my $mask = join '', map { chr(int(rand(256))) } 1..4;
     my $masked = $payload ^ ($mask x int((length($payload)+3)/4));
@@ -299,9 +319,8 @@ sub _ws_recv_text($sock) {
     my ($b1, $b2) = unpack('CC', $hdr);
     my $opcode = $b1 & 0x0f;
     die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
-    my $masked = ($b2 & 0x80) ? 1 : 0;  # server MUST NOT mask
+    my $masked = ($b2 & 0x80) ? 1 : 0;
     my $len = ($b2 & 0x7f);
-
     if ($len == 126) {
         my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
         $len = unpack('n', $ext);
@@ -309,17 +328,11 @@ sub _ws_recv_text($sock) {
         my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
         $len = unpack('Q>', $ext);
     }
-
     my $mask_key = '';
-    if ($masked) {
-        _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask";
-    }
-
+    if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
     my $payload = '';
     _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
-
     if ($masked) {
-        # Shouldn't happen from server, but handle defensively
         $payload = $payload ^ ($mask_key x int(($len+3)/4));
         $payload = substr($payload, 0, $len);
     }
@@ -338,30 +351,26 @@ sub _ws_read_exact {
     return 1;
 }
 
-# ======== Transport‑agnostic API wrapper ========
+# ======== Transport-agnostic call wrapper ========
 
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
 
     if ($transport eq 'ws') {
-        # Try WS JSON-RPC
+        my $err;
+        my $res;
         eval {
             my $conn = _ws_open($scfg);
-            my $res  = _ws_rpc($conn, {
+            $res = _ws_rpc($conn, {
                 jsonrpc => "2.0",
                 id      => 1,
                 method  => $ws_method,
                 params  => $ws_params || [],
             });
-            return $res;
-        } and return $@ if 0; # placate perlcritic
-        if (!$@) { return $_; } # already returned
-        my $err = $@;
-        # Fall back to REST if allowed by presence of fallback mapping
-        if ($rest_fallback) {
-            # warn "WS failed ($err). Falling back to REST...\n";
-            return $rest_fallback->();
-        }
+        };
+        if ($@) { $err = $@; }
+        return $res if !$err;
+        if ($rest_fallback) { return $rest_fallback->(); }
         die $err;
     } elsif ($transport eq 'rest') {
         return $rest_fallback->() if $rest_fallback;
@@ -371,7 +380,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     }
 }
 
-# ======== TrueNAS API ops via WS (with REST fallback) ========
+# ======== TrueNAS API ops (WS with REST fallback) ========
 
 sub _tn_get_target($scfg) {
     return _api_call($scfg, 'iscsi.target.query', [],
@@ -385,17 +394,22 @@ sub _tn_targetextents($scfg) {
     );
 }
 
+sub _tn_extents($scfg) {
+    return _api_call($scfg, 'iscsi.extent.query', [],
+        sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
+    );
+}
+
 sub _tn_dataset_create($scfg, $full, $bytes, $blocksize) {
     my $payload = { name => $full, type => 'VOLUME', volsize => int($bytes) };
     $payload->{volblocksize} = $blocksize if $blocksize;
-
     return _api_call($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
 }
 
 sub _tn_dataset_delete($scfg, $full) {
-    my $id = uri_escape($full); # encode '/' as %2F  [8](https://www.truenas.com/docs/scale/api/)
+    my $id = uri_escape($full); # encode '/' as %2F for REST  [4](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/6-7/vsphere-storage-6-7/configuring-iscsi-and-iser-adapters-and-storage-with-esxi/configuring-discovery-addresses-for-iscsi-initiators.html)
     return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
     );
@@ -429,7 +443,7 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
     );
 }
 
-# ======== PVE side: discovery and device path ========
+# ======== PVE initiator discovery & device path ========
 
 sub _normalize_portal($p) {
     $p =~ s/^\s+|\s+$//g;
@@ -463,7 +477,7 @@ sub _iscsi_login_all($scfg) {
             ) { run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {}); }
         }
         run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
-            errmsg => "iscsiadm login failed", outfunc => sub {});
+            errmsg => "iSCSI login failed", outfunc => sub {});
     }
 
     for my $p (@extra) {
@@ -528,14 +542,14 @@ sub alloc_image {
     my $zname = _zvol_name($vmid, $name);
     my $full  = $scfg->{dataset} . '/' . $zname;
 
-    # 1) Create zvol
+    # 1) zvol
     _tn_dataset_create($scfg, $full, $size, $scfg->{zvol_blocksize});
 
-    # 2) Create extent for the zvol
+    # 2) extent
     my $extent = _tn_extent_create($scfg, $zname, $full);
     my $extent_id = ref($extent) eq 'HASH' && exists $extent->{id} ? $extent->{id} : $extent;
 
-    # 3) Map to the shared target at the next free LUN
+    # 3) target and free LUN
     my $targets = _tn_get_target($scfg);
     my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
     die "Target '$scfg->{target_iqn}' not found" if !$t;
@@ -556,17 +570,18 @@ sub free_image {
 
     my $targets = _tn_get_target($scfg);
     my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
-    my $maps = _tn_targetextents($scfg);
-    my ($tx) = grep { $_->{target} == $t->{id} && defined($_->{extent}) } @$maps;
 
-    # Find extent id by name
-    my $extents = _api_call($scfg, 'iscsi.extent.query', [],
-        sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
-    );
+    # resolve extent id by name
+    my $extents = _tn_extents($scfg);
     my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
+    my $extent_id = $extent ? $extent->{id} : undef;
+
+    # resolve targetextent row matching this target + extent
+    my $maps = _tn_targetextents($scfg);
+    my ($tx) = grep { $_->{target} == $t->{id} && defined($extent_id) && ($_->{extent} // -1) == $extent_id } @$maps;
 
     _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
-    _tn_extent_delete($scfg, $extent->{id})   if $extent && defined $extent->{id};
+    _tn_extent_delete($scfg, $extent_id)      if defined $extent_id;
     _tn_dataset_delete($scfg, $full);
 
     return 1;
