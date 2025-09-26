@@ -8,7 +8,7 @@ use Digest::SHA qw(sha1);
 use IO::Socket::INET;
 use IO::Socket::SSL;
 use Time::HiRes qw(usleep);
-use Socket qw(inet_ntoa gethostbyname);
+use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 
@@ -164,13 +164,14 @@ sub options {
 
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
-    my @ent = gethostbyname($host);                 # A record lookup (IPv4)
+    my @ent = Socket::gethostbyname($host);          # fully qualify; do not import
     if (@ent && defined $ent[4]) {
         my $ip = inet_ntoa($ent[4]);
         return $ip if $ip;
     }
     return $host; # fallback to original
 }
+
 
 # ======== REST Client (fallback) ========
 
