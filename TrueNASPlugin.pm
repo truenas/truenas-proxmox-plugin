@@ -1,8 +1,14 @@
 package PVE::Storage::Custom::TrueNASPlugin;
 
 use v5.36;
-use JSON::PP qw(encode_json);
-use File::Basename;
+use JSON::PP qw(encode_json decode_json);
+use URI::Escape qw(uri_escape);
+use MIME::Base64 qw(encode_base64);
+use Digest::SHA qw(sha1);
+use IO::Socket::INET;
+use IO::Socket::SSL;
+use Time::HiRes qw(usleep);
+
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
@@ -10,289 +16,511 @@ use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::Storage::Plugin);
 
 # ======== Definition ========
+sub api  { return 11; }                          # PVE storage plugin API version
+sub type { return 'truenasplugin'; }             # storage.cfg type
 
-# Storage Plugin API version; compatible with current libpve-storage-perl.
-# See Proxmox "Writing a Storage Plugin" doc for versioning details.
-sub api { return 11; }  # adjust if your host requires newer APIVER
-
-# The storage "type" string users put into storage.cfg
-sub type { return 'truenasplugin'; }
-
-# Metadata: we only expose block images (RAW) for VMs, and mark as "select_existing"
 sub plugindata {
     return {
         content         => [ { images => 1, none => 1 }, { images => 1 } ],
         format          => [ { raw => 1 }, 'raw' ],
-        'sensitive-properties' => { 'chap_password' => 1, 'ssh_privkey' => 1, 'api_key' => 1 },
+        'sensitive-properties' => { 'api_key' => 1, 'chap_password' => 1 },
         select_existing => 1,
     };
 }
 
-# Extra properties this plugin understands (types & validations)
 sub properties {
     return {
-        truenas_host  => {
-            description => "TrueNAS hostname or IP",
+        # Transport selection
+        api_transport => {
+            description => "API transport: 'ws' (JSON-RPC over WebSocket) or 'rest'.",
+            type        => 'string',
+            optional    => 1,
+        },
+
+        # Common connection opts
+        api_host => {
+            description => "TrueNAS hostname or IP (IPv4/IPv6/DNS).",
             type        => 'string',
             format      => 'pve-storage-server',
         },
-        truenas_user  => {
-            description => "SSH user for midclt (usually 'root' on SCALE unless you prefer a service user)",
+        api_key  => {
+            description => "TrueNAS user-linked API key (Bearer / login_with_api_key).",
             type        => 'string',
         },
-        ssh_privkey   => {
-            description => "Path to private key for SSH auth to TrueNAS",
-            type        => 'string',
-            optional    => 1,
-        },
-        api_key       => {
-            description => "TrueNAS API key (optional). If set, plugin can use HTTPS+WebSocket client instead of SSH midclt.",
+        api_scheme => {
+            description => "http/https (for REST) or ws/wss (for WebSocket). Defaults: wss for WS, https for REST.",
             type        => 'string',
             optional    => 1,
         },
-        dataset       => {
-            description => "ZFS dataset on TrueNAS where zvols are created, e.g. tank/proxmox",
-            type        => 'string',
-        },
-        target_iqn    => {
-            description => "Shared iSCSI Target IQN on TrueNAS",
-            type        => 'string',
-        },
-        discovery_portal => {
-            description => "Primary portal for SendTargets discovery (IP/DNS, v4 or v6).",
-            type        => 'string',
-        },
-        portals       => {
-            description => "Comma-separated additional portals (IP/DNS, IPv6 allowed in bracket form). If empty, auto-discovery is used.",
-            type        => 'string',
+        api_port => {
+            description => "Port (defaults: 443 for https/wss, 80 for http/ws).",
+            type        => 'integer',
             optional    => 1,
         },
-        use_multipath => {
-            description => "Enable multipath for block devices.",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 1,
-        },
-        use_by_path   => {
-            description => "Prefer /dev/disk/by-path (IPv6-safe) over /dev/mapper multipath alias.",
+        api_insecure => {
+            description => "Skip TLS certificate verification.",
             type        => 'boolean',
             optional    => 1,
             default     => 0,
         },
-        ipv6_by_path  => {
-            description => "Normalize IPv6 addresses for by-path lookup.",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 1,
+
+        # Storage placement
+        dataset => {
+            description => "Parent dataset for zvols, e.g. tank/proxmox.",
+            type        => 'string',
         },
-        chap_user     => { type => 'string', optional => 1 },
-        chap_password => { type => 'string', optional => 1 },
         zvol_blocksize => {
-            description => "ZVOL volblocksize, e.g. 16K, 64K. If unset, TrueNAS default is used.",
+            description => "ZVOL volblocksize (e.g. 16K, 64K).",
             type        => 'string',
             optional    => 1,
         },
+
+        # iSCSI target you maintain on TrueNAS
+        target_iqn => {
+            description => "Shared iSCSI Target IQN on TrueNAS.",
+            type        => 'string',
+        },
+
+        # Initiator discovery/portals
+        discovery_portal => {
+            description => "Primary SendTargets portal (IP[:port]; IPv6 allowed as [addr]:port).",
+            type        => 'string',
+        },
+        portals => {
+            description => "Comma-separated additional portals.",
+            type        => 'string',
+            optional    => 1,
+        },
+
+        # initiator path selection
+        use_multipath => { type => 'boolean', optional => 1, default => 1  },
+        use_by_path   => { type => 'boolean', optional => 1, default => 0  },
+        ipv6_by_path  => { type => 'boolean', optional => 1, default => 1  },
+
+        # optional CHAP (session)
+        chap_user     => { type => 'string',  optional => 1 },
+        chap_password => { type => 'string',  optional => 1 },
+
+        # misc
+        bwlimit       => { type => 'integer', optional => 1 },
+        nodes         => get_standard_option('pve-node-list', { optional => 1 }),
     };
 }
 
-# Which of those properties are valid in storage.cfg (and whether fixed/optional)
 sub options {
     return {
-        # common storage flags
+        # Storage flags
         disable => { optional => 1 },
         nodes   => { optional => 1 },
         content => { optional => 1 },
-        shared  => { optional => 1 },  # must be set in storage.cfg for custom plugins
+        shared  => { optional => 1 },
 
-        # plugin-specific (fixed to prevent changes that would orphan LUNs)
-        truenas_host     => { fixed => 1 },
-        truenas_user     => { fixed => 1 },
-        ssh_privkey      => { optional => 1, fixed => 1 },
-        api_key          => { optional => 1, fixed => 1 },
+        # Connection (fixed to prevent orphaning)
+        api_transport => { optional => 1, fixed => 1 },
+        api_host      => { fixed => 1 },
+        api_key       => { fixed => 1 },
+        api_scheme    => { optional => 1, fixed => 1 },
+        api_port      => { optional => 1, fixed => 1 },
+        api_insecure  => { optional => 1, fixed => 1 },
 
-        dataset          => { fixed => 1 },
-        target_iqn       => { fixed => 1 },
+        dataset         => { fixed => 1 },
+        zvol_blocksize  => { optional => 1, fixed => 1 },
+        target_iqn      => { fixed => 1 },
+
         discovery_portal => { fixed => 1 },
         portals          => { optional => 1 },
 
-        use_multipath    => { optional => 1 },
-        use_by_path      => { optional => 1 },
-        ipv6_by_path     => { optional => 1 },
+        use_multipath   => { optional => 1 },
+        use_by_path     => { optional => 1 },
+        ipv6_by_path    => { optional => 1 },
 
-        chap_user        => { optional => 1 },
-        chap_password    => { optional => 1 },
+        chap_user       => { optional => 1 },
+        chap_password   => { optional => 1 },
 
-        zvol_blocksize   => { optional => 1, fixed => 1 },
-        bwlimit          => { optional => 1 },
+        bwlimit         => { optional => 1 },
     };
 }
 
-# ======== Helpers ========
+# ======== REST Client (fallback) ========
 
-# Run midclt via SSH on TrueNAS (simple/robust for SCALE). Requires ssh key or agent.
-# Example: _midclt($scfg, 'zfs.dataset.create', {name=>'tank/pve/vm-100-disk-0', type=>'VOLUME', volsize=>10737418240})
-sub _midclt($scfg, $method, $payload) {
-    my $host = $scfg->{truenas_host};
-    my $user = $scfg->{truenas_user} || 'root';
-
-    my @ssh = ('/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new');
-    push @ssh, ('-i', $scfg->{ssh_privkey}) if $scfg->{ssh_privkey};
-    push @ssh, "$user\@$host", 'midclt', 'call', $method, encode_json($payload);
-
-    my $out = '';
-    run_command(\@ssh, errmsg => "midclt call failed", outfunc => sub { $out .= "$_[0]\n" });
-    return $out;
-}
-
-# Call TrueNAS to find/allocate next free LUN ID on a target (simple strategy).
-sub _next_free_lun($scfg) {
-    # query all Target-Extent associations, then pick a free LUN id
-    my $target_iqn = $scfg->{target_iqn};
-    my $json = _midclt($scfg, 'iscsi.targetextent.query', []);
-    # naive parse: pick LUNs for our target and find the first free in [0..4095]
-    my @used;
-    for my $line (split(/\n/, $json)) {
-        # Expect JSON lines; keep it simple by extracting "lunid" and "target" fields
-        if ($line =~ /\"target\":\s*\"?\Q$target_iqn\E\"?.*\"lunid\":\s*(\d+)/) {
-            push @used, int($1);
-        } elsif ($line =~ /\"lunid\":\s*(\d+)/ && $json =~ /\Q$target_iqn\E/) {
-            # best effort when API output is compact
-            push @used, int($1);
+sub _ua($scfg) {
+    require LWP::UserAgent;
+    my $ua = LWP::UserAgent->new(
+        timeout => 30, keep_alive => 1,
+        ssl_opts => {
+            verify_hostname => !$scfg->{api_insecure},
+            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
         }
-    }
-    my %used = map { $_ => 1 } @used;
-    for my $lun (0..4095) {
-        return $lun if !$used{$lun};
-    }
-    die "No free LUN IDs available on target $target_iqn\n";
+    );
+    return $ua;
 }
 
-# Normalize portal strings (IPv4/IPv6 + optional :port).
+sub _rest_base($scfg) {
+    my $scheme = ($scfg->{api_scheme} && $scfg->{api_scheme} =~ /^http$/i) ? 'http' : 'https';
+    my $port   = $scfg->{api_port} || ($scheme eq 'https' ? 443 : 80);
+    return "$scheme://$scfg->{api_host}:$port/api/v2.0";
+}
+
+sub _rest_call($scfg, $method, $path, $payload=undef) {
+    my $ua = _ua($scfg);
+    my $url = _rest_base($scfg) . $path;
+
+    my $req = HTTP::Request->new(uc($method) => $url);
+    $req->header('Authorization' => "Bearer $scfg->{api_key}");
+    $req->header('Content-Type'  => 'application/json');
+    $req->content(encode_json($payload)) if defined $payload;
+
+    my $res = $ua->request($req);
+    die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
+        if !$res->is_success;
+
+    my $content = $res->decoded_content // '';
+    return length($content) ? decode_json($content) : undef;
+}
+
+# ======== WebSocket JSON-RPC Client ========
+# Minimal WS client for TrueNAS JSON-RPC 2.0 at ws(s)://<host>/api/current
+# Auth: call 'auth.login_with_api_key', then invoke service methods. [2](https://github.com/truenas/api_client)
+sub _ws_defaults($scfg) {
+    my $scheme = $scfg->{api_scheme};
+    if (!$scheme) {
+        # default to wss unless user said otherwise
+        $scheme = 'wss';
+    } elsif ($scheme =~ /^https$/i) {
+        $scheme = 'wss';
+    } elsif ($scheme =~ /^http$/i) {
+        $scheme = 'ws';
+    }
+    my $port = $scfg->{api_port} || (($scheme eq 'wss') ? 443 : 80);
+    return ($scheme, $port);
+}
+
+sub _ws_open($scfg) {
+    my ($scheme, $port) = _ws_defaults($scfg);
+    my $host = $scfg->{api_host};
+    my $path = '/api/current';  # official JSON-RPC WS endpoint [2](https://github.com/truenas/api_client)
+
+    my $sock;
+    if ($scheme eq 'wss') {
+        $sock = IO::Socket::SSL->new(
+            PeerHost => $host, PeerPort => $port,
+            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_hostname    => $host,
+            Timeout => 15,
+        ) or die "wss connect failed: $SSL_ERROR\n";
+    } else {
+        $sock = IO::Socket::INET->new(
+            PeerHost => $host, PeerPort => $port, Proto => 'tcp', Timeout => 15,
+        ) or die "ws connect failed: $!\n";
+    }
+
+    # WebSocket handshake
+    my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
+    my $key_b64 = encode_base64($key_raw, '');
+    my $hosthdr = $host.":$port";
+    my $req =
+        "GET $path HTTP/1.1\r\n".
+        "Host: $hosthdr\r\n".
+        "Upgrade: websocket\r\n".
+        "Connection: Upgrade\r\n".
+        "Sec-WebSocket-Key: $key_b64\r\n".
+        "Sec-WebSocket-Version: 13\r\n".
+        "\r\n";
+    print $sock $req;
+
+    my $resp = '';
+    while ($sock->sysread(my $buf, 1024)) {
+        $resp .= $buf;
+        last if $resp =~ /\r\n\r\n/s;
+    }
+    die "WebSocket handshake failed (no 101)" if $resp !~ m#^HTTP/1\.[01] 101#;
+
+    # Verify accept key
+    my $accept = ($resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i) ? $1 : '';
+    my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
+    die "WebSocket handshake invalid accept key" if lc($accept) ne lc($expect);
+
+    # Authenticate using API key via JSON-RPC method auth.login_with_api_key [2](https://github.com/truenas/api_client)
+    my $conn = { sock => $sock, next_id => 1 };
+    _ws_rpc($conn, {
+        jsonrpc => "2.0", id => $conn->{next_id}++,
+        method  => "auth.login_with_api_key",
+        params  => [ $scfg->{api_key} ],
+    }) or die "TrueNAS auth.login_with_api_key failed";
+
+    return $conn;
+}
+
+# Send a JSON-RPC request and return the decoded result or die on error
+sub _ws_rpc($conn, $obj) {
+    my $text = encode_json($obj);
+    _ws_send_text($conn->{sock}, $text);
+
+    # Read a single complete text frame
+    my $resp = _ws_recv_text($conn->{sock});
+    my $decoded = decode_json($resp);
+
+    die "JSON-RPC error: ".encode_json($decoded->{error})
+        if exists $decoded->{error};
+
+    return $decoded->{result};
+}
+
+# --- WebSocket framing (simple, text only, no compression/fragmentation) ---
+
+sub _ws_send_text($sock, $payload) {
+    my $fin_opcode = 0x81; # FIN + text
+    my $maskbit    = 0x80; # clients MUST mask
+
+    my $len = length($payload);
+    my $hdr = pack('C', $fin_opcode);
+
+    my $lenfield;
+    if    ($len <= 125)         { $lenfield = pack('C', $maskbit | $len); }
+    elsif ($len <= 0xFFFF)      { $lenfield = pack('C n', $maskbit | 126, $len); }
+    else                        { $lenfield = pack('C Q>', $maskbit | 127, $len); }
+
+    my $mask = join '', map { chr(int(rand(256))) } 1..4;
+    my $masked = $payload ^ ($mask x int((length($payload)+3)/4));
+    $masked = substr($masked, 0, $len);
+
+    my $frame = $hdr . $lenfield . $mask . $masked;
+    my $off = 0;
+    while ($off < length($frame)) {
+        my $w = $sock->syswrite($frame, length($frame) - $off, $off);
+        die "WS write failed: $!" unless defined $w;
+        $off += $w;
+    }
+}
+
+sub _ws_recv_text($sock) {
+    my $hdr;
+    _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
+    my ($b1, $b2) = unpack('CC', $hdr);
+    my $opcode = $b1 & 0x0f;
+    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
+    my $masked = ($b2 & 0x80) ? 1 : 0;  # server MUST NOT mask
+    my $len = ($b2 & 0x7f);
+
+    if ($len == 126) {
+        my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
+        $len = unpack('n', $ext);
+    } elsif ($len == 127) {
+        my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
+        $len = unpack('Q>', $ext);
+    }
+
+    my $mask_key = '';
+    if ($masked) {
+        _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask";
+    }
+
+    my $payload = '';
+    _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
+
+    if ($masked) {
+        # Shouldn't happen from server, but handle defensively
+        $payload = $payload ^ ($mask_key x int(($len+3)/4));
+        $payload = substr($payload, 0, $len);
+    }
+    return $payload;
+}
+
+sub _ws_read_exact {
+    my ($sock, $ref, $want) = @_;
+    $$ref = '' if !defined $$ref;
+    my $got = 0;
+    while ($got < $want) {
+        my $r = $sock->sysread($$ref, $want - $got, $got);
+        return undef if !defined $r || $r == 0;
+        $got += $r;
+    }
+    return 1;
+}
+
+# ======== Transport‑agnostic API wrapper ========
+
+sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
+    my $transport = lc($scfg->{api_transport} // 'ws');
+
+    if ($transport eq 'ws') {
+        # Try WS JSON-RPC
+        eval {
+            my $conn = _ws_open($scfg);
+            my $res  = _ws_rpc($conn, {
+                jsonrpc => "2.0",
+                id      => 1,
+                method  => $ws_method,
+                params  => $ws_params || [],
+            });
+            return $res;
+        } and return $@ if 0; # placate perlcritic
+        if (!$@) { return $_; } # already returned
+        my $err = $@;
+        # Fall back to REST if allowed by presence of fallback mapping
+        if ($rest_fallback) {
+            # warn "WS failed ($err). Falling back to REST...\n";
+            return $rest_fallback->();
+        }
+        die $err;
+    } elsif ($transport eq 'rest') {
+        return $rest_fallback->() if $rest_fallback;
+        die "REST fallback not provided for $ws_method";
+    } else {
+        die "Invalid api_transport '$transport' (use 'ws' or 'rest')";
+    }
+}
+
+# ======== TrueNAS API ops via WS (with REST fallback) ========
+
+sub _tn_get_target($scfg) {
+    return _api_call($scfg, 'iscsi.target.query', [],
+        sub { _rest_call($scfg, 'GET', '/iscsi/target') }
+    );
+}
+
+sub _tn_targetextents($scfg) {
+    return _api_call($scfg, 'iscsi.targetextent.query', [],
+        sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
+    );
+}
+
+sub _tn_dataset_create($scfg, $full, $bytes, $blocksize) {
+    my $payload = { name => $full, type => 'VOLUME', volsize => int($bytes) };
+    $payload->{volblocksize} = $blocksize if $blocksize;
+
+    return _api_call($scfg, 'pool.dataset.create', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
+    );
+}
+
+sub _tn_dataset_delete($scfg, $full) {
+    my $id = uri_escape($full); # encode '/' as %2F  [8](https://www.truenas.com/docs/scale/api/)
+    return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
+        sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
+    );
+}
+
+sub _tn_extent_create($scfg, $zname, $full) {
+    my $payload = {
+        name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
+    };
+    return _api_call($scfg, 'iscsi.extent.create', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
+    );
+}
+
+sub _tn_extent_delete($scfg, $extent_id) {
+    return _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
+        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
+    );
+}
+
+sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
+    my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
+    return _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
+    );
+}
+
+sub _tn_targetextent_delete($scfg, $tx_id) {
+    return _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
+        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
+    );
+}
+
+# ======== PVE side: discovery and device path ========
+
 sub _normalize_portal($p) {
     $p =~ s/^\s+|\s+$//g;
     return $p if !$p;
-    # strip brackets for sysfs/by-path, but keep port
-    if ($p =~ /^\[(.+)\]:(\d+)$/) { return "$1:$2"; }
-    return $p;
+    $p =~ /^\[(.+)\]:(\d+)$/ ? "$1:$2" : $p; # strip IPv6 brackets for by-path
 }
 
-# Discover portals and login (persistent), optionally configure CHAP.
 sub _iscsi_login_all($scfg) {
     my $primary = $scfg->{discovery_portal};
-    my @extra = ();
-    if ($scfg->{portals}) {
-        @extra = map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals});
-    }
+    my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
 
-    my @discover_cmd = ('iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $primary);
-    run_command(\@discover_cmd, errmsg => "iSCSI discovery failed", outfunc => sub {});
-
-    # The sendtargets record should be created; now enumerate known nodes for our target
+    run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary],
+        errmsg => "iSCSI discovery failed", outfunc => sub {});
     my $iqn = $scfg->{target_iqn};
-    my @nodes_cmd = ('iscsiadm', '-m', 'node', '-T', $iqn);
+
     my @nodes;
-    run_command(\@nodes_cmd, errmsg => "iscsiadm list nodes failed", outfunc => sub {
+    run_command(['iscsiadm','-m','node','-T',$iqn], errmsg => "iscsiadm nodes failed", outfunc => sub {
         push @nodes, $_[0] if $_[0] =~ /\S/;
     });
 
-    # Ensure node DB has startup=automatic, CHAP (optional), and then login
-    for my $node_line (@nodes) {
-        # expected: "<ip>:<port>,<tpgt> <iqn>"
-        if ($node_line =~ /^(\S+)\s+$iqn$/) {
-            my $portal = $1;
-            my @upd = ('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $portal, '-o', 'update', '-n', 'node.startup', '-v', 'automatic');
-            run_command(\@upd, errmsg => "iscsiadm update node.startup failed", outfunc => sub {});
-            if ($scfg->{chap_user} && $scfg->{chap_password}) {
-                my @auth = (
-                    ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
-                    ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{chap_user}],
-                    ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
-                );
-                for my $cmd (@auth) { run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {}); }
-            }
-            my @login = ('iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login');
-            run_command(\@login, errmsg => "iscsiadm login failed", outfunc => sub {});
+    for my $n (@nodes) {
+        next unless $n =~ /^(\S+)\s+$iqn$/;
+        my $portal = $1;
+        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
+            errmsg => "iscsiadm update failed", outfunc => sub {});
+        if ($scfg->{chap_user} && $scfg->{chap_password}) {
+            for my $cmd (
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{chap_user}],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
+            ) { run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {}); }
         }
+        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
+            errmsg => "iscsiadm login failed", outfunc => sub {});
     }
 
-    # Also try extra portals (IPv4/IPv6); discovery then login
     for my $p (@extra) {
-        run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p], errmsg => "iSCSI discovery failed", outfunc => sub {});
-        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'], errmsg => "iSCSI login failed", outfunc => sub {});
+        run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p],
+            errmsg => "iSCSI discovery failed", outfunc => sub {});
+        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
+            errmsg => "iSCSI login failed", outfunc => sub {});
     }
 }
 
-# Find the device node for a given LUN.
-# - If multipath enabled, prefer /dev/mapper/dm-uuid-mpath-*
-# - Else, /dev/disk/by-path/ip-<addr>:<port>-iscsi-<iqn>-lun-<lun>
 sub _device_for_lun($scfg, $lun) {
-    my $iqn = $scfg->{target_iqn};
-    my $prefer_by_path = $scfg->{use_by_path};
-
-    # settle devices
     run_command(['udevadm','settle'], outfunc => sub {});
+    my $iqn = $scfg->{target_iqn};
 
-    if ($scfg->{use_multipath} && !$prefer_by_path) {
-        # Grep WWIDs for luns, then map to dm-uuid
+    if ($scfg->{use_multipath} && !$scfg->{use_by_path}) {
         my $mp = '';
         run_command(['multipath','-ll'], outfunc => sub {
             my $line = $_[0];
-            if ($line =~ /^\s*size=/) { return; }
-            # very rough: pick the first map referencing our IQN
-            if ($line =~ /(dm-\d+)/ && $line =~ /$iqn/) { $mp = "/dev/$1"; }
+            if ($line =~ /(dm-\d+)/ && $line =~ /\Q$iqn\E/) { $mp = "/dev/$1"; }
         });
         return $mp if $mp;
     }
 
-    # by-path; scan all symlinks for our iqn+lun
     my $pattern = "-iscsi-$iqn-lun-$lun";
-    my @paths;
     opendir(my $dh, "/dev/disk/by-path") or die "cannot open /dev/disk/by-path\n";
-    while (my $e = readdir($dh)) {
-        next unless $e =~ /^ip-.*\Q$pattern\E$/; # handles IPv6 ip-... variants too
-        push @paths, "/dev/disk/by-path/$e";
-    }
+    my @paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
     closedir($dh);
-
     die "Could not locate by-path device for LUN $lun (IQN $iqn)\n" if !@paths;
-    # If multipath enabled but we still prefer by-path, return the first by-path
-    return $paths[0];
+    return "/dev/disk/by-path/$paths[0]";
 }
 
-# Build a "safe" zvol name for new allocations
 sub _zvol_name($vmid, $name) {
     $name //= 'disk-0';
-    $name =~ s/[^a-zA-Z0-9\-_\.]+/_/g;
+    $name =~ s/[^a-zA-Z0-9._\-]+/_/g;
     return "vm-$vmid-$name";
 }
 
 # ======== Storage implementation ========
 
-# Parse our volume names: "vol-<zname>-lun<id>"
 sub parse_volname {
     my ($class, $volname) = @_;
     if ($volname =~ m!^vol-([a-zA-Z0-9._\-]+)-lun(\d+)$!) {
         my ($zname, $lun) = ($1, int($2));
-        # vtype, name, vmid, basename, basevmid, isBase, format
         return ('images', $zname, undef, undef, undef, undef, 'raw', $lun);
     }
     die "unable to parse truenas volume name '$volname'\n";
 }
 
-# The device path returned here is used by QEMU to attach the disk
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
-    die "snapshots not supported on raw iSCSI LUNs via this plugin" if defined $snapname;
-
-    my ($vtype, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
-
+    die "snapshots not supported on raw iSCSI LUNs" if defined $snapname;
+    my (undef, undef, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     _iscsi_login_all($scfg);
     my $dev = _device_for_lun($scfg, $lun);
-
-    return ($dev, undef, $vtype);
+    return ($dev, undef, 'images');
 }
 
-# Create a zvol + extent and map it to the shared target with the next free LUN
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
     die "only raw is supported" if defined($fmt) && $fmt ne 'raw';
@@ -300,89 +528,71 @@ sub alloc_image {
     my $zname = _zvol_name($vmid, $name);
     my $full  = $scfg->{dataset} . '/' . $zname;
 
-    # Create zvol on TrueNAS
-    my $payload = { name => $full, type => 'VOLUME', volsize => int($size) };
-    $payload->{volblocksize} = $scfg->{zvol_blocksize} if $scfg->{zvol_blocksize};
-    _midclt($scfg, 'zfs.dataset.create', $payload);
+    # 1) Create zvol
+    _tn_dataset_create($scfg, $full, $size, $scfg->{zvol_blocksize});
 
-    # Create extent and associate with target
-    my $lun = _next_free_lun($scfg);
+    # 2) Create extent for the zvol
+    my $extent = _tn_extent_create($scfg, $zname, $full);
+    my $extent_id = ref($extent) eq 'HASH' && exists $extent->{id} ? $extent->{id} : $extent;
 
-    # extent create (device-backed zvol path on TrueNAS)
-    my $extent = {
-        name   => $zname,
-        type   => 'DISK',
-        disk   => "zvol/$full",
-        insecure_tpc => JSON::PP::true,
-    };
-    _midclt($scfg, 'iscsi.extent.create', $extent);
+    # 3) Map to the shared target at the next free LUN
+    my $targets = _tn_get_target($scfg);
+    my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
+    die "Target '$scfg->{target_iqn}' not found" if !$t;
 
-    # attach extent to target with computed LUN
-    my $associate = {
-        target => $scfg->{target_iqn},
-        extent => $zname,
-        lunid  => $lun,
-    };
-    _midclt($scfg, 'iscsi.targetextent.create', $associate);
+    my $maps = _tn_targetextents($scfg);
+    my %used = map { ($_->{lunid} // -1) => 1 } grep { $_->{target} == $t->{id} } @$maps;
+    my $lun; for my $cand (0..4095) { if (!$used{$cand}) { $lun = $cand; last; } }
+    die "No free LUN on target id=$t->{id}" if !defined $lun;
 
-    # Return canonical volname for PVE
+    _tn_targetextent_create($scfg, $t->{id}, $extent_id, $lun);
     return "vol-$zname-lun$lun";
 }
 
-# Remove extent mapping + extent + zvol
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
-    my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
-    my $full  = $scfg->{dataset} . '/' . $zname;
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;
 
-    # delete targetextent association by target+extent (idempotent cleanup)
-    _midclt($scfg, 'iscsi.targetextent.delete', { target => $scfg->{target_iqn}, extent => $zname, lunid => $lun });
+    my $targets = _tn_get_target($scfg);
+    my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
+    my $maps = _tn_targetextents($scfg);
+    my ($tx) = grep { $_->{target} == $t->{id} && defined($_->{extent}) } @$maps;
 
-    # delete extent
-    _midclt($scfg, 'iscsi.extent.delete', { name => $zname });
+    # Find extent id by name
+    my $extents = _api_call($scfg, 'iscsi.extent.query', [],
+        sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
+    );
+    my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
 
-    # delete zvol
-    _midclt($scfg, 'zfs.dataset.delete', { name => $full, recursive => JSON::PP::true });
+    _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
+    _tn_extent_delete($scfg, $extent->{id})   if $extent && defined $extent->{id};
+    _tn_dataset_delete($scfg, $full);
+
     return 1;
 }
 
-# We don't manage quotas/space; report active=1 so PVE won’t gray it out
-sub status { my ($class, $storeid, $scfg, $cache) = @_; return (0,0,0,1); }
-
-# Activate storage (noop; discovery happens in path()/activate_volume())
+sub status { return (0,0,0,1); }
 sub activate_storage { return 1; }
 sub deactivate_storage { return 1; }
 
-# Make sure sessions exist before VM starts
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
     die "snapshots not supported" if $snapname;
     _iscsi_login_all($scfg);
-    if ($scfg->{use_multipath}) {
-        run_command(['multipath','-r'], outfunc => sub {});
-    }
+    if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
     run_command(['udevadm','settle'], outfunc => sub {});
     return 1;
 }
 
-sub deactivate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
-    # keep sessions persistent (node.startup=automatic), do nothing here
-    return 1;
-}
+sub deactivate_volume { return 1; }
 
-# No snapshots/clones on raw LUNs (TrueNAS snapshots could be added later)
-sub volume_snapshot           { die "snapshot not supported"; }
-sub volume_snapshot_delete    { die "snapshot not supported"; }
-sub volume_snapshot_rollback  { die "snapshot not supported"; }
-sub clone_image               { die "clone not supported"; }
-sub create_base               { die "base images not supported"; }
-sub volume_resize             { die "resize not supported"; }
-
-# feature matrix
-sub volume_has_feature {
-    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
-    return undef; # minimal set; can be expanded
-}
+sub volume_snapshot          { die "snapshot not supported"; }
+sub volume_snapshot_delete   { die "snapshot not supported"; }
+sub volume_snapshot_rollback { die "snapshot not supported"; }
+sub clone_image              { die "clone not supported"; }
+sub create_base              { die "base images not supported"; }
+sub volume_resize            { die "resize not supported"; }
+sub volume_has_feature       { return undef; }
 
 1;
