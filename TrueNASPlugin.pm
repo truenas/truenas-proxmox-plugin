@@ -731,54 +731,87 @@ sub free_image {
 }
 
 # ======== List VM disks (images) for the storage ========
-# Proxmox calls this when you open "VM Disks" on the storage in the GUI.
+# Proxmox calls this when you open "VM Disks" on the storage in the GUI,
+# and when pvesm list <storeid> is invoked. Return an arrayref of entries
+# with keys: volid, size (bytes), format ('raw'), and optional vmid.
 sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache, $errors) = @_;
 
-    # Resolve our shared target id
-    my $target_id = eval { _resolve_target_id($scfg) };
-    if ($@) {
-        push @$errors, "target resolution failed: $@";
-        return;
+    # Build output list locally (Proxmox expects a return value here)
+    my $out = [];
+
+    # Optional filter: when caller passes a list of desired volids
+    my %want = ();
+    if (defined $vollist && ref($vollist) eq 'ARRAY') {
+        %want = map { $_ => 1 } @$vollist;
     }
 
-    # Map: extent_id -> LUN (for our target only)
+    # Tiny local normalizer for TrueNAS numeric fields:
+    my $norm_bytes = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+
+    # Resolve our shared target id; if this fails, don't 500 the UI.
+    my $target_id = eval { _resolve_target_id($scfg) };
+    if ($@) {
+        push(@$errors, "target resolution failed: $@")
+            if defined($errors) && ref($errors) eq 'ARRAY';
+        return $out;
+    }
+
+    # Map: extent_id -> LUN for THIS target only
     my $maps = _tn_targetextents($scfg) // [];
     my %lun_for_ext = map { $_->{extent} => ($_->{lunid} // 0) }
                       grep { ($_->{target} // -1) == $target_id } @$maps;
 
-    # All extents; filter to zvols under our dataset
+    # Enumerate all extents; keep only zvols under our dataset and mapped to our target
     my $extents = _tn_extents($scfg) // [];
+
     EXT: for my $e (@$extents) {
         next EXT if ($e->{type} // '') ne 'DISK';
-        my $disk = $e->{disk} // '';
-        # Expect "zvol/<dataset>/<zname>"
-        next EXT if $disk !~ m{^zvol/\Q$scfg->{dataset}\E/};
-        my $zname = $e->{name} // next EXT;
-        my $extent_id = $e->{id};
-        my $lun = $lun_for_ext{$extent_id};
-        next EXT if !defined $lun; # not mapped to our target
 
-        # If a specific VMID is requested, filter by our naming convention vm-<id>-
+        my $disk = $e->{disk} // '';              # e.g., "zvol/<dataset>/<zname>"
+        next EXT if $disk !~ m{^zvol/\Q$scfg->{dataset}\E/};
+
+        my $zname     = $e->{name} // next EXT;   # zvol dataset name leaf (vm-<id>-disk-N)
+        my $extent_id = $e->{id};
+        my $lun       = $lun_for_ext{$extent_id};
+        next EXT if !defined $lun;                # not mapped to our shared target
+
+        # If a specific VMID is requested, filter by naming convention "vm-<id>-..."
         if (defined $vmid && $zname !~ /^vm-\Q$vmid\E-/) {
             next EXT;
         }
 
-        # Fetch size from the zvol dataset
-        my $full = "$scfg->{dataset}/$zname";
-        my $ds = eval { _tn_dataset_get($scfg, $full) } // {};
-        my $size = _norm_bytes($ds->{volsize}); # bytes
-        $size = 0 if !$size;
+        # Compose the volname our plugin uses elsewhere: "vol-<zname>-lun<LUN>"
+        my $volname = "vol-$zname-lun$lun";
 
-        # Deduce vmid if possible
+        # If caller provided an allow-list of volids (storeid:volname), honor it
+        if (%want && !$want{"$storeid:$volname"}) { next EXT; }
+
+        # Get capacity (bytes) from the zvol dataset; prefer volsize
+        my $full_ds = "$scfg->{dataset}/$zname";
+        my $ds = eval { _tn_dataset_get($scfg, $full_ds) } // {};
+        my $size = $norm_bytes->($ds->{volsize}) || 0;
+
+        # Best-effort VMID extraction from zvol name
         my $vid;
         if ($zname =~ /^vm-(\d+)-/) { $vid = int($1); }
 
-        my $volname = "vol-$zname-lun$lun";
-        # Register volume in the list (raw format)
-        _tn_add_volume($vollist, $storeid, $volname, $size, { vmid => $vid, format => 'raw' });
+        # Add entry to output (raw iSCSI LUNs)
+        _tn_add_volume($out, $storeid, $volname, $size, {
+            format => 'raw',
+            (defined $vid ? (vmid => $vid) : ()),
+        });
     }
+
+    return $out;
 }
+
 
 # ======== status(): report dataset capacity correctly ========
 # total = quota (if set) else (written/used + available)
