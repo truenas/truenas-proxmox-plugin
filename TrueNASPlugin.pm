@@ -147,9 +147,9 @@ sub options {
         zvol_blocksize => { optional => 1, fixed => 1 },
 
         # Target & portals
-        target_iqn      => { fixed => 1 },
-        discovery_portal=> { fixed => 1 },
-        portals         => { optional => 1 },
+        target_iqn       => { fixed => 1 },
+        discovery_portal => { fixed => 1 },
+        portals          => { optional => 1 },
 
         # Initiator
         use_multipath => { optional => 1 },
@@ -610,7 +610,7 @@ sub _device_for_lun($scfg, $lun) {
         if ($real && $real =~ m{^/dev/([^/]+)$}) {
             my $leaf = $1; # e.g., sdc
             if (my $dm = _dm_map_for_leaf($leaf)) {
-                return $dm; # return the /dev/mapper/<name> (or /dev/dm-*)
+                return $dm; # return /dev/mapper/<name> (or /dev/dm-*)
             }
         }
         # if no dm map found yet, fall back to by-path
@@ -626,10 +626,19 @@ sub _zvol_name($vmid, $name) {
     return "vm-$vmid-$name";
 }
 
+# ======== Helpers for listing ========
+sub _norm_bytes {
+    my ($v) = @_;
+    return 0 if !defined $v;
+    return $v if !ref($v);
+    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+    return 0;
+}
+
 # ======== Required storage interface ========
 sub parse_volname {
     my ($class, $volname) = @_;
-    if ($volname =~ m!^vol-(\[a-zA-Z0-9._\-]+)-lun(\d+)$!) {
+    if ($volname =~ m!^vol-([a-zA-Z0-9._\-]+)-lun(\d+)$!) {
         my ($zname, $lun) = ($1, int($2));
         return ('images', $zname, undef, undef, undef, undef, 'raw', $lun);
     }
@@ -694,6 +703,59 @@ sub free_image {
     _tn_extent_delete($scfg, $extent_id) if defined $extent_id;
     _tn_dataset_delete($scfg, $full);
     return 1;
+}
+
+# ======== List VM disks (images) for the storage ========
+# Proxmox calls this when you open "VM Disks" on the storage in the GUI.
+sub list_images {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache, $errors) = @_;
+
+    # Resolve our shared target id
+    my $target_id = eval { _resolve_target_id($scfg) };
+    if ($@) {
+        push @$errors, "target resolution failed: $@";
+        return;
+    }
+
+    # Map: extent_id -> LUN (for our target only)
+    my $maps = _tn_targetextents($scfg) // [];
+    my %lun_for_ext = map { $_->{extent} => ($_->{lunid} // 0) }
+                      grep { ($_->{target} // -1) == $target_id } @$maps;
+
+    # All extents; filter to zvols under our dataset
+    my $extents = _tn_extents($scfg) // [];
+    EXT: for my $e (@$extents) {
+        next EXT if ($e->{type} // '') ne 'DISK';
+        my $disk = $e->{disk} // '';
+        # Expect "zvol/<dataset>/<zname>"
+        next EXT if $disk !~ m{^zvol/\Q$scfg->{dataset}\E/};
+        my $zname = $e->{name} // next EXT;
+        my $extent_id = $e->{id};
+        my $lun = $lun_for_ext{$extent_id};
+        next EXT if !defined $lun; # not mapped to our target
+
+        # If a specific VMID is requested, filter by our naming convention vm-<id>-
+        if (defined $vmid && $zname !~ /^vm-\Q$vmid\E-/) {
+            next EXT;
+        }
+
+        # Fetch size from the zvol dataset
+        my $full = "$scfg->{dataset}/$zname";
+        my $ds = eval { _tn_dataset_get($scfg, $full) } // {};
+        my $size = _norm_bytes($ds->{volsize}); # bytes
+        $size = 0 if !$size;
+
+        # Deduce vmid if possible
+        my $vid;
+        if ($zname =~ /^vm-(\d+)-/) { $vid = int($1); }
+
+        my $volname = "vol-$zname-lun$lun";
+        # Register volume in the list (raw format)
+        $class->add_volume($vollist, $storeid, $volname, $size, {
+            format => 'raw',
+            vmid   => $vid,
+        });
+    }
 }
 
 # ======== status(): report dataset capacity correctly ========
