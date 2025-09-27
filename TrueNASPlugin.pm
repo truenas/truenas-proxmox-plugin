@@ -170,6 +170,27 @@ sub _host_ipv4($host) {
     return $host; # fallback to original
 }
 
+# Resolve configured target_iqn to a target id by matching full IQN or short name
+sub _resolve_target_id {
+    my ($scfg) = @_;
+    my $want = $scfg->{target_iqn} // die "target_iqn not set\n";
+    my $short = $want;
+    $short =~ s/^.*://; # take text after last colon as short target name
+
+    my $targets = _tn_get_target($scfg); # returns arrayref of targets
+    # Try exact name == full IQN, then name == short, then fallback if an 'iqn' field exists
+    my ($t) = grep { defined($_->{name}) && ($_->{name} eq $want || $_->{name} eq $short) } @$targets;
+    if (!$t) {
+        ($t) = grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets; # just in case some versions expose 'iqn'
+    }
+
+    if (!$t) {
+        my @names = map { $_->{name} // '(unnamed)' } @$targets;
+        die "Target '$want' not found. Available targets: ".join(', ', @names)."\n";
+    }
+    return $t->{id};
+}
+
 
 # ======== REST Client (fallback) ========
 
@@ -573,43 +594,64 @@ sub alloc_image {
     my $extent = _tn_extent_create($scfg, $zname, $full);
     my $extent_id = ref($extent) eq 'HASH' && exists $extent->{id} ? $extent->{id} : $extent;
 
-    # 3) target and free LUN
-    my $targets = _tn_get_target($scfg);
-    my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
-    die "Target '$scfg->{target_iqn}' not found" if !$t;
+    # 3) map to the shared target at the next free LUN
+    my $target_id = _resolve_target_id($scfg);
 
     my $maps = _tn_targetextents($scfg);
-    my %used = map { ($_->{lunid} // -1) => 1 } grep { $_->{target} == $t->{id} } @$maps;
+    my %used = map { ($_->{lunid} // -1) => 1 } grep { $_->{target} == $target_id } @$maps;
     my $lun; for my $cand (0..4095) { if (!$used{$cand}) { $lun = $cand; last; } }
-    die "No free LUN on target id=$t->{id}" if !defined $lun;
+    die "No free LUN on target id=$target_id" if !defined $lun;
 
-    _tn_targetextent_create($scfg, $t->{id}, $extent_id, $lun);
+    _tn_targetextent_create($scfg, $target_id, $extent_id, $lun);
+
     return "vol-$zname-lun$lun";
 }
 
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
+
+    # parse volname -> zvol short name
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    my $targets = _tn_get_target($scfg);
-    my ($t) = grep { $_->{name} && $_->{name} eq $scfg->{target_iqn} } @$targets;
+    # --- resolve target id (accept full IQN or short target name) ---
+    my $target_id;
+    eval {
+        my $want  = $scfg->{target_iqn} // die "target_iqn not set\n";
+        my $short = $want; $short =~ s/^.*://;  # tail after last ':'
 
-    # resolve extent id by name
-    my $extents = _tn_extents($scfg);
+        my $targets = _tn_get_target($scfg);    # arrayref of targets
+        my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
+
+        # Some versions may expose an 'iqn' field; try that if name didn't match
+        $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
+
+        die "not found" if !$t;
+        $target_id = $t->{id};
+    };
+    # If target lookup fails, we continue with best-effort cleanup (extent + zvol).
+
+    # --- find the extent id by our zvol name ---
+    my $extents = _tn_extents($scfg);                 # arrayref of extents
     my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
     my $extent_id = $extent ? $extent->{id} : undef;
 
-    # resolve targetextent row matching this target + extent
-    my $maps = _tn_targetextents($scfg);
-    my ($tx) = grep { $_->{target} == $t->{id} && defined($extent_id) && ($_->{extent} // -1) == $extent_id } @$maps;
+    # --- remove targetextent association if we can resolve both target & extent ---
+    if (defined $target_id && defined $extent_id) {
+        my $maps = _tn_targetextents($scfg);          # arrayref of targetextent rows
+        my ($tx) = grep { $_->{target} == $target_id && ($_->{extent} // -1) == $extent_id } @$maps;
+        _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
+    }
 
-    _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
-    _tn_extent_delete($scfg, $extent_id)      if defined $extent_id;
+    # --- remove extent (if it still exists) ---
+    _tn_extent_delete($scfg, $extent_id) if defined $extent_id;
+
+    # --- remove the zvol (always attempt) ---
     _tn_dataset_delete($scfg, $full);
 
     return 1;
 }
+
 
 sub status { return (0,0,0,1); }
 sub activate_storage { return 1; }
