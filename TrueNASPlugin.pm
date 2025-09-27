@@ -29,12 +29,11 @@ sub type { return 'truenasplugin'; }    # storage.cfg "type"
 
 sub plugindata {
     return {
-        content => [ { images => 1, none => 1 }, { images => 1 } ],
+        content => [ { images => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
-        'sensitive-properties' => { api_key => 1, chap_password => 1 },
-        select_existing => 1,
     };
 }
+
 
 # ======== Config schema (only plugin-specific keys) ========
 sub properties {
@@ -775,30 +774,96 @@ sub path {
     return ($dev, undef, 'images');
 }
 
+# Create a new VM disk (zvol + iSCSI extent + mapping) and hand it to Proxmox.
+# Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_bytes)
 sub alloc_image {
-    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
-    die "only raw is supported" if defined($fmt) && $fmt ne 'raw';
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
 
-    my $zname = _zvol_name($vmid, $name);
-    my $full  = $scfg->{dataset} . '/' . $zname;
+    die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
+    die "invalid size\n"         if !defined($size) || $size <= 0;
 
-    # 1) Create zvol (bytes + thin toggle)
-    _tn_dataset_create($scfg, $full, $size_kib, $scfg->{zvol_blocksize});
+    # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
+    my $zname = $name;
+    if (!$zname) {
+        # naive free name finder: vm-<vmid>-disk-0...999 (replace with your own helper if you have one)
+        for (my $n = 0; $n < 1000; $n++) {
+            my $candidate = "vm-$vmid-disk-$n";
+            my $full = $scfg->{dataset} . '/' . $candidate;
+            my $exists = eval { _tn_dataset_get($scfg, $full) };
+            if ($@ || !$exists) { $zname = $candidate; last; }
+        }
+        die "unable to find free disk name\n" if !$zname;
+    }
 
-    # 2) Create extent for the zvol
-    my $extent = _tn_extent_create($scfg, $zname, $full);
-    my $extent_id = ref($extent) eq 'HASH' && exists $extent->{id} ? $extent->{id} : $extent;
+    my $full_ds = $scfg->{dataset} . '/' . $zname;
 
-    # 3) Map to shared target at next free LUN
+    # 1) Create the zvol (VOLUME) on TrueNAS with requested size (bytes)
+    my $create_payload = {
+        name    => $full_ds,
+        type    => 'VOLUME',
+        volsize => int($size),
+        # optionally: volblocksize => '16K', sparse => JSON::true
+    };
+    _api_call(
+        $scfg,
+        'pool.dataset.create',
+        [ $create_payload ],
+        sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
+    );
+
+    # 2) Create an iSCSI extent for that zvol (device-backed)
+    # TrueNAS expects a 'disk' like "zvol/<pool>/<zname>"
+    my $zvol_path = 'zvol/' . $full_ds;
+    my $extent_payload = {
+        name => $zname,
+        type => 'DISK',
+        disk => $zvol_path,
+        insecure_tpc => JSON::true, # typical default for modern OS initiators
+    };
+    my $extent_id;
+    {
+        my $ext = _api_call(
+            $scfg,
+            'iscsi.extent.create',
+            [ $extent_payload ],
+            sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
+        );
+        # normalize id from either WS result or REST (hashref)
+        $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+    }
+    die "failed to create extent for $zname\n" if !defined $extent_id;
+
+    # 3) Map extent to our shared target (targetextent.create); lunid is auto-assigned if not given
     my $target_id = _resolve_target_id($scfg);
-    my $maps = _tn_targetextents($scfg);
-    my %used = map { (($_->{lunid} // -1) => 1) } grep { $_->{target} == $target_id } @$maps;
-    my $lun; for my $cand (0..4095) { if (!$used{$cand}) { $lun = $cand; last; } }
-    die "No free LUN on target id=$target_id" if !defined $lun;
-    _tn_targetextent_create($scfg, $target_id, $extent_id, $lun);
+    my $tx_payload = { target => $target_id, extent => $extent_id };
+    my $tx = _api_call(
+        $scfg,
+        'iscsi.targetextent.create',
+        [ $tx_payload ],
+        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+    );
 
-    return "vol-$zname-lun$lun";
+    # 4) Find the lunid that TrueNAS assigned for this (target, extent)
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($tx_map) = grep {
+        ($_->{target}//-1) == $target_id && ($_->{extent}//-1) == $extent_id
+    } @$maps;
+    my $lun = $tx_map ? $tx_map->{lunid} : undef;
+    die "could not determine assigned LUN for $zname\n" if !defined $lun;
+
+    # 5) Refresh initiator view on this node (login already exists; rescan & multipath)
+    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    if ($scfg->{use_multipath}) {
+        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+    }
+    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+
+    # 6) Return our encoded volname so Proxmox can store it in the VM config
+    # We use the same naming scheme we handle elsewhere: vol-<zname>-lun<lun>
+    my $volname = "vol-$zname-lun$lun";
+    return $volname;
 }
+
 
 # Return size in bytes (scalar), or (size_bytes, format) in list context
 sub volume_size_info {
