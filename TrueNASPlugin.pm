@@ -289,21 +289,45 @@ sub _ws_rpc($conn, $obj) {
 }
 
 # Simple text frames (no compression/fragmentation)
-sub _ws_send_text($sock, $payload) {
+# --- helper: byte-wise XOR without numeric warnings ---
+sub _xor_mask {
+    my ($data, $mask) = @_;
+    my $len  = length($data);
+    my $out  = $data; # will mutate in place
+    my $m0 = ord(substr($mask, 0, 1));
+    my $m1 = ord(substr($mask, 1, 1));
+    my $m2 = ord(substr($mask, 2, 1));
+    my $m3 = ord(substr($mask, 3, 1));
+
+    for (my $i = 0; $i < $len; $i++) {
+        my $mi = ($i & 3) == 0 ? $m0
+              : ($i & 3) == 1 ? $m1
+              : ($i & 3) == 2 ? $m2
+              :                 $m3;
+        substr($out, $i, 1, chr( ord(substr($out, $i, 1)) ^ $mi ));
+    }
+    return $out;
+}
+
+sub _ws_send_text {
+    my ($sock, $payload) = @_;
+
     my $fin_opcode = 0x81; # FIN + text
-    my $maskbit    = 0x80; # client masks
+    my $maskbit    = 0x80; # clients MUST mask
+
     my $len = length($payload);
     my $hdr = pack('C', $fin_opcode);
-    my $lenfield;
-    if    ($len <= 125)    { $lenfield = pack('C', $maskbit | $len); }
-    elsif ($len <= 0xFFFF) { $lenfield = pack('C n', $maskbit | 126, $len); }
-    else                   { $lenfield = pack('C Q>', $maskbit | 127, $len); }
 
-    my $mask = join '', map { chr(int(rand(256))) } 1..4;
-    my $masked = $payload ^ ($mask x int((length($payload)+3)/4));
-    $masked = substr($masked, 0, $len);
+    my $lenfield;
+    if    ($len <= 125)    { $lenfield = pack('C',     $maskbit | $len); }
+    elsif ($len <= 0xFFFF) { $lenfield = pack('C n',   $maskbit | 126, $len); }
+    else                   { $lenfield = pack('C Q>',  $maskbit | 127, $len); }
+
+    my $mask   = join '', map { chr(int(rand(256))) } 1..4;
+    my $masked = _xor_mask($payload, $mask);
 
     my $frame = $hdr . $lenfield . $mask . $masked;
+
     my $off = 0;
     while ($off < length($frame)) {
         my $w = $sock->syswrite($frame, length($frame) - $off, $off);
@@ -311,6 +335,7 @@ sub _ws_send_text($sock, $payload) {
         $off += $w;
     }
 }
+
 
 sub _ws_recv_text($sock) {
     my $hdr;
