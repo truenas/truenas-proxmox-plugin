@@ -136,6 +136,8 @@ sub options {
         target_iqn       => { fixed => 1 },
         discovery_portal => { fixed => 1 },
         portals          => { optional => 1 },
+        force_delete_on_inuse  => { optional => 1 },  # temporarily logout → delete → login (default: off)
+        logout_on_free         => { optional => 1 },  # logout if no LUNs remain for this target (default: off)
 
         # Initiator
         use_multipath => { optional => 1 },
@@ -705,6 +707,39 @@ sub _dm_map_for_leaf($leaf) {
     return undef;
 }
 
+sub _logout_target_all_portals {
+    my ($scfg) = @_;
+    my $iqn = $scfg->{target_iqn};
+    my @portals = map { s/^\s+|\s+$//gr } split(/\s*,\s*/, ($scfg->{portal}//''));
+    for my $p (@portals) {
+        eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--logout'], errfunc=>sub{}) };
+        eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','delete'], errfunc=>sub{}) };
+    }
+}
+
+sub _login_target_all_portals {
+    my ($scfg) = @_;
+    my $iqn = $scfg->{target_iqn};
+    my @portals = map { s/^\s+|\s+$//gr } split(/\s*,\s*/, ($scfg->{portal}//''));
+
+    for my $p (@portals) {
+        eval {
+            # Ensure node record exists & autostarts, then login
+            PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','new'], errfunc=>sub{});
+            PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--op','update','-n','node.startup','-v','automatic'], errfunc=>sub{});
+            PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--login'], errfunc=>sub{});
+        };
+    }
+
+    # Refresh kernel & multipath views
+    eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
+    eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+    if ($scfg->{use_multipath}) {
+        eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
+        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+    }
+}
+
 sub _device_for_lun($scfg, $lun) {
     # Wait briefly for by-path to appear if needed
     my $by;
@@ -902,120 +937,131 @@ sub volume_size_info {
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
 
-    die "snapshots not supported on raw iSCSI LUNs\n" if $isBase; # Proxmox passes $isBase for base images
+    die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
-    # Parse our custom volname: "vol-<zname>-lun<N>"
-    my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
-        $class->parse_volname($volname);
-    $fmt //= 'raw';
+    my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
+    my $full_ds = $scfg->{dataset} . '/' . $zname;
 
-    my $zvol_ds = $scfg->{dataset} . '/' . $zname;
-
-    # Capture device + WWID before we tear down mapping, so we can flush cleanly
-    my ($dev_path, $wwid);
-    eval {
-        if (defined $lun) {
-            ($dev_path) = $class->path($scfg, $volname, $storeid, undef);
-            # Resolve leaf for WWID query (works for /dev/disk/by-path/...lun-N)
-            my $leaf = Cwd::abs_path($dev_path);
-            if ($scfg->{use_multipath}) {
-                my $out = '';
+    # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
+    if ($scfg->{use_multipath}) {
+        eval {
+            my ($dev) = $class->path($scfg, $volname, $storeid, undef);
+            if ($dev) {
+                my $leaf = Cwd::abs_path($dev);
+                my $wwid = '';
                 eval {
-                    run_command(
-                        ['/lib/udev/scsi_id', '-g', '-u', '-d', $leaf],
-                        outfunc => sub { $out .= $_[0]; },
-                        errfunc => sub { }, timeout => 10
+                    PVE::Tools::run_command(
+                        ['/lib/udev/scsi_id','-g','-u','-d',$leaf],
+                        outfunc => sub { $wwid .= $_[0]; }, errfunc => sub {}
                     );
                 };
-                chomp($out) if defined $out;
-                $wwid = $out if $out;
+                chomp($wwid) if $wwid;
+                if ($wwid) {
+                    eval { PVE::Tools::run_command(['multipath','-f',$wwid], outfunc=>sub{}, errfunc=>sub{}) };
+                }
             }
-        }
-    }; # best-effort; ignore errors if LUN already unmapped
-    # --- Look up TrueNAS extent + mapping for this zvol on our shared target ---
-    my $extents = _tn_extents($scfg) // [];
-    my ($extent) = grep { (($_->{name}//'') eq $zname) } @$extents;
-
-    # If the extent is already gone, we still try to delete the zvol (idempotent behavior)
-    my $target_id = _resolve_target_id($scfg);
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($tx) = ($extent && $target_id)
-        ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
-        : ();
-
-    # --- Unstage from host first: flush multipath path for this WWID (if any) ---
-    if ($scfg->{use_multipath} && $wwid) {
-        eval { _try_run(['multipath', '-f', $wwid], "multipath flush $wwid failed"); };
-        warn $@ if $@;
+        };
+        # ignore any multipath flush errors here
     }
 
-    # --- Remove targetextent mapping on TrueNAS (target -> extent) ---
+    # Resolve target/extent/mapping on TrueNAS
+    my $target_id = _resolve_target_id($scfg);
+    my $extents   = _tn_extents($scfg) // [];
+    my ($extent)  = grep { ($_->{name}//'') eq $zname } @$extents;
+    my $maps      = _tn_targetextents($scfg) // [];
+    my ($tx)      = ($extent && $target_id)
+                  ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
+                  : ();
+
+    my $in_use = sub { my ($e)=@_; return ($e && $e =~ /in use/i) ? 1 : 0; };
+    my $need_force_logout = 0;
+
+    # 1) Delete targetextent mapping
     if ($tx && defined $tx->{id}) {
         my $id = $tx->{id};
-        eval {
-            _api_call(
-                $scfg,
-                'iscsi.targetextent.delete',
-                [ $id ],
-                sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) },
-            );
+        my $ok = eval {
+            _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
+                sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+            1;
         };
-        warn "warning: delete targetextent mapping id=$id failed: $@" if $@;
+        if (!$ok) {
+            my $err = $@ // '';
+            if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+                $need_force_logout = 1;
+            } else {
+                warn "warning: delete targetextent id=$id failed: $err";
+            }
+        }
     }
 
-    # --- Remove the extent itself on TrueNAS ---
+    # 2) Delete extent (may still be mapped if step 1 failed)
     if ($extent && defined $extent->{id}) {
         my $eid = $extent->{id};
-        eval {
-            _api_call(
-                $scfg,
-                'iscsi.extent.delete',
-                [ $eid ],
-                sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$eid", undef) },
-            );
+        my $ok = eval {
+            _api_call($scfg,'iscsi.extent.delete',[ $eid ],
+                sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+            1;
         };
-        warn "warning: delete extent id=$eid failed: $@" if $@;
+        if (!$ok) {
+            my $err = $@ // '';
+            if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+                $need_force_logout = 1;
+            } else {
+                warn "warning: delete extent id=$eid failed: $err";
+            }
+        }
     }
 
-    # --- Delete the zvol (dataset) on TrueNAS (recursive => drop any snaps) ---
+    # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, temporarily logout → retry
+    if ($need_force_logout) {
+        _logout_target_all_portals($scfg);
+
+        # Retry mapping delete
+        if ($tx && defined $tx->{id}) {
+            my $id = $tx->{id};
+            eval {
+                _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
+                    sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+            } or warn "warning: delete targetextent (retry) id=$id failed: $@";
+        }
+
+        # Retry extent delete (re-query extent by name)
+        $extents = _tn_extents($scfg) // [];
+        ($extent) = grep { ($_->{name}//'') eq $zname } @$extents;
+        if ($extent && defined $extent->{id}) {
+            my $eid = $extent->{id};
+            eval {
+                _api_call($scfg,'iscsi.extent.delete',[ $eid ],
+                    sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+            } or warn "warning: delete extent (retry) id=$eid failed: $@";
+        }
+    }
+
+    # 4) Delete the zvol dataset (recursive/force as safety)
     eval {
-        my $id = URI::Escape::uri_escape($zvol_ds);
+        my $id = URI::Escape::uri_escape($full_ds);
         my $payload = { recursive => JSON::true, force => JSON::true };
-        _api_call(
-            $scfg,
-            'pool.dataset.delete',
-            [ $zvol_ds, $payload ],
-            sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id", $payload) },
-        );
-    };
-    warn "warning: delete dataset $zvol_ds failed: $@" if $@;
+        _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+            sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+    } or warn "warning: delete dataset $full_ds failed: $@";
 
-    # --- Initiator cleanup on the node ---
-    # Rescan sessions so the kernel removes defunct LUNs; then reload multipath and settle udev.
-    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-    warn $@ if $@;
-    if ($scfg->{use_multipath}) {
-        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
-        warn $@ if $@;
+    # 5) Re-login & refresh (only if we did the forced logout)
+    if ($need_force_logout) {
+        _login_target_all_portals($scfg);
+    } else {
+        eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
+        if ($scfg->{use_multipath}) {
+            eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
+        }
+        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     }
-    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
-    warn $@ if $@;
 
-    # --- Optional: logout if the target has no remaining LUNs and logout_on_free=1 ---
+    # Optional: logout if no LUNs remain for this target on this node
     if ($scfg->{logout_on_free}) {
         eval {
-            my $iqn = $scfg->{target_iqn};
-            if (_session_has_no_luns($iqn)) {
-                # try to logout from all known portals for this target
-                my @portals = @{ $scfg->{portals} // [] };
-                @portals = ($scfg->{portal}) if !@portals && $scfg->{portal};
-                for my $p (@portals) {
-                    eval { _try_run(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--logout'], "iscsi logout failed"); };
-                    warn $@ if $@;
-                    eval { _try_run(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','delete'], "iscsi node delete failed"); };
-                    warn $@ if $@;
-                }
+            if (_session_has_no_luns($scfg)) {
+                _logout_target_all_portals($scfg);
             }
         };
         warn "warning: logout_on_free check failed: $@" if $@;
