@@ -15,7 +15,7 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
-use Carp qw(croak);
+use Carp qw(carp croak);
 
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
@@ -24,8 +24,8 @@ use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::Storage::Plugin);
 
 # ======== Storage plugin identity ========
-sub api { return 11; }                 # storage plugin API version
-sub type { return 'truenasplugin'; }   # storage.cfg "type"
+sub api  { return 11; }                 # storage plugin API version
+sub type { return 'truenasplugin'; }    # storage.cfg "type"
 
 sub plugindata {
     return {
@@ -42,13 +42,11 @@ sub properties {
         # Transport & connection
         api_transport => {
             description => "API transport: 'ws' (JSON-RPC) or 'rest'.",
-            type => 'string',
-            optional => 1,
+            type => 'string', optional => 1,
         },
         api_host => {
             description => "TrueNAS hostname or IP.",
-            type => 'string',
-            format => 'pve-storage-server',
+            type => 'string', format => 'pve-storage-server',
         },
         api_key => {
             description => "TrueNAS user-linked API key.",
@@ -56,25 +54,19 @@ sub properties {
         },
         api_scheme => {
             description => "wss/ws for WS, https/http for REST (defaults: wss/https).",
-            type => 'string',
-            optional => 1,
+            type => 'string', optional => 1,
         },
         api_port => {
             description => "TCP port (defaults: 443 for wss/https, 80 for ws/http).",
-            type => 'integer',
-            optional => 1,
+            type => 'integer', optional => 1,
         },
         api_insecure => {
             description => "Skip TLS certificate verification.",
-            type => 'boolean',
-            optional => 1,
-            default => 0,
+            type => 'boolean', optional => 1, default => 0,
         },
         prefer_ipv4 => {
             description => "Prefer IPv4 (A records) when resolving api_host.",
-            type => 'boolean',
-            optional => 1,
-            default => 1,
+            type => 'boolean', optional => 1, default => 1,
         },
 
         # Placement
@@ -84,8 +76,7 @@ sub properties {
         },
         zvol_blocksize => {
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
-            type => 'string',
-            optional => 1,
+            type => 'string', optional => 1,
         },
 
         # iSCSI target & portals
@@ -99,8 +90,7 @@ sub properties {
         },
         portals => {
             description => "Comma-separated additional portals.",
-            type => 'string',
-            optional => 1,
+            type => 'string', optional => 1,
         },
 
         # Initiator pathing
@@ -108,21 +98,17 @@ sub properties {
         use_by_path   => { type => 'boolean', optional => 1, default => 0 },
         ipv6_by_path  => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
-            type => 'boolean',
-            optional => 1,
-            default => 0,
+            type => 'boolean', optional => 1, default => 0,
         },
 
         # CHAP (optional)
         chap_user     => { type => 'string', optional => 1 },
         chap_password => { type => 'string', optional => 1 },
 
-        # Thin provisioning toggle (plugin-specific to avoid schema collision)
+        # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
-            description => "Create thin-provisioned zvols on TrueNAS (maps to TrueNAS 'sparse').",
-            type => 'boolean',
-            optional => 1,
-            default => 1,
+            description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
+            type => 'boolean', optional => 1, default => 1,
         },
     };
 }
@@ -458,30 +444,6 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
 }
-sub _tn_add_volume {
-    my ($vollist, $storeid, $volname, $size, $extra) = @_;
-
-    die "_tn_add_volume: vollist must be an arrayref"
-        if ref($vollist) ne 'ARRAY';
-    die "_tn_add_volume: missing storeid/volname"
-        if !defined($storeid) || !defined($volname);
-
-    my %entry = (
-        volid  => "$storeid:$volname",
-        format => 'raw',
-        size   => int($size // 0),
-    );
-
-    if (defined $extra && ref($extra) eq 'HASH') {
-        $entry{format} = $extra->{format} if defined $extra->{format};
-        $entry{vmid}   = $extra->{vmid}   if defined $extra->{vmid};
-        $entry{notes}  = $extra->{notes}  if defined $extra->{notes};
-    }
-
-    push @$vollist, \%entry;
-    return \%entry;
-}
-
 
 # ======== Target resolution (IQN or short Target Name) ========
 sub _resolve_target_id {
@@ -531,6 +493,25 @@ sub _probe_portal($portal) {
     return 1;
 }
 
+# ======== Safe wrappers for external commands ========
+sub _try_run {
+    my ($cmd, $errmsg) = @_;
+    my $ok = 1;
+    eval { run_command($cmd, errmsg => $errmsg, outfunc => sub {}, errfunc => sub {}); };
+    if ($@) { carp (($errmsg // 'cmd failed').": $@"); $ok = 0; }
+    return $ok;
+}
+sub _run_lines {
+    my ($cmd) = @_;
+    my @lines;
+    eval {
+        run_command($cmd,
+            outfunc => sub { push @lines, $_[0] if defined $_[0] && $_[0] =~ /\S/; },
+            errfunc => sub {});
+    };
+    return @lines; # return whatever we captured even on non-zero RC
+}
+
 # ======== Initiator: discovery/login and device resolution ========
 sub _iscsi_login_all($scfg) {
     my $primary = _normalize_portal($scfg->{discovery_portal});
@@ -540,53 +521,51 @@ sub _iscsi_login_all($scfg) {
     _probe_portal($primary);
     _probe_portal($_) for @extra;
 
-    # Ensure discovery DB entries exist for primary + extras
-    run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary],
-        errmsg => "iSCSI discovery failed (primary)", outfunc => sub {});
+    # Discovery (don't die on non-zero)
+    _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery failed (primary)");
     for my $p (@extra) {
-        run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p],
-            errmsg => "iSCSI discovery failed (extra $p)", outfunc => sub {});
+        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p], "iSCSI discovery failed ($p)");
     }
 
     my $iqn = $scfg->{target_iqn};
-    my @nodes;
-    run_command(['iscsiadm','-m','node','-T',$iqn], errmsg => "iscsiadm nodes failed", outfunc => sub {
-        push @nodes, $_[0] if $_[0] =~ /\S/;
-    });
+    my @nodes = _run_lines(['iscsiadm','-m','node','-T',$iqn]);
 
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         next unless $n =~ /^(\S+)\s+$iqn$/;
         my $portal = _normalize_portal($1);
-        # Persist startup = automatic
-        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
-            errmsg => "iscsiadm update failed (node.startup)", outfunc => sub {});
-        # CHAP (optional)
+        _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
+                 "iscsiadm update failed (node.startup)");
         if ($scfg->{chap_user} && $scfg->{chap_password}) {
             for my $cmd (
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{chap_user}],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
-            ) {
-                run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {});
-            }
+            ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
         }
-        # Login
-        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
-            errmsg => "iscsiadm login failed ($portal)", outfunc => sub {});
+        _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
+                 "iscsiadm login failed ($portal)");
     }
-
-    # Also attempt direct login for any extra portals not returned by -m node (edge)
+    # attempt direct login for any extra portals not already in -m node
     for my $p (@extra) {
-        eval {
-            run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
-                errmsg => "iscsiadm login failed ($p)", outfunc => sub {});
-        };
+        _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
+                 "iscsiadm login failed ($p)");
     }
 
-    # Give udev a moment to create by-path links
+    # Verify a session exists; if not, retry once
+    my $have_session = 0;
+    for my $line (_run_lines(['iscsiadm','-m','session'])) {
+        if ($line =~ /\b\Q$iqn\E\b/) { $have_session = 1; last; }
+    }
+    if (!$have_session) {
+        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery retry");
+        for my $p (@extra, $primary) {
+            _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'], "iSCSI login retry ($p)");
+        }
+    }
+
     run_command(['udevadm','settle'], outfunc => sub {});
-    usleep(150_000); # 150ms grace
+    usleep(250_000); # modest grace
 }
 
 sub _find_by_path_for_lun($scfg, $lun) {
@@ -621,10 +600,14 @@ sub _dm_map_for_leaf($leaf) {
 sub _device_for_lun($scfg, $lun) {
     # Wait briefly for by-path to appear if needed
     my $by;
-    for (1..20) { # up to ~2s total
+    for (my $i = 1; $i <= 50; $i++) { # up to ~5s
         $by = _find_by_path_for_lun($scfg, $lun);
         last if $by && -e $by;
         run_command(['udevadm','settle'], outfunc => sub {});
+        if ($i == 10 || $i == 20 || $i == 35) {
+            _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
+            run_command(['udevadm','settle'], outfunc => sub {});
+        }
         usleep(100_000);
     }
     die "Could not locate by-path device for LUN $lun (IQN $scfg->{target_iqn})\n" if !$by || !-e $by;
@@ -635,11 +618,10 @@ sub _device_for_lun($scfg, $lun) {
         if ($real && $real =~ m{^/dev/([^/]+)$}) {
             my $leaf = $1; # e.g., sdc
             if (my $dm = _dm_map_for_leaf($leaf)) {
-                return $dm; # return /dev/mapper/<name> (or /dev/dm-*)
+                return $dm; # /dev/mapper/<name> (or /dev/dm-*)
             }
         }
-        # if no dm map found yet, fall back to by-path
-        return $by;
+        return $by; # fallback to by-path
     }
 
     return $by; # by-path preferred or fallback
@@ -649,15 +631,6 @@ sub _zvol_name($vmid, $name) {
     $name //= 'disk-0';
     $name =~ s/[^a-zA-Z0-9._\-]+/_/g;
     return "vm-$vmid-$name";
-}
-
-# ======== Helpers for listing ========
-sub _norm_bytes {
-    my ($v) = @_;
-    return 0 if !defined $v;
-    return $v if !ref($v);
-    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-    return 0;
 }
 
 # ======== Required storage interface ========
@@ -709,16 +682,13 @@ sub free_image {
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    # Resolve target id (accept IQN or short name), but continue best-effort if missing
     my $target_id;
     eval { $target_id = _resolve_target_id($scfg); };
 
-    # Find extent id by our zvol name
     my $extents = _tn_extents($scfg);
     my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
     my $extent_id = $extent ? $extent->{id} : undef;
 
-    # Remove targetextent association
     if (defined $target_id && defined $extent_id) {
         my $maps = _tn_targetextents($scfg);
         my ($tx) = grep { $_->{target} == $target_id && (($_->{extent} // -1) == $extent_id) } @$maps;
@@ -730,17 +700,14 @@ sub free_image {
     return 1;
 }
 
-# ======== List VM disks (images) for the storage ========
-# Proxmox calls this when you open "VM Disks" on the storage in the GUI,
-# and when pvesm list <storeid> is invoked. Return an arrayref of entries
-# with keys: volid, size (bytes), format ('raw'), and optional vmid.
+# ======== List VM disks for the storage (GUI/CLI content) ========
 # Returns an arrayref of entries: { volid, size (bytes), format, vmid? }.
 sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache, $errors) = @_;
 
     my $out = [];
 
-    # Optional filter: a allow-list of volids to include
+    # Optional filter: allow-list of specific volids
     my %want = ();
     if (defined $vollist && ref($vollist) eq 'ARRAY') {
         %want = map { $_ => 1 } @$vollist;
@@ -766,8 +733,8 @@ sub list_images {
     my %lun_for_ext = map { $_->{extent} => ($_->{lunid} // 0) }
                       grep { ($_->{target} // -1) == $target_id } @$maps;
 
+    # All extents; filter to zvols under our dataset and mapped to our target
     my $extents = _tn_extents($scfg) // [];
-
   EXT: for my $e (@$extents) {
         next EXT if ($e->{type} // '') ne 'DISK';
 
@@ -780,33 +747,29 @@ sub list_images {
         next EXT if !defined $lun; # not mapped to our target
 
         # STRICT filter: only include real VM disks "vm-<id>-..."
-        # (prevents stray entries like "proxmox" or other non-VM zvols)
         next EXT if $zname !~ /^vm-(\d+)-/;
         my $vid = int($1);
-
-        # Per-VM filter
         if (defined $vmid && $vid != $vmid) { next EXT; }
 
         my $volname = "vol-$zname-lun$lun";
         if (%want && !$want{"$storeid:$volname"}) { next EXT; }
 
-        # Fetch capacity (bytes) from zvol
+        # Fetch capacity (bytes) from the zvol dataset
         my $full_ds = "$scfg->{dataset}/$zname";
         my $ds = eval { _tn_dataset_get($scfg, $full_ds) } // {};
         my $size = $norm_bytes->($ds->{volsize}) || 0;
-        # Skip if we cannot determine a plausible size (optional)
-        # next EXT if $size == 0;
 
-        _tn_add_volume($out, $storeid, $volname, $size, {
+        # Register the volume
+        push @$out, {
+            volid  => "$storeid:$volname",
+            size   => $size,
             format => 'raw',
             vmid   => $vid,
-        });
+        };
     }
 
     return $out;
 }
-
-
 
 # ======== status(): report dataset capacity correctly ========
 # total = quota (if set) else (written/used + available)
@@ -853,7 +816,7 @@ sub status {
     return ($total, $avail, $used, $active);
 }
 
-sub activate_storage { return 1; }
+sub activate_storage   { return 1; }
 sub deactivate_storage { return 1; }
 
 sub activate_volume {
@@ -867,12 +830,12 @@ sub activate_volume {
 }
 sub deactivate_volume { return 1; }
 
-sub volume_snapshot { die "snapshot not supported"; }
-sub volume_snapshot_delete { die "snapshot not supported"; }
-sub volume_snapshot_rollback { die "snapshot not supported"; }
-sub clone_image { die "clone not supported"; }
-sub create_base { die "base images not supported"; }
-sub volume_resize { die "resize not supported"; }
-sub volume_has_feature { return undef; }
+sub volume_snapshot           { die "snapshot not supported"; }
+sub volume_snapshot_delete    { die "snapshot not supported"; }
+sub volume_snapshot_rollback  { die "snapshot not supported"; }
+sub clone_image               { die "clone not supported"; }
+sub create_base               { die "base images not supported"; }
+sub volume_resize             { die "resize not supported"; }
+sub volume_has_feature        { return undef; }
 
 1;
