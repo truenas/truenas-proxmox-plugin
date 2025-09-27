@@ -15,6 +15,7 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
+use Carp qw(croak);
 
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
@@ -457,6 +458,30 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
 }
+sub _tn_add_volume {
+    my ($vollist, $storeid, $volname, $size, $extra) = @_;
+
+    die "_tn_add_volume: vollist must be an arrayref"
+        if ref($vollist) ne 'ARRAY';
+    die "_tn_add_volume: missing storeid/volname"
+        if !defined($storeid) || !defined($volname);
+
+    my %entry = (
+        volid  => "$storeid:$volname",
+        format => 'raw',
+        size   => int($size // 0),
+    );
+
+    if (defined $extra && ref($extra) eq 'HASH') {
+        $entry{format} = $extra->{format} if defined $extra->{format};
+        $entry{vmid}   = $extra->{vmid}   if defined $extra->{vmid};
+        $entry{notes}  = $extra->{notes}  if defined $extra->{notes};
+    }
+
+    push @$vollist, \%entry;
+    return \%entry;
+}
+
 
 # ======== Target resolution (IQN or short Target Name) ========
 sub _resolve_target_id {
@@ -751,10 +776,7 @@ sub list_images {
 
         my $volname = "vol-$zname-lun$lun";
         # Register volume in the list (raw format)
-        $class->add_volume($vollist, $storeid, $volname, $size, {
-            format => 'raw',
-            vmid   => $vid,
-        });
+        _tn_add_volume($vollist, $storeid, $volname, $size, { vmid => $vid, format => 'raw' });
     }
 }
 
