@@ -1,6 +1,9 @@
 package PVE::Storage::Custom::TrueNASPlugin;
 
 use v5.36;
+use strict;
+use warnings;
+
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -18,36 +21,36 @@ use PVE::JSONSchema qw(get_standard_option);
 
 use base qw(PVE::Storage::Plugin);
 
-# ======== Definition ========
+# ======== Storage plugin identity ========
 
-sub api  { return 11; }                          # PVE storage plugin API version
-sub type { return 'truenasplugin'; }             # storage.cfg type
+sub api  { return 11; }                    # storage plugin API version
+sub type { return 'truenasplugin'; }       # storage.cfg "type"
 
 sub plugindata {
     return {
-        content         => [ { images => 1, none => 1 }, { images => 1 } ],
-        format          => [ { raw => 1 }, 'raw' ],
-        'sensitive-properties' => { 'api_key' => 1, 'chap_password' => 1 },
+        content => [ { images => 1, none => 1 }, { images => 1 } ],
+        format  => [ { raw => 1 }, 'raw' ],
+        'sensitive-properties' => { api_key => 1, chap_password => 1 },
         select_existing => 1,
     };
 }
 
+# ======== Config schema (only plugin-specific keys here!) ========
+
 sub properties {
     return {
-        # Transport (default WS)
+        # Transport & connection
         api_transport => {
-            description => "API transport: 'ws' (JSON-RPC over WebSocket) or 'rest'.",
+            description => "API transport: 'ws' (JSON-RPC) or 'rest'.",
             type        => 'string',
             optional    => 1,
         },
-
-        # Connection
         api_host => {
             description => "TrueNAS hostname or IP.",
             type        => 'string',
             format      => 'pve-storage-server',
         },
-        api_key  => {
+        api_key => {
             description => "TrueNAS user-linked API key.",
             type        => 'string',
         },
@@ -57,7 +60,7 @@ sub properties {
             optional    => 1,
         },
         api_port => {
-            description => "Port (defaults: 443 for wss/https, 80 for ws/http).",
+            description => "TCP port (defaults: 443 for wss/https, 80 for ws/http).",
             type        => 'integer',
             optional    => 1,
         },
@@ -67,8 +70,6 @@ sub properties {
             optional    => 1,
             default     => 0,
         },
-
-        # NEW: Prefer IPv4 for API connections
         prefer_ipv4 => {
             description => "Prefer IPv4 (A records) when resolving api_host.",
             type        => 'boolean',
@@ -76,7 +77,7 @@ sub properties {
             default     => 1,
         },
 
-        # Storage placement
+        # Placement
         dataset => {
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type        => 'string',
@@ -86,23 +87,14 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
-        sparse => {
-            description => "Create thin-provisioned zvols (TrueNAS 'sparse'=on).",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 1,
-        },
 
-
-        # iSCSI target on TrueNAS
+        # iSCSI target & portals
         target_iqn => {
-            description => "Shared iSCSI Target IQN on TrueNAS.",
+            description => "Shared iSCSI Target IQN on TrueNAS (or target's short name).",
             type        => 'string',
         },
-
-        # Initiator discovery/portals
         discovery_portal => {
-            description => "Primary SendTargets portal (IP[:port]; IPv6 ok as [addr]:port).",
+            description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
             type        => 'string',
         },
         portals => {
@@ -110,60 +102,68 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
-        
 
         # Initiator pathing
-        use_multipath => { type => 'boolean', optional => 1, default => 1  },
-        use_by_path   => { type => 'boolean', optional => 1, default => 0  },
+        use_multipath => { type => 'boolean', optional => 1, default => 1 },
+        use_by_path   => { type => 'boolean', optional => 1, default => 0 },
         ipv6_by_path  => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type        => 'boolean',
             optional    => 1,
-            default     => 0,   # default to IPv4 behavior
+            default     => 0,   # default IPv4 behaviors
         },
 
-        # Optional CHAP (session)
+        # CHAP (optional)
         chap_user     => { type => 'string', optional => 1 },
         chap_password => { type => 'string', optional => 1 },
 
+        # Thin provisioning toggle (plugin-specific to avoid schema collision)
+        tn_sparse => {
+            description => "Create thin-provisioned zvols on TrueNAS (maps to TrueNAS 'sparse').",
+            type        => 'boolean',
+            optional    => 1,
+            default     => 1,
+        },
     };
 }
 
 sub options {
     return {
-        # Storage flags
+        # Base storage options (do NOT add to properties)
         disable => { optional => 1 },
         nodes   => { optional => 1 },
         content => { optional => 1 },
         shared  => { optional => 1 },
-        sparse => { optional => 1 },  # OK to toggle without orphaning
 
-        # Connection (fixed to prevent orphaning)
+        # Connection (fixed to avoid orphaning volumes)
         api_transport => { optional => 1, fixed => 1 },
         api_host      => { fixed => 1 },
         api_key       => { fixed => 1 },
         api_scheme    => { optional => 1, fixed => 1 },
         api_port      => { optional => 1, fixed => 1 },
         api_insecure  => { optional => 1, fixed => 1 },
-
-        # IPv4 preference (can be toggled)
         prefer_ipv4   => { optional => 1 },
 
-        dataset         => { fixed => 1 },
-        zvol_blocksize  => { optional => 1, fixed => 1 },
-        target_iqn      => { fixed => 1 },
+        # Placement
+        dataset        => { fixed => 1 },
+        zvol_blocksize => { optional => 1, fixed => 1 },
 
-        discovery_portal => { fixed => 1 },
-        portals          => { optional => 1 },
+        # Target & portals
+        target_iqn        => { fixed => 1 },
+        discovery_portal  => { fixed => 1 },
+        portals           => { optional => 1 },
 
-        use_multipath   => { optional => 1 },
-        use_by_path     => { optional => 1 },
-        ipv6_by_path    => { optional => 1 },
+        # Initiator
+        use_multipath => { optional => 1 },
+        use_by_path   => { optional => 1 },
+        ipv6_by_path  => { optional => 1 },
 
-        chap_user       => { optional => 1 },
-        chap_password   => { optional => 1 },
+        # CHAP
+        chap_user     => { optional => 1 },
+        chap_password => { optional => 1 },
 
-        bwlimit         => { optional => 1 },
+        # Thin toggle
+        tn_sparse     => { optional => 1 },
     };
 }
 
@@ -171,37 +171,15 @@ sub options {
 
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
-    my @ent = Socket::gethostbyname($host);          # fully qualify; do not import
+    my @ent = Socket::gethostbyname($host);          # A-record lookup
     if (@ent && defined $ent[4]) {
         my $ip = inet_ntoa($ent[4]);
         return $ip if $ip;
     }
-    return $host; # fallback to original
+    return $host; # fallback (could be IPv6 literal or DNS)
 }
 
-# Resolve configured target_iqn to a target id by matching full IQN or short name
-sub _resolve_target_id {
-    my ($scfg) = @_;
-    my $want = $scfg->{target_iqn} // die "target_iqn not set\n";
-    my $short = $want;
-    $short =~ s/^.*://; # take text after last colon as short target name
-
-    my $targets = _tn_get_target($scfg); # returns arrayref of targets
-    # Try exact name == full IQN, then name == short, then fallback if an 'iqn' field exists
-    my ($t) = grep { defined($_->{name}) && ($_->{name} eq $want || $_->{name} eq $short) } @$targets;
-    if (!$t) {
-        ($t) = grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets; # just in case some versions expose 'iqn'
-    }
-
-    if (!$t) {
-        my @names = map { $_->{name} // '(unnamed)' } @$targets;
-        die "Target '$want' not found. Available targets: ".join(', ', @names)."\n";
-    }
-    return $t->{id};
-}
-
-
-# ======== REST Client (fallback) ========
+# ======== REST client (fallback) ========
 
 sub _ua($scfg) {
     my $ua = LWP::UserAgent->new(
@@ -238,14 +216,14 @@ sub _rest_call($scfg, $method, $path, $payload=undef) {
     return length($content) ? decode_json($content) : undef;
 }
 
-# ======== WebSocket JSON-RPC Client ========
-# Connect to ws(s)://<host>/api/current; authenticate with auth.login_with_api_key. [2](https://github.com/proxmox/pve-storage/blob/master/src/PVE/Storage/Plugin.pm)
+# ======== WebSocket JSON-RPC client ========
+# Connect to ws(s)://<host>/api/current; auth via auth.login_with_api_key.
 
 sub _ws_defaults($scfg) {
     my $scheme = $scfg->{api_scheme};
-    if (!$scheme) { $scheme = 'wss'; }
-    elsif ($scheme =~ /^https$/i) { $scheme = 'wss'; }
-    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
+    if (!$scheme)                  { $scheme = 'wss'; }
+    elsif ($scheme =~ /^https$/i)  { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)   { $scheme = 'ws';  }
 
     my $port = $scfg->{api_port} || (($scheme eq 'wss') ? 443 : 80);
     return ($scheme, $port);
@@ -254,7 +232,7 @@ sub _ws_defaults($scfg) {
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{api_host};
-    my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;  # IPv4 preferred
+    my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
 
     my $sock;
@@ -297,7 +275,7 @@ sub _ws_open($scfg) {
     my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
     die "WebSocket handshake invalid accept key" if lc($accept) ne lc($expect);
 
-    # Authenticate using API key via JSON-RPC auth.login_with_api_key  [2](https://github.com/proxmox/pve-storage/blob/master/src/PVE/Storage/Plugin.pm)
+    # Authenticate with API key (JSON-RPC)
     my $conn = { sock => $sock, next_id => 1 };
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
@@ -308,32 +286,19 @@ sub _ws_open($scfg) {
     return $conn;
 }
 
-sub _ws_rpc($conn, $obj) {
-    my $text = encode_json($obj);
-    _ws_send_text($conn->{sock}, $text);
-    my $resp = _ws_recv_text($conn->{sock});
-    my $decoded = decode_json($resp);
-    die "JSON-RPC error: ".encode_json($decoded->{error})
-        if exists $decoded->{error};
-    return $decoded->{result};
-}
+# ---- WS framing (text only, no compression/fragmentation) ----
 
-# Simple text frames (no compression/fragmentation)
-# --- helper: byte-wise XOR without numeric warnings ---
+# helper: byte-wise XOR masking (no numeric warnings)
 sub _xor_mask {
     my ($data, $mask) = @_;
-    my $len  = length($data);
-    my $out  = $data; # will mutate in place
-    my $m0 = ord(substr($mask, 0, 1));
-    my $m1 = ord(substr($mask, 1, 1));
-    my $m2 = ord(substr($mask, 2, 1));
-    my $m3 = ord(substr($mask, 3, 1));
-
-    for (my $i = 0; $i < $len; $i++) {
-        my $mi = ($i & 3) == 0 ? $m0
-              : ($i & 3) == 1 ? $m1
-              : ($i & 3) == 2 ? $m2
-              :                 $m3;
+    my $len = length($data);
+    my $out = $data;
+    my $m0 = ord(substr($mask,0,1));
+    my $m1 = ord(substr($mask,1,1));
+    my $m2 = ord(substr($mask,2,1));
+    my $m3 = ord(substr($mask,3,1));
+    for (my $i=0; $i<$len; $i++) {
+        my $mi = ($i & 3) == 0 ? $m0 : ($i & 3) == 1 ? $m1 : ($i & 3) == 2 ? $m2 : $m3;
         substr($out, $i, 1, chr( ord(substr($out, $i, 1)) ^ $mi ));
     }
     return $out;
@@ -341,13 +306,11 @@ sub _xor_mask {
 
 sub _ws_send_text {
     my ($sock, $payload) = @_;
-
     my $fin_opcode = 0x81; # FIN + text
-    my $maskbit    = 0x80; # clients MUST mask
+    my $maskbit    = 0x80; # client must mask
 
     my $len = length($payload);
     my $hdr = pack('C', $fin_opcode);
-
     my $lenfield;
     if    ($len <= 125)    { $lenfield = pack('C',     $maskbit | $len); }
     elsif ($len <= 0xFFFF) { $lenfield = pack('C n',   $maskbit | 126, $len); }
@@ -357,40 +320,12 @@ sub _ws_send_text {
     my $masked = _xor_mask($payload, $mask);
 
     my $frame = $hdr . $lenfield . $mask . $masked;
-
     my $off = 0;
     while ($off < length($frame)) {
         my $w = $sock->syswrite($frame, length($frame) - $off, $off);
         die "WS write failed: $!" unless defined $w;
         $off += $w;
     }
-}
-
-
-sub _ws_recv_text($sock) {
-    my $hdr;
-    _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
-    my ($b1, $b2) = unpack('CC', $hdr);
-    my $opcode = $b1 & 0x0f;
-    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
-    my $masked = ($b2 & 0x80) ? 1 : 0;
-    my $len = ($b2 & 0x7f);
-    if ($len == 126) {
-        my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
-        $len = unpack('n', $ext);
-    } elsif ($len == 127) {
-        my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
-        $len = unpack('Q>', $ext);
-    }
-    my $mask_key = '';
-    if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
-    my $payload = '';
-    _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
-    if ($masked) {
-        $payload = $payload ^ ($mask_key x int(($len+3)/4));
-        $payload = substr($payload, 0, $len);
-    }
-    return $payload;
 }
 
 sub _ws_read_exact {
@@ -405,26 +340,63 @@ sub _ws_read_exact {
     return 1;
 }
 
-# ======== Transport-agnostic call wrapper ========
+sub _ws_recv_text {
+    my $sock = shift;
+    my $hdr;
+    _ws_read_exact($sock, \$hdr, 2) or die "WS read hdr failed";
+    my ($b1, $b2) = unpack('CC', $hdr);
+    my $opcode = $b1 & 0x0f;
+    die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
+    my $masked = ($b2 & 0x80) ? 1 : 0;  # server MUST NOT mask
+    my $len = ($b2 & 0x7f);
+
+    if ($len == 126) {
+        my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
+        $len = unpack('n', $ext);
+    } elsif ($len == 127) {
+        my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
+        $len = unpack('Q>', $ext);
+    }
+
+    my $mask_key = '';
+    if ($masked) {
+        _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask";
+    }
+
+    my $payload = '';
+    _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
+
+    if ($masked) {
+        $payload = _xor_mask($payload, $mask_key);
+    }
+    return $payload;
+}
+
+sub _ws_rpc($conn, $obj) {
+    my $text = encode_json($obj);
+    _ws_send_text($conn->{sock}, $text);
+    my $resp = _ws_recv_text($conn->{sock});
+    my $decoded = decode_json($resp);
+    die "JSON-RPC error: ".encode_json($decoded->{error}) if exists $decoded->{error};
+    return $decoded->{result};
+}
+
+# ======== Transport-agnostic API wrapper ========
 
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
 
     if ($transport eq 'ws') {
-        my $err;
-        my $res;
+        my ($res, $err);
         eval {
             my $conn = _ws_open($scfg);
             $res = _ws_rpc($conn, {
-                jsonrpc => "2.0",
-                id      => 1,
-                method  => $ws_method,
-                params  => $ws_params || [],
+                jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params || [],
             });
         };
-        if ($@) { $err = $@; }
+        $err = $@ if $@;
         return $res if !$err;
-        if ($rest_fallback) { return $rest_fallback->(); }
+        return $rest_fallback->() if $rest_fallback;
         die $err;
     } elsif ($transport eq 'rest') {
         return $rest_fallback->() if $rest_fallback;
@@ -441,29 +413,25 @@ sub _tn_get_target($scfg) {
         sub { _rest_call($scfg, 'GET', '/iscsi/target') }
     );
 }
-
 sub _tn_targetextents($scfg) {
     return _api_call($scfg, 'iscsi.targetextent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
     );
 }
-
 sub _tn_extents($scfg) {
     return _api_call($scfg, 'iscsi.extent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
     );
 }
 
+# PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
-    # Proxmox passes size in KiB for alloc_image(); TrueNAS expects bytes.
-    # Example: 10G in PVE -> 10 * 1024 * 1024 KiB; we must multiply by 1024.
     my $bytes = int($size_kib) * 1024;
-
     my $payload = {
-        name       => $full,
-        type       => 'VOLUME',
-        volsize    => $bytes,
-        sparse     => ($scfg->{sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        name    => $full,
+        type    => 'VOLUME',
+        volsize => $bytes,
+        sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
     $payload->{volblocksize} = $blocksize if $blocksize;
 
@@ -472,14 +440,12 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     );
 }
 
-
 sub _tn_dataset_delete($scfg, $full) {
-    my $id = uri_escape($full); # encode '/' as %2F for REST  [4](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/6-7/vsphere-storage-6-7/configuring-iscsi-and-iser-adapters-and-storage-with-esxi/configuring-discovery-addresses-for-iscsi-initiators.html)
+    my $id = uri_escape($full); # encode '/' as %2F for REST
     return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
     );
 }
-
 sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
@@ -488,27 +454,42 @@ sub _tn_extent_create($scfg, $zname, $full) {
         sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
     );
 }
-
 sub _tn_extent_delete($scfg, $extent_id) {
     return _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
     );
 }
-
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
     return _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
     );
 }
-
 sub _tn_targetextent_delete($scfg, $tx_id) {
     return _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
 }
 
-# ======== PVE initiator discovery & device path ========
+# ======== Target resolution (IQN or short Target Name) ========
+
+sub _resolve_target_id {
+    my ($scfg) = @_;
+    my $want  = $scfg->{target_iqn} // die "target_iqn not set\n";
+    my $short = $want; $short =~ s/^.*://;  # tail after last ':'
+
+    my $targets = _tn_get_target($scfg);
+    my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
+    $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
+
+    if (!$t) {
+        my @names = map { $_->{name} // '(unnamed)' } @$targets;
+        die "Target '$want' not found. Available targets: ".join(', ', @names)."\n";
+    }
+    return $t->{id};
+}
+
+# ======== Initiator: discovery/login and device resolution ========
 
 sub _normalize_portal($p) {
     $p =~ s/^\s+|\s+$//g;
@@ -542,7 +523,7 @@ sub _iscsi_login_all($scfg) {
             ) { run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {}); }
         }
         run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
-            errmsg => "iSCSI login failed", outfunc => sub {});
+            errmsg => "iscsiadm login failed", outfunc => sub {});
     }
 
     for my $p (@extra) {
@@ -580,7 +561,7 @@ sub _zvol_name($vmid, $name) {
     return "vm-$vmid-$name";
 }
 
-# ======== Storage implementation ========
+# ======== Required storage interface ========
 
 sub parse_volname {
     my ($class, $volname) = @_;
@@ -601,20 +582,20 @@ sub path {
 }
 
 sub alloc_image {
-    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
     die "only raw is supported" if defined($fmt) && $fmt ne 'raw';
 
     my $zname = _zvol_name($vmid, $name);
     my $full  = $scfg->{dataset} . '/' . $zname;
 
-    # 1) zvol
-    _tn_dataset_create($scfg, $full, $size, $scfg->{zvol_blocksize});
+    # 1) Create zvol (bytes + thin toggle)
+    _tn_dataset_create($scfg, $full, $size_kib, $scfg->{zvol_blocksize});
 
-    # 2) extent
+    # 2) Create extent for the zvol
     my $extent = _tn_extent_create($scfg, $zname, $full);
     my $extent_id = ref($extent) eq 'HASH' && exists $extent->{id} ? $extent->{id} : $extent;
 
-    # 3) map to the shared target at the next free LUN
+    # 3) Map to shared target at next free LUN
     my $target_id = _resolve_target_id($scfg);
 
     my $maps = _tn_targetextents($scfg);
@@ -623,55 +604,36 @@ sub alloc_image {
     die "No free LUN on target id=$target_id" if !defined $lun;
 
     _tn_targetextent_create($scfg, $target_id, $extent_id, $lun);
-
     return "vol-$zname-lun$lun";
 }
 
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
 
-    # parse volname -> zvol short name
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    # --- resolve target id (accept full IQN or short target name) ---
+    # Resolve target id (accept IQN or short name), but continue best-effort if missing
     my $target_id;
-    eval {
-        my $want  = $scfg->{target_iqn} // die "target_iqn not set\n";
-        my $short = $want; $short =~ s/^.*://;  # tail after last ':'
+    eval { $target_id = _resolve_target_id($scfg); };
 
-        my $targets = _tn_get_target($scfg);    # arrayref of targets
-        my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
-
-        # Some versions may expose an 'iqn' field; try that if name didn't match
-        $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
-
-        die "not found" if !$t;
-        $target_id = $t->{id};
-    };
-    # If target lookup fails, we continue with best-effort cleanup (extent + zvol).
-
-    # --- find the extent id by our zvol name ---
-    my $extents = _tn_extents($scfg);                 # arrayref of extents
+    # Find extent id by our zvol name
+    my $extents = _tn_extents($scfg);
     my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
     my $extent_id = $extent ? $extent->{id} : undef;
 
-    # --- remove targetextent association if we can resolve both target & extent ---
+    # Remove targetextent association
     if (defined $target_id && defined $extent_id) {
-        my $maps = _tn_targetextents($scfg);          # arrayref of targetextent rows
+        my $maps = _tn_targetextents($scfg);
         my ($tx) = grep { $_->{target} == $target_id && ($_->{extent} // -1) == $extent_id } @$maps;
         _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
     }
 
-    # --- remove extent (if it still exists) ---
     _tn_extent_delete($scfg, $extent_id) if defined $extent_id;
-
-    # --- remove the zvol (always attempt) ---
     _tn_dataset_delete($scfg, $full);
 
     return 1;
 }
-
 
 sub status { return (0,0,0,1); }
 sub activate_storage { return 1; }
