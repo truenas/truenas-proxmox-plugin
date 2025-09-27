@@ -823,27 +823,155 @@ sub volume_size_info {
     return wantarray ? ($bytes, $fmt) : $bytes;
 }
 
+# Delete a VM disk: remove iSCSI mapping+extent on TrueNAS, delete zvol, and
+# clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
-    my ($class, $storeid, $scfg, $volname, $isBase) = @_;
-    my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
 
-    my $target_id;
-    eval { $target_id = _resolve_target_id($scfg); };
+    die "snapshots not supported on raw iSCSI LUNs\n" if $isBase; # Proxmox passes $isBase for base images
+    die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
-    my $extents = _tn_extents($scfg);
-    my ($extent) = grep { $_->{name} && $_->{name} eq $zname } @$extents;
-    my $extent_id = $extent ? $extent->{id} : undef;
+    # Parse our custom volname: "vol-<zname>-lun<N>"
+    my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
+        $class->parse_volname($volname);
+    $fmt //= 'raw';
 
-    if (defined $target_id && defined $extent_id) {
-        my $maps = _tn_targetextents($scfg);
-        my ($tx) = grep { $_->{target} == $target_id && (($_->{extent} // -1) == $extent_id) } @$maps;
-        _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
+    my $zvol_ds = $scfg->{dataset} . '/' . $zname;
+
+    # Capture device + WWID before we tear down mapping, so we can flush cleanly
+    my ($dev_path, $wwid);
+    eval {
+        if (defined $lun) {
+            ($dev_path) = $class->path($scfg, $volname, $storeid, undef);
+            # Resolve leaf for WWID query (works for /dev/disk/by-path/...lun-N)
+            my $leaf = Cwd::abs_path($dev_path);
+            if ($scfg->{use_multipath}) {
+                my $out = '';
+                eval {
+                    run_command(
+                        ['/lib/udev/scsi_id', '-g', '-u', '-d', $leaf],
+                        outfunc => sub { $out .= $_[0]; },
+                        errfunc => sub { }, timeout => 10
+                    );
+                };
+                chomp($out) if defined $out;
+                $wwid = $out if $out;
+            }
+        }
+    }; # best-effort; ignore errors if LUN already unmapped
+    # --- Look up TrueNAS extent + mapping for this zvol on our shared target ---
+    my $extents = _tn_extents($scfg) // [];
+    my ($extent) = grep { (($_->{name}//'') eq $zname) } @$extents;
+
+    # If the extent is already gone, we still try to delete the zvol (idempotent behavior)
+    my $target_id = _resolve_target_id($scfg);
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($tx) = ($extent && $target_id)
+        ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
+        : ();
+
+    # --- Unstage from host first: flush multipath path for this WWID (if any) ---
+    if ($scfg->{use_multipath} && $wwid) {
+        eval { _try_run(['multipath', '-f', $wwid], "multipath flush $wwid failed"); };
+        warn $@ if $@;
     }
 
-    _tn_extent_delete($scfg, $extent_id) if defined $extent_id;
-    _tn_dataset_delete($scfg, $full);
-    return 1;
+    # --- Remove targetextent mapping on TrueNAS (target -> extent) ---
+    if ($tx && defined $tx->{id}) {
+        my $id = $tx->{id};
+        eval {
+            _api_call(
+                $scfg,
+                'iscsi.targetextent.delete',
+                [ $id ],
+                sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) },
+            );
+        };
+        warn "warning: delete targetextent mapping id=$id failed: $@" if $@;
+    }
+
+    # --- Remove the extent itself on TrueNAS ---
+    if ($extent && defined $extent->{id}) {
+        my $eid = $extent->{id};
+        eval {
+            _api_call(
+                $scfg,
+                'iscsi.extent.delete',
+                [ $eid ],
+                sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$eid", undef) },
+            );
+        };
+        warn "warning: delete extent id=$eid failed: $@" if $@;
+    }
+
+    # --- Delete the zvol (dataset) on TrueNAS (recursive => drop any snaps) ---
+    eval {
+        my $id = URI::Escape::uri_escape($zvol_ds);
+        my $payload = { recursive => JSON::true, force => JSON::true };
+        _api_call(
+            $scfg,
+            'pool.dataset.delete',
+            [ $zvol_ds, $payload ],
+            sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id", $payload) },
+        );
+    };
+    warn "warning: delete dataset $zvol_ds failed: $@" if $@;
+
+    # --- Initiator cleanup on the node ---
+    # Rescan sessions so the kernel removes defunct LUNs; then reload multipath and settle udev.
+    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    warn $@ if $@;
+    if ($scfg->{use_multipath}) {
+        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+        warn $@ if $@;
+    }
+    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+    warn $@ if $@;
+
+    # --- Optional: logout if the target has no remaining LUNs and logout_on_free=1 ---
+    if ($scfg->{logout_on_free}) {
+        eval {
+            my $iqn = $scfg->{target_iqn};
+            if (_session_has_no_luns($iqn)) {
+                # try to logout from all known portals for this target
+                my @portals = @{ $scfg->{portals} // [] };
+                @portals = ($scfg->{portal}) if !@portals && $scfg->{portal};
+                for my $p (@portals) {
+                    eval { _try_run(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--logout'], "iscsi logout failed"); };
+                    warn $@ if $@;
+                    eval { _try_run(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','delete'], "iscsi node delete failed"); };
+                    warn $@ if $@;
+                }
+            }
+        };
+        warn "warning: logout_on_free check failed: $@" if $@;
+    }
+
+    return undef;
+}
+
+# Heuristic: returns true if our target session shows no "Attached SCSI devices" with LUNs.
+# Conservative: we only logout if we see a session for the IQN AND there are zero LUNs listed.
+sub _session_has_no_luns {
+    my ($target_iqn) = @_;
+    my $buf = '';
+    eval {
+        run_command(
+            ['iscsiadm','-m','session','-P','3'],
+            outfunc => sub { $buf .= $_[0]; }, errfunc => sub {}
+        );
+    };
+    return 0 if $@; # if we cannot inspect, do nothing
+    my @stanzas = split(/\n\s*\n/s, $buf);
+    for my $s (@stanzas) {
+        next unless $s =~ /Target:\s*\Q$target_iqn\E\b/s;
+        # If any "Lun:" lines remain, do not logout
+        return 0 if $s =~ /Lun:\s*\d+/;
+        # If section exists and shows no Lun lines, safe to logout
+        return 1;
+    }
+    # No session for this target found => nothing to logout
+    return 0;
 }
 
 # ======== List VM disks for the storage (GUI/CLI content) ========
