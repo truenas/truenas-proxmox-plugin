@@ -1,0 +1,8 @@
+- Allow snapshotting
+- Find safer way to force delete disks
+- Cluster support
+- Use JSON-RPC for everything, fall back to API calls if needed
+- Allow cloning
+- Create a readme
+- Test multipathing
+- See if displaying snapshots of zvols as snapshots in Proxmox is viable
