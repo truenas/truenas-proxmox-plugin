@@ -420,6 +420,71 @@ sub _tn_dataset_get($scfg, $full) {
         sub { _rest_call($scfg, 'GET', "/pool/dataset/id/$id") }
     );
 }
+
+sub _tn_dataset_resize($scfg, $full, $new_bytes) {
+    # REST path uses %2F for '/', same as get/delete helpers
+    my $id = URI::Escape::uri_escape($full);
+    my $payload = { volsize => int($new_bytes) }; # grow-only
+    return _api_call($scfg, 'pool.dataset.update', [ $full, $payload ],
+        sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) }
+    );
+}
+
+sub volume_has_feature {
+    my ($class, $scfg, $feature, @more) = @_;
+    # Enable disk grow for raw iSCSI-backed images
+    return 1 if defined($feature) && $feature eq 'resize';
+    return undef;
+}
+
+# --- implement grow-only resize ---
+sub volume_resize {
+    my ($class, $scfg, $storeid, $volname, $new_kib, @rest) = @_;
+
+    # 1) Parse current volume identity
+    my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) = $class->parse_volname($volname);
+    die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
+
+    my $full = $scfg->{dataset} . '/' . $zname;
+
+    # 2) Discover current volsize and volblocksize (bytes)
+    my $ds = _tn_dataset_get($scfg, $full); # may return { volsize => {...}, volblocksize => {...} }
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+    my $cur_bytes = $norm->($ds->{volsize});
+    my $bs_bytes  = $norm->($ds->{volblocksize});
+    $bs_bytes = 0 if !$bs_bytes; # if unknown, we’ll skip alignment check
+
+    # 3) Calculate desired new size (bytes) from KiB, enforce grow-only & alignment
+    my $req_bytes = int($new_kib) * 1024;
+    die "shrink not supported (current=$cur_bytes requested=$req_bytes)\n"
+        if $req_bytes <= $cur_bytes;
+
+    # Align up to volblocksize if available
+    if ($bs_bytes && $bs_bytes > 0) {
+        my $rem = $req_bytes % $bs_bytes;
+        $req_bytes += ($bs_bytes - $rem) if $rem;
+    }
+
+    # 4) Grow the zvol on TrueNAS
+    _tn_dataset_resize($scfg, $full, $req_bytes);
+
+    # 5) Refresh initiator view: rescan iSCSI session(s) and multipath (if enabled)
+    _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
+    if ($scfg->{use_multipath}) {
+        _try_run(['multipath','-r'], "multipath map reload failed");
+    }
+    run_command(['udevadm','settle'], outfunc => sub { });
+    Time::HiRes::usleep(250_000);
+
+    return $new_kib; # Proxmox expects KiB back
+}
+
 sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
@@ -835,7 +900,5 @@ sub volume_snapshot_delete    { die "snapshot not supported"; }
 sub volume_snapshot_rollback  { die "snapshot not supported"; }
 sub clone_image               { die "clone not supported"; }
 sub create_base               { die "base images not supported"; }
-sub volume_resize             { die "resize not supported"; }
-sub volume_has_feature        { return undef; }
 
 1;
