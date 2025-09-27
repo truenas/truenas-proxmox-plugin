@@ -437,18 +437,19 @@ sub volume_has_feature {
     return undef;
 }
 
-# --- implement grow-only resize ---
+# Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
 sub volume_resize {
     my ($class, $scfg, $storeid, $volname, $new_kib, @rest) = @_;
 
-    # 1) Parse current volume identity
-    my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) = $class->parse_volname($volname);
+    # Parse our custom volname: "vol-<zname>-lun<N>"
+    my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
+        $class->parse_volname($volname);
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
 
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    # 2) Discover current volsize and volblocksize (bytes)
-    my $ds = _tn_dataset_get($scfg, $full); # may return { volsize => {...}, volblocksize => {...} }
+    # Fetch current zvol info from TrueNAS
+    my $ds = _tn_dataset_get($scfg, $full) // {};
     my $norm = sub {
         my ($v) = @_;
         return 0 if !defined $v;
@@ -457,32 +458,55 @@ sub volume_resize {
         return 0;
     };
     my $cur_bytes = $norm->($ds->{volsize});
-    my $bs_bytes  = $norm->($ds->{volblocksize});
-    $bs_bytes = 0 if !$bs_bytes; # if unknown, we’ll skip alignment check
+    my $bs_bytes  = $norm->($ds->{volblocksize}); # may be 0/undef if unknown
 
-    # 3) Calculate desired new size (bytes) from KiB, enforce grow-only & alignment
+    # Convert Proxmox KiB -> bytes; grow-only enforcement
     my $req_bytes = int($new_kib) * 1024;
     die "shrink not supported (current=$cur_bytes requested=$req_bytes)\n"
         if $req_bytes <= $cur_bytes;
 
-    # Align up to volblocksize if available
+    # Align up to volblocksize if known to avoid middleware alignment errors
     if ($bs_bytes && $bs_bytes > 0) {
         my $rem = $req_bytes % $bs_bytes;
         $req_bytes += ($bs_bytes - $rem) if $rem;
     }
 
-    # 4) Grow the zvol on TrueNAS
-    _tn_dataset_resize($scfg, $full, $req_bytes);
+    # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
+    # Query parent dataset (where all VM zvols live)
+    my $pds          = _tn_dataset_get($scfg, $scfg->{dataset}) // {};
+    my $avail_bytes  = $norm->($pds->{available}); # pool/dataset available bytes
+    my $delta        = $req_bytes - $cur_bytes;
+    my $max_grow     = $avail_bytes ? int($avail_bytes * 0.80) : 0; # conservative mirror
 
-    # 5) Refresh initiator view: rescan iSCSI session(s) and multipath (if enabled)
+    if ($avail_bytes && $delta > $max_grow) {
+        my $fmt_g = sub { sprintf('%.2f GiB', $_[0] / (1024*1024*1024)) };
+        die sprintf(
+            "resize refused by preflight: requested grow %s exceeds TrueNAS ~80%% headroom (%s) on dataset %s.\n".
+            "Reduce the grow amount or free up space on the backing dataset/pool.\n",
+            $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{dataset}
+        );
+    }
+    # ---- End preflight ----
+
+    # Perform the TrueNAS zvol grow via WS with REST fallback
+    my $id = URI::Escape::uri_escape($full);
+    my $payload = { volsize => int($req_bytes) };
+    _api_call(
+        $scfg,
+        'pool.dataset.update',
+        [ $full, $payload ],
+        sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) },
+    );
+
+    # Initiator-side rescan so Linux + multipath see the new size
     _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
     if ($scfg->{use_multipath}) {
         _try_run(['multipath','-r'], "multipath map reload failed");
     }
-    run_command(['udevadm','settle'], outfunc => sub { });
+    run_command(['udevadm','settle'], outfunc => sub {});
     Time::HiRes::usleep(250_000);
 
-    return $new_kib; # Proxmox expects KiB back
+    return $new_kib; # Proxmox expects KiB
 }
 
 sub _tn_extent_create($scfg, $zname, $full) {
@@ -770,16 +794,14 @@ sub alloc_image {
     return "vol-$zname-lun$lun";
 }
 
-# Return ($size_bytes, $format)
+# Return size in bytes (scalar), or (size_bytes, format) in list context
 sub volume_size_info {
     my ($class, $scfg, $storeid, $volname, $timeout) = @_;
 
-    # Parse zvol identity from our encoded volname "vol-<zname>-lun<N>"
     my (undef, $zname, undef, undef, undef, undef, $fmt, undef) =
         $class->parse_volname($volname);
     $fmt //= 'raw';
 
-    # Query TrueNAS for zvol attributes: volsize is in bytes (may be in a hash with parsed/raw)
     my $full = $scfg->{dataset} . '/' . $zname;
     my $ds = _tn_dataset_get($scfg, $full) // {};
     my $norm = sub {
@@ -792,7 +814,7 @@ sub volume_size_info {
     my $bytes = $norm->($ds->{volsize});
     die "volume_size_info: missing volsize for $full\n" if !$bytes;
 
-    return ($bytes, $fmt);
+    return wantarray ? ($bytes, $fmt) : $bytes;
 }
 
 sub free_image {
