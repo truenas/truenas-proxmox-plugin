@@ -14,6 +14,7 @@ use Time::HiRes qw(usleep);
 use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
+use Cwd qw(abs_path);
 
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
@@ -22,9 +23,8 @@ use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::Storage::Plugin);
 
 # ======== Storage plugin identity ========
-
-sub api  { return 11; }                    # storage plugin API version
-sub type { return 'truenasplugin'; }       # storage.cfg "type"
+sub api { return 11; }                 # storage plugin API version
+sub type { return 'truenasplugin'; }   # storage.cfg "type"
 
 sub plugindata {
     return {
@@ -35,72 +35,71 @@ sub plugindata {
     };
 }
 
-# ======== Config schema (only plugin-specific keys here!) ========
-
+# ======== Config schema (only plugin-specific keys) ========
 sub properties {
     return {
         # Transport & connection
         api_transport => {
             description => "API transport: 'ws' (JSON-RPC) or 'rest'.",
-            type        => 'string',
-            optional    => 1,
+            type => 'string',
+            optional => 1,
         },
         api_host => {
             description => "TrueNAS hostname or IP.",
-            type        => 'string',
-            format      => 'pve-storage-server',
+            type => 'string',
+            format => 'pve-storage-server',
         },
         api_key => {
             description => "TrueNAS user-linked API key.",
-            type        => 'string',
+            type => 'string',
         },
         api_scheme => {
             description => "wss/ws for WS, https/http for REST (defaults: wss/https).",
-            type        => 'string',
-            optional    => 1,
+            type => 'string',
+            optional => 1,
         },
         api_port => {
             description => "TCP port (defaults: 443 for wss/https, 80 for ws/http).",
-            type        => 'integer',
-            optional    => 1,
+            type => 'integer',
+            optional => 1,
         },
         api_insecure => {
             description => "Skip TLS certificate verification.",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 0,
+            type => 'boolean',
+            optional => 1,
+            default => 0,
         },
         prefer_ipv4 => {
             description => "Prefer IPv4 (A records) when resolving api_host.",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 1,
+            type => 'boolean',
+            optional => 1,
+            default => 1,
         },
 
         # Placement
         dataset => {
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
-            type        => 'string',
+            type => 'string',
         },
         zvol_blocksize => {
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
-            type        => 'string',
-            optional    => 1,
+            type => 'string',
+            optional => 1,
         },
 
         # iSCSI target & portals
         target_iqn => {
             description => "Shared iSCSI Target IQN on TrueNAS (or target's short name).",
-            type        => 'string',
+            type => 'string',
         },
         discovery_portal => {
             description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
-            type        => 'string',
+            type => 'string',
         },
         portals => {
             description => "Comma-separated additional portals.",
-            type        => 'string',
-            optional    => 1,
+            type => 'string',
+            optional => 1,
         },
 
         # Initiator pathing
@@ -108,9 +107,9 @@ sub properties {
         use_by_path   => { type => 'boolean', optional => 1, default => 0 },
         ipv6_by_path  => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 0,   # default IPv4 behaviors
+            type => 'boolean',
+            optional => 1,
+            default => 0,
         },
 
         # CHAP (optional)
@@ -120,13 +119,12 @@ sub properties {
         # Thin provisioning toggle (plugin-specific to avoid schema collision)
         tn_sparse => {
             description => "Create thin-provisioned zvols on TrueNAS (maps to TrueNAS 'sparse').",
-            type        => 'boolean',
-            optional    => 1,
-            default     => 1,
+            type => 'boolean',
+            optional => 1,
+            default => 1,
         },
     };
 }
-
 sub options {
     return {
         # Base storage options (do NOT add to properties)
@@ -149,9 +147,9 @@ sub options {
         zvol_blocksize => { optional => 1, fixed => 1 },
 
         # Target & portals
-        target_iqn        => { fixed => 1 },
-        discovery_portal  => { fixed => 1 },
-        portals           => { optional => 1 },
+        target_iqn      => { fixed => 1 },
+        discovery_portal=> { fixed => 1 },
+        portals         => { optional => 1 },
 
         # Initiator
         use_multipath => { optional => 1 },
@@ -163,12 +161,11 @@ sub options {
         chap_password => { optional => 1 },
 
         # Thin toggle
-        tn_sparse     => { optional => 1 },
+        tn_sparse => { optional => 1 },
     };
 }
 
 # ======== DNS/IPv4 helper ========
-
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
     my @ent = Socket::gethostbyname($host);          # A-record lookup
@@ -180,7 +177,6 @@ sub _host_ipv4($host) {
 }
 
 # ======== REST client (fallback) ========
-
 sub _ua($scfg) {
     my $ua = LWP::UserAgent->new(
         timeout   => 30,
@@ -192,88 +188,77 @@ sub _ua($scfg) {
     );
     return $ua;
 }
-
 sub _rest_base($scfg) {
     my $scheme = ($scfg->{api_scheme} && $scfg->{api_scheme} =~ /^http$/i) ? 'http' : 'https';
-    my $port   = $scfg->{api_port} || ($scheme eq 'https' ? 443 : 80);
+    my $port = $scfg->{api_port} // ($scheme eq 'https' ? 443 : 80);
     return "$scheme://$scfg->{api_host}:$port/api/v2.0";
 }
-
 sub _rest_call($scfg, $method, $path, $payload=undef) {
-    my $ua  = _ua($scfg);
+    my $ua = _ua($scfg);
     my $url = _rest_base($scfg) . $path;
-
     my $req = HTTP::Request->new(uc($method) => $url);
     $req->header('Authorization' => "Bearer $scfg->{api_key}");
     $req->header('Content-Type'  => 'application/json');
     $req->content(encode_json($payload)) if defined $payload;
-
     my $res = $ua->request($req);
     die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
         if !$res->is_success;
-
     my $content = $res->decoded_content // '';
     return length($content) ? decode_json($content) : undef;
 }
 
 # ======== WebSocket JSON-RPC client ========
 # Connect to ws(s)://<host>/api/current; auth via auth.login_with_api_key.
-
 sub _ws_defaults($scfg) {
     my $scheme = $scfg->{api_scheme};
-    if (!$scheme)                  { $scheme = 'wss'; }
-    elsif ($scheme =~ /^https$/i)  { $scheme = 'wss'; }
-    elsif ($scheme =~ /^http$/i)   { $scheme = 'ws';  }
-
-    my $port = $scfg->{api_port} || (($scheme eq 'wss') ? 443 : 80);
+    if (!$scheme) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^https$/i) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws'; }
+    my $port = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
     return ($scheme, $port);
 }
-
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{api_host};
     my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
-
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
-            PeerHost       => $peer,
-            PeerPort       => $port,
-            SSL_verify_mode=> $scfg->{api_insecure} ? 0x00 : 0x02,
-            SSL_hostname   => $host,
-            Timeout        => 15,
+            PeerHost => $peer,
+            PeerPort => $port,
+            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_hostname    => $host,
+            Timeout => 15,
         ) or die "wss connect failed: $SSL_ERROR\n";
     } else {
         $sock = IO::Socket::INET->new(
             PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
         ) or die "ws connect failed: $!\n";
     }
-
     # WebSocket handshake
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
     my $key_b64 = encode_base64($key_raw, '');
     my $hosthdr = $host.":$port";
     my $req =
-        "GET $path HTTP/1.1\r\n".
-        "Host: $hosthdr\r\n".
-        "Upgrade: websocket\r\n".
-        "Connection: Upgrade\r\n".
-        "Sec-WebSocket-Key: $key_b64\r\n".
-        "Sec-WebSocket-Version: 13\r\n".
-        "\r\n";
+      "GET $path HTTP/1.1\r\n".
+      "Host: $hosthdr\r\n".
+      "Upgrade: websocket\r\n".
+      "Connection: Upgrade\r\n".
+      "Sec-WebSocket-Key: $key_b64\r\n".
+      "Sec-WebSocket-Version: 13\r\n".
+      "\r\n";
     print $sock $req;
-
     my $resp = '';
     while ($sock->sysread(my $buf, 1024)) {
         $resp .= $buf;
         last if $resp =~ /\r\n\r\n/s;
     }
     die "WebSocket handshake failed (no 101)" if $resp !~ m#^HTTP/1\.[01] 101#;
-
-    my $accept = ($resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i) ? $1 : '';
+    my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
     my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
-    die "WebSocket handshake invalid accept key" if lc($accept) ne lc($expect);
+    # Case-sensitive check (correct)
+    die "WebSocket handshake invalid accept key" if ($accept // '') ne $expect;
 
     # Authenticate with API key (JSON-RPC)
     my $conn = { sock => $sock, next_id => 1 };
@@ -282,13 +267,9 @@ sub _ws_open($scfg) {
         method  => "auth.login_with_api_key",
         params  => [ $scfg->{api_key} ],
     }) or die "TrueNAS auth.login_with_api_key failed";
-
     return $conn;
 }
-
-# ---- WS framing (text only, no compression/fragmentation) ----
-
-# helper: byte-wise XOR masking (no numeric warnings)
+# ---- WS framing helpers (text only) ----
 sub _xor_mask {
     my ($data, $mask) = @_;
     my $len = length($data);
@@ -303,22 +284,18 @@ sub _xor_mask {
     }
     return $out;
 }
-
 sub _ws_send_text {
     my ($sock, $payload) = @_;
     my $fin_opcode = 0x81; # FIN + text
-    my $maskbit    = 0x80; # client must mask
-
+    my $maskbit = 0x80;    # client must mask
     my $len = length($payload);
     my $hdr = pack('C', $fin_opcode);
     my $lenfield;
-    if    ($len <= 125)    { $lenfield = pack('C',     $maskbit | $len); }
-    elsif ($len <= 0xFFFF) { $lenfield = pack('C n',   $maskbit | 126, $len); }
-    else                   { $lenfield = pack('C Q>',  $maskbit | 127, $len); }
-
-    my $mask   = join '', map { chr(int(rand(256))) } 1..4;
+    if ($len <= 125) { $lenfield = pack('C', $maskbit | $len); }
+    elsif ($len <= 0xFFFF) { $lenfield = pack('C n', $maskbit | 126, $len); }
+    else { $lenfield = pack('C Q>', $maskbit | 127, $len); }
+    my $mask = join '', map { chr(int(rand(256))) } 1..4;
     my $masked = _xor_mask($payload, $mask);
-
     my $frame = $hdr . $lenfield . $mask . $masked;
     my $off = 0;
     while ($off < length($frame)) {
@@ -327,7 +304,6 @@ sub _ws_send_text {
         $off += $w;
     }
 }
-
 sub _ws_read_exact {
     my ($sock, $ref, $want) = @_;
     $$ref = '' if !defined $$ref;
@@ -339,7 +315,6 @@ sub _ws_read_exact {
     }
     return 1;
 }
-
 sub _ws_recv_text {
     my $sock = shift;
     my $hdr;
@@ -347,9 +322,8 @@ sub _ws_recv_text {
     my ($b1, $b2) = unpack('CC', $hdr);
     my $opcode = $b1 & 0x0f;
     die "WS: unexpected opcode $opcode" if $opcode != 1; # text only
-    my $masked = ($b2 & 0x80) ? 1 : 0;  # server MUST NOT mask
+    my $masked = ($b2 & 0x80) ? 1 : 0; # server MUST NOT mask
     my $len = ($b2 & 0x7f);
-
     if ($len == 126) {
         my $ext; _ws_read_exact($sock, \$ext, 2) or die "WS len16 read fail";
         $len = unpack('n', $ext);
@@ -357,22 +331,15 @@ sub _ws_recv_text {
         my $ext; _ws_read_exact($sock, \$ext, 8) or die "WS len64 read fail";
         $len = unpack('Q>', $ext);
     }
-
     my $mask_key = '';
-    if ($masked) {
-        _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask";
-    }
-
+    if ($masked) { _ws_read_exact($sock, \$mask_key, 4) or die "WS unexpected mask"; }
     my $payload = '';
     _ws_read_exact($sock, \$payload, $len) or die "WS payload read fail";
-
-    if ($masked) {
-        $payload = _xor_mask($payload, $mask_key);
-    }
+    if ($masked) { $payload = _xor_mask($payload, $mask_key); }
     return $payload;
 }
-
-sub _ws_rpc($conn, $obj) {
+sub _ws_rpc {
+    my ($conn, $obj) = @_;
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
     my $resp = _ws_recv_text($conn->{sock});
@@ -382,16 +349,14 @@ sub _ws_rpc($conn, $obj) {
 }
 
 # ======== Transport-agnostic API wrapper ========
-
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
-
     if ($transport eq 'ws') {
         my ($res, $err);
         eval {
             my $conn = _ws_open($scfg);
             $res = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params || [],
+                jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
             });
         };
         $err = $@ if $@;
@@ -407,20 +372,16 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
 }
 
 # ======== TrueNAS API ops (WS with REST fallback) ========
-
-
 sub _tn_get_target($scfg) {
     my $res = _api_call($scfg, 'iscsi.target.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/target') }
     );
     if (ref($res) eq 'ARRAY' && !@$res) {
-        # WS returned empty but not an error; try REST once more
         my $rest = _rest_call($scfg, 'GET', '/iscsi/target');
         $res = $rest if ref($rest) eq 'ARRAY';
     }
     return $res;
 }
-
 sub _tn_targetextents($scfg) {
     my $res = _api_call($scfg, 'iscsi.targetextent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
@@ -431,7 +392,6 @@ sub _tn_targetextents($scfg) {
     }
     return $res;
 }
-
 sub _tn_extents($scfg) {
     my $res = _api_call($scfg, 'iscsi.extent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
@@ -442,14 +402,11 @@ sub _tn_extents($scfg) {
     }
     return $res;
 }
-
 sub _tn_global($scfg) {
     return _api_call($scfg, 'iscsi.global.config', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/global') }
     );
 }
-
-
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
@@ -460,16 +417,20 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
         sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
     $payload->{volblocksize} = $blocksize if $blocksize;
-
     return _api_call($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
 }
-
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full); # encode '/' as %2F for REST
     return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
+    );
+}
+sub _tn_dataset_get($scfg, $full) {
+    my $id = uri_escape($full);
+    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ],
+        sub { _rest_call($scfg, 'GET', "/pool/dataset/id/$id") }
     );
 }
 sub _tn_extent_create($scfg, $zname, $full) {
@@ -498,31 +459,26 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
 }
 
 # ======== Target resolution (IQN or short Target Name) ========
-
 sub _resolve_target_id {
     my ($scfg) = @_;
-    my $want  = $scfg->{target_iqn} // die "target_iqn not set\n";
+    my $want = $scfg->{target_iqn} // die "target_iqn not set\n";
     my $short = $want; $short =~ s/^.*://;
-
     my $targets = _tn_get_target($scfg);
     if (!ref($targets) || !@$targets) {
         my $g = eval { _tn_global($scfg) } // {};
         my $basename = $g->{basename} // '(unknown)';
-        my $portal   = $scfg->{discovery_portal} // '(unset)';
-
+        my $portal = $scfg->{discovery_portal} // '(unset)';
         die
           "TrueNAS API returned no iSCSI targets.\n".
           " - iSCSI Base Name: $basename\n".
           " - Configured discovery portal: $portal\n".
           "Next steps:\n".
-          "  1) On TrueNAS, ensure the iSCSI service is RUNNING.\n".
-          "  2) In Shares → Block (iSCSI) → Portals, add/listen on $portal (or 0.0.0.0:3260).\n".
-          "  3) From this Proxmox node, run: iscsiadm -m discovery -t sendtargets -p $portal\n";
+          " 1) On TrueNAS, ensure the iSCSI service is RUNNING.\n".
+          " 2) In Shares → Block (iSCSI) → Portals, add/listen on $portal (or 0.0.0.0:3260).\n".
+          " 3) From this Proxmox node, run: iscsiadm -m discovery -t sendtargets -p $portal\n";
     }
-
     my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
     $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
-
     if (!$t) {
         my @names = map { $_->{name} // '(unnamed)' } @$targets;
         die "Target '$want' not found. Available targets: ".join(', ', @names)."\n";
@@ -530,71 +486,138 @@ sub _resolve_target_id {
     return $t->{id};
 }
 
-
-# ======== Initiator: discovery/login and device resolution ========
-
+# ======== Portal normalization & reachability ========
 sub _normalize_portal($p) {
+    $p //= '';
     $p =~ s/^\s+|\s+$//g;
     return $p if !$p;
-    $p =~ /^\[(.+)\]:(\d+)$/ ? "$1:$2" : $p; # strip IPv6 brackets for by-path
+    # strip IPv6 brackets for by-path normalization
+    $p = ($p =~ /^\[(.+)\]:(\d+)$/) ? "$1:$2" : $p;
+    # strip trailing ",TPGT"
+    $p =~ s/,\d+$//;
+    return $p;
+}
+sub _probe_portal($portal) {
+    my ($h,$port) = $portal =~ /^(.+):(\d+)$/;
+    return 1 if !$h || !$port; # nothing to probe
+    my $sock = IO::Socket::INET->new(PeerHost=>$h, PeerPort=>$port, Proto=>'tcp', Timeout=>5);
+    die "iSCSI portal $portal is not reachable (TCP connect failed)\n" if !$sock;
+    close $sock;
+    return 1;
 }
 
+# ======== Initiator: discovery/login and device resolution ========
 sub _iscsi_login_all($scfg) {
-    my $primary = $scfg->{discovery_portal};
-    my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
+    my $primary = _normalize_portal($scfg->{discovery_portal});
+    my @extra = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
 
+    # Preflight reachability
+    _probe_portal($primary);
+    _probe_portal($_) for @extra;
+
+    # Ensure discovery DB entries exist for primary + extras
     run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary],
-        errmsg => "iSCSI discovery failed", outfunc => sub {});
-    my $iqn = $scfg->{target_iqn};
+        errmsg => "iSCSI discovery failed (primary)", outfunc => sub {});
+    for my $p (@extra) {
+        run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p],
+            errmsg => "iSCSI discovery failed (extra $p)", outfunc => sub {});
+    }
 
+    my $iqn = $scfg->{target_iqn};
     my @nodes;
     run_command(['iscsiadm','-m','node','-T',$iqn], errmsg => "iscsiadm nodes failed", outfunc => sub {
         push @nodes, $_[0] if $_[0] =~ /\S/;
     });
 
+    # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         next unless $n =~ /^(\S+)\s+$iqn$/;
-        my $portal = $1;
+        my $portal = _normalize_portal($1);
+        # Persist startup = automatic
         run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
-            errmsg => "iscsiadm update failed", outfunc => sub {});
+            errmsg => "iscsiadm update failed (node.startup)", outfunc => sub {});
+        # CHAP (optional)
         if ($scfg->{chap_user} && $scfg->{chap_password}) {
             for my $cmd (
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{chap_user}],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
-            ) { run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {}); }
+            ) {
+                run_command($cmd, errmsg => "iscsiadm CHAP update failed", outfunc => sub {});
+            }
         }
+        # Login
         run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
-            errmsg => "iscsiadm login failed", outfunc => sub {});
+            errmsg => "iscsiadm login failed ($portal)", outfunc => sub {});
     }
 
+    # Also attempt direct login for any extra portals not returned by -m node (edge)
     for my $p (@extra) {
-        run_command(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p],
-            errmsg => "iSCSI discovery failed", outfunc => sub {});
-        run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
-            errmsg => "iSCSI login failed", outfunc => sub {});
+        eval {
+            run_command(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
+                errmsg => "iscsiadm login failed ($p)", outfunc => sub {});
+        };
     }
+
+    # Give udev a moment to create by-path links
+    run_command(['udevadm','settle'], outfunc => sub {});
+    usleep(150_000); # 150ms grace
 }
 
-sub _device_for_lun($scfg, $lun) {
-    run_command(['udevadm','settle'], outfunc => sub {});
+sub _find_by_path_for_lun($scfg, $lun) {
     my $iqn = $scfg->{target_iqn};
-
-    if ($scfg->{use_multipath} && !$scfg->{use_by_path}) {
-        my $mp = '';
-        run_command(['multipath','-ll'], outfunc => sub {
-            my $line = $_[0];
-            if ($line =~ /(dm-\d+)/ && $line =~ /\Q$iqn\E/) { $mp = "/dev/$1"; }
-        });
-        return $mp if $mp;
-    }
-
     my $pattern = "-iscsi-$iqn-lun-$lun";
     opendir(my $dh, "/dev/disk/by-path") or die "cannot open /dev/disk/by-path\n";
     my @paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
     closedir($dh);
-    die "Could not locate by-path device for LUN $lun (IQN $iqn)\n" if !@paths;
-    return "/dev/disk/by-path/$paths[0]";
+    return "/dev/disk/by-path/$paths[0]" if @paths;
+    return undef;
+}
+
+sub _dm_map_for_leaf($leaf) {
+    # Map /dev/<leaf> (e.g. sdc) to its multipath /dev/mapper/<name> using sysfs
+    my $sys = "/sys/block";
+    opendir(my $dh, $sys) or return undef;
+    while (my $e = readdir($dh)) {
+        next unless $e =~ /^dm-\d+$/;
+        my $slave = "$sys/$e/slaves/$leaf";
+        next unless -e $slave;
+        my $name = '';
+        if (open my $fh, '<', "$sys/$e/dm/name") {
+            chomp($name = <$fh> // ''); close $fh;
+        }
+        closedir($dh);
+        return $name ? "/dev/mapper/$name" : "/dev/$e";
+    }
+    closedir($dh);
+    return undef;
+}
+
+sub _device_for_lun($scfg, $lun) {
+    # Wait briefly for by-path to appear if needed
+    my $by;
+    for (1..20) { # up to ~2s total
+        $by = _find_by_path_for_lun($scfg, $lun);
+        last if $by && -e $by;
+        run_command(['udevadm','settle'], outfunc => sub {});
+        usleep(100_000);
+    }
+    die "Could not locate by-path device for LUN $lun (IQN $scfg->{target_iqn})\n" if !$by || !-e $by;
+
+    # Multipath preference
+    if ($scfg->{use_multipath} && !$scfg->{use_by_path}) {
+        my $real = abs_path($by);
+        if ($real && $real =~ m{^/dev/([^/]+)$}) {
+            my $leaf = $1; # e.g., sdc
+            if (my $dm = _dm_map_for_leaf($leaf)) {
+                return $dm; # return the /dev/mapper/<name> (or /dev/dm-*)
+            }
+        }
+        # if no dm map found yet, fall back to by-path
+        return $by;
+    }
+
+    return $by; # by-path preferred or fallback
 }
 
 sub _zvol_name($vmid, $name) {
@@ -604,10 +627,9 @@ sub _zvol_name($vmid, $name) {
 }
 
 # ======== Required storage interface ========
-
 sub parse_volname {
     my ($class, $volname) = @_;
-    if ($volname =~ m!^vol-([a-zA-Z0-9._\-]+)-lun(\d+)$!) {
+    if ($volname =~ m!^vol-(\[a-zA-Z0-9._\-]+)-lun(\d+)$!) {
         my ($zname, $lun) = ($1, int($2));
         return ('images', $zname, undef, undef, undef, undef, 'raw', $lun);
     }
@@ -639,19 +661,17 @@ sub alloc_image {
 
     # 3) Map to shared target at next free LUN
     my $target_id = _resolve_target_id($scfg);
-
     my $maps = _tn_targetextents($scfg);
-    my %used = map { ($_->{lunid} // -1) => 1 } grep { $_->{target} == $target_id } @$maps;
+    my %used = map { (($_->{lunid} // -1) => 1) } grep { $_->{target} == $target_id } @$maps;
     my $lun; for my $cand (0..4095) { if (!$used{$cand}) { $lun = $cand; last; } }
     die "No free LUN on target id=$target_id" if !defined $lun;
-
     _tn_targetextent_create($scfg, $target_id, $extent_id, $lun);
+
     return "vol-$zname-lun$lun";
 }
 
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
-
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
@@ -667,17 +687,60 @@ sub free_image {
     # Remove targetextent association
     if (defined $target_id && defined $extent_id) {
         my $maps = _tn_targetextents($scfg);
-        my ($tx) = grep { $_->{target} == $target_id && ($_->{extent} // -1) == $extent_id } @$maps;
+        my ($tx) = grep { $_->{target} == $target_id && (($_->{extent} // -1) == $extent_id) } @$maps;
         _tn_targetextent_delete($scfg, $tx->{id}) if $tx && defined $tx->{id};
     }
 
     _tn_extent_delete($scfg, $extent_id) if defined $extent_id;
     _tn_dataset_delete($scfg, $full);
-
     return 1;
 }
 
-sub status { return (0,0,0,1); }
+# ======== status(): report dataset capacity correctly ========
+# total = quota (if set) else (written/used + available)
+# avail = (quota - written/used) when quota present, else dataset available
+# used  = dataset "written" (preferred), fallback to "used"
+sub status {
+    my ($class, $storeid, $scfg, $cache) = @_;
+    my $active = 1;
+    my ($total, $avail, $used) = (0,0,0);
+
+    eval {
+        my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
+
+        my $norm = sub {
+            my ($v) = @_;
+            return 0 if !defined $v;
+            return $v if !ref($v);
+            return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+            return 0;
+        };
+
+        my $quota     = $norm->($ds->{quota});        # bytes; 0 = no quota
+        my $available = $norm->($ds->{available});    # bytes
+        $used = $norm->($ds->{written});
+        $used = $norm->($ds->{used}) if !$used;
+
+        if ($quota && $quota > 0) {
+            $total = $quota;
+            my $free = $quota - $used;
+            $avail = $free > 0 ? $free : 0;
+        } else {
+            $avail = $available;
+            $total = $used + $avail;
+        }
+    };
+
+    if ($@) {
+        # Conservative fallback to avoid blocking VM starts if stats fail
+        $total ||= 1024*1024*1024*1024; # 1 TiB
+        $avail ||= 900*1024*1024*1024;  # 900 GiB
+        $used  ||= $total - $avail;
+    }
+
+    return ($total, $avail, $used, $active);
+}
+
 sub activate_storage { return 1; }
 sub deactivate_storage { return 1; }
 
@@ -687,17 +750,17 @@ sub activate_volume {
     _iscsi_login_all($scfg);
     if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
     run_command(['udevadm','settle'], outfunc => sub {});
+    usleep(150_000);
     return 1;
 }
-
 sub deactivate_volume { return 1; }
 
-sub volume_snapshot          { die "snapshot not supported"; }
-sub volume_snapshot_delete   { die "snapshot not supported"; }
+sub volume_snapshot { die "snapshot not supported"; }
+sub volume_snapshot_delete { die "snapshot not supported"; }
 sub volume_snapshot_rollback { die "snapshot not supported"; }
-sub clone_image              { die "clone not supported"; }
-sub create_base              { die "base images not supported"; }
-sub volume_resize            { die "resize not supported"; }
-sub volume_has_feature       { return undef; }
+sub clone_image { die "clone not supported"; }
+sub create_base { die "base images not supported"; }
+sub volume_resize { die "resize not supported"; }
+sub volume_has_feature { return undef; }
 
 1;
