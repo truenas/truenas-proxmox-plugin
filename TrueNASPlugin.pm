@@ -770,6 +770,31 @@ sub alloc_image {
     return "vol-$zname-lun$lun";
 }
 
+# Return ($size_bytes, $format)
+sub volume_size_info {
+    my ($class, $scfg, $storeid, $volname, $timeout) = @_;
+
+    # Parse zvol identity from our encoded volname "vol-<zname>-lun<N>"
+    my (undef, $zname, undef, undef, undef, undef, $fmt, undef) =
+        $class->parse_volname($volname);
+    $fmt //= 'raw';
+
+    # Query TrueNAS for zvol attributes: volsize is in bytes (may be in a hash with parsed/raw)
+    my $full = $scfg->{dataset} . '/' . $zname;
+    my $ds = _tn_dataset_get($scfg, $full) // {};
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+    my $bytes = $norm->($ds->{volsize});
+    die "volume_size_info: missing volsize for $full\n" if !$bytes;
+
+    return ($bytes, $fmt);
+}
+
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
