@@ -439,7 +439,7 @@ sub volume_has_feature {
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
 sub volume_resize {
-    my ($class, $scfg, $storeid, $volname, $new_kib, @rest) = @_;
+    my ($class, $scfg, $storeid, $volname, $new_size_bytes, @rest) = @_;
 
     # Parse our custom volname: "vol-<zname>-lun<N>"
     my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
@@ -458,39 +458,43 @@ sub volume_resize {
         return 0;
     };
     my $cur_bytes = $norm->($ds->{volsize});
-    my $bs_bytes  = $norm->($ds->{volblocksize}); # may be 0/undef if unknown
+    my $bs_bytes  = $norm->($ds->{volblocksize}); # may be 0/undef
 
-    # Convert Proxmox KiB -> bytes; grow-only enforcement
-    my $req_bytes = int($new_kib) * 1024;
+    # IMPORTANT: Proxmox passes the ABSOLUTE target size in BYTES.
+    my $req_bytes = int($new_size_bytes);
+
+    # Grow-only enforcement
     die "shrink not supported (current=$cur_bytes requested=$req_bytes)\n"
         if $req_bytes <= $cur_bytes;
 
-    # Align up to volblocksize if known to avoid middleware alignment errors
+    # Align up to volblocksize to avoid middleware alignment complaints
     if ($bs_bytes && $bs_bytes > 0) {
         my $rem = $req_bytes % $bs_bytes;
         $req_bytes += ($bs_bytes - $rem) if $rem;
     }
 
+    # Compute delta AFTER alignment
+    my $delta = $req_bytes - $cur_bytes;
+
     # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
-    # Query parent dataset (where all VM zvols live)
     my $pds          = _tn_dataset_get($scfg, $scfg->{dataset}) // {};
-    my $avail_bytes  = $norm->($pds->{available}); # pool/dataset available bytes
-    my $delta        = $req_bytes - $cur_bytes;
-    my $max_grow     = $avail_bytes ? int($avail_bytes * 0.80) : 0; # conservative mirror
+    my $avail_bytes  = $norm->($pds->{available}); # parent dataset/pool available
+    my $max_grow     = $avail_bytes ? int($avail_bytes * 0.80) : 0;
 
     if ($avail_bytes && $delta > $max_grow) {
         my $fmt_g = sub { sprintf('%.2f GiB', $_[0] / (1024*1024*1024)) };
         die sprintf(
             "resize refused by preflight: requested grow %s exceeds TrueNAS ~80%% headroom (%s) on dataset %s.\n".
-            "Reduce the grow amount or free up space on the backing dataset/pool.\n",
+            "Reduce the grow amount or free space on the backing dataset/pool.\n",
             $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{dataset}
         );
     }
     # ---- End preflight ----
 
-    # Perform the TrueNAS zvol grow via WS with REST fallback
+    # Perform the TrueNAS zvol grow
     my $id = URI::Escape::uri_escape($full);
     my $payload = { volsize => int($req_bytes) };
+
     _api_call(
         $scfg,
         'pool.dataset.update',
@@ -504,9 +508,11 @@ sub volume_resize {
         _try_run(['multipath','-r'], "multipath map reload failed");
     }
     run_command(['udevadm','settle'], outfunc => sub {});
-    Time::HiRes::usleep(250_000);
+    select(undef, undef, undef, 0.25);  # ~250ms
 
-    return $new_kib; # Proxmox expects KiB
+    # Proxmox expects KiB as return value
+    my $ret_kib = int(($req_bytes + 1023) / 1024);
+    return $ret_kib;
 }
 
 sub _tn_extent_create($scfg, $zname, $full) {
