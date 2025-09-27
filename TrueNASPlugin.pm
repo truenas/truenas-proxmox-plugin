@@ -510,6 +510,20 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
     );
 }
 
+sub _current_lun_for_zname($scfg, $zname) {
+    my $extents = _tn_extents($scfg) // [];
+    my ($extent) = grep { ($_->{name} // '') eq $zname } @$extents;
+    return undef if !$extent || !defined $extent->{id};
+
+    my $target_id = _resolve_target_id($scfg);
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($tx) = grep {
+        ($_->{target} // -1) == $target_id
+            && (($_->{extent} // -1) == $extent->{id})
+    } @$maps;
+    return defined($tx) ? $tx->{lunid} : undef;
+}
+
 # ======== Target resolution (IQN or short Target Name) ========
 sub _resolve_target_id {
     my ($scfg) = @_;
@@ -711,9 +725,23 @@ sub parse_volname {
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     die "snapshots not supported on raw iSCSI LUNs" if defined $snapname;
-    my (undef, undef, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
+    my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
+
     _iscsi_login_all($scfg);
-    my $dev = _device_for_lun($scfg, $lun);
+
+    my $dev;
+    eval { $dev = _device_for_lun($scfg, $lun); };
+    if ($@ || !$dev) {
+        # try to re-resolve LUN mapping from TrueNAS
+        my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
+        if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
+            $dev = _device_for_lun($scfg, $real_lun);
+            # (optional) carp "LUN changed for $zname: $lun -> $real_lun; resolved $dev";
+        } else {
+            die $@ if $@; # bubble up original cause
+            die "Could not locate device for LUN $lun (IQN $scfg->{target_iqn})\n";
+        }
+    }
     return ($dev, undef, 'images');
 }
 
