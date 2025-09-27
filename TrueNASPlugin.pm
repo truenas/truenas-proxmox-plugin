@@ -742,13 +742,22 @@ sub _zvol_name($vmid, $name) {
 }
 
 # ======== Required storage interface ========
+# volname format: vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
 sub parse_volname {
     my ($class, $volname) = @_;
-    if ($volname =~ m!^vol-([a-zA-Z0-9._\-]+)-lun(\d+)$!) {
-        my ($zname, $lun) = ($1, int($2));
-        return ('images', $zname, undef, undef, undef, undef, 'raw', $lun);
+
+    if ($volname =~ m/^vol-([A-Za-z0-9:_\.\-]+)-lun(\d+)$/) {
+        my ($zname, $lun) = ($1, $2);
+
+        my $vmid;
+        $vmid = $1 if $zname =~ m/^vm-(\d+)-/; # derive owner if named vm-<vmid>-...
+
+        # return shape mimics other block plugins:
+        # ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format, $lun)
+        return ('images', $zname, $vmid, undef, undef, undef, 'raw', $lun);
     }
-    die "unable to parse truenas volume name '$volname'\n";
+
+    die "unable to parse volname '$volname'\n";
 }
 
 sub path {
@@ -1040,19 +1049,29 @@ sub _session_has_no_luns {
 }
 
 # ======== List VM disks for the storage (GUI/CLI content) ========
-# Returns an arrayref of entries: { volid, size (bytes), format, vmid? }.
+# Returns an arrayref of hashes: { volid, size, format, vmid? }
+# Respects $vmid (owner filter) and $vollist (explicit include list).
 sub list_images {
-    my ($class, $storeid, $scfg, $vmid, $vollist, $cache, $errors) = @_;
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
 
-    my $out = [];
+    my $res = [];
 
-    # Optional filter: allow-list of specific volids
-    my %want = ();
-    if (defined $vollist && ref($vollist) eq 'ARRAY') {
+    # ---- cache TrueNAS state for this call chain ----
+    my $extents = $cache->{tn_extents} //= (_tn_extents($scfg) // []);
+    my $maps    = $cache->{tn_targetextents} //= (_tn_targetextents($scfg) // []);
+    my $target_id = _resolve_target_id($scfg);
+
+    # Index extents by id for quick lookups
+    my %extent_by_id = map { ($_->{id} // -1) => $_ } @$extents;
+
+    # Optional include filter (vollist is "<storeid>:<volname>" entries)
+    my %want;
+    if ($vollist && ref($vollist) eq 'ARRAY' && @$vollist) {
         %want = map { $_ => 1 } @$vollist;
     }
 
-    my $norm_bytes = sub {
+    # Normalizer for volsize/typed fields ({parsed}|{raw}|scalar)
+    my $norm = sub {
         my ($v) = @_;
         return 0 if !defined $v;
         return $v if !ref($v);
@@ -1060,55 +1079,60 @@ sub list_images {
         return 0;
     };
 
-    my $target_id = eval { _resolve_target_id($scfg) };
-    if ($@) {
-        push(@$errors, "target resolution failed: $@")
-            if defined($errors) && ref($errors) eq 'ARRAY';
-        return $out;
-    }
+    # Walk all mappings for our shared target; each mapping -> one LUN for an extent
+    MAPPING: for my $tx (@$maps) {
+        next MAPPING unless (($tx->{target} // -1) == $target_id);
 
-    # extent_id -> LUN for our shared target
-    my $maps = _tn_targetextents($scfg) // [];
-    my %lun_for_ext = map { $_->{extent} => ($_->{lunid} // 0) }
-                      grep { ($_->{target} // -1) == $target_id } @$maps;
+        my $eid = $tx->{extent};
+        my $e   = $extent_by_id{$eid} // next MAPPING;
 
-    # All extents; filter to zvols under our dataset and mapped to our target
-    my $extents = _tn_extents($scfg) // [];
-  EXT: for my $e (@$extents) {
-        next EXT if ($e->{type} // '') ne 'DISK';
+        # We name extents with the zvol name (e.g., vm-<vmid>-disk-<n>)
+        my $zname = $e->{name} // '';
+        next MAPPING if !$zname;
 
-        my $disk = $e->{disk} // '';  # "zvol/<dataset>/<zname>"
-        next EXT if $disk !~ m{^zvol/\Q$scfg->{dataset}\E/};
+        # Optional: constrain to our dataset by verifying zvol exists under dataset
+        my $ds_full = "$scfg->{dataset}/$zname";
 
-        my $zname     = $e->{name} // next EXT;
-        my $extent_id = $e->{id};
-        my $lun       = $lun_for_ext{$extent_id};
-        next EXT if !defined $lun; # not mapped to our target
+        # Determine assigned LUN id
+        my $lun = $tx->{lunid};
+        next MAPPING if !defined $lun;
 
-        # STRICT filter: only include real VM disks "vm-<id>-..."
-        next EXT if $zname !~ /^vm-(\d+)-/;
-        my $vid = int($1);
-        if (defined $vmid && $vid != $vmid) { next EXT; }
+        # Owner (vmid) from our naming convention
+        my $owner;
+        $owner = $1 if $zname =~ /^vm-(\d+)-/;
 
+        # Honor $vmid filter if owner is known
+        if (defined $vmid && defined $owner && $owner != $vmid) {
+            next MAPPING;
+        }
+
+        # Compose plugin volname + volid
         my $volname = "vol-$zname-lun$lun";
-        if (%want && !$want{"$storeid:$volname"}) { next EXT; }
+        my $volid   = "$storeid:$volname";
 
-        # Fetch capacity (bytes) from the zvol dataset
-        my $full_ds = "$scfg->{dataset}/$zname";
-        my $ds = eval { _tn_dataset_get($scfg, $full_ds) } // {};
-        my $size = $norm_bytes->($ds->{volsize}) || 0;
+        # Honor explicit include filter
+        if (%want && !$want{$volid}) {
+            next MAPPING;
+        }
 
-        # Register the volume
-        push @$out, {
-            volid  => "$storeid:$volname",
+        # Ask TrueNAS for the zvol to get current size (bytes)
+        my $ds = eval { _tn_dataset_get($scfg, $ds_full) } // {};
+        my $size = $norm->($ds->{volsize}); # bytes (0 if missing)
+
+        # Format is always raw for block iSCSI zvols
+        my %entry = (
+            volid  => $volid,
             size   => $size,
             format => 'raw',
-            vmid   => $vid,
-        };
+        );
+        $entry{vmid} = int($owner) if defined $owner;
+
+        push @$res, \%entry;
     }
 
-    return $out;
+    return $res;
 }
+
 
 # ======== status(): report dataset capacity correctly ========
 # total = quota (if set) else (written/used + available)
