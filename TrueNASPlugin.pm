@@ -86,6 +86,13 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
+        sparse => {
+            description => "Create thin-provisioned zvols (TrueNAS 'sparse'=on).",
+            type        => 'boolean',
+            optional    => 1,
+            default     => 1,
+        },
+
 
         # iSCSI target on TrueNAS
         target_iqn => {
@@ -103,6 +110,7 @@ sub properties {
             type        => 'string',
             optional    => 1,
         },
+        
 
         # Initiator pathing
         use_multipath => { type => 'boolean', optional => 1, default => 1  },
@@ -128,6 +136,7 @@ sub options {
         nodes   => { optional => 1 },
         content => { optional => 1 },
         shared  => { optional => 1 },
+        sparse => { optional => 1 },  # OK to toggle without orphaning
 
         # Connection (fixed to prevent orphaning)
         api_transport => { optional => 1, fixed => 1 },
@@ -445,13 +454,24 @@ sub _tn_extents($scfg) {
     );
 }
 
-sub _tn_dataset_create($scfg, $full, $bytes, $blocksize) {
-    my $payload = { name => $full, type => 'VOLUME', volsize => int($bytes) };
+sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
+    # Proxmox passes size in KiB for alloc_image(); TrueNAS expects bytes.
+    # Example: 10G in PVE -> 10 * 1024 * 1024 KiB; we must multiply by 1024.
+    my $bytes = int($size_kib) * 1024;
+
+    my $payload = {
+        name       => $full,
+        type       => 'VOLUME',
+        volsize    => $bytes,
+        sparse     => ($scfg->{sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+    };
     $payload->{volblocksize} = $blocksize if $blocksize;
+
     return _api_call($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
 }
+
 
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full); # encode '/' as %2F for REST  [4](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere/6-7/vsphere-storage-6-7/configuring-iscsi-and-iser-adapters-and-storage-with-esxi/configuring-discovery-addresses-for-iscsi-initiators.html)
