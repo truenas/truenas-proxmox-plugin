@@ -408,21 +408,47 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
 
 # ======== TrueNAS API ops (WS with REST fallback) ========
 
+
 sub _tn_get_target($scfg) {
-    return _api_call($scfg, 'iscsi.target.query', [],
+    my $res = _api_call($scfg, 'iscsi.target.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/target') }
     );
+    if (ref($res) eq 'ARRAY' && !@$res) {
+        # WS returned empty but not an error; try REST once more
+        my $rest = _rest_call($scfg, 'GET', '/iscsi/target');
+        $res = $rest if ref($rest) eq 'ARRAY';
+    }
+    return $res;
 }
+
 sub _tn_targetextents($scfg) {
-    return _api_call($scfg, 'iscsi.targetextent.query', [],
+    my $res = _api_call($scfg, 'iscsi.targetextent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
     );
+    if (ref($res) eq 'ARRAY' && !@$res) {
+        my $rest = _rest_call($scfg, 'GET', '/iscsi/targetextent');
+        $res = $rest if ref($rest) eq 'ARRAY';
+    }
+    return $res;
 }
+
 sub _tn_extents($scfg) {
-    return _api_call($scfg, 'iscsi.extent.query', [],
+    my $res = _api_call($scfg, 'iscsi.extent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
     );
+    if (ref($res) eq 'ARRAY' && !@$res) {
+        my $rest = _rest_call($scfg, 'GET', '/iscsi/extent');
+        $res = $rest if ref($rest) eq 'ARRAY';
+    }
+    return $res;
 }
+
+sub _tn_global($scfg) {
+    return _api_call($scfg, 'iscsi.global.config', [],
+        sub { _rest_call($scfg, 'GET', '/iscsi/global') }
+    );
+}
+
 
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
@@ -476,9 +502,24 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
 sub _resolve_target_id {
     my ($scfg) = @_;
     my $want  = $scfg->{target_iqn} // die "target_iqn not set\n";
-    my $short = $want; $short =~ s/^.*://;  # tail after last ':'
+    my $short = $want; $short =~ s/^.*://;
 
     my $targets = _tn_get_target($scfg);
+    if (!ref($targets) || !@$targets) {
+        my $g = eval { _tn_global($scfg) } // {};
+        my $basename = $g->{basename} // '(unknown)';
+        my $portal   = $scfg->{discovery_portal} // '(unset)';
+
+        die
+          "TrueNAS API returned no iSCSI targets.\n".
+          " - iSCSI Base Name: $basename\n".
+          " - Configured discovery portal: $portal\n".
+          "Next steps:\n".
+          "  1) On TrueNAS, ensure the iSCSI service is RUNNING.\n".
+          "  2) In Shares → Block (iSCSI) → Portals, add/listen on $portal (or 0.0.0.0:3260).\n".
+          "  3) From this Proxmox node, run: iscsiadm -m discovery -t sendtargets -p $portal\n";
+    }
+
     my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
     $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
 
@@ -488,6 +529,7 @@ sub _resolve_target_id {
     }
     return $t->{id};
 }
+
 
 # ======== Initiator: discovery/login and device resolution ========
 
