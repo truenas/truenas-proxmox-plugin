@@ -94,6 +94,17 @@ sub properties {
 
         # Initiator pathing
         use_multipath => { type => 'boolean', optional => 1, default => 1 },
+        force_delete_on_inuse => {
+            description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
+            type        => 'boolean',
+            default     => 'false',
+        },
+        logout_on_free => {
+            description => 'After delete, logout the target if no LUNs remain for this node.',
+            type        => 'boolean',
+            default     => 'false',
+        },
+
         use_by_path   => { type => 'boolean', optional => 1, default => 0 },
         ipv6_by_path  => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
