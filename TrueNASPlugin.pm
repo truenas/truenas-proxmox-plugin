@@ -622,8 +622,11 @@ sub volume_snapshot_info {
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
 
-    # TrueNAS REST: GET /zfs/snapshot (returns an array of snapshots system-wide)
-    my $list = _rest_call($scfg, 'GET', '/zfs/snapshot', undef) // [];
+    # Use WebSocket API for fresh snapshot data (TrueNAS 25.04+)
+    my $list = _api_call($scfg, 'zfs.snapshot.query', [],
+        sub { _rest_call($scfg, 'GET', '/zfs/snapshot', undef) }
+    ) // [];
+
     my $snaps = {};
     for my $s (@$list) {
         my $name = $s->{name} // next; # "pool/ds@sn"
@@ -639,6 +642,7 @@ sub volume_snapshot_info {
         }
         $snaps->{$snapname} = { id => $snapname, timestamp => $ts };
     }
+
     return $snaps;
 }
 
