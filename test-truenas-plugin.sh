@@ -98,18 +98,23 @@ die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
 # Snapshot list
 my @snapshots = ($snapshot_args);
 
-# Use bulk delete function
-my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\\@snapshots);
-
-if (\$errors && @\$errors) {
-    print "Bulk deletion errors:\\n";
-    for my \$error (@\$errors) {
-        print "  ERROR: \$error\\n";
+# Use bulk delete function with error handling
+eval {
+    my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\\@snapshots);
+    if (\$errors && @\$errors) {
+        print "Bulk deletion completed with errors:\\n";
+        for my \$error (@\$errors) {
+            print "  ERROR: \$error\\n";
+        }
+        exit 1;
+    } else {
+        print "Bulk deletion of " . scalar(@snapshots) . " snapshots completed successfully\\n";
+        exit 0;
     }
+};
+if (\$@) {
+    print "Bulk deletion failed with exception: \$@\\n";
     exit 1;
-} else {
-    print "Bulk deletion of " . scalar(@snapshots) . " snapshots completed successfully\\n";
-    exit 0;
 }
 EOF
 
@@ -430,6 +435,7 @@ test_clone_operations() {
         return 1
     fi
     echo " ✓"
+    echo ""  # Add explicit newline after clone completion
 
     log_step "Verifying clone was created..."
     if ! run_command "qm config $TEST_VM_CLONE" >/dev/null 2>&1; then
@@ -512,17 +518,21 @@ test_bulk_operations() {
 
         # Get the volume name for the bulk operation
         local volname
-        volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f2 | cut -d, -f1 | sed 's/^[[:space:]]*//')
+        volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f3 | cut -d, -f1 | sed 's/^[[:space:]]*//')
 
         if [[ -n "$volname" ]]; then
             log_to_file "INFO" "Using volume: $volname for bulk deletion"
 
             # Use embedded Perl bulk deletion
-            if bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${bulk_snapshots[@]}"; then
+            local bulk_output
+            bulk_output=$(bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${bulk_snapshots[@]}" 2>&1)
+            if [ $? -eq 0 ]; then
                 log_step "Bulk deletion completed successfully"
+                log_to_file "INFO" "Bulk output: $bulk_output"
                 log_success "Bulk operations test passed - used TrueNAS core.bulk API"
             else
                 log_warning "Bulk deletion failed, falling back to individual deletion"
+                log_to_file "INFO" "Bulk deletion error: $bulk_output"
 
                 # Fallback to individual deletion
                 local deleted_count=0
@@ -611,7 +621,7 @@ test_volume_deletion() {
         if [ ${#snapshots_array[@]} -gt 1 ]; then
             # Get the volume name for bulk operations
             local volname
-            volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f2 | cut -d, -f1 | sed 's/^[[:space:]]*//')
+            volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f3 | cut -d, -f1 | sed 's/^[[:space:]]*//')
 
             if [[ -n "$volname" ]]; then
                 log_to_file "INFO" "Attempting bulk cleanup of ${#snapshots_array[@]} snapshots using core.bulk"
