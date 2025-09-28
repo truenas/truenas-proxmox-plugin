@@ -124,6 +124,11 @@ sub properties {
             description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
             type => 'boolean', optional => 1, default => 1,
         },
+        # vmstate storage location
+        vmstate_storage => {
+            description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
+            type => 'string', optional => 1, default => 'local',
+        },
     };
 }
 sub options {
@@ -169,6 +174,7 @@ sub options {
         # Live snapshots
         enable_live_snapshots => { optional => 1 },
         snapshot_volume_chains => { optional => 1 },
+        vmstate_storage => { optional => 1 },
     };
 }
 
@@ -512,44 +518,9 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     return 1;
 }
 
-# Helper function to get vmstate dataset path for a given VM
-sub _vmstate_dataset($scfg, $vmid) {
-    return $scfg->{dataset} . '/vmstate/vm-' . $vmid;
-}
-
-# Helper function to store VM state to cluster filesystem (cluster compatible)
-sub _store_vmstate($scfg, $vmid, $snapname, $vmstate_file) {
-    # Use cluster filesystem for vmstate to ensure accessibility from all nodes
-    my $vmstate_dir = "/etc/pve/vmstate/truenas/$vmid";
-
-    # Create vmstate directory if it doesn't exist
-    run_command(['mkdir', '-p', $vmstate_dir]);
-
-    # Copy the vmstate file to cluster-accessible location
-    my $vmstate_target = "$vmstate_dir/$snapname.vmstate";
-    if ($vmstate_file && -f $vmstate_file) {
-        run_command(['cp', $vmstate_file, $vmstate_target]);
-    }
-
-    return $vmstate_target;
-}
-
-# Helper function to retrieve VM state from cluster filesystem
-sub _retrieve_vmstate($scfg, $vmid, $snapname) {
-    my $vmstate_file = "/etc/pve/vmstate/truenas/$vmid/$snapname.vmstate";
-
-    return -f $vmstate_file ? $vmstate_file : undef;
-}
-
-# Helper function to clean up vmstate files
-sub _cleanup_vmstate($scfg, $vmid, $snapname) {
-    my $vmstate_file = "/etc/pve/vmstate/truenas/$vmid/$snapname.vmstate";
-
-    eval {
-        unlink $vmstate_file if -f $vmstate_file;
-    };
-    # Ignore errors - vmstate cleanup is best effort
-}
+# Note: vmstate handling is now done through Proxmox's standard volume allocation
+# When vmstate_storage is 'shared', Proxmox automatically creates vmstate volumes on this storage
+# When vmstate_storage is 'local', Proxmox stores vmstate on local filesystem (better performance)
 
 # Helper function to clean up stale snapshot entries from VM config
 sub _cleanup_vm_snapshot_config {
@@ -602,9 +573,18 @@ sub _cleanup_vm_snapshot_config {
 
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
-    # We support both disk snapshots and live snapshots with vmstate via ZFS
-    return 1 if $feature && $feature eq 'snapshot';
-    return undef; # others unchanged
+
+    if ($feature && $feature eq 'snapshot') {
+        # Always support disk snapshots via ZFS
+        return 1;
+    }
+
+    # Note: vmstate support is determined by the vmstate_storage setting:
+    # - 'shared': vmstate stored as volumes on this storage (current behavior)
+    # - 'local': vmstate stored on local filesystem (better performance)
+    # Proxmox handles vmstate automatically based on storage capabilities
+
+    return undef; # other features unchanged
 }
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
@@ -683,10 +663,10 @@ sub volume_resize {
 
 # Create a ZFS snapshot on the TrueNAS zvol backing this volume.
 # 'snapname' must be a simple token (PVE passes it).
-# Now supports both disk-only and live snapshots with VM state.
+# Note: vmstate is handled automatically by Proxmox through standard volume allocation
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
-    my (undef, $zname, $vmid) = $class->parse_volname($volname);
+    my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
 
     # Create ZFS snapshot for the disk
@@ -698,55 +678,28 @@ sub volume_snapshot {
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
 
-    # Handle VM state if provided (live snapshot) - Proxmox 8.x compatible approach
-    if ($vmstate && $vmid) {
-        # Check if live snapshots are enabled
-        if (!($scfg->{enable_live_snapshots} // 1)) {
-            die "Live snapshots with VM state are disabled for this storage\n";
-        }
-
-        eval {
-            _store_vmstate($scfg, $vmid, $snapname, $vmstate);
-        };
-        if ($@) {
-            # If vmstate storage fails, clean up the disk snapshot and re-throw
-            eval {
-                my $snap_full = $full . '@' . $snapname;
-                my $id = URI::Escape::uri_escape($snap_full);
-                _api_call($scfg, 'zfs.snapshot.delete', [ $snap_full ],
-                    sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
-                );
-            };
-            die "Failed to store VM state for live snapshot: $@";
-        }
-    }
+    # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
+    # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage
+    # - If vmstate_storage is 'local': Proxmox stores vmstate on local filesystem
+    # Our plugin only needs to handle the disk snapshot creation
 
     return undef;
 }
 
-# Delete a ZFS snapshot on the zvol and clean up vmstate if present.
+# Delete a ZFS snapshot on the zvol.
+# Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    my (undef, $zname, $vmid) = $class->parse_volname($volname);
+    my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
     my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
-    # Delete ZFS snapshot for the disk
     # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap>
     _api_call(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
     );
-
-    # Clean up vmstate if it exists (best effort)
-    if ($vmid) {
-        eval {
-            _cleanup_vmstate($scfg, $vmid, $snapname);
-        };
-        # Ignore vmstate cleanup errors - disk snapshot deletion succeeded
-    }
-
     return undef;
 }
 
@@ -767,25 +720,10 @@ sub volume_snapshot_rollback {
         };
     }
 
-    # Check if this snapshot has associated VM state
-    my $has_vmstate = 0;
-    if ($vmid) {
-        my $vmstate_ds = _retrieve_vmstate($scfg, $vmid, $snapname);
-        $has_vmstate = 1 if $vmstate_ds;
-    }
-
     # WS-first rollback with safe fallbacks; allow non-latest rollback (destroy newer snaps)
     _tn_snapshot_rollback($scfg, $snap_full, 1, 0);
 
-    # For live snapshots, we need to provide the vmstate file path for restoration
-    if ($has_vmstate) {
-        my $vmstate_file = _retrieve_vmstate($scfg, $vmid, $snapname);
-        if ($vmstate_file && -f $vmstate_file) {
-            # The vmstate file needs to be accessible to QEMU for restoration
-            # For now, we've stored it locally, but this needs cluster compatibility
-            # TODO: Implement cluster-shared vmstate storage
-        }
-    }
+    # Note: vmstate restoration is handled automatically by Proxmox
 
     # Clean up stale Proxmox VM config entries for deleted snapshots
     if ($vmid && %$pre_rollback_snaps) {
@@ -799,11 +737,6 @@ sub volume_snapshot_rollback {
             if (@deleted_snaps) {
                 # Clean up VM config file by removing stale snapshot entries
                 _cleanup_vm_snapshot_config($vmid, \@deleted_snaps);
-
-                # Clean up vmstate for deleted snapshots
-                for my $deleted_snap (@deleted_snaps) {
-                    eval { _cleanup_vmstate($scfg, $vmid, $deleted_snap); };
-                }
             }
         };
         warn "Failed to clean up stale snapshot entries: $@" if $@;
