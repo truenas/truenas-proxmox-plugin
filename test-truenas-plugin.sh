@@ -116,6 +116,79 @@ wait_for_vm_unlock() {
     return 1  # Timeout
 }
 
+# Function to check for stale ZFS volumes on TrueNAS
+check_truenas_stale_volumes() {
+    local storage_name="$1"
+    local vm_ids="$2"  # space-separated list like "990 991"
+
+    log_step "Checking for stale ZFS volumes on TrueNAS..."
+
+    # Use embedded Perl to query TrueNAS for volumes
+    local stale_volumes
+    stale_volumes=$(perl << EOF
+use strict;
+use warnings;
+use lib '/usr/share/perl5';
+use PVE::Storage;
+use PVE::Storage::Custom::TrueNASPlugin;
+
+# Get storage configuration
+my \$storage_config = PVE::Storage::config();
+my \$scfg = PVE::Storage::storage_config(\$storage_config, '$storage_name');
+die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
+    unless \$scfg && \$scfg->{type} eq 'truenasplugin';
+
+# Get list of ZFS volumes from TrueNAS
+eval {
+    my \$result = PVE::Storage::Custom::TrueNASPlugin::_api_call(\$scfg, 'zfs.dataset.query',
+        [[\['name', '~', '\$scfg->{dataset}/vm-(990|991)-']], {'extra': {'properties': ['name']}}]);
+
+    if (\$result && ref(\$result) eq 'ARRAY') {
+        for my \$dataset (@\$result) {
+            if (\$dataset->{name} && \$dataset->{name} =~ /vm-(990|991)-/) {
+                print "\$dataset->{name}\\n";
+            }
+        }
+    }
+};
+if (\$@) {
+    print "ERROR: \$@\\n";
+}
+EOF
+)
+
+    if echo "$stale_volumes" | grep -q "ERROR:"; then
+        log_warning "Could not query TrueNAS for stale volumes: $stale_volumes"
+        return 1
+    fi
+
+    # Filter out empty lines
+    stale_volumes=$(echo "$stale_volumes" | grep -v "^$" || true)
+
+    if [[ -n "$stale_volumes" ]]; then
+        log_warning "Found stale ZFS volumes on TrueNAS:"
+        echo "$stale_volumes" | while read -r volume; do
+            log_to_file "WARNING" "Stale volume: $volume"
+            echo "  - $volume"
+        done
+        echo ""
+        echo -e "${YELLOW}📋 Manual cleanup commands for TrueNAS:${NC}"
+        echo ""
+        echo -e "${BLUE}# Connect to TrueNAS and run:${NC}"
+        echo "$stale_volumes" | while read -r volume; do
+            echo "zfs destroy \"$volume\""
+        done
+        echo ""
+        echo -e "${BLUE}# Or via TrueNAS Web UI:${NC}"
+        echo "Storage → Pools → [Your Pool] → Delete the vm-990-* and vm-991-* datasets"
+        echo ""
+        return 1
+    else
+        log_to_file "SUCCESS" "No stale ZFS volumes found on TrueNAS"
+        return 0
+    fi
+}
+
 # Function to clean up any existing test VMs
 cleanup_test_vms() {
     log_info "Cleaning up any existing test VMs..."
@@ -146,6 +219,18 @@ cleanup_test_vms() {
         log_step "Waiting for VM cleanup to complete..."
         sleep 3
         log_step "VM cleanup completed"
+    fi
+
+    # Check for stale ZFS volumes on TrueNAS
+    if ! check_truenas_stale_volumes "$STORAGE_NAME" "$TEST_VM_BASE $TEST_VM_CLONE"; then
+        echo -e "${RED}⚠️  Please clean up the stale volumes before running tests to avoid conflicts.${NC}"
+        echo -n "   Continue anyway? [y/N]: "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy] ]]; then
+            echo "❌ Test aborted by user."
+            exit 1
+        fi
+        echo ""
     fi
 }
 
@@ -791,7 +876,15 @@ test_volume_deletion() {
         log_to_file "WARNING" "Some volumes may still remain: $remaining_volumes"
     fi
 
-    log_success "Volume deletion test passed"
+    # Final verification: Check TrueNAS for any remaining ZFS volumes
+    log_step "Verifying TrueNAS ZFS cleanup..."
+    if check_truenas_stale_volumes "$STORAGE_NAME" "$TEST_VM_BASE $TEST_VM_CLONE"; then
+        log_to_file "SUCCESS" "TrueNAS ZFS volumes properly cleaned up"
+        log_success "Volume deletion test passed - all volumes cleaned up"
+    else
+        log_to_file "WARNING" "Some ZFS volumes may remain on TrueNAS (see output above)"
+        log_success "Volume deletion test passed - Proxmox cleaned, TrueNAS may need manual cleanup"
+    fi
     return 0
 }
 
