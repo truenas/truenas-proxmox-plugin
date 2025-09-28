@@ -441,63 +441,40 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     # Force WebSocket transport for snapshot rollback (REST API removed in 25.04+)
     my $ws_scfg = { %$scfg, api_transport => 'ws' };
 
-    my @attempts = (
-        # TrueNAS 25.04+ primary method: simple positional parameters
-        sub {
-            my $conn = _ws_open($ws_scfg);
-            return _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 1,
-                method  => "zfs.snapshot.rollback",
-                params  => [ $snap_full, $FORCE, $RECURSIVE ],
-            });
-        },
+    # TrueNAS 25.04+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
+    my $attempt_rollback = sub {
+        my $conn = _ws_open($ws_scfg);
+        return _ws_rpc($conn, {
+            jsonrpc => "2.0", id => 1,
+            method  => "zfs.snapshot.rollback",
+            params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+        });
+    };
 
-        # TrueNAS 25.04+ alternative: options object
-        sub {
-            my $conn = _ws_open($ws_scfg);
-            return _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 2,
-                method  => "zfs.snapshot.rollback",
-                params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
-            });
-        },
-
-        # Legacy WebSocket format (pre-25.04)
-        sub {
-            my $conn = _ws_open($ws_scfg);
-            return _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 3,
-                method  => "zfs.snapshot.rollback",
-                params  => [ { snapshot => $snap_full, force => $FORCE, recursive => $RECURSIVE } ],
-            });
-        },
-
-        # Last resort: just the snapshot name
-        sub {
-            my $conn = _ws_open($ws_scfg);
-            return _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 4,
-                method  => "zfs.snapshot.rollback",
-                params  => [ $snap_full ],
-            });
-        },
-    );
-
-    my $ok = 0; my $last_err = '';
-    for my $attempt (@attempts) {
-        eval { $attempt->(); $ok = 1; };
-        if ($@) {
-            $last_err = $@;
-            # Add more specific error info for debugging
-            warn "WebSocket attempt failed: $@";
-            next;
+    eval { $attempt_rollback->(); };
+    if ($@) {
+        my $err = $@;
+        # Check if it's a ZFS constraint error (newer snapshots exist)
+        if ($err =~ /more recent snapshots or bookmarks exist/ && $err =~ /use '-r' to force deletion/) {
+            # If force=1 but recursive=0, and newer snapshots exist, we need recursive=1
+            if ($force_bool && !$recursive_bool) {
+                # Retry with recursive=1 to delete newer snapshots
+                eval {
+                    my $conn = _ws_open($ws_scfg);
+                    _ws_rpc($conn, {
+                        jsonrpc => "2.0", id => 2,
+                        method  => "zfs.snapshot.rollback",
+                        params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
+                    });
+                };
+                return 1 if !$@;
+            }
+            # Give a more user-friendly error message
+            my ($newer_snaps) = $err =~ /use '-r' to force deletion of the following[^:]*:\s*([^\n]+)/;
+            die "Cannot rollback to snapshot: newer snapshots exist ($newer_snaps). ".
+                "Delete newer snapshots first or enable recursive rollback.\n";
         }
-        last if $ok;
-    }
-
-    if (!$ok) {
-        die "TrueNAS snapshot rollback failed (WebSocket required for TrueNAS 25.04+): $last_err\n".
-            "Ensure WebSocket API is accessible and api_transport is set to 'ws'.\n";
+        die "TrueNAS snapshot rollback failed: $err";
     }
     return 1;
 }
