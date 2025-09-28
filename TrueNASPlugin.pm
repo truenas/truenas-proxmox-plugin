@@ -638,6 +638,14 @@ sub volume_snapshot_info {
     return $snaps;
 }
 
+# List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
+sub _tn_targets {
+    my ($scfg) = @_;
+    # NOTE: adjust the argument list if your _rest_call signature differs.
+    my $list = _rest_call($scfg, 'GET', '/iscsi/target', undef, 30);
+    return $list // [];
+}
+
 sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
