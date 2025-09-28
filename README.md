@@ -111,6 +111,7 @@ sudo systemctl restart pveproxy
 | `vmstate_storage` | vmstate storage location | `local` | `local`, `shared` |
 | `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
 | `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
+| `enable_bulk_operations` | Enable bulk API operations for performance | `1` | `0`, `1` |
 
 ## Usage Examples
 
@@ -305,6 +306,8 @@ This is a fundamental limitation of Proxmox's storage architecture when using iS
 
 ### TrueNAS Specific
 - **API Rate Limits**: TrueNAS limits API requests to 20 calls per 60 seconds with a 10-minute cooldown when exceeded. Automatic retry with backoff is implemented. During heavy operations or testing, you may see harmless rate limit messages.
+- **Persistent Connections**: WebSocket connections are cached and reused to minimize authentication overhead and reduce API calls
+- **Bulk Operations**: When `enable_bulk_operations=1`, multiple operations of the same type are batched using TrueNAS core.bulk API for improved performance
 - **WebSocket Stability**: REST fallback available for unreliable WebSocket connections
 - **Version Compatibility**: Some features require TrueNAS SCALE 25.04+
 

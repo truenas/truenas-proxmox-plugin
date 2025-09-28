@@ -130,6 +130,12 @@ sub properties {
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
+
+        # Bulk operations for improved performance
+        enable_bulk_operations => {
+            description => "Enable bulk API operations for better performance (requires WebSocket transport).",
+            type => 'boolean', optional => 1, default => 1,
+        },
     };
 }
 sub options {
@@ -176,6 +182,9 @@ sub options {
         enable_live_snapshots => { optional => 1 },
         snapshot_volume_chains => { optional => 1 },
         vmstate_storage => { optional => 1 },
+
+        # Bulk operations
+        enable_bulk_operations => { optional => 1 },
     };
 }
 
@@ -419,8 +428,175 @@ sub _ws_cleanup_connections() {
 sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
     # Use core.bulk to batch multiple calls of the same method
     # $params_array should be an array of parameter arrays
+
+    # Check if bulk operations are enabled (default: enabled)
+    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+    if (!$bulk_enabled) {
+        die "Bulk operations are disabled in storage configuration";
+    }
+
     return _api_call($scfg, 'core.bulk', [$method_name, $params_array, $description],
         sub { die "Bulk operations require WebSocket transport"; });
+}
+
+# Bulk snapshot deletion helper
+sub _bulk_snapshot_delete($scfg, $snapshot_list) {
+    return [] if !$snapshot_list || !@$snapshot_list;
+
+    # Prepare parameter arrays for each snapshot deletion
+    my @params_array = map { [$_] } @$snapshot_list;
+
+    my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
+        'Deleting snapshot {0}');
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete $snapshot_list->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Bulk iSCSI targetextent deletion helper
+sub _bulk_targetextent_delete($scfg, $targetextent_ids) {
+    return [] if !$targetextent_ids || !@$targetextent_ids;
+
+    # Prepare parameter arrays for each targetextent deletion
+    my @params_array = map { [$_] } @$targetextent_ids;
+
+    my $results = _api_bulk_call($scfg, 'iscsi.targetextent.delete', \@params_array,
+        'Deleting targetextent {0}');
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete targetextent $targetextent_ids->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Bulk iSCSI extent deletion helper
+sub _bulk_extent_delete($scfg, $extent_ids) {
+    return [] if !$extent_ids || !@$extent_ids;
+
+    # Prepare parameter arrays for each extent deletion
+    my @params_array = map { [$_] } @$extent_ids;
+
+    my $results = _api_bulk_call($scfg, 'iscsi.extent.delete', \@params_array,
+        'Deleting extent {0}');
+
+    # Process results and collect any errors
+    my @errors;
+    for my $i (0 .. $#{$results}) {
+        my $result = $results->[$i];
+        if ($result->{error}) {
+            push @errors, "Failed to delete extent $extent_ids->[$i]: $result->{error}";
+        }
+    }
+
+    return \@errors;
+}
+
+# Enhanced cleanup helper that can use bulk operations when possible
+sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
+    # $volume_info_list is array of hashrefs: [{zname, extent_id, targetextent_id}, ...]
+    return if !$volume_info_list || !@$volume_info_list;
+
+    my @targetextent_ids = grep { defined } map { $_->{targetextent_id} } @$volume_info_list;
+    my @extent_ids = grep { defined } map { $_->{extent_id} } @$volume_info_list;
+    my @dataset_names = grep { defined } map { $_->{zname} } @$volume_info_list;
+
+    my @all_errors;
+    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+
+    # Delete targetextents - use bulk if enabled and multiple items
+    if (@targetextent_ids > 1 && $bulk_enabled) {
+        my $errors = eval { _bulk_targetextent_delete($scfg, \@targetextent_ids) };
+        if ($@) {
+            # Fall back to individual deletion if bulk fails
+            foreach my $id (@targetextent_ids) {
+                eval {
+                    _api_call($scfg, 'iscsi.targetextent.delete', [$id],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                };
+                push @all_errors, "Failed to delete targetextent $id: $@" if $@;
+            }
+        } else {
+            push @all_errors, @$errors if $errors && @$errors;
+        }
+    } else {
+        # Individual deletion for single item or when bulk disabled
+        foreach my $id (@targetextent_ids) {
+            eval {
+                _api_call($scfg, 'iscsi.targetextent.delete', [$id],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+            };
+            push @all_errors, "Failed to delete targetextent $id: $@" if $@;
+        }
+    }
+
+    # Delete extents - use bulk if enabled and multiple items
+    if (@extent_ids > 1 && $bulk_enabled) {
+        my $errors = eval { _bulk_extent_delete($scfg, \@extent_ids) };
+        if ($@) {
+            # Fall back to individual deletion if bulk fails
+            foreach my $id (@extent_ids) {
+                eval {
+                    _api_call($scfg, 'iscsi.extent.delete', [$id],
+                        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                };
+                push @all_errors, "Failed to delete extent $id: $@" if $@;
+            }
+        } else {
+            push @all_errors, @$errors if $errors && @$errors;
+        }
+    } else {
+        # Individual deletion for single item or when bulk disabled
+        foreach my $id (@extent_ids) {
+            eval {
+                _api_call($scfg, 'iscsi.extent.delete', [$id],
+                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+            };
+            push @all_errors, "Failed to delete extent $id: $@" if $@;
+        }
+    }
+
+    # Datasets are typically deleted individually since they might have different parameters
+    for my $dataset (@dataset_names) {
+        eval {
+            my $full_ds = $scfg->{dataset} . '/' . $dataset;
+            my $id = URI::Escape::uri_escape($full_ds);
+            my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
+            _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload],
+                sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id", $payload) });
+        };
+        push @all_errors, "Failed to delete dataset $dataset: $@" if $@;
+    }
+
+    return \@all_errors;
+}
+
+# Public bulk operations interface for external use (like test scripts)
+sub bulk_delete_snapshots {
+    my ($class, $scfg, $storeid, $volname, $snapshot_names) = @_;
+    return [] if !$snapshot_names || !@$snapshot_names;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;
+
+    # Convert snapshot names to full snapshot names
+    my @full_snapshots = map { "$full\@$_" } @$snapshot_names;
+
+    # Use bulk deletion
+    return _bulk_snapshot_delete($scfg, \@full_snapshots);
 }
 
 # ======== Transport-agnostic API wrapper ========
