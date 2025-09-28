@@ -471,6 +471,18 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) }
     );
 }
+sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
+    # Clone a ZFS snapshot to create a new dataset
+    # source_snapshot: pool/dataset@snapshot
+    # target_dataset: pool/new-dataset
+    my $payload = {
+        snapshot => $source_snapshot,
+        dataset_dst => $target_dataset,
+    };
+    return _api_call($scfg, 'zfs.snapshot.clone', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/zfs/snapshot/clone', $payload) }
+    );
+}
 
 # ---- WebSocket-only snapshot rollback for TrueNAS 25.04+ ----
 sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
@@ -577,6 +589,11 @@ sub volume_has_feature {
     if ($feature && $feature eq 'snapshot') {
         # Always support disk snapshots via ZFS
         return 1;
+    }
+
+    if ($feature && $feature eq 'clone') {
+        # Support cloning from snapshots via ZFS clone
+        return $snapname ? 1 : undef;
     }
 
     # Note: vmstate support is determined by the vmstate_storage setting:
@@ -1513,7 +1530,86 @@ sub deactivate_volume { return 1; }
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 
-sub clone_image { die "clone not supported"; }
+sub clone_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+    die "clone not supported without snapshot\n" unless $snapname;
+    die "only raw format is supported\n" if defined($format) && $format ne 'raw';
+
+    # Parse source volume information
+    my (undef, $source_zname) = $class->parse_volname($volname);
+    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_snapshot = $source_full . '@' . $snapname;
+
+    # Determine target dataset name
+    my $target_zname = $name;
+    if (!$target_zname) {
+        # Generate automatic name: vm-<vmid>-disk-<n>
+        for (my $n = 0; $n < 1000; $n++) {
+            my $candidate = "vm-$vmid-disk-$n";
+            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
+            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
+            if ($@ || !$exists) {
+                $target_zname = $candidate;
+                last;
+            }
+        }
+        die "unable to find free clone name\n" if !$target_zname;
+    }
+
+    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+
+    # 1) Create ZFS clone from snapshot
+    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # 2) Create iSCSI extent for the cloned zvol
+    my $zvol_path = 'zvol/' . $target_full;
+    my $extent_payload = {
+        name => $target_zname,
+        type => 'DISK',
+        disk => $zvol_path,
+        insecure_tpc => JSON::PP::true,
+    };
+    my $extent_id;
+    {
+        my $ext = _api_call(
+            $scfg,
+            'iscsi.extent.create',
+            [ $extent_payload ],
+            sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
+        );
+        $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+    }
+    die "failed to create extent for clone $target_zname\n" if !defined $extent_id;
+
+    # 3) Map extent to target
+    my $target_id = _resolve_target_id($scfg);
+    my $tx_payload = { target => $target_id, extent => $extent_id };
+    my $tx = _api_call(
+        $scfg,
+        'iscsi.targetextent.create',
+        [ $tx_payload ],
+        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+    );
+
+    # 4) Find assigned LUN
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($tx_map) = grep {
+        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+    } @$maps;
+    my $lun = $tx_map ? $tx_map->{lunid} : undef;
+    die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
+
+    # 5) Refresh initiator view
+    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    if ($scfg->{use_multipath}) {
+        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+    }
+    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+
+    # 6) Return clone volume name
+    my $clone_volname = "vol-$target_zname-lun$lun";
+    return $clone_volname;
+}
 sub create_base { die "base images not supported"; }
 
 1;
