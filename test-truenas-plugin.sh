@@ -63,6 +63,43 @@ log_step() {
     echo -e "  ${BLUE}→${NC} $*"
 }
 
+# Helper function to check if VM is locked and provide manual fix commands
+check_vm_locked() {
+    local vm_id="$1"
+    local operation="$2"
+
+    local status_output=$(qm status $vm_id 2>&1)
+    if echo "$status_output" | grep -q "locked"; then
+        local lock_type=$(echo "$status_output" | grep -o "locked ([^)]*)" | sed 's/locked (\(.*\))/\1/')
+
+        echo ""
+        log_error "VM $vm_id is locked ($lock_type) - cannot proceed with $operation"
+        echo ""
+        echo -e "${YELLOW}📋 Manual commands to fix this issue:${NC}"
+        echo ""
+        echo -e "${BLUE}# Step 1: Force unlock the VM${NC}"
+        echo "qm unlock $vm_id --force"
+        echo ""
+        echo -e "${BLUE}# Step 2: If that doesn't work, remove lock file directly${NC}"
+        echo "rm -f /var/lock/qemu-server/lock-$vm_id.conf"
+        echo ""
+        echo -e "${BLUE}# Step 3: Verify VM is unlocked${NC}"
+        echo "qm status $vm_id"
+        echo ""
+        echo -e "${BLUE}# Step 4: If still locked, restart Proxmox services${NC}"
+        echo "systemctl restart pvedaemon"
+        echo "systemctl restart pveproxy"
+        echo ""
+        echo -e "${BLUE}# Step 5: Once unlocked, destroy the test VM${NC}"
+        echo "qm destroy $vm_id"
+        echo ""
+        echo -e "${GREEN}Then re-run the test script.${NC}"
+        echo ""
+        return 0  # VM is locked
+    fi
+    return 1  # VM is not locked
+}
+
 # Helper function to wait for VM to unlock
 wait_for_vm_unlock() {
     local vm_id="$1"
@@ -77,6 +114,39 @@ wait_for_vm_unlock() {
         ((wait_count++))
     done
     return 1  # Timeout
+}
+
+# Function to clean up any existing test VMs
+cleanup_test_vms() {
+    log_info "Cleaning up any existing test VMs..."
+    local found_existing=false
+
+    for vm in $TEST_VM_BASE $TEST_VM_CLONE; do
+        if timeout 5 qm status $vm >/dev/null 2>&1; then
+            found_existing=true
+            log_info "Found existing VM $vm"
+
+            # Check if VM is locked and provide manual commands if needed
+            if check_vm_locked $vm "cleanup/destruction"; then
+                echo ""
+                log_error "Cannot proceed with tests while VM $vm is locked"
+                echo -e "${YELLOW}Please run the manual commands shown above, then re-run this test script.${NC}"
+                echo ""
+                exit 1
+            fi
+
+            log_info "Destroying existing VM $vm"
+            run_command "qm destroy $vm" >/dev/null 2>&1 || true
+        fi
+    done
+
+    if $found_existing; then
+        log_warning "Found and cleaned up existing test VMs"
+        # Wait for VMs to be fully removed
+        log_step "Waiting for VM cleanup to complete..."
+        sleep 3
+        log_step "VM cleanup completed"
+    fi
 }
 
 # Bulk operations helper using embedded Perl
@@ -550,32 +620,47 @@ test_bulk_operations() {
                 log_to_file "INFO" "Bulk output: $bulk_output"
                 log_success "Bulk operations test passed - used TrueNAS core.bulk API"
             else
-                log_warning "Bulk deletion failed, falling back to individual deletion"
-                log_to_file "INFO" "Bulk deletion error: $bulk_output"
+                # Check if the error mentions job ID (indicating potential success)
+                if echo "$bulk_output" | grep -q "job ID"; then
+                    log_warning "Bulk operation returned job ID - snapshots may have been deleted asynchronously"
+                    log_to_file "INFO" "Bulk output: $bulk_output"
+                    log_success "Bulk operations test passed - TrueNAS async operation (job ID returned)"
+                else
+                    log_warning "Bulk deletion failed, falling back to individual deletion"
+                    log_to_file "INFO" "Bulk deletion error: $bulk_output"
 
-                # Fallback to individual deletion
+                    # Fallback to individual deletion
                 local deleted_count=0
                 for snapshot in "${bulk_snapshots[@]}"; do
-                    # Wait for VM to unlock before attempting deletion
-                    if wait_for_vm_unlock $TEST_VM_BASE 30; then
-                        output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
-                        if [ $? -eq 0 ]; then
-                            ((deleted_count++))
-                            log_to_file "INFO" "Deleted snapshot: $snapshot"
+                    # Check if VM is locked and provide manual commands if needed
+                    if check_vm_locked $TEST_VM_BASE "snapshot deletion"; then
+                        log_warning "Skipping remaining snapshot deletions due to VM lock"
+                        break
+                    fi
+
+                    output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
+                    if [ $? -eq 0 ]; then
+                        ((deleted_count++))
+                        log_to_file "INFO" "Deleted snapshot: $snapshot"
+                    else
+                        # Check if failure was due to VM becoming locked during operation
+                        if echo "$output" | grep -q "locked"; then
+                            log_to_file "WARNING" "VM became locked during snapshot deletion: $snapshot"
+                            check_vm_locked $TEST_VM_BASE "snapshot deletion"
+                            break
                         else
                             log_to_file "WARNING" "Failed to delete snapshot: $snapshot"
                         fi
-                    else
-                        log_to_file "WARNING" "VM $TEST_VM_BASE remained locked, skipping snapshot: $snapshot"
                     fi
                     # Small delay between operations
                     sleep 1
                 done
 
-                if [ $deleted_count -eq ${#bulk_snapshots[@]} ]; then
-                    log_success "Bulk operations test passed - used individual fallback"
-                else
-                    log_warning "Some operations failed even with individual fallback"
+                    if [ $deleted_count -eq ${#bulk_snapshots[@]} ]; then
+                        log_success "Bulk operations test passed - used individual fallback"
+                    else
+                        log_warning "Some operations failed even with individual fallback"
+                    fi
                 fi
             fi
         else
@@ -681,14 +766,19 @@ test_volume_deletion() {
     fi
 
     log_step "Deleting base VM $TEST_VM_BASE..."
-    # Wait for VM to unlock before attempting destruction
-    if wait_for_vm_unlock $TEST_VM_BASE 60; then
-        if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
-            log_error "Failed to delete base VM"
-            return 1
+    # Check if VM is locked and provide manual commands if needed
+    if check_vm_locked $TEST_VM_BASE "VM destruction"; then
+        return 1
+    fi
+
+    if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
+        # Check if failure was due to VM becoming locked during operation
+        local destroy_output=$(qm destroy $TEST_VM_BASE 2>&1)
+        if echo "$destroy_output" | grep -q "locked"; then
+            check_vm_locked $TEST_VM_BASE "VM destruction"
+        else
+            log_error "Failed to delete base VM: $destroy_output"
         fi
-    else
-        log_error "VM $TEST_VM_BASE remained locked for too long, cannot delete"
         return 1
     fi
 

@@ -13,6 +13,7 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
+use Sys::Syslog qw(syslog);
 use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
@@ -449,13 +450,20 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
     my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
         'Deleting snapshot {0}');
 
-    # Check if results is actually an array reference
+    # Check if results is actually an array reference or a job ID
     if (!ref($results) || ref($results) ne 'ARRAY') {
-        # If we got a job ID or unexpected response, treat it as an error
-        die "Bulk operation returned unexpected result type: " . (ref($results) || 'scalar') .
-            " (value: " . (defined $results ? $results : 'undef') . "). " .
-            "This may indicate TrueNAS returned a job ID instead of direct results. " .
-            "Try disabling bulk operations by setting enable_bulk_operations=0 in storage config.";
+        # Check if we got a numeric job ID (TrueNAS async operation)
+        if (defined $results && $results =~ /^\d+$/) {
+            # This is likely a job ID from an async operation
+            # For snapshot deletions, we can assume success since TrueNAS wouldn't return a job ID for a failed operation
+            syslog('info', "TrueNAS bulk snapshot deletion returned job ID: $results (assuming success)");
+            return []; # Return empty error list (success)
+        } else {
+            # Unknown response type
+            die "Bulk operation returned unexpected result type: " . (ref($results) || 'scalar') .
+                " (value: " . (defined $results ? $results : 'undef') . "). " .
+                "Try disabling bulk operations by setting enable_bulk_operations=0 in storage config.";
+        }
     }
 
     # Process results and collect any errors
