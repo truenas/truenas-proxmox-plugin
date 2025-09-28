@@ -140,8 +140,8 @@ sub options {
         target_iqn             => { fixed => 1 },
         discovery_portal       => { fixed => 1 },
         portals                => { optional => 1 },
-        force_delete_on_inuse  => { optional => 1 }, # temporarily logout → delete → login (default: off)
-        logout_on_free         => { optional => 1 }, # logout if no LUNs remain for this target (default: off)
+        force_delete_on_inuse  => { optional => 1 },
+        logout_on_free         => { optional => 1 },
 
         # Initiator
         use_multipath => { optional => 1 },
@@ -433,6 +433,55 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     );
 }
 
+# ---- Robust snapshot rollback helper (WS-first; multi-shape; REST fallbacks) ----
+sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
+    my $FORCE     = $force_bool     ? JSON::PP::true  : JSON::PP::false;
+    my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
+
+    my $try_ws_positional = sub {
+        # zfs.snapshot.rollback("<pool/ds@snap>", {force,recursive})
+        return _api_call($scfg, 'zfs.snapshot.rollback',
+          [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+          undef
+        );
+    };
+
+    my $try_ws_object = sub {
+        # zfs.snapshot.rollback({snapshot:"<pool/ds@snap>", force, recursive})
+        return _api_call($scfg, 'zfs.snapshot.rollback',
+          [ { snapshot => $snap_full, force => $FORCE, recursive => $RECURSIVE } ],
+          undef
+        );
+    };
+
+    my $try_rest_id_path = sub {
+        # Some builds expose .../zfs/snapshot/id/<pool%2Fds%40snap>/rollback
+        my $id = URI::Escape::uri_escape($snap_full);
+        return _rest_call($scfg, 'POST', "/zfs/snapshot/id/$id/rollback",
+          { force => $force_bool ? JSON::PP::true : JSON::PP::false,
+            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
+        );
+    };
+
+    my $try_rest_plain = sub {
+        # Legacy route present on some builds: POST /zfs/snapshot/rollback
+        return _rest_call($scfg, 'POST', '/zfs/snapshot/rollback',
+          { snapshot  => $snap_full,
+            force     => $force_bool ? JSON::PP::true : JSON::PP::false,
+            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
+        );
+    };
+
+    my $ok = 0; my $last_err = '';
+    for my $attempt ($try_ws_positional, $try_ws_object, $try_rest_id_path, $try_rest_plain) {
+        eval { $attempt->(); $ok = 1; };
+        if ($@) { $last_err = $@; next; }
+        last if $ok;
+    }
+    die "TrueNAS snapshot rollback failed: $last_err" if !$ok;
+    return 1;
+}
+
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
     # We support disk snapshots via ZFS (no vmstate/RAM).
@@ -557,17 +606,8 @@ sub volume_snapshot_rollback {
     my $full = $scfg->{dataset} . '/' . $zname;
     my $snap_full = $full . '@' . $snapname;
 
-    # ZFS rollback (forced: destroy newer snaps if needed)
-    my $payload = {
-        snapshot  => $snap_full,
-        force     => JSON::PP::true,   # allow rollback even if newer snaps exist (destroy them)
-        recursive => JSON::PP::false,  # zvol only
-    };
-    # TrueNAS REST: POST /zfs/snapshot/rollback { snapshot, force, recursive }
-    _api_call(
-        $scfg, 'zfs.snapshot.rollback', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/zfs/snapshot/rollback', $payload) },
-    );
+    # WS-first rollback with safe fallbacks; allow non-latest rollback (destroy newer snaps)
+    _tn_snapshot_rollback($scfg, $snap_full, 1, 0);
 
     # Refresh initiator view
     eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
