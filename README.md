@@ -304,7 +304,7 @@ truenasplugin: your-storage-name
 This is a fundamental limitation of Proxmox's storage architecture when using iSCSI-based storage plugins and cannot be resolved without changes to Proxmox itself.
 
 ### TrueNAS Specific
-- **API Rate Limits**: Automatic retry implemented for rate limiting
+- **API Rate Limits**: TrueNAS limits API requests to 20 calls per 60 seconds with a 10-minute cooldown when exceeded. Automatic retry with backoff is implemented. During heavy operations or testing, you may see harmless rate limit messages.
 - **WebSocket Stability**: REST fallback available for unreliable WebSocket connections
 - **Version Compatibility**: Some features require TrueNAS SCALE 25.04+
 

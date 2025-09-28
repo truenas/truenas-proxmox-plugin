@@ -63,6 +63,22 @@ log_step() {
     echo -e "  ${BLUE}→${NC} $*"
 }
 
+# Check for TrueNAS rate limiting in output
+check_rate_limit() {
+    local output="$1"
+    if [[ -n "$output" ]]; then
+        # Check for simple rate limit warnings
+        if [[ "$output" =~ "TrueNAS rate limit hit" ]]; then
+            return 0
+        fi
+        # Check for JSON-RPC rate limit errors
+        if [[ "$output" =~ "Rate Limit Exceeded" ]] || [[ "$output" =~ "EBUSY.*Rate Limit" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Helper functions with clean output
 run_command() {
     local cmd="$*"
@@ -82,7 +98,7 @@ run_command() {
     fi
 
     # Check for rate limiting in output and show friendly message
-    if [[ -n "$output" && "$output" =~ "TrueNAS rate limit hit" ]]; then
+    if check_rate_limit "$output"; then
         echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
     fi
 
@@ -221,7 +237,13 @@ test_volume_creation() {
     fi
 
     log_step "Adding 2GB disk (may take time for TrueNAS API calls)..."
-    if ! run_command "qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single" >/dev/null 2>&1; then
+    # Capture output to check for rate limiting messages
+    output=$(run_command "qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single" 2>&1)
+    exit_code=$?
+    if check_rate_limit "$output"; then
+        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+    fi
+    if [ $exit_code -ne 0 ]; then
         log_error "Failed to add disk to VM"
         return 1
     fi
@@ -234,7 +256,13 @@ test_volume_listing() {
     log_test "Testing volume listing and information"
 
     log_step "Listing volumes on storage..."
-    if ! run_command "pvesm list $STORAGE_NAME" >/dev/null 2>&1; then
+    # Capture output to check for rate limiting messages
+    output=$(run_command "pvesm list $STORAGE_NAME" 2>&1)
+    exit_code=$?
+    if check_rate_limit "$output"; then
+        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+    fi
+    if [ $exit_code -ne 0 ]; then
         log_error "Failed to list volumes"
         return 1
     fi
@@ -255,7 +283,13 @@ test_snapshot_operations() {
     local snapshot_name="test-snapshot-$(date +%s)"
 
     log_step "Creating snapshot: $snapshot_name..."
-    if ! run_command "qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'" >/dev/null 2>&1; then
+    # Capture output to check for rate limiting messages
+    output=$(run_command "qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'" 2>&1)
+    exit_code=$?
+    if check_rate_limit "$output"; then
+        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+    fi
+    if [ $exit_code -ne 0 ]; then
         log_error "Failed to create snapshot"
         return 1
     fi
@@ -295,7 +329,13 @@ test_snapshot_operations() {
         # Create the clone snapshot after successful rollback
         local clone_snapshot="clone-base-$(date +%s)"
         log_step "Creating snapshot for clone testing: $clone_snapshot..."
-        if ! run_command "qm snapshot $TEST_VM_BASE $clone_snapshot --description 'Snapshot for clone testing (post-rollback)'" >/dev/null 2>&1; then
+        # Capture output to check for rate limiting messages
+        output=$(run_command "qm snapshot $TEST_VM_BASE $clone_snapshot --description 'Snapshot for clone testing (post-rollback)'" 2>&1)
+        exit_code=$?
+        if check_rate_limit "$output"; then
+            echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        fi
+        if [ $exit_code -ne 0 ]; then
             log_error "Failed to create clone base snapshot"
             return 1
         fi
@@ -321,9 +361,17 @@ test_clone_operations() {
     log_step "Note: This uses network transfer (qemu-img) as documented"
 
     # Show progress for clone operation since it takes time
-    echo -n "  ${BLUE}→${NC} Cloning in progress"
+    printf "  \033[0;34m→\033[0m Cloning in progress"
 
-    if ! run_command "qm clone $TEST_VM_BASE $TEST_VM_CLONE --name 'test-clone-vm' --snapname $clone_snapshot" >/dev/null 2>&1; then
+    # Capture output to check for rate limiting messages
+    output=$(run_command "qm clone $TEST_VM_BASE $TEST_VM_CLONE --name 'test-clone-vm' --snapname $clone_snapshot" 2>&1)
+    exit_code=$?
+    if check_rate_limit "$output"; then
+        echo ""
+        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        printf "  \033[0;34m→\033[0m Cloning in progress"
+    fi
+    if [ $exit_code -ne 0 ]; then
         echo ""
         log_error "Failed to create clone"
         return 1
