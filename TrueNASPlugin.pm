@@ -479,6 +479,55 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     return 1;
 }
 
+# Helper function to clean up stale snapshot entries from VM config
+sub _cleanup_vm_snapshot_config {
+    my ($vmid, $deleted_snaps) = @_;
+    return unless $vmid && $deleted_snaps && @$deleted_snaps;
+
+    my $config_file = "/etc/pve/qemu-server/$vmid.conf";
+    return unless -f $config_file;
+
+    # Read the current config
+    open my $fh, '<', $config_file or die "Cannot read $config_file: $!";
+    my @lines = <$fh>;
+    close $fh;
+
+    # Filter out stale snapshot sections
+    my @new_lines = ();
+    my $in_stale_section = 0;
+    my $current_section = '';
+
+    for my $line (@lines) {
+        chomp $line;
+
+        # Check if this line starts a snapshot section
+        if ($line =~ /^\[([^\]]+)\]$/) {
+            $current_section = $1;
+            $in_stale_section = grep { $_ eq $current_section } @$deleted_snaps;
+        }
+
+        # Skip lines that are part of a stale snapshot section
+        unless ($in_stale_section) {
+            push @new_lines, $line;
+        }
+
+        # Reset section tracking on blank lines
+        if ($line eq '') {
+            $in_stale_section = 0;
+            $current_section = '';
+        }
+    }
+
+    # Write the cleaned config back
+    open $fh, '>', $config_file or die "Cannot write $config_file: $!";
+    for my $line (@new_lines) {
+        print $fh "$line\n";
+    }
+    close $fh;
+
+    # Note: pve-cluster restart removed as it's not necessary for snapshot cleanup to work
+}
+
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
     # We support disk snapshots via ZFS (no vmstate/RAM).
@@ -599,12 +648,38 @@ sub volume_snapshot_delete {
 # Roll back the zvol to a specific ZFS snapshot and rescan iSCSI/multipath.
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    my (undef, $zname) = $class->parse_volname($volname);
+    my (undef, $zname, $vmid) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname;
     my $snap_full = $full . '@' . $snapname;
 
+    # Get list of snapshots that exist BEFORE rollback
+    my $pre_rollback_snaps = {};
+    if ($vmid) {
+        eval {
+            my $snap_list = $class->volume_snapshot_info($scfg, $storeid, $volname);
+            $pre_rollback_snaps = { %$snap_list };
+        };
+    }
+
     # WS-first rollback with safe fallbacks; allow non-latest rollback (destroy newer snaps)
     _tn_snapshot_rollback($scfg, $snap_full, 1, 0);
+
+    # Clean up stale Proxmox VM config entries for deleted snapshots
+    if ($vmid && %$pre_rollback_snaps) {
+        eval {
+            # Get current snapshots from TrueNAS after rollback
+            my $post_rollback_snaps = $class->volume_snapshot_info($scfg, $storeid, $volname);
+
+            # Find snapshots that were deleted by the rollback
+            my @deleted_snaps = grep { !exists $post_rollback_snaps->{$_} } keys %$pre_rollback_snaps;
+
+            if (@deleted_snaps) {
+                # Clean up VM config file by removing stale snapshot entries
+                _cleanup_vm_snapshot_config($vmid, \@deleted_snaps);
+            }
+        };
+        warn "Failed to clean up stale snapshot entries: $@" if $@;
+    }
 
     # Refresh initiator view
     eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
