@@ -91,22 +91,26 @@ sudo systemctl restart pveproxy
 
 ### Optional Parameters
 
-| Parameter | Description | Default | Example |
-|-----------|-------------|---------|---------|
-| `api_transport` | API transport method | `ws` | `ws` or `rest` |
+| Parameter | Description | Default | Available Options |
+|-----------|-------------|---------|-------------------|
+| `api_transport` | API transport method | `ws` | `ws`, `rest` |
 | `api_scheme` | API scheme | `wss/https` | `wss`, `ws`, `https`, `http` |
-| `api_port` | API port | `443/80` | `443`, `8443` |
-| `api_insecure` | Skip TLS verification | `0` | `1` |
-| `prefer_ipv4` | Prefer IPv4 DNS resolution | `1` | `0` |
-| `portals` | Additional iSCSI portals | - | `192.168.1.101:3260,192.168.1.102:3260` |
-| `use_multipath` | Enable multipath | `1` | `0` |
-| `use_by_path` | Use by-path device names | `0` | `1` |
-| `zvol_blocksize` | ZFS volume block size | - | `16K`, `64K`, `128K` |
-| `tn_sparse` | Create sparse volumes | `1` | `0` |
-| `chap_user` | CHAP username | - | `proxmox` |
-| `chap_password` | CHAP password | - | `secret123` |
-| `vmstate_storage` | vmstate storage location | `local` | `shared` |
-| `enable_live_snapshots` | Enable live snapshots | `1` | `0` |
+| `api_port` | API port | `443/80` | `443`, `8443`, `80`, `8080`, any valid port |
+| `api_insecure` | Skip TLS verification | `0` | `0`, `1` |
+| `prefer_ipv4` | Prefer IPv4 DNS resolution | `1` | `0`, `1` |
+| `portals` | Additional iSCSI portals | - | `IP:PORT,IP:PORT` (comma-separated) |
+| `use_multipath` | Enable multipath | `1` | `0`, `1` |
+| `use_by_path` | Use by-path device names | `0` | `0`, `1` |
+| `ipv6_by_path` | Normalize IPv6 by-path names | `0` | `0`, `1` |
+| `force_delete_on_inuse` | Force delete when target in use | `0` | `0`, `1` |
+| `logout_on_free` | Logout target when no LUNs remain | `0` | `0`, `1` |
+| `zvol_blocksize` | ZFS volume block size | - | `4K`, `8K`, `16K`, `32K`, `64K`, `128K`, `256K`, `512K`, `1M` |
+| `tn_sparse` | Create sparse volumes | `1` | `0`, `1` |
+| `chap_user` | CHAP username | - | any valid username |
+| `chap_password` | CHAP password | - | any valid password |
+| `vmstate_storage` | vmstate storage location | `local` | `local`, `shared` |
+| `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
+| `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
 
 ## Usage Examples
 
@@ -180,14 +184,6 @@ truenasplugin: production-storage
 - **Multiple Portals**: Configure multiple iSCSI portals for redundancy
 - **MPIO**: Enable multipath I/O for better performance and availability
 
-### ZFS Tuning
-
-```bash
-# On TrueNAS, optimize for VM workloads
-zfs set recordsize=128K tank/proxmox
-zfs set compression=lz4 tank/proxmox
-zfs set sync=standard tank/proxmox
-```
 
 ## Cluster Configuration
 
@@ -292,42 +288,10 @@ truenasplugin: your-storage-name
 
 ## Contributing
 
-### Development Setup
-```bash
-# Clone repository
-git clone https://github.com/your-repo/truenas-proxmox-plugin
-
-# Install development dependencies
-cpan install JSON::PP URI::Escape MIME::Base64 Digest::SHA
-
-# Run tests
-prove -l t/
-```
-
 ### Reporting Issues
 - **Bug Reports**: Include Proxmox and TrueNAS versions
 - **Feature Requests**: Describe use case and benefits
 - **Performance Issues**: Include storage and network configuration
-
-## License
-
-This project is licensed under the AGPL-3.0 License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- **Proxmox VE Team**: For the excellent virtualization platform
-- **TrueNAS Team**: For the robust storage platform
-- **Community Contributors**: For testing and feedback
-
-## Support
-
-### Community Support
-- **Documentation**: https://github.com/your-repo/wiki
-- **Issues**: https://github.com/your-repo/issues
-- **Discussions**: https://github.com/your-repo/discussions
-
-### Commercial Support
-For enterprise support and consulting services, contact: support@your-domain.com
 
 ---
 
