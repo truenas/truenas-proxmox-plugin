@@ -587,9 +587,6 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
-    # Log the actual parameters being passed for debugging
-    syslog('info', "TrueNAS volume_has_feature called: feature=$feature, volname=" . ($volname // 'undef') . ", snapname=" . ($snapname // 'undef'));
-
     my $features = {
         snapshot => { current => 1 },
         clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
@@ -609,7 +606,6 @@ sub volume_has_feature {
     }
 
     my $result = ($features->{$feature} && $features->{$feature}->{$key}) ? 1 : undef;
-    syslog('info', "TrueNAS volume_has_feature result: feature=$feature, key=" . ($key // 'undef') . ", result=" . ($result // 'undef'));
 
     return $result;
 }
@@ -1575,14 +1571,41 @@ sub clone_image {
 
     # 2) Create iSCSI extent for the cloned zvol
     my $zvol_path = 'zvol/' . $target_full;
-    my $extent_payload = {
-        name => $target_zname,
-        type => 'DISK',
-        disk => $zvol_path,
-        insecure_tpc => JSON::PP::true,
-    };
+
+    # Check if extent with target name already exists
+    my $extents = _tn_extents($scfg) // [];
+    my ($existing_extent) = grep { ($_->{name} // '') eq $target_zname } @$extents;
+
+    my $extent_name = $target_zname;
     my $extent_id;
-    {
+
+    if ($existing_extent) {
+        # If extent exists and points to our zvol, reuse it
+        if (($existing_extent->{disk} // '') eq $zvol_path) {
+            $extent_id = $existing_extent->{id};
+        } else {
+            # Generate unique extent name with timestamp suffix
+            my $timestamp = time();
+            $extent_name = "$target_zname-$timestamp";
+
+            # Double-check the new name doesn't exist
+            my ($conflict) = grep { ($_->{name} // '') eq $extent_name } @$extents;
+            if ($conflict) {
+                # Add random suffix as fallback
+                $extent_name = "$target_zname-$timestamp-" . int(rand(1000));
+            }
+        }
+    }
+
+    # Create extent if we don't have one yet
+    if (!defined $extent_id) {
+        my $extent_payload = {
+            name => $extent_name,
+            type => 'DISK',
+            disk => $zvol_path,
+            insecure_tpc => JSON::PP::true,
+        };
+
         my $ext = _api_call(
             $scfg,
             'iscsi.extent.create',
@@ -1591,6 +1614,7 @@ sub clone_image {
         );
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
     }
+
     die "failed to create extent for clone $target_zname\n" if !defined $extent_id;
 
     # 3) Map extent to target
