@@ -613,7 +613,7 @@ sub volume_snapshot_info {
 
     # TrueNAS REST: GET /zfs/snapshot  (returns an array of snapshots system-wide)
     # We'll filter to our dataset/zvol and normalize fields.
-    my $list = _rest_call($scfg, 'GET', '/zfs/snapshot', undef, 30) // [];
+    my $list = _rest_call($scfg, 'GET', '/zfs/snapshot', undef) // [];
 
     my $snaps = {};
     for my $s (@$list) {
@@ -642,7 +642,7 @@ sub volume_snapshot_info {
 sub _tn_targets {
     my ($scfg) = @_;
     # NOTE: adjust the argument list if your _rest_call signature differs.
-    my $list = _rest_call($scfg, 'GET', '/iscsi/target', undef, 30);
+    my $list = _rest_call($scfg, 'GET', '/iscsi/target', undef);
     return $list // [];
 }
 
@@ -695,7 +695,7 @@ sub _resolve_target_id {
     my $targets = _tn_targets($scfg) // [];
     if (!@$targets) {
         # Try to fetch the base name for a more helpful message
-        my $global   = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef, 15) } // {};
+        my $global   = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef) } // {};
         my $basename = $global->{basename} // '(unknown)';
         my $portal   = $scfg->{portal} // '(none)';
 
@@ -715,7 +715,7 @@ sub _resolve_target_id {
     }
 
     # 2) Get global base name to construct full IQNs
-    my $global = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef, 15) } // {};
+    my $global = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef) } // {};
     my $basename = $global->{basename} // '';
 
     # 3) Try several matching strategies
