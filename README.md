@@ -280,6 +280,28 @@ truenasplugin: your-storage-name
 - **Shrink Operations**: Volume shrinking is not supported (ZFS limitation)
 - **Live Migration**: Requires shared storage configuration
 - **Backup Integration**: Snapshots are not included in Proxmox backups
+- **Clone Performance**: VM cloning uses network transfer instead of instant ZFS clones due to Proxmox architecture limitations with iSCSI storage
+
+### Clone Performance Limitation
+
+**Important**: VM cloning operations do not use instant ZFS clones as expected. Instead, Proxmox performs network-based copying using `qemu-img convert`, which transfers the entire disk over the network.
+
+**Why this happens:**
+- Proxmox treats storage plugins that return block device paths (like iSCSI) as "generic block storage"
+- For such storage, Proxmox bypasses storage plugin clone methods and uses `qemu-img convert` directly
+- This means our efficient `clone_image` and `copy_image` methods are never called during VM cloning operations
+
+**Performance impact:**
+- Clone operations transfer data over the network at your connection speed (e.g., 1GbE = ~100MB/s)
+- Large VMs (32GB+) can take significant time to clone
+- Network bandwidth is consumed during cloning
+
+**Workaround:**
+- For frequent cloning, consider using smaller base images/templates
+- Ensure adequate network bandwidth between Proxmox and TrueNAS
+- ZFS snapshots within TrueNAS are still instant and space-efficient
+
+This is a fundamental limitation of Proxmox's storage architecture when using iSCSI-based storage plugins and cannot be resolved without changes to Proxmox itself.
 
 ### TrueNAS Specific
 - **API Rate Limits**: Automatic retry implemented for rate limiting

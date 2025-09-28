@@ -1543,8 +1543,6 @@ sub deactivate_volume { return 1; }
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
 
-    # Log that our clone_image method is being called
-    syslog('info', "TrueNAS clone_image called: volname=$volname, vmid=$vmid, snapname=" . ($snapname // 'undef') . ", name=" . ($name // 'undef'));
 
     die "clone not supported without snapshot\n" unless $snapname;
     die "only raw format is supported\n" if defined($format) && $format ne 'raw';
@@ -1628,8 +1626,6 @@ sub clone_image {
 sub copy_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
 
-    # Log that our copy_image method is being called
-    syslog('info', "TrueNAS copy_image called: volname=$volname, vmid=$vmid, snapname=" . ($snapname // 'undef') . ", name=" . ($name // 'undef'));
 
     # For our TrueNAS plugin, copy_image uses the same ZFS clone functionality as clone_image
     # This provides efficient space-efficient copying via ZFS clone technology
