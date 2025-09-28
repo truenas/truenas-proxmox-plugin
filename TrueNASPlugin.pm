@@ -229,6 +229,10 @@ sub _ws_open($scfg) {
     my $host = $scfg->{api_host};
     my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
+
+    # Add small delay to avoid rate limiting
+    usleep(100_000); # 100ms delay
+
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
@@ -365,6 +369,20 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             });
         };
         $err = $@ if $@;
+
+        # Handle rate limiting with retry
+        if ($err && $err =~ /Rate Limit Exceeded/) {
+            warn "TrueNAS rate limit hit, waiting before retry...";
+            sleep(2); # Wait 2 seconds for rate limit to reset
+            eval {
+                my $conn = _ws_open($scfg);
+                $res = _ws_rpc($conn, {
+                    jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                });
+            };
+            $err = $@ if $@;
+        }
+
         return $res if !$err;
         return $rest_fallback->() if $rest_fallback;
         die $err;
