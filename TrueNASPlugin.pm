@@ -449,6 +449,15 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
     my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
         'Deleting snapshot {0}');
 
+    # Check if results is actually an array reference
+    if (!ref($results) || ref($results) ne 'ARRAY') {
+        # If we got a job ID or unexpected response, treat it as an error
+        die "Bulk operation returned unexpected result type: " . (ref($results) || 'scalar') .
+            " (value: " . (defined $results ? $results : 'undef') . "). " .
+            "This may indicate TrueNAS returned a job ID instead of direct results. " .
+            "Try disabling bulk operations by setting enable_bulk_operations=0 in storage config.";
+    }
+
     # Process results and collect any errors
     my @errors;
     for my $i (0 .. $#{$results}) {

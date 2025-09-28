@@ -63,6 +63,22 @@ log_step() {
     echo -e "  ${BLUE}→${NC} $*"
 }
 
+# Helper function to wait for VM to unlock
+wait_for_vm_unlock() {
+    local vm_id="$1"
+    local max_wait="$2"
+    local wait_count=0
+
+    while [ $wait_count -lt $max_wait ]; do
+        if ! qm status $vm_id 2>&1 | grep -q "locked"; then
+            return 0  # VM is unlocked
+        fi
+        sleep 1
+        ((wait_count++))
+    done
+    return 1  # Timeout
+}
+
 # Bulk operations helper using embedded Perl
 bulk_delete_snapshots() {
     local storage_name="$1"
@@ -76,8 +92,14 @@ bulk_delete_snapshots() {
 
     # Create snapshot list for Perl
     local snapshot_args=""
+    local first=1
     for snap in "${snapshots[@]}"; do
-        snapshot_args="$snapshot_args '$snap'"
+        if [ $first -eq 1 ]; then
+            snapshot_args="'$snap'"
+            first=0
+        else
+            snapshot_args="$snapshot_args, '$snap'"
+        fi
     done
 
     # Execute bulk deletion using embedded Perl
@@ -100,7 +122,7 @@ my @snapshots = ($snapshot_args);
 
 # Use bulk delete function with error handling
 eval {
-    my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\\@snapshots);
+    my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\@snapshots);
     if (\$errors && @\$errors) {
         print "Bulk deletion completed with errors:\\n";
         for my \$error (@\$errors) {
@@ -417,25 +439,22 @@ test_clone_operations() {
 
     log_step "Creating clone from snapshot: $clone_snapshot..."
     log_step "Note: This uses network transfer (qemu-img) as documented"
-
-    # Show progress for clone operation since it takes time
-    printf "  \033[0;34m→\033[0m Cloning in progress"
+    log_step "Starting clone operation (may see kernel iSCSI messages)..."
+    echo ""  # Provide space for kernel messages
 
     # Capture output to check for rate limiting messages
     output=$(run_command "qm clone $TEST_VM_BASE $TEST_VM_CLONE --name 'test-clone-vm' --snapname $clone_snapshot" 2>&1)
     exit_code=$?
+
     if check_rate_limit "$output"; then
-        echo ""
         echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
-        printf "  \033[0;34m→\033[0m Cloning in progress"
     fi
     if [ $exit_code -ne 0 ]; then
-        echo ""
         log_error "Failed to create clone"
         return 1
     fi
-    echo " ✓"
-    echo ""  # Add explicit newline after clone completion
+
+    log_step "Clone operation completed successfully"
 
     log_step "Verifying clone was created..."
     if ! run_command "qm config $TEST_VM_CLONE" >/dev/null 2>&1; then
@@ -537,13 +556,20 @@ test_bulk_operations() {
                 # Fallback to individual deletion
                 local deleted_count=0
                 for snapshot in "${bulk_snapshots[@]}"; do
-                    output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
-                    if [ $? -eq 0 ]; then
-                        ((deleted_count++))
-                        log_to_file "INFO" "Deleted snapshot: $snapshot"
+                    # Wait for VM to unlock before attempting deletion
+                    if wait_for_vm_unlock $TEST_VM_BASE 30; then
+                        output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
+                        if [ $? -eq 0 ]; then
+                            ((deleted_count++))
+                            log_to_file "INFO" "Deleted snapshot: $snapshot"
+                        else
+                            log_to_file "WARNING" "Failed to delete snapshot: $snapshot"
+                        fi
                     else
-                        log_to_file "WARNING" "Failed to delete snapshot: $snapshot"
+                        log_to_file "WARNING" "VM $TEST_VM_BASE remained locked, skipping snapshot: $snapshot"
                     fi
+                    # Small delay between operations
+                    sleep 1
                 done
 
                 if [ $deleted_count -eq ${#bulk_snapshots[@]} ]; then
@@ -655,8 +681,14 @@ test_volume_deletion() {
     fi
 
     log_step "Deleting base VM $TEST_VM_BASE..."
-    if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
-        log_error "Failed to delete base VM"
+    # Wait for VM to unlock before attempting destruction
+    if wait_for_vm_unlock $TEST_VM_BASE 60; then
+        if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
+            log_error "Failed to delete base VM"
+            return 1
+        fi
+    else
+        log_error "VM $TEST_VM_BASE remained locked for too long, cannot delete"
         return 1
     fi
 
