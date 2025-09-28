@@ -1,0 +1,221 @@
+# TrueNAS Proxmox VE Storage Plugin - Configuration Examples
+#
+# Add these configurations to your /etc/pve/storage.cfg file
+# Choose the configuration that best matches your environment
+
+# =============================================================================
+# BASIC CONFIGURATION
+# =============================================================================
+# Simple single-node setup with minimal configuration
+truenasplugin: truenas-basic
+    api_host 192.168.1.100
+    api_key 1-abcdef1234567890abcdef1234567890abcdef12
+    target_iqn iqn.2005-10.org.freenas.ctl:proxmox-target
+    dataset tank/proxmox
+    discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+
+# =============================================================================
+# PRODUCTION CLUSTER CONFIGURATION
+# =============================================================================
+# High-performance cluster setup with redundancy and optimization
+truenasplugin: truenas-cluster
+    api_host 192.168.10.100
+    api_key 1-fedcba0987654321fedcba0987654321fedcba09
+    target_iqn iqn.2005-10.org.freenas.ctl:cluster-storage
+    dataset tank/cluster/proxmox
+    discovery_portal 192.168.10.100:3260
+    portals 192.168.10.101:3260,192.168.10.102:3260
+    content images
+    shared 1
+    # Performance optimizations
+    zvol_blocksize 128K
+    tn_sparse 1
+    use_multipath 1
+    vmstate_storage local
+    # Security
+    chap_user proxmox-cluster
+    chap_password your-secure-chap-password
+    # Advanced options
+    force_delete_on_inuse 1
+    logout_on_free 0
+
+# =============================================================================
+# HIGH AVAILABILITY CONFIGURATION
+# =============================================================================
+# Enterprise HA setup with all redundancy features enabled
+truenasplugin: truenas-ha
+    api_host truenas-vip.company.com
+    api_key 1-1234567890abcdef1234567890abcdef12345678
+    api_scheme https
+    api_port 443
+    api_insecure 0
+    target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
+    dataset tank/ha/proxmox
+    discovery_portal 192.168.100.10:3260
+    portals 192.168.100.11:3260,192.168.100.12:3260,192.168.101.10:3260,192.168.101.11:3260
+    content images
+    shared 1
+    # Performance
+    zvol_blocksize 128K
+    tn_sparse 1
+    use_multipath 1
+    vmstate_storage local
+    # Security
+    chap_user proxmox-ha
+    chap_password very-secure-password-here
+    # HA specific
+    force_delete_on_inuse 1
+    logout_on_free 0
+    prefer_ipv4 1
+
+# =============================================================================
+# DEVELOPMENT/TESTING CONFIGURATION
+# =============================================================================
+# Development setup with relaxed security for testing
+truenasplugin: truenas-dev
+    api_host 192.168.1.50
+    api_key 1-dev123456789abcdef123456789abcdef123456789
+    api_scheme http
+    api_port 80
+    api_insecure 1
+    api_transport rest
+    target_iqn iqn.2005-10.org.freenas.ctl:dev-target
+    dataset tank/development
+    discovery_portal 192.168.1.50:3260
+    content images
+    shared 0
+    # Development settings
+    zvol_blocksize 64K
+    tn_sparse 1
+    use_multipath 0
+    vmstate_storage shared
+    enable_live_snapshots 1
+
+# =============================================================================
+# IPv6 CONFIGURATION
+# =============================================================================
+# Configuration for IPv6 environments
+truenasplugin: truenas-ipv6
+    api_host 2001:db8::100
+    api_key 1-ipv6example1234567890abcdef1234567890abc
+    target_iqn iqn.2005-10.org.freenas.ctl:ipv6-target
+    dataset tank/ipv6/proxmox
+    discovery_portal [2001:db8::100]:3260
+    portals [2001:db8::101]:3260,[2001:db8::102]:3260
+    content images
+    shared 1
+    # IPv6 specific
+    prefer_ipv4 0
+    ipv6_by_path 1
+    use_by_path 1
+    # Standard options
+    zvol_blocksize 128K
+    tn_sparse 1
+    use_multipath 1
+
+# =============================================================================
+# WEBSOCKET CONFIGURATION
+# =============================================================================
+# Optimized for WebSocket API performance
+truenasplugin: truenas-websocket
+    api_host 192.168.1.100
+    api_key 1-websocket123456789abcdef123456789abcdef12
+    api_transport ws
+    api_scheme wss
+    api_port 443
+    target_iqn iqn.2005-10.org.freenas.ctl:ws-target
+    dataset tank/websocket
+    discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+    # WebSocket optimizations
+    zvol_blocksize 128K
+    tn_sparse 1
+    vmstate_storage local
+
+# =============================================================================
+# REST API CONFIGURATION
+# =============================================================================
+# Fallback configuration using REST API
+truenasplugin: truenas-rest
+    api_host 192.168.1.100
+    api_key 1-restapi123456789abcdef123456789abcdef123
+    api_transport rest
+    api_scheme https
+    api_port 443
+    target_iqn iqn.2005-10.org.freenas.ctl:rest-target
+    dataset tank/rest
+    discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+    # REST specific
+    zvol_blocksize 64K
+    tn_sparse 1
+
+# =============================================================================
+# SMALL OFFICE CONFIGURATION
+# =============================================================================
+# Single TrueNAS server, small cluster (2-3 nodes)
+truenasplugin: truenas-soho
+    api_host truenas.local
+    api_key 1-soho123456789abcdef123456789abcdef1234567
+    target_iqn iqn.2005-10.org.freenas.ctl:office
+    dataset tank/office
+    discovery_portal truenas.local:3260
+    content images
+    shared 1
+    # SOHO optimizations
+    zvol_blocksize 64K
+    tn_sparse 1
+    use_multipath 0
+    vmstate_storage local
+    # Simple security
+    chap_user office
+    chap_password office-password
+
+# =============================================================================
+# CONFIGURATION NOTES
+# =============================================================================
+#
+# API Keys:
+# - Generate API keys in TrueNAS: System Settings > API Keys
+# - Use user-linked keys with appropriate permissions
+# - Keep keys secure and rotate regularly
+#
+# Target IQN:
+# - Configure in TrueNAS: Shares > Block Shares (iSCSI) > Targets
+# - Use descriptive names for easier management
+# - Ensure targets are associated with proper portals
+#
+# Datasets:
+# - Create parent datasets in TrueNAS before use
+# - Use descriptive paths (e.g., tank/cluster/proxmox)
+# - Consider quotas and compression settings
+#
+# Portals:
+# - Configure in TrueNAS: Shares > Block Shares (iSCSI) > Portals
+# - Use multiple portals for redundancy
+# - Ensure proper network connectivity
+#
+# Security:
+# - Use CHAP authentication in production
+# - Disable api_insecure in production
+# - Use dedicated VLANs for storage traffic
+#
+# Performance:
+# - Use 128K block size for VM workloads
+# - Enable sparse volumes for thin provisioning
+# - Configure multipath for redundancy and performance
+# - Use local vmstate storage for better performance
+#
+# Cluster:
+# - Set shared=1 for cluster configurations
+# - Ensure all nodes have identical configurations
+# - Test failover scenarios regularly
+#
+# Monitoring:
+# - Monitor storage performance regularly
+# - Set up alerts for storage issues
+# - Keep TrueNAS and Proxmox updated
