@@ -454,10 +454,19 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
     if (!ref($results) || ref($results) ne 'ARRAY') {
         # Check if we got a numeric job ID (TrueNAS async operation)
         if (defined $results && $results =~ /^\d+$/) {
-            # This is likely a job ID from an async operation
-            # For snapshot deletions, we can assume success since TrueNAS wouldn't return a job ID for a failed operation
-            syslog('info', "TrueNAS bulk snapshot deletion returned job ID: $results (assuming success)");
-            return []; # Return empty error list (success)
+            # This is a job ID from an async operation - wait for completion
+            syslog('info', "TrueNAS bulk snapshot deletion started (job ID: $results)");
+
+            my $job_result = _wait_for_job_completion($scfg, $results, 90); # 90 second timeout for bulk snapshots
+
+            if ($job_result->{success}) {
+                syslog('info', "TrueNAS bulk snapshot deletion completed successfully");
+                return []; # Return empty error list (success)
+            } else {
+                my $error = "Bulk snapshot deletion job failed: " . $job_result->{error};
+                syslog('error', $error);
+                return [$error]; # Return error list
+            }
         } else {
             # Unknown response type
             die "Bulk operation returned unexpected result type: " . (ref($results) || 'scalar') .
@@ -614,6 +623,87 @@ sub bulk_delete_snapshots {
 
     # Use bulk deletion
     return _bulk_snapshot_delete($scfg, \@full_snapshots);
+}
+
+# ======== Job completion helper ========
+sub _wait_for_job_completion {
+    my ($scfg, $job_id, $timeout_seconds) = @_;
+
+    $timeout_seconds //= 60; # Default 60 second timeout
+
+    syslog('info', "Waiting for TrueNAS job $job_id to complete (timeout: ${timeout_seconds}s)");
+
+    for my $attempt (1..$timeout_seconds) {
+        # Small delay between checks
+        sleep(1);
+
+        my $job_status;
+        eval {
+            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]],
+                                  sub { _rest_call($scfg, 'GET', "/core/get_jobs") });
+        };
+
+        if ($@) {
+            syslog('warning', "Failed to check job status for job $job_id: $@");
+            next; # Continue trying
+        }
+
+        if ($job_status && ref($job_status) eq 'ARRAY' && @$job_status > 0) {
+            my $job = $job_status->[0];
+            my $state = $job->{state} // 'UNKNOWN';
+
+            if ($state eq 'SUCCESS') {
+                syslog('info', "TrueNAS job $job_id completed successfully");
+                return { success => 1 };
+            } elsif ($state eq 'FAILED') {
+                my $error = $job->{error} // $job->{exc_info} // 'Unknown error';
+                syslog('error', "TrueNAS job $job_id failed: $error");
+                return { success => 0, error => $error };
+            } elsif ($state eq 'RUNNING' || $state eq 'WAITING') {
+                # Job still in progress, continue waiting
+                if ($attempt % 10 == 0) { # Log every 10 seconds
+                    syslog('info', "TrueNAS job $job_id still $state (${attempt}s elapsed)");
+                }
+                next;
+            } else {
+                syslog('warning', "TrueNAS job $job_id in unexpected state: $state");
+                next;
+            }
+        } else {
+            syslog('warning', "Could not retrieve status for TrueNAS job $job_id (attempt $attempt)");
+            next;
+        }
+    }
+
+    # Timeout reached
+    syslog('error', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
+    return { success => 0, error => "Job timed out after ${timeout_seconds} seconds" };
+}
+
+# Helper function to handle potential async job results
+sub _handle_api_result_with_job_support {
+    my ($scfg, $result, $operation_name, $timeout_seconds) = @_;
+
+    $timeout_seconds //= 60;
+
+    # If result is a job ID (numeric), wait for completion
+    if (defined $result && !ref($result) && $result =~ /^\d+$/) {
+        syslog('info', "TrueNAS $operation_name started (job ID: $result)");
+
+        my $job_result = _wait_for_job_completion($scfg, $result, $timeout_seconds);
+
+        if ($job_result->{success}) {
+            syslog('info', "TrueNAS $operation_name completed successfully");
+            return { success => 1, result => undef };
+        } else {
+            my $error = "TrueNAS $operation_name job failed: " . $job_result->{error};
+            syslog('error', $error);
+            return { success => 0, error => $error };
+        }
+    }
+
+    # For non-job results, return as-is (synchronous operation)
+    return { success => 1, result => $result };
 }
 
 # ======== Transport-agnostic API wrapper ========
