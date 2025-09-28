@@ -41,17 +41,17 @@ log_info() {
 
 log_success() {
     log_to_file "SUCCESS" "$@"
-    echo -e "${GREEN}✓ $*${NC}"
+    echo -e "${GREEN}✅ $*${NC}"
 }
 
 log_warning() {
     log_to_file "WARNING" "$@"
-    echo -e "${YELLOW}⚠ $*${NC}"
+    echo -e "${YELLOW}⚠️  $*${NC}"
 }
 
 log_error() {
     log_to_file "ERROR" "$@"
-    echo -e "${RED}✗ $*${NC}"
+    echo -e "${RED}❌ $*${NC}"
 }
 
 log_test() {
@@ -61,7 +61,225 @@ log_test() {
 
 log_step() {
     log_to_file "STEP" "$@"
-    echo -e "  ${BLUE}→${NC} $*"
+    echo -e "    ${BLUE}→${NC} $*"
+}
+
+# Additional status message functions for consistent formatting
+status_info() {
+    echo -e "    ${BLUE}ℹ️  $*${NC}"
+    log_to_file "INFO" "$@"
+}
+
+status_progress() {
+    echo -e "    ${YELLOW}⏳ $*${NC}"
+    log_to_file "INFO" "$@"
+}
+
+status_rate_limit() {
+    echo -e "    ${YELLOW}⏱️  TrueNAS API rate limit encountered (harmless - auto-retry in progress)${NC}"
+    log_to_file "INFO" "TrueNAS API rate limit encountered - retrying"
+}
+
+# Stage separator function for clear visual organization
+print_stage_header() {
+    local stage_name="$1"
+    local stage_emoji="$2"
+    echo ""
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}${stage_emoji} ${stage_name}${NC}"
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Comprehensive TrueNAS cleanup function - handles snapshots and volumes in correct order
+cleanup_truenas_volumes() {
+    log_info "Performing comprehensive TrueNAS cleanup"
+
+    # Get list of test-related volumes and snapshots via embedded Perl
+    local cleanup_script=$(cat << 'PERL_EOF'
+use strict;
+use warnings;
+use PVE::Storage::Custom::TrueNASPlugin;
+
+# Test VM IDs that we need to clean up
+my @test_vms = ($ENV{TEST_VM_BASE}, $ENV{TEST_VM_CLONE}, $ENV{TEST_VM_RESIZE});
+
+# Storage configuration (we'll use the working storage)
+my $storage_name = $ENV{STORAGE_NAME};
+
+# Read storage config to get TrueNAS details
+my $storage_cfg = PVE::Storage::config();
+my $scfg = PVE::Storage::storage_config($storage_cfg, $storage_name);
+
+eval {
+    # Create plugin instance
+    my $plugin = PVE::Storage::Custom::TrueNASPlugin->new();
+
+    # Connect to TrueNAS
+    my $conn = $plugin->_get_connection($scfg);
+
+    print "INFO: Connected to TrueNAS for cleanup\n";
+
+    # First, get all snapshots for our test volumes and delete them
+    for my $vm_id (@test_vms) {
+        next unless $vm_id;
+
+        my $volname_pattern = "vm-$vm_id-";
+        print "INFO: Looking for snapshots of volumes matching: $volname_pattern\n";
+
+        # Get all ZFS snapshots
+        my $snapshots_result = $plugin->_api_call($conn, 'core.call', ['zfs.snapshot.query'], $scfg);
+
+        if ($snapshots_result && ref($snapshots_result) eq 'ARRAY') {
+            for my $snapshot (@$snapshots_result) {
+                if ($snapshot->{name} && $snapshot->{name} =~ /$volname_pattern/) {
+                    print "INFO: Deleting snapshot: $snapshot->{name}\n";
+                    eval {
+                        my $result = $plugin->_api_call($conn, 'core.call', ['zfs.snapshot.delete', $snapshot->{name}], $scfg);
+
+                        # Check if result is a job ID (async operation)
+                        if (defined $result && $result =~ /^\d+$/) {
+                            print "INFO: Snapshot deletion started (job ID: $result), waiting for completion...\n";
+
+                            # Wait for job completion (max 30 seconds)
+                            my $job_completed = 0;
+                            for my $attempt (1..30) {
+                                sleep 1;
+                                my $job_status = $plugin->_api_call($conn, 'core.call', ['core.get_jobs', [{id => $result}]], $scfg);
+                                if ($job_status && ref($job_status) eq 'ARRAY' && @$job_status > 0) {
+                                    my $job = $job_status->[0];
+                                    if ($job->{state} eq 'SUCCESS') {
+                                        print "SUCCESS: Snapshot deletion job completed successfully\n";
+                                        $job_completed = 1;
+                                        last;
+                                    } elsif ($job->{state} eq 'FAILED') {
+                                        print "WARNING: Snapshot deletion job failed: " . ($job->{error} || 'Unknown error') . "\n";
+                                        $job_completed = 1;
+                                        last;
+                                    }
+                                }
+                            }
+
+                            if (!$job_completed) {
+                                print "WARNING: Snapshot deletion job timeout after 30 seconds\n";
+                            }
+                        } else {
+                            print "SUCCESS: Deleted snapshot $snapshot->{name}\n";
+                        }
+                    };
+                    if ($@) {
+                        print "WARNING: Failed to delete snapshot $snapshot->{name}: $@\n";
+                    }
+                }
+            }
+        }
+    }
+
+    # Then delete the volumes themselves
+    for my $vm_id (@test_vms) {
+        next unless $vm_id;
+
+        my $volname_pattern = "vm-$vm_id-";
+        print "INFO: Looking for volumes matching: $volname_pattern\n";
+
+        # Get all ZFS datasets
+        my $datasets_result = $plugin->_api_call($conn, 'core.call', ['zfs.dataset.query'], $scfg);
+
+        if ($datasets_result && ref($datasets_result) eq 'ARRAY') {
+            for my $dataset (@$datasets_result) {
+                if ($dataset->{name} && $dataset->{name} =~ /$volname_pattern/ && $dataset->{type} eq 'VOLUME') {
+                    print "INFO: Deleting volume: $dataset->{name}\n";
+                    eval {
+                        my $result = $plugin->_api_call($conn, 'core.call', ['zfs.dataset.delete', $dataset->{name}, {force => JSON::true}], $scfg);
+
+                        # Check if result is a job ID (async operation)
+                        if (defined $result && $result =~ /^\d+$/) {
+                            print "INFO: Volume deletion started (job ID: $result), waiting for completion...\n";
+
+                            # Wait for job completion (max 60 seconds for volumes)
+                            my $job_completed = 0;
+                            for my $attempt (1..60) {
+                                sleep 1;
+                                my $job_status = $plugin->_api_call($conn, 'core.call', ['core.get_jobs', [{id => $result}]], $scfg);
+                                if ($job_status && ref($job_status) eq 'ARRAY' && @$job_status > 0) {
+                                    my $job = $job_status->[0];
+                                    if ($job->{state} eq 'SUCCESS') {
+                                        print "SUCCESS: Volume deletion job completed successfully\n";
+                                        $job_completed = 1;
+                                        last;
+                                    } elsif ($job->{state} eq 'FAILED') {
+                                        print "WARNING: Volume deletion job failed: " . ($job->{error} || 'Unknown error') . "\n";
+                                        $job_completed = 1;
+                                        last;
+                                    }
+                                }
+                            }
+
+                            if (!$job_completed) {
+                                print "WARNING: Volume deletion job timeout after 60 seconds\n";
+                            }
+                        } else {
+                            print "SUCCESS: Deleted volume $dataset->{name}\n";
+                        }
+                    };
+                    if ($@) {
+                        print "WARNING: Failed to delete volume $dataset->{name}: $@\n";
+                    }
+                }
+            }
+        }
+    }
+
+    print "INFO: TrueNAS cleanup completed\n";
+};
+
+if ($@) {
+    print "ERROR: TrueNAS cleanup failed: $@\n";
+    exit 1;
+}
+PERL_EOF
+)
+
+    # Execute the cleanup script
+    local cleanup_output
+    local cleanup_exit_code
+    cleanup_output=$(echo "$cleanup_script" | perl 2>&1)
+    cleanup_exit_code=$?
+
+    if [[ $cleanup_exit_code -eq 0 ]]; then
+        echo "$cleanup_output" | while IFS= read -r line; do
+            if [[ "$line" =~ ^INFO: ]]; then
+                log_info "$(echo "$line" | sed 's/^INFO: //')"
+            elif [[ "$line" =~ ^SUCCESS: ]]; then
+                log_success "$(echo "$line" | sed 's/^SUCCESS: //')"
+            elif [[ "$line" =~ ^WARNING: ]]; then
+                log_warning "$(echo "$line" | sed 's/^WARNING: //')"
+            elif [[ "$line" =~ ^ERROR: ]]; then
+                log_error "$(echo "$line" | sed 's/^ERROR: //')"
+            fi
+        done
+        log_success "TrueNAS cleanup completed successfully"
+    else
+        log_error "TrueNAS cleanup failed (exit code: $cleanup_exit_code)"
+        log_error "Error output: $cleanup_output"
+        log_warning "Manual cleanup required - check TrueNAS for remaining volumes/snapshots"
+
+        # Provide manual cleanup instructions
+        echo ""
+        log_warning "Manual cleanup commands for TrueNAS:"
+        echo ""
+        log_info "# Connect to TrueNAS and run:"
+        echo "zfs list -t snapshot | grep 'vm-990\\|vm-991\\|vm-992'"
+        echo "# Delete any snapshots found:"
+        echo "zfs destroy dataset@snapshot_name"
+        echo ""
+        echo "zfs list -t volume | grep 'vm-990\\|vm-991\\|vm-992'"
+        echo "# Delete any volumes found:"
+        echo "zfs destroy dataset/volume_name"
+        echo ""
+        log_info "# Or via TrueNAS Web UI:"
+        echo "Storage → Pools → [Your Pool] → Delete the vm-990-*, vm-991-*, vm-992-* datasets and snapshots"
+    fi
 }
 
 # Helper function to check if VM is locked and provide manual fix commands
@@ -338,7 +556,7 @@ run_command() {
 
     # Check for rate limiting in output and show friendly message
     if check_rate_limit "$output"; then
-        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        status_rate_limit
     fi
 
     # Log the detailed output to file only
@@ -476,7 +694,7 @@ test_volume_creation() {
     output=$(run_command "qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single" 2>&1)
     exit_code=$?
     if check_rate_limit "$output"; then
-        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        status_rate_limit
     fi
     if [ $exit_code -ne 0 ]; then
         log_error "Failed to add disk to VM"
@@ -495,7 +713,7 @@ test_volume_listing() {
     output=$(run_command "pvesm list $STORAGE_NAME" 2>&1)
     exit_code=$?
     if check_rate_limit "$output"; then
-        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        status_rate_limit
     fi
     if [ $exit_code -ne 0 ]; then
         log_error "Failed to list volumes"
@@ -522,7 +740,7 @@ test_snapshot_operations() {
     output=$(run_command "qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'" 2>&1)
     exit_code=$?
     if check_rate_limit "$output"; then
-        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        status_rate_limit
     fi
     if [ $exit_code -ne 0 ]; then
         log_error "Failed to create snapshot"
@@ -568,7 +786,7 @@ test_snapshot_operations() {
         output=$(run_command "qm snapshot $TEST_VM_BASE $clone_snapshot --description 'Snapshot for clone testing (post-rollback)'" 2>&1)
         exit_code=$?
         if check_rate_limit "$output"; then
-            echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+            status_rate_limit
         fi
         if [ $exit_code -ne 0 ]; then
             log_error "Failed to create clone base snapshot"
@@ -602,7 +820,7 @@ test_clone_operations() {
     exit_code=$?
 
     if check_rate_limit "$output"; then
-        echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        status_rate_limit
     fi
     if [ $exit_code -ne 0 ]; then
         log_error "Failed to create clone"
@@ -672,7 +890,7 @@ test_bulk_operations() {
         output=$(run_command "qm snapshot $TEST_VM_BASE $snap_name --description 'Bulk test snapshot $i'" 2>&1)
         exit_code=$?
         if check_rate_limit "$output"; then
-            echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+            status_rate_limit
         fi
 
         if [ $exit_code -eq 0 ]; then
@@ -959,6 +1177,111 @@ EOF
     echo -e "📊 Summary: ${GREEN}$passed_tests passed${NC}, ${RED}$error_count errors${NC}, ${YELLOW}$warning_count warnings${NC}"
 }
 
+# Pre-flight checks to verify system readiness
+run_preflight_checks() {
+    local checks_passed=true
+
+    echo "  🔧 Checking plugin installation..."
+
+    # Check if plugin file exists
+    if [[ ! -f "/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm" ]]; then
+        echo -e "        ${RED}❌ TrueNAS plugin not found at /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm${NC}"
+        echo "           Install with: sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/"
+        checks_passed=false
+    else
+        echo -e "        ${GREEN}✅ Plugin file found${NC}"
+    fi
+
+    # Check if storage is configured
+    echo "  📦 Checking storage configuration..."
+    if ! pvesm status | grep -q "^$STORAGE_NAME"; then
+        echo -e "        ${RED}❌ Storage '$STORAGE_NAME' not found in Proxmox configuration${NC}"
+        echo "           Add to /etc/pve/storage.cfg or use: pvesm add truenasplugin $STORAGE_NAME ..."
+        checks_passed=false
+    else
+        echo -e "        ${GREEN}✅ Storage '$STORAGE_NAME' configured${NC}"
+    fi
+
+    # Test storage status
+    echo "  🔌 Testing storage connectivity..."
+    if timeout 30 pvesm status | grep -qw "$STORAGE_NAME" 2>/dev/null; then
+        echo -e "        ${GREEN}✅ Storage responds to status queries${NC}"
+    else
+        echo -e "        ${YELLOW}⚠️  Storage '$STORAGE_NAME' status check inconclusive${NC}"
+        echo "           This may be normal - the main test suite will perform more detailed checks"
+    fi
+
+    # Check required tools
+    echo "  🛠️  Checking required tools..."
+    local missing_tools=()
+
+    for tool in qm pvesm iscsiadm journalctl; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        echo -e "        ${RED}❌ Missing required tools: ${missing_tools[*]}${NC}"
+        checks_passed=false
+    else
+        echo -e "        ${GREEN}✅ All required tools available${NC}"
+    fi
+
+    # Check if test VMs already exist
+    echo "  🖥️  Checking test VM availability..."
+    local existing_vms=()
+
+    for vm_id in $TEST_VM_BASE $TEST_VM_CLONE $TEST_VM_RESIZE; do
+        if qm config "$vm_id" >/dev/null 2>&1; then
+            existing_vms+=("$vm_id")
+        fi
+    done
+
+    if [[ ${#existing_vms[@]} -gt 0 ]]; then
+        echo -e "        ${YELLOW}⚠️  Test VMs already exist: ${existing_vms[*]}${NC}"
+        echo "           These VMs will be destroyed and recreated during testing"
+    else
+        echo -e "        ${GREEN}✅ Test VM IDs available${NC}"
+    fi
+
+    # Check storage content type
+    echo "  📁 Checking storage content type..."
+    local storage_info=$(pvesm status 2>/dev/null | grep "^$STORAGE_NAME" || true)
+    if [[ -n "$storage_info" ]]; then
+        # Check if storage line contains content types or if it's operational
+        if echo "$storage_info" | grep -q -E "(images|active|available)"; then
+            echo -e "        ${GREEN}✅ Storage accessible and operational${NC}"
+        else
+            echo -e "        ${YELLOW}⚠️  Storage may not support 'images' content type${NC}"
+            echo "           Add 'content images' to storage configuration if needed"
+        fi
+    else
+        echo -e "        ${YELLOW}⚠️  Could not retrieve storage content type information${NC}"
+    fi
+
+    # Test basic perl functionality
+    echo "  🐪 Testing Perl integration..."
+    if perl -e 'use PVE::Storage::Custom::TrueNASPlugin; print "OK\n";' 2>/dev/null; then
+        echo -e "        ${GREEN}✅ Perl plugin loads successfully${NC}"
+    else
+        echo -e "        ${RED}❌ Perl plugin failed to load${NC}"
+        echo "           Check plugin syntax and Perl dependencies"
+        checks_passed=false
+    fi
+
+    # Check permissions
+    echo "  🔐 Checking permissions..."
+    if [[ $EUID -eq 0 ]]; then
+        echo -e "        ${GREEN}✅ Running as root${NC}"
+    else
+        echo -e "        ${YELLOW}⚠️  Not running as root - some operations may fail${NC}"
+        echo "           Consider running with: sudo $0"
+    fi
+
+    return $($checks_passed && echo 0 || echo 1)
+}
+
 # Main test execution
 main() {
     echo -e "${BLUE}🧪 TrueNAS Proxmox Plugin Test Suite${NC}"
@@ -969,18 +1292,18 @@ main() {
 
     # Display what the script will do
     echo -e "${YELLOW}⚠️  This script will perform the following operations:${NC}"
-    echo "   • Test TrueNAS storage plugin functionality"
-    echo "   • Create and delete test VMs (990, 991, 992)"
-    echo "   • Allocate and free storage volumes on TrueNAS"
-    echo "   • Create and delete ZFS snapshots"
-    echo "   • Test volume resize operations"
-    echo "   • Test clone operations (may take time for large volumes)"
-    echo "   • Check for VM locks and provide unlock commands if needed"
-    echo "   • Verify TrueNAS volume cleanup"
-    echo "   • Generate comprehensive test report"
+    echo "    • Test TrueNAS storage plugin functionality"
+    echo "    • Create and delete test VMs (990, 991, 992)"
+    echo "    • Allocate and free storage volumes on TrueNAS"
+    echo "    • Create and delete ZFS snapshots"
+    echo "    • Test volume resize operations"
+    echo "    • Test clone operations (may take time for large volumes)"
+    echo "    • Check for VM locks and provide unlock commands if needed"
+    echo "    • Verify TrueNAS volume cleanup"
+    echo "    • Generate comprehensive test report"
     echo ""
     echo -e "${YELLOW}⚠️  Warning: This will modify your Proxmox and TrueNAS configuration!${NC}"
-    echo -e "${YELLOW}   Make sure you're running this on a test environment.${NC}"
+    echo -e "${YELLOW}    Make sure you're running this on a test environment.${NC}"
     echo ""
 
     # Ask for user confirmation
@@ -990,7 +1313,14 @@ main() {
         echo -e "${RED}❌ Test suite cancelled by user${NC}"
         exit 0
     fi
-    echo ""
+    print_stage_header "PRE-FLIGHT CHECKS" "🔍"
+    if ! run_preflight_checks; then
+        echo -e "${RED}❌ Pre-flight checks failed. Please fix the issues above before running the test suite.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Pre-flight checks passed${NC}"
+
+    print_stage_header "MAIN TEST EXECUTION" "🧪"
 
     log_to_file "INFO" "Starting TrueNAS plugin test suite"
     log_to_file "INFO" "Storage: $STORAGE_NAME"
@@ -1014,12 +1344,18 @@ main() {
     test_error_conditions || ((failed_tests++))
     test_volume_deletion || ((failed_tests++))
 
-    # Generate summary
+    print_stage_header "TEST RESULTS" "📊"
+
     generate_summary_report
 
-    # Final cleanup
+    print_stage_header "CLEANUP" "🧹"
     log_to_file "INFO" "Starting final cleanup"
     cleanup_test_vms
+
+    # Comprehensive TrueNAS cleanup - snapshots first, then volumes
+    log_step "Cleaning up TrueNAS volumes and snapshots..."
+    cleanup_truenas_volumes
+
     rm -f /tmp/clone_snapshot_name
 
     if [[ $failed_tests -eq 0 ]]; then
@@ -1038,40 +1374,6 @@ if [[ $EUID -ne 0 ]]; then
     echo "❌ This script must be run as root (for qm and pvesm commands)"
     exit 1
 fi
-
-# Basic storage existence check (non-blocking)
-echo "🔍 Checking if storage '$STORAGE_NAME' exists..."
-if ! timeout 10 pvesm status | grep -qw "$STORAGE_NAME"; then
-    echo "❌ Error: Storage '$STORAGE_NAME' not found in storage list"
-    echo "📋 Available storage:"
-    timeout 10 pvesm status 2>/dev/null || echo "Unable to list storage"
-    exit 1
-fi
-
-echo "✅ Storage '$STORAGE_NAME' found."
-
-# Pre-flight check for existing test VMs
-echo "🔍 Checking for existing test VMs..."
-existing_vms=""
-for vm in $TEST_VM_BASE $TEST_VM_CLONE; do
-    if timeout 5 qm status $vm >/dev/null 2>&1; then
-        existing_vms="$existing_vms $vm"
-    fi
-done
-
-if [[ -n "$existing_vms" ]]; then
-    echo "⚠️  Found existing test VMs:$existing_vms"
-    echo "   These will be automatically destroyed and recreated during testing."
-    echo -n "   Continue? [Y/n]: "
-    read -r response
-    if [[ "$response" =~ ^[Nn] ]]; then
-        echo "❌ Test aborted by user."
-        exit 1
-    fi
-fi
-
-echo "🚀 Starting tests..."
-echo ""
 
 # Run main function
 main "$@"
