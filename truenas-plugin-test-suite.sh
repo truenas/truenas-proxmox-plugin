@@ -894,6 +894,9 @@ generate_summary_report() {
     local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null || echo "0")
     local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
     local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
+    passed_tests=$(echo "$passed_tests" | tr -d '\n\r')
+    error_count=$(echo "$error_count" | tr -d '\n\r')
+    warning_count=$(echo "$warning_count" | tr -d '\n\r')
 
     cat >> "$LOG_FILE" << EOF
 
