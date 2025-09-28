@@ -364,15 +364,74 @@ sub _ws_rpc {
     return $decoded->{result};
 }
 
+# ======== Persistent WebSocket Connection Management ========
+my %_ws_connections; # Global connection cache
+
+sub _ws_connection_key($scfg) {
+    # Create a unique key for this storage configuration
+    my $host = $scfg->{api_host};
+    my $key = $scfg->{api_key};
+    my $transport = $scfg->{api_transport} // 'ws';
+    return "$transport:$host:$key";
+}
+
+sub _ws_get_persistent($scfg) {
+    my $key = _ws_connection_key($scfg);
+    my $conn = $_ws_connections{$key};
+
+    # Test if existing connection is still alive
+    if ($conn && $conn->{sock}) {
+        # Quick connection test - try to send a ping
+        eval {
+            # Test with a lightweight method call
+            _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+            });
+        };
+        if ($@) {
+            # Connection is dead, remove it
+            delete $_ws_connections{$key};
+            $conn = undef;
+        }
+    }
+
+    # Create new connection if needed
+    if (!$conn) {
+        $conn = _ws_open($scfg);
+        $_ws_connections{$key} = $conn if $conn;
+    }
+
+    return $conn;
+}
+
+sub _ws_cleanup_connections() {
+    # Clean up all stored connections (called during shutdown)
+    for my $key (keys %_ws_connections) {
+        my $conn = $_ws_connections{$key};
+        if ($conn && $conn->{sock}) {
+            eval { $conn->{sock}->close(); };
+        }
+    }
+    %_ws_connections = ();
+}
+
+# ======== Bulk Operations Helper ========
+sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
+    # Use core.bulk to batch multiple calls of the same method
+    # $params_array should be an array of parameter arrays
+    return _api_call($scfg, 'core.bulk', [$method_name, $params_array, $description],
+        sub { die "Bulk operations require WebSocket transport"; });
+}
+
 # ======== Transport-agnostic API wrapper ========
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
     if ($transport eq 'ws') {
         my ($res, $err);
         eval {
-            my $conn = _ws_open($scfg);
+            my $conn = _ws_get_persistent($scfg);
             $res = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
         };
         $err = $@ if $@;
@@ -382,9 +441,9 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             warn "TrueNAS rate limit hit, waiting before retry...";
             sleep(2); # Wait 2 seconds for rate limit to reset
             eval {
-                my $conn = _ws_open($scfg);
+                my $conn = _ws_get_persistent($scfg);
                 $res = _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => 1, method => $ws_method, params => $ws_params // [],
+                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
                 });
             };
             $err = $@ if $@;
