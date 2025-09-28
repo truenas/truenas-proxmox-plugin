@@ -593,7 +593,14 @@ sub volume_has_feature {
 
     if ($feature && $feature eq 'clone') {
         # Support cloning from snapshots via ZFS clone
-        return $snapname ? 1 : undef;
+        # Return 1 for both regular clones and snapshot clones
+        return 1;
+    }
+
+    if ($feature && $feature eq 'copy') {
+        # Support full copy functionality for clones
+        # This is what Proxmox checks for full clones from snapshots
+        return 1;
     }
 
     # Note: vmstate support is determined by the vmstate_storage setting:
@@ -1610,6 +1617,17 @@ sub clone_image {
     my $clone_volname = "vol-$target_zname-lun$lun";
     return $clone_volname;
 }
+
+sub copy_image {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+
+    # For our TrueNAS plugin, copy_image uses the same ZFS clone functionality as clone_image
+    # This provides efficient space-efficient copying via ZFS clone technology
+    # Proxmox calls this method for full clones when the 'copy' feature is supported
+
+    return $class->clone_image($scfg, $storeid, $volname, $vmid, $snapname, $name, $format);
+}
+
 sub create_base { die "base images not supported"; }
 
 1;
