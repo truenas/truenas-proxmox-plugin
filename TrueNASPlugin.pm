@@ -1194,13 +1194,19 @@ sub alloc_image {
 
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
-    # 1) Create the zvol (VOLUME) on TrueNAS with requested size (bytes)
+    # 1) Create the zvol (VOLUME) on TrueNAS with requested size
+    # Proxmox passes $size in KILOBYTES, TrueNAS expects bytes in volsize
+    my $bytes = int($size) * 1024;
+    my $blocksize = $scfg->{zvol_blocksize};
+
     my $create_payload = {
         name    => $full_ds,
         type    => 'VOLUME',
-        volsize => int($size),
-        # optionally: volblocksize => '16K', sparse => JSON::true
+        volsize => $bytes,
+        sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
+    $create_payload->{volblocksize} = $blocksize if $blocksize;
+
     _api_call(
         $scfg,
         'pool.dataset.create',
@@ -1450,10 +1456,10 @@ sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
     my $res = [];
 
-    # ---- cache TrueNAS state for this call chain ----
-    my $extents    = $cache->{tn_extents}        //= (_tn_extents($scfg) // []);
-    my $maps       = $cache->{tn_targetextents}  //= (_tn_targetextents($scfg) // []);
-    my $target_id  = _resolve_target_id($scfg);
+    # ---- fetch fresh TrueNAS state (minimal caching for target_id only) ----
+    my $extents    = _tn_extents($scfg) // [];
+    my $maps       = _tn_targetextents($scfg) // [];
+    my $target_id  = $cache->{target_id} //= _resolve_target_id($scfg);
 
     # Index extents by id for quick lookups
     my %extent_by_id = map { ($_->{id} // -1) => $_ } @$extents;
@@ -1513,11 +1519,12 @@ sub list_images {
 
         # Format is always raw for block iSCSI zvols
         my %entry = (
-            volid  => $volid,
-            size   => $size,
-            format => 'raw',
+            volid   => $volid,
+            size    => $size || 0,
+            format  => 'raw',
+            content => 'images',
+            vmid    => defined($owner) ? int($owner) : 0,
         );
-        $entry{vmid} = int($owner) if defined $owner;
         push @$res, \%entry;
     }
     return $res;

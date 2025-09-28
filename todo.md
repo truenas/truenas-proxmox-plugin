@@ -1,11 +1,11 @@
 ## Features
-- Allow snapshotting
+✅ Allow snapshotting
 - Find safer way to force delete disks
 - Cluster support
-- Use JSON-RPC for everything, fall back to API calls if needed
+✅ Use JSON-RPC for everything, fall back to API calls if needed
 - Allow cloning
 - Create a readme
-- See if displaying snapshots of zvols as snapshots in Proxmox is viable
+✅ See if displaying snapshots of zvols as snapshots in Proxmox is viable
 
 ## Things to Check
 - Test multipathing
