@@ -677,32 +677,57 @@ sub _current_lun_for_zname($scfg, $zname) {
     return defined($tx) ? $tx->{lunid} : undef;
 }
 
-# ======== Target resolution (IQN or short Target Name) ========
+# Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
 sub _resolve_target_id {
     my ($scfg) = @_;
-    my $want = $scfg->{target_iqn} // die "target_iqn not set\n";
-    my $short = $want; $short =~ s/^.*://;
-    my $targets = _tn_get_target($scfg);
-    if (!ref($targets) || !@$targets) {
-        my $g = eval { _tn_global($scfg) } // {};
-        my $basename = $g->{basename} // '(unknown)';
-        my $portal = $scfg->{discovery_portal} // '(unset)';
-        die
-          "TrueNAS API returned no iSCSI targets.\n".
-          " - iSCSI Base Name: $basename\n".
-          " - Configured discovery portal: $portal\n".
-          "Next steps:\n".
-          " 1) On TrueNAS, ensure the iSCSI service is RUNNING.\n".
-          " 2) In Shares → Block (iSCSI) → Portals, add/listen on $portal (or 0.0.0.0:3260).\n".
-          " 3) From this Proxmox node, run: iscsiadm -m discovery -t sendtargets -p $portal\n";
+
+    my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
+
+    # 1) Get targets; if empty, surface a clear diagnostic
+    my $targets = _tn_targets($scfg) // [];
+    if (!@$targets) {
+        # Try to fetch the base name for a more helpful message
+        my $global   = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef, 15) } // {};
+        my $basename = $global->{basename} // '(unknown)';
+        my $portal   = $scfg->{portal} // '(none)';
+
+        my $msg = join("\n",
+            "TrueNAS API returned no iSCSI targets.",
+            "  iSCSI Base Name: $basename",
+            "  Configured discovery portal: $portal",
+            "",
+            "Next steps:",
+            "  1) On TrueNAS, ensure the iSCSI service is RUNNING.",
+            "  2) In Shares -> Block (iSCSI) -> Portals, add/listen on $portal (or 0.0.0.0:3260).",
+            "  3) From this Proxmox node, run:",
+            "     iscsiadm -m discovery -t sendtargets -p $portal",
+        );
+
+        die "$msg\n";
     }
-    my ($t) = grep { defined($_->{name}) && ( $_->{name} eq $want || $_->{name} eq $short ) } @$targets;
-    $t //= (grep { defined($_->{iqn}) && $_->{iqn} eq $want } @$targets)[0];
-    if (!$t) {
-        my @names = map { $_->{name} // '(unnamed)' } @$targets;
-        die "Target '$want' not found. Available targets: ".join(', ', @names)."\n";
+
+    # 2) Get global base name to construct full IQNs
+    my $global = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef, 15) } // {};
+    my $basename = $global->{basename} // '';
+
+    # 3) Try several matching strategies
+    my $found;
+    for my $t (@$targets) {
+        my $name = $t->{name} // '';
+        my $full = ($basename && $name) ? "$basename:$name" : undef;
+
+        # Some SCALE builds include 'iqn' per target; prefer exact match if present
+        if (defined $t->{iqn} && $t->{iqn} eq $want) { $found = $t; last; }
+
+        # Otherwise compare constructed IQN or target suffix
+        if ($full && $full eq $want)             { $found = $t; last; }
+        if ($name && $want =~ /:\Q$name\E$/)     { $found = $t; last; }
     }
-    return $t->{id};
+
+    die "could not resolve target id for IQN $want (saw ".scalar(@$targets)." target(s))\n"
+        if !$found;
+
+    return $found->{id};
 }
 
 # ======== Portal normalization & reachability ========
