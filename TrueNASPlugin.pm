@@ -1105,7 +1105,7 @@ sub parse_volname {
 
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
-    die "snapshots not supported on raw iSCSI LUNs" if defined $snapname;
+    # Note: snapname is used during clone operations - we support snapshots via ZFS
     my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     _iscsi_login_all($scfg);
     my $dev;
