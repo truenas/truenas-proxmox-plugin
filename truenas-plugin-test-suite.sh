@@ -967,6 +967,31 @@ main() {
     echo -e "⏱️  API timeout: ${YELLOW}$API_TIMEOUT seconds${NC}"
     echo ""
 
+    # Display what the script will do
+    echo -e "${YELLOW}⚠️  This script will perform the following operations:${NC}"
+    echo "   • Test TrueNAS storage plugin functionality"
+    echo "   • Create and delete test VMs (990, 991, 992)"
+    echo "   • Allocate and free storage volumes on TrueNAS"
+    echo "   • Create and delete ZFS snapshots"
+    echo "   • Test volume resize operations"
+    echo "   • Test clone operations (may take time for large volumes)"
+    echo "   • Check for VM locks and provide unlock commands if needed"
+    echo "   • Verify TrueNAS volume cleanup"
+    echo "   • Generate comprehensive test report"
+    echo ""
+    echo -e "${YELLOW}⚠️  Warning: This will modify your Proxmox and TrueNAS configuration!${NC}"
+    echo -e "${YELLOW}   Make sure you're running this on a test environment.${NC}"
+    echo ""
+
+    # Ask for user confirmation
+    read -p "Do you want to continue? (y/N): " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${RED}❌ Test suite cancelled by user${NC}"
+        exit 0
+    fi
+    echo ""
+
     log_to_file "INFO" "Starting TrueNAS plugin test suite"
     log_to_file "INFO" "Storage: $STORAGE_NAME"
     log_to_file "INFO" "Test VMs: $TEST_VM_BASE, $TEST_VM_CLONE"
