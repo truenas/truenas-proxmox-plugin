@@ -1,12 +1,13 @@
 #!/bin/bash
 #
-# TrueNAS Proxmox Plugin Comprehensive Test Suite
+# TrueNAS Proxmox Plugin Test Suite
 #
-# This script tests all major functions of the TrueNAS storage plugin with
-# clean terminal output and verbose logging to file.
+# Comprehensive test suite for TrueNAS storage plugin that validates all major
+# functions including volume operations, snapshots, cloning, bulk operations,
+# and cleanup verification with clean terminal output and verbose logging.
 #
-# Usage: ./test-truenas-plugin.sh [storage_name]
-# Example: ./test-truenas-plugin.sh tnscale
+# Usage: ./truenas-plugin-test-suite.sh [storage_name]
+# Example: ./truenas-plugin-test-suite.sh tnscale
 #
 
 set -e  # Exit on any error
@@ -15,7 +16,7 @@ set -e  # Exit on any error
 STORAGE_NAME=${1:-"tnscale"}
 TEST_VM_BASE=990
 TEST_VM_CLONE=991
-LOG_FILE="/tmp/truenas-plugin-test-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="/tmp/truenas-plugin-test-suite-$(date +%Y%m%d-%H%M%S).log"
 API_TIMEOUT=60  # Increased timeout for TrueNAS API calls
 
 # Colors for output
@@ -140,11 +141,14 @@ die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
 
 # Get list of ZFS volumes from TrueNAS
 eval {
+    my \$query_filter = [['name', '~', '\$scfg->{dataset}/vm-(990|991)-']];
+    my \$query_options = {extra => {properties => ['name']}};
     my \$result = PVE::Storage::Custom::TrueNASPlugin::_api_call(\$scfg, 'zfs.dataset.query',
-        [[\['name', '~', '\$scfg->{dataset}/vm-(990|991)-']], {'extra': {'properties': ['name']}}]);
+        [\$query_filter, \$query_options],
+        sub { die "TrueNAS volume check requires WebSocket transport"; });
 
     if (\$result && ref(\$result) eq 'ARRAY') {
-        for my \$dataset (@\$result) {
+        for my \$dataset (@{\$result}) {
             if (\$dataset->{name} && \$dataset->{name} =~ /vm-(990|991)-/) {
                 print "\$dataset->{name}\\n";
             }
@@ -446,19 +450,15 @@ test_storage_status() {
     log_test "Testing storage status and capacity"
     log_step "Checking storage accessibility..."
 
-    if ! run_command "pvesm status $STORAGE_NAME" >/dev/null 2>&1; then
-        log_step "Primary check failed, trying alternative method..."
-
-        if run_command "pvesm status | grep -w $STORAGE_NAME" >/dev/null 2>&1; then
-            log_success "Storage found in status list"
-            return 0
-        else
-            log_error "Storage $STORAGE_NAME is not accessible"
-            return 1
-        fi
+    # Note: pvesm status <storage> syntax may not be supported in all Proxmox versions
+    # Using the reliable method: pvesm status | grep
+    if run_command "pvesm status | grep -w $STORAGE_NAME" >/dev/null 2>&1; then
+        log_success "Storage found in status list"
+    else
+        log_error "Storage $STORAGE_NAME is not accessible"
+        return 1
     fi
 
-    log_success "Storage status check passed"
     return 0
 }
 
@@ -951,7 +951,7 @@ EOF
 
 # Main test execution
 main() {
-    echo -e "${BLUE}TrueNAS Proxmox Plugin Test Suite${NC}"
+    echo -e "${BLUE}🧪 TrueNAS Proxmox Plugin Test Suite${NC}"
     echo -e "📦 Testing storage: ${YELLOW}$STORAGE_NAME${NC}"
     echo -e "📝 Log file: ${BLUE}$LOG_FILE${NC}"
     echo -e "⏱️  API timeout: ${YELLOW}$API_TIMEOUT seconds${NC}"
