@@ -443,10 +443,12 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
 }
 
 sub volume_has_feature {
-    my ($class, $scfg, $feature, @more) = @_;
-    # Enable disk grow for raw iSCSI-backed images
-    return 1 if defined($feature) && $feature eq 'resize';
-    return undef;
+    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
+
+    # We support disk snapshots via ZFS (no vmstate/RAM).
+    return 1 if $feature && $feature eq 'snapshot';
+
+    return undef; # others unchanged
 }
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
@@ -525,6 +527,115 @@ sub volume_resize {
     # Proxmox expects KiB as return value
     my $ret_kib = int(($req_bytes + 1023) / 1024);
     return $ret_kib;
+}
+
+# Create a ZFS snapshot on the TrueNAS zvol backing this volume.
+# 'snapname' must be a simple token (PVE passes it).
+sub volume_snapshot {
+    my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
+
+    # We only support disk-only snapshots on this backend.
+    die "RAM/vmstate snapshots are not supported on TrueNAS iSCSI backend\n"
+        if $vmstate;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+
+    # TrueNAS REST: POST /zfs/snapshot  { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
+    # Snapshot will be <pool/ds/...>@<snapname>
+    my $payload = { dataset => $full, name => $snapname, recursive => JSON::false };
+
+    _api_call(
+        $scfg, 'zfs.snapshot.create', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
+    );
+
+    return undef;
+}
+
+# Delete a ZFS snapshot on the zvol.
+sub volume_snapshot_delete {
+    my ($class, $scfg, $storeid, $volname, $snapname) = @_;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;          # pool/dataset/.../vm-<id>-disk-<n>
+    my $snap_full = $full . '@' . $snapname;             # full snapshot name
+    my $id = URI::Escape::uri_escape($snap_full);        # '@' must be URL-encoded in path
+
+    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap>
+    _api_call(
+        $scfg, 'zfs.snapshot.delete', [ $snap_full ],
+        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
+    );
+
+    return undef;
+}
+
+# Roll back the zvol to a specific ZFS snapshot and rescan iSCSI/multipath.
+sub volume_snapshot_rollback {
+    my ($class, $scfg, $storeid, $volname, $snapname) = @_;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;
+    my $snap_full = $full . '@' . $snapname;
+
+    # ZFS semantics: rolling back to a non-latest snapshot requires destroying newer ones.
+    # TrueNAS exposes a 'rollback' action for snapshots. We request a forced rollback to handle older snapshots.
+    my $payload = {
+        snapshot => $snap_full,
+        force    => JSON::true,   # allow rollback even if newer snaps exist (destroy them)
+        recursive => JSON::false, # zvol only
+    };
+
+    # TrueNAS REST: POST /zfs/snapshot/rollback { snapshot, force, recursive }
+    _api_call(
+        $scfg, 'zfs.snapshot.rollback', [ $payload ],
+        sub { _rest_call($scfg, 'POST', '/zfs/snapshot/rollback', $payload) },
+    );
+
+    # Refresh initiator view so the kernel/multipath sees rolled-back size/geometry immediately
+    eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
+    if ($scfg->{use_multipath}) {
+        eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
+    }
+    eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+
+    return undef;
+}
+
+# Return a hash describing available snapshots for this volume.
+# Shape: { <snapname> => { id => <snapname>, timestamp => <epoch> }, ... }
+sub volume_snapshot_info {
+    my ($class, $scfg, $storeid, $volname) = @_;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $full = $scfg->{dataset} . '/' . $zname;
+
+    # TrueNAS REST: GET /zfs/snapshot  (returns an array of snapshots system-wide)
+    # We'll filter to our dataset/zvol and normalize fields.
+    my $list = _rest_call($scfg, 'GET', '/zfs/snapshot', undef, 30) // [];
+
+    my $snaps = {};
+    for my $s (@$list) {
+        my $name = $s->{name} // next;     # "pool/ds@sn"
+        next unless $name =~ /^\Q$full\E\@(.+)$/;
+        my $snapname = $1;
+
+        # Try to extract creation time; fall back to 0 if not provided
+        my $ts = 0;
+        if (my $props = $s->{properties}) {
+            # common layouts: { creation => { rawvalue => <epoch> } } or { creation => <string> }
+            if (ref($props->{creation}) eq 'HASH') {
+                $ts = int($props->{creation}{rawvalue} // 0);
+            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+                $ts = int($1);
+            }
+        }
+
+        $snaps->{$snapname} = { id => $snapname, timestamp => $ts };
+    }
+
+    return $snaps;
 }
 
 sub _tn_extent_create($scfg, $zname, $full) {
