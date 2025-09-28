@@ -891,9 +891,9 @@ test_volume_deletion() {
 generate_summary_report() {
     log_to_file "INFO" "Generating test summary report"
 
-    local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null || echo "0")
-    local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
-    local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
+    local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null)
+    local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null)
+    local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null)
 
     # Clean and ensure single numeric values
     passed_tests=$(echo "$passed_tests" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
