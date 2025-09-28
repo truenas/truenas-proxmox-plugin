@@ -894,9 +894,16 @@ generate_summary_report() {
     local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null || echo "0")
     local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
     local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
-    passed_tests=$(echo "$passed_tests" | tr -d '\n\r')
-    error_count=$(echo "$error_count" | tr -d '\n\r')
-    warning_count=$(echo "$warning_count" | tr -d '\n\r')
+
+    # Clean and ensure single numeric values
+    passed_tests=$(echo "$passed_tests" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
+    error_count=$(echo "$error_count" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
+    warning_count=$(echo "$warning_count" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
+
+    # Ensure we have valid numbers (fallback to 0 if empty)
+    passed_tests=${passed_tests:-0}
+    error_count=${error_count:-0}
+    warning_count=${warning_count:-0}
 
     cat >> "$LOG_FILE" << EOF
 
