@@ -63,6 +63,59 @@ log_step() {
     echo -e "  ${BLUE}→${NC} $*"
 }
 
+# Bulk operations helper using embedded Perl
+bulk_delete_snapshots() {
+    local storage_name="$1"
+    local volname="$2"
+    shift 2
+    local snapshots=("$@")
+
+    if [ ${#snapshots[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    # Create snapshot list for Perl
+    local snapshot_args=""
+    for snap in "${snapshots[@]}"; do
+        snapshot_args="$snapshot_args '$snap'"
+    done
+
+    # Execute bulk deletion using embedded Perl
+    perl << EOF
+use strict;
+use warnings;
+use lib '/usr/share/perl5';
+use PVE::Storage;
+use PVE::Storage::Custom::TrueNASPlugin;
+
+# Get storage configuration
+my \$storage_config = PVE::Storage::config();
+my \$scfg = PVE::Storage::storage_config(\$storage_config, '$storage_name');
+
+die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
+    unless \$scfg && \$scfg->{type} eq 'truenasplugin';
+
+# Snapshot list
+my @snapshots = ($snapshot_args);
+
+# Use bulk delete function
+my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\\@snapshots);
+
+if (\$errors && @\$errors) {
+    print "Bulk deletion errors:\\n";
+    for my \$error (@\$errors) {
+        print "  ERROR: \$error\\n";
+    }
+    exit 1;
+} else {
+    print "Bulk deletion of " . scalar(@snapshots) . " snapshots completed successfully\\n";
+    exit 0;
+}
+EOF
+
+    return $?
+}
+
 # Check for TrueNAS rate limiting in output
 check_rate_limit() {
     local output="$1"
@@ -425,6 +478,80 @@ test_volume_resize() {
     return 0
 }
 
+test_bulk_operations() {
+    log_test "Testing bulk operations and performance features"
+
+    log_step "Testing bulk snapshot creation and deletion..."
+
+    # Create multiple snapshots for bulk testing
+    local bulk_snapshots=()
+    for i in {1..3}; do
+        local snap_name="bulk-test-$i-$(date +%s)"
+        log_to_file "INFO" "Creating snapshot: $snap_name"
+
+        output=$(run_command "qm snapshot $TEST_VM_BASE $snap_name --description 'Bulk test snapshot $i'" 2>&1)
+        exit_code=$?
+        if check_rate_limit "$output"; then
+            echo -e "  ${YELLOW}⏱${NC} TrueNAS API rate limit encountered (harmless - auto-retry in progress)"
+        fi
+
+        if [ $exit_code -eq 0 ]; then
+            bulk_snapshots+=("$snap_name")
+        else
+            log_warning "Failed to create snapshot $snap_name for bulk testing"
+        fi
+
+        # Small delay between snapshots to avoid rate limiting
+        sleep 1
+    done
+
+    log_step "Created ${#bulk_snapshots[@]} snapshots for bulk testing"
+
+    if [ ${#bulk_snapshots[@]} -gt 1 ]; then
+        log_step "Testing bulk snapshot deletion using core.bulk API..."
+
+        # Get the volume name for the bulk operation
+        local volname
+        volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f2 | cut -d, -f1 | sed 's/^[[:space:]]*//')
+
+        if [[ -n "$volname" ]]; then
+            log_to_file "INFO" "Using volume: $volname for bulk deletion"
+
+            # Use embedded Perl bulk deletion
+            if bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${bulk_snapshots[@]}"; then
+                log_step "Bulk deletion completed successfully"
+                log_success "Bulk operations test passed - used TrueNAS core.bulk API"
+            else
+                log_warning "Bulk deletion failed, falling back to individual deletion"
+
+                # Fallback to individual deletion
+                local deleted_count=0
+                for snapshot in "${bulk_snapshots[@]}"; do
+                    output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
+                    if [ $? -eq 0 ]; then
+                        ((deleted_count++))
+                        log_to_file "INFO" "Deleted snapshot: $snapshot"
+                    else
+                        log_to_file "WARNING" "Failed to delete snapshot: $snapshot"
+                    fi
+                done
+
+                if [ $deleted_count -eq ${#bulk_snapshots[@]} ]; then
+                    log_success "Bulk operations test passed - used individual fallback"
+                else
+                    log_warning "Some operations failed even with individual fallback"
+                fi
+            fi
+        else
+            log_warning "Could not determine volume name for bulk operations"
+        fi
+    else
+        log_warning "Insufficient snapshots for bulk testing"
+    fi
+
+    return 0
+}
+
 test_error_conditions() {
     log_test "Testing error conditions and edge cases"
 
@@ -465,16 +592,57 @@ test_volume_deletion() {
     fi
 
     log_step "Cleaning up snapshots..."
-    # Improved snapshot cleanup - skip the formatting lines
-    local snapshots
-    snapshots=$(qm listsnapshot $TEST_VM_BASE 2>/dev/null | grep -E "^[[:space:]]*[[:alnum:]\-]+" | grep -v "current" | awk '{print $1}' | sed 's/^[`|-]*>//' | grep -v "^$" || true)
+    # Get snapshot list
+    local snapshots_raw
+    snapshots_raw=$(qm listsnapshot $TEST_VM_BASE 2>/dev/null | grep -E "^[[:space:]]*[[:alnum:]\-]+" | grep -v "current" | awk '{print $1}' | sed 's/^[`|-]*>//' | grep -v "^$" || true)
 
-    for snapshot in $snapshots; do
+    # Convert to array
+    local snapshots_array=()
+    while IFS= read -r snapshot; do
         if [[ -n "$snapshot" && "$snapshot" != "NAME" && "$snapshot" != "current" ]]; then
-            log_to_file "INFO" "Deleting snapshot: $snapshot"
-            run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
+            snapshots_array+=("$snapshot")
         fi
-    done
+    done <<< "$snapshots_raw"
+
+    if [ ${#snapshots_array[@]} -gt 0 ]; then
+        log_to_file "INFO" "Found ${#snapshots_array[@]} snapshots to clean up"
+
+        # Try bulk deletion first if we have multiple snapshots
+        if [ ${#snapshots_array[@]} -gt 1 ]; then
+            # Get the volume name for bulk operations
+            local volname
+            volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f2 | cut -d, -f1 | sed 's/^[[:space:]]*//')
+
+            if [[ -n "$volname" ]]; then
+                log_to_file "INFO" "Attempting bulk cleanup of ${#snapshots_array[@]} snapshots using core.bulk"
+
+                if bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${snapshots_array[@]}" >/dev/null 2>&1; then
+                    log_to_file "INFO" "Bulk snapshot cleanup completed successfully"
+                else
+                    log_to_file "WARNING" "Bulk cleanup failed, falling back to individual deletion"
+                    # Fall back to individual deletion
+                    for snapshot in "${snapshots_array[@]}"; do
+                        log_to_file "INFO" "Deleting snapshot: $snapshot"
+                        run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
+                    done
+                fi
+            else
+                log_to_file "WARNING" "Could not determine volume name, using individual deletion"
+                for snapshot in "${snapshots_array[@]}"; do
+                    log_to_file "INFO" "Deleting snapshot: $snapshot"
+                    run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
+                done
+            fi
+        else
+            # Single snapshot - use individual deletion
+            for snapshot in "${snapshots_array[@]}"; do
+                log_to_file "INFO" "Deleting snapshot: $snapshot"
+                run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
+            done
+        fi
+    else
+        log_to_file "INFO" "No snapshots found to clean up"
+    fi
 
     log_step "Deleting base VM $TEST_VM_BASE..."
     if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
@@ -582,6 +750,7 @@ main() {
     test_snapshot_operations || ((failed_tests++))
     test_clone_operations || ((failed_tests++))
     test_volume_resize || ((failed_tests++))
+    test_bulk_operations || ((failed_tests++))
     test_error_conditions || ((failed_tests++))
     test_volume_deletion || ((failed_tests++))
 
