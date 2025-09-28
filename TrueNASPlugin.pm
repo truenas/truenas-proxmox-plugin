@@ -1526,7 +1526,7 @@ sub deactivate_storage { return 1; }
 
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
-    die "snapshots not supported" if $snapname;
+    # Note: snapname is used for snapshot operations, we support snapshots via ZFS
     _iscsi_login_all($scfg);
     if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
     run_command(['udevadm','settle'], outfunc => sub {});
