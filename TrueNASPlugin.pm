@@ -17,6 +17,7 @@ use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
+use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
 
 # ======== Storage plugin identity ========00
@@ -586,22 +587,25 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
-    if ($feature && $feature eq 'snapshot') {
-        # Always support disk snapshots via ZFS
-        return 1;
+    my $features = {
+        snapshot => { current => 1 },
+        clone => { snap => 1 },  # Support cloning from snapshots
+        copy => { snap => 1, current => 1 },  # Support copying from snapshots and current volumes
+    };
+
+    # Parse volume information to determine context
+    my ($vtype, $name, $vmid, $basename, $basevmid, $isBase) = eval { $class->parse_volname($volname) };
+
+    my $key = undef;
+    if ($snapname) {
+        $key = 'snap';  # Operation on snapshot
+    } elsif ($isBase) {
+        $key = 'base';  # Operation on base image
+    } else {
+        $key = 'current';  # Operation on current volume
     }
 
-    if ($feature && $feature eq 'clone') {
-        # Support cloning from snapshots via ZFS clone
-        # Return 1 for both regular clones and snapshot clones
-        return 1;
-    }
-
-    if ($feature && $feature eq 'copy') {
-        # Support full copy functionality for clones
-        # This is what Proxmox checks for full clones from snapshots
-        return 1;
-    }
+    return 1 if $features->{$feature} && $features->{$feature}->{$key};
 
     # Note: vmstate support is determined by the vmstate_storage setting:
     # - 'shared': vmstate stored as volumes on this storage (current behavior)
@@ -1620,6 +1624,9 @@ sub clone_image {
 
 sub copy_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+
+    # Log that our copy_image method is being called
+    syslog('info', "TrueNAS copy_image called: volname=$volname, vmid=$vmid, snapname=" . ($snapname // 'undef') . ", name=" . ($name // 'undef'));
 
     # For our TrueNAS plugin, copy_image uses the same ZFS clone functionality as clone_image
     # This provides efficient space-efficient copying via ZFS clone technology
