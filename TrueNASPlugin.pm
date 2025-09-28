@@ -587,10 +587,13 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
+    # Log the actual parameters being passed for debugging
+    syslog('info', "TrueNAS volume_has_feature called: feature=$feature, volname=" . ($volname // 'undef') . ", snapname=" . ($snapname // 'undef'));
+
     my $features = {
         snapshot => { current => 1 },
-        clone => { snap => 1 },  # Support cloning from snapshots
-        copy => { snap => 1, current => 1 },  # Support copying from snapshots and current volumes
+        clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
+        copy => { snap => 1, current => 1 },   # Support copying from snapshots and current volumes
     };
 
     # Parse volume information to determine context
@@ -605,14 +608,10 @@ sub volume_has_feature {
         $key = 'current';  # Operation on current volume
     }
 
-    return 1 if $features->{$feature} && $features->{$feature}->{$key};
+    my $result = ($features->{$feature} && $features->{$feature}->{$key}) ? 1 : undef;
+    syslog('info', "TrueNAS volume_has_feature result: feature=$feature, key=" . ($key // 'undef') . ", result=" . ($result // 'undef'));
 
-    # Note: vmstate support is determined by the vmstate_storage setting:
-    # - 'shared': vmstate stored as volumes on this storage (current behavior)
-    # - 'local': vmstate stored on local filesystem (better performance)
-    # Proxmox handles vmstate automatically based on storage capabilities
-
-    return undef; # other features unchanged
+    return $result;
 }
 
 # Grow-only resize of a raw iSCSI-backed zvol, with TrueNAS 80% preflight and initiator rescan.
@@ -1543,6 +1542,10 @@ sub deactivate_volume { return 1; }
 
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
+
+    # Log that our clone_image method is being called
+    syslog('info', "TrueNAS clone_image called: volname=$volname, vmid=$vmid, snapname=" . ($snapname // 'undef') . ", name=" . ($name // 'undef'));
+
     die "clone not supported without snapshot\n" unless $snapname;
     die "only raw format is supported\n" if defined($format) && $format ne 'raw';
 
