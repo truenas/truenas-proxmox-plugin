@@ -433,52 +433,72 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     );
 }
 
-# ---- Robust snapshot rollback helper (WS-first; multi-shape; REST fallbacks) ----
+# ---- WebSocket-only snapshot rollback for TrueNAS 25.04+ ----
 sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     my $FORCE     = $force_bool     ? JSON::PP::true  : JSON::PP::false;
     my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
 
-    my $try_ws_positional = sub {
-        # zfs.snapshot.rollback("<pool/ds@snap>", {force,recursive})
-        return _api_call($scfg, 'zfs.snapshot.rollback',
-          [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
-          undef
-        );
-    };
+    # Force WebSocket transport for snapshot rollback (REST API removed in 25.04+)
+    my $ws_scfg = { %$scfg, api_transport => 'ws' };
 
-    my $try_ws_object = sub {
-        # zfs.snapshot.rollback({snapshot:"<pool/ds@snap>", force, recursive})
-        return _api_call($scfg, 'zfs.snapshot.rollback',
-          [ { snapshot => $snap_full, force => $FORCE, recursive => $RECURSIVE } ],
-          undef
-        );
-    };
+    my @attempts = (
+        # TrueNAS 25.04+ primary method: simple positional parameters
+        sub {
+            my $conn = _ws_open($ws_scfg);
+            return _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 1,
+                method  => "zfs.snapshot.rollback",
+                params  => [ $snap_full, $FORCE, $RECURSIVE ],
+            });
+        },
 
-    my $try_rest_id_path = sub {
-        # Some builds expose .../zfs/snapshot/id/<pool%2Fds%40snap>/rollback
-        my $id = URI::Escape::uri_escape($snap_full);
-        return _rest_call($scfg, 'POST', "/zfs/snapshot/id/$id/rollback",
-          { force => $force_bool ? JSON::PP::true : JSON::PP::false,
-            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
-        );
-    };
+        # TrueNAS 25.04+ alternative: options object
+        sub {
+            my $conn = _ws_open($ws_scfg);
+            return _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 2,
+                method  => "zfs.snapshot.rollback",
+                params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+            });
+        },
 
-    my $try_rest_plain = sub {
-        # Legacy route present on some builds: POST /zfs/snapshot/rollback
-        return _rest_call($scfg, 'POST', '/zfs/snapshot/rollback',
-          { snapshot  => $snap_full,
-            force     => $force_bool ? JSON::PP::true : JSON::PP::false,
-            recursive => $recursive_bool ? JSON::PP::true : JSON::PP::false }
-        );
-    };
+        # Legacy WebSocket format (pre-25.04)
+        sub {
+            my $conn = _ws_open($ws_scfg);
+            return _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 3,
+                method  => "zfs.snapshot.rollback",
+                params  => [ { snapshot => $snap_full, force => $FORCE, recursive => $RECURSIVE } ],
+            });
+        },
+
+        # Last resort: just the snapshot name
+        sub {
+            my $conn = _ws_open($ws_scfg);
+            return _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 4,
+                method  => "zfs.snapshot.rollback",
+                params  => [ $snap_full ],
+            });
+        },
+    );
 
     my $ok = 0; my $last_err = '';
-    for my $attempt ($try_ws_positional, $try_ws_object, $try_rest_id_path, $try_rest_plain) {
+    for my $attempt (@attempts) {
         eval { $attempt->(); $ok = 1; };
-        if ($@) { $last_err = $@; next; }
+        if ($@) {
+            $last_err = $@;
+            # Add more specific error info for debugging
+            warn "WebSocket attempt failed: $@";
+            next;
+        }
         last if $ok;
     }
-    die "TrueNAS snapshot rollback failed: $last_err" if !$ok;
+
+    if (!$ok) {
+        die "TrueNAS snapshot rollback failed (WebSocket required for TrueNAS 25.04+): $last_err\n".
+            "Ensure WebSocket API is accessible and api_transport is set to 'ws'.\n";
+    }
     return 1;
 }
 
