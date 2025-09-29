@@ -45,7 +45,9 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 
 ## Installation
 
-### 1. Install the Plugin
+### Proxmox VE Setup
+
+#### 1. Install the Plugin
 
 ```bash
 # Copy the plugin to Proxmox storage directory
@@ -55,7 +57,7 @@ sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 sudo chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 ```
 
-### 2. Register the Plugin
+#### 2. Register the Plugin
 
 Add to `/etc/pve/storage.cfg`:
 
@@ -70,12 +72,43 @@ truenasplugin: your-storage-name
     shared 1
 ```
 
-### 3. Restart Proxmox Services
+#### 3. Restart Proxmox Services
 
 ```bash
 sudo systemctl restart pvedaemon
 sudo systemctl restart pveproxy
 ```
+
+### TrueNAS SCALE Setup
+
+#### 1. Create ZFS Dataset
+
+```bash
+# Create parent dataset for Proxmox volumes
+sudo zfs create tank/proxmox
+```
+
+#### 2. Configure iSCSI Service
+
+- **Enable iSCSI Service**: Navigate to **System Settings > Services** and enable the iSCSI service
+- **Create Target**: Go to **Shares > Block Shares (iSCSI)** and create a new target
+  - Set **Target Name**: `iqn.2005-10.org.freenas.ctl:your-target`
+  - Configure **Target Global Configuration** as needed
+
+#### 3. Configure iSCSI Portal
+
+- **Create Portal**: In **Shares > Block Shares (iSCSI) > Portals**
+  - Set **Discovery IP**: Your TrueNAS IP address
+  - Set **Port**: 3260 (default)
+  - Configure **Discovery Auth Method** if using CHAP
+
+#### 4. Generate API Key
+
+- **Create API Key**: Navigate to **Credentials > Local Users**
+  - Select your admin user or create a dedicated user
+  - Click **Edit** and scroll to **API Key**
+  - Generate a new API key and save it securely
+  - Ensure the user has appropriate permissions for storage management
 
 ## Configuration
 

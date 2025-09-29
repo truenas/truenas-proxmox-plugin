@@ -14,8 +14,11 @@ set -e  # Exit on any error
 
 # Configuration
 STORAGE_NAME=${1:-"tnscale"}
+
+# Dynamic VM ID selection - will be set by find_available_vm_ids()
 TEST_VM_BASE=990
 TEST_VM_CLONE=991
+
 LOG_FILE="/tmp/truenas-plugin-test-suite-$(date +%Y%m%d-%H%M%S).log"
 API_TIMEOUT=60  # Increased timeout for TrueNAS API calls
 
@@ -91,6 +94,70 @@ print_stage_header() {
     echo ""
 }
 
+# Function to find available VM IDs dynamically
+find_available_vm_ids() {
+    local base_id=${TEST_VM_BASE_HINT:-990}  # Allow override via environment
+    local found_base=false
+    local found_clone=false
+
+    log_to_file "INFO" "Finding available VM IDs starting from $base_id"
+
+    # Search for two consecutive available VM IDs
+    for candidate in $(seq $base_id $((base_id + 100))); do
+        local next_id=$((candidate + 1))
+
+        # Check if both candidate and next_id are available
+        if ! timeout 5 qm config $candidate >/dev/null 2>&1 && \
+           ! timeout 5 qm config $next_id >/dev/null 2>&1; then
+            TEST_VM_BASE=$candidate
+            TEST_VM_CLONE=$next_id
+            found_base=true
+            found_clone=true
+            break
+        fi
+    done
+
+    if $found_base && $found_clone; then
+        log_to_file "INFO" "Selected VM IDs: BASE=$TEST_VM_BASE, CLONE=$TEST_VM_CLONE"
+        return 0
+    else
+        log_to_file "ERROR" "Could not find available VM IDs in range $base_id to $((base_id + 100))"
+        return 1
+    fi
+}
+
+# Performance timing wrapper function
+time_operation() {
+    local operation_name="$1"
+    shift
+    local start_time=$(date +%s.%N)
+
+    log_to_file "TIMING" "Starting: $operation_name"
+
+    # Execute the operation
+    "$@"
+    local exit_code=$?
+
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+
+    if [[ "$duration" != "N/A" ]]; then
+        # Format duration nicely
+        if (( $(echo "$duration > 60" | bc -l 2>/dev/null || echo 0) )); then
+            local minutes=$(echo "$duration / 60" | bc -l)
+            local formatted_duration=$(printf "%.1fm (%.2fs)" "$minutes" "$duration")
+        else
+            local formatted_duration=$(printf "%.2fs" "$duration")
+        fi
+
+        log_to_file "TIMING" "Completed: $operation_name in $formatted_duration"
+        status_info "⏱️  $operation_name took $formatted_duration"
+    else
+        log_to_file "TIMING" "Completed: $operation_name (duration calculation failed)"
+    fi
+
+    return $exit_code
+}
 
 # Helper function to check if VM is locked and provide manual fix commands
 check_vm_locked() {
@@ -152,9 +219,9 @@ check_truenas_stale_volumes() {
 
     log_step "Checking for stale ZFS volumes on TrueNAS..."
 
-    # Use embedded Perl to query TrueNAS for volumes
+    # Use embedded Perl to query TrueNAS for volumes with timeout protection
     local stale_volumes
-    stale_volumes=$(perl << EOF
+    stale_volumes=$(timeout 60 perl << EOF
 use strict;
 use warnings;
 use lib '/usr/share/perl5';
@@ -189,7 +256,11 @@ if (\$@) {
 EOF
 )
 
-    if echo "$stale_volumes" | grep -q "ERROR:"; then
+    local timeout_exit_code=$?
+    if [[ $timeout_exit_code -eq 124 ]]; then
+        log_warning "TrueNAS API query timed out after 60 seconds"
+        return 1
+    elif echo "$stale_volumes" | grep -q "ERROR:"; then
         log_warning "Could not query TrueNAS for stale volumes: $stale_volumes"
         return 1
     fi
@@ -221,50 +292,6 @@ EOF
     fi
 }
 
-# Function to clean up any existing test VMs
-cleanup_test_vms() {
-    log_info "Cleaning up any existing test VMs..."
-    local found_existing=false
-
-    for vm in $TEST_VM_BASE $TEST_VM_CLONE; do
-        if timeout 5 qm status $vm >/dev/null 2>&1; then
-            found_existing=true
-            log_info "Found existing VM $vm"
-
-            # Check if VM is locked and provide manual commands if needed
-            if check_vm_locked $vm "cleanup/destruction"; then
-                echo ""
-                log_error "Cannot proceed with tests while VM $vm is locked"
-                echo -e "${YELLOW}Please run the manual commands shown above, then re-run this test script.${NC}"
-                echo ""
-                exit 1
-            fi
-
-            log_info "Destroying existing VM $vm"
-            run_command "qm destroy $vm" >/dev/null 2>&1 || true
-        fi
-    done
-
-    if $found_existing; then
-        log_warning "Found and cleaned up existing test VMs"
-        # Wait for VMs to be fully removed
-        log_step "Waiting for VM cleanup to complete..."
-        sleep 3
-        log_step "VM cleanup completed"
-    fi
-
-    # Check for stale ZFS volumes on TrueNAS
-    if ! check_truenas_stale_volumes "$STORAGE_NAME" "$TEST_VM_BASE $TEST_VM_CLONE"; then
-        echo -e "${RED}⚠️  Please clean up the stale volumes before running tests to avoid conflicts.${NC}"
-        echo -n "   Continue anyway? [y/N]: "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy] ]]; then
-            echo "❌ Test aborted by user."
-            exit 1
-        fi
-        echo ""
-    fi
-}
 
 # Bulk operations helper using embedded Perl
 bulk_delete_snapshots() {
@@ -500,13 +527,20 @@ test_volume_creation() {
     fi
 
     log_step "Adding 2GB disk (may take time for TrueNAS API calls)..."
-    # Capture output to check for rate limiting messages
-    output=$(run_command "qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single" 2>&1)
-    exit_code=$?
-    if check_rate_limit "$output"; then
-        status_rate_limit
-    fi
-    if [ $exit_code -ne 0 ]; then
+    # Capture output and time the volume creation operation
+    time_operation "Volume Creation (2GB)" bash -c "
+        output=\$(run_command \"qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single\" 2>&1)
+        exit_code=\$?
+        if check_rate_limit \"\$output\"; then
+            status_rate_limit
+        fi
+        if [ \$exit_code -ne 0 ]; then
+            echo \"Volume creation failed\" >&2
+            exit 1
+        fi
+        exit 0
+    "
+    if [ $? -ne 0 ]; then
         log_error "Failed to add disk to VM"
         return 1
     fi
@@ -546,13 +580,20 @@ test_snapshot_operations() {
     local snapshot_name="test-snapshot-$(date +%s)"
 
     log_step "Creating snapshot: $snapshot_name..."
-    # Capture output to check for rate limiting messages
-    output=$(run_command "qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'" 2>&1)
-    exit_code=$?
-    if check_rate_limit "$output"; then
-        status_rate_limit
-    fi
-    if [ $exit_code -ne 0 ]; then
+    # Time the snapshot creation operation
+    time_operation "Snapshot Creation" bash -c "
+        output=\$(run_command \"qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'\" 2>&1)
+        exit_code=\$?
+        if check_rate_limit \"\$output\"; then
+            status_rate_limit
+        fi
+        if [ \$exit_code -ne 0 ]; then
+            echo \"Snapshot creation failed\" >&2
+            exit 1
+        fi
+        exit 0
+    "
+    if [ $? -ne 0 ]; then
         log_error "Failed to create snapshot"
         return 1
     fi
@@ -895,10 +936,28 @@ test_volume_deletion() {
     fi
 
     log_step "Verifying storage cleanup..."
-    local remaining_volumes
-    remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
 
-    if [[ -n "$remaining_volumes" ]]; then
+    # Progressive retry logic for cleanup verification
+    local remaining_volumes=""
+    local cleanup_verified=false
+
+    for attempt in {1..10}; do
+        log_to_file "INFO" "Cleanup verification attempt $attempt/10"
+        remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
+
+        if [[ -z "$remaining_volumes" ]]; then
+            cleanup_verified=true
+            log_to_file "SUCCESS" "Storage cleanup verified on attempt $attempt"
+            break
+        fi
+
+        if [[ $attempt -lt 10 ]]; then
+            log_to_file "INFO" "Volumes still present, waiting 3 seconds before retry..."
+            sleep 3
+        fi
+    done
+
+    if [[ "$cleanup_verified" == "false" && -n "$remaining_volumes" ]]; then
         log_to_file "WARNING" "Some volumes remain after VM destruction: $remaining_volumes"
         log_step "Manual cleanup required (qm destroy doesn't call storage plugin cleanup)..."
 
@@ -908,7 +967,16 @@ test_volume_deletion() {
                 local volid=$(echo "$line" | awk '{print $1}')
                 if [[ -n "$volid" ]]; then
                     log_to_file "INFO" "Manually cleaning up volume: $volid"
-                    if timeout 60 pvesm free "$volid" >/dev/null 2>&1; then
+                    time_operation "Volume Deletion ($volid)" bash -c "
+                        if timeout 60 pvesm free \"$volid\" >/dev/null 2>&1; then
+                            echo \"Volume deletion successful\" >&2
+                            exit 0
+                        else
+                            echo \"Volume deletion failed\" >&2
+                            exit 1
+                        fi
+                    "
+                    if [ $? -eq 0 ]; then
                         log_to_file "SUCCESS" "Successfully cleaned up $volid"
                     else
                         log_to_file "WARNING" "Failed to clean up $volid"
@@ -917,11 +985,28 @@ test_volume_deletion() {
             fi
         done <<< "$remaining_volumes"
 
-        # Re-check after manual cleanup
-        remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
+        # Re-check after manual cleanup with progressive retry
+        log_step "Re-verifying cleanup after manual volume deletion..."
+        local final_cleanup_verified=false
+
+        for attempt in {1..5}; do
+            log_to_file "INFO" "Final cleanup verification attempt $attempt/5"
+            remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
+
+            if [[ -z "$remaining_volumes" ]]; then
+                final_cleanup_verified=true
+                log_to_file "SUCCESS" "Final cleanup verified on attempt $attempt"
+                break
+            fi
+
+            if [[ $attempt -lt 5 ]]; then
+                log_to_file "INFO" "Some volumes still present, waiting 5 seconds before retry..."
+                sleep 5
+            fi
+        done
     fi
 
-    if [[ -z "$remaining_volumes" ]]; then
+    if [[ "$cleanup_verified" == "true" || "$final_cleanup_verified" == "true" ]] && [[ -z "$remaining_volumes" ]]; then
         log_to_file "SUCCESS" "All volumes properly cleaned up"
     else
         log_to_file "ERROR" "Some volumes could not be cleaned up: $remaining_volumes"
@@ -986,6 +1071,9 @@ Test Results:
 $passed_tests tests passed
 $error_count errors encountered
 $warning_count warnings issued
+
+Performance Metrics:
+$(grep "TIMING.*Completed:" "$LOG_FILE" 2>/dev/null | sed 's/.*TIMING.*Completed: /⏱️  /' | head -10 || echo "No timing data available")
 
 Storage Information:
 $(timeout 30 pvesm status "$STORAGE_NAME" 2>/dev/null || echo "Storage status unavailable (timeout)")
@@ -1119,6 +1207,45 @@ run_preflight_checks() {
         checks_passed=false
     fi
 
+    # Test TrueNAS API connectivity
+    echo "  🔗 Testing TrueNAS API connectivity..."
+    local api_test_result
+    api_test_result=$(timeout 30 perl << 'EOF'
+use strict;
+use warnings;
+use lib '/usr/share/perl5';
+use PVE::Storage;
+use PVE::Storage::Custom::TrueNASPlugin;
+
+eval {
+    my $storage_config = PVE::Storage::config();
+    my $scfg = PVE::Storage::storage_config($storage_config, $ENV{STORAGE_NAME});
+    die "Storage not found or not TrueNAS plugin\n" unless $scfg && $scfg->{type} eq 'truenasplugin';
+
+    # Test API ping
+    my $result = PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, 'core.ping', [],
+        sub { die "API test requires WebSocket transport"; });
+    print "API_OK\n";
+};
+if ($@) {
+    print "API_ERROR: $@\n";
+}
+EOF
+)
+
+    if echo "$api_test_result" | grep -q "API_OK"; then
+        echo -e "        ${GREEN}✅ TrueNAS API connectivity verified${NC}"
+    elif echo "$api_test_result" | grep -q "API_ERROR"; then
+        local error_msg=$(echo "$api_test_result" | grep "API_ERROR:" | sed 's/API_ERROR: //')
+        echo -e "        ${RED}❌ TrueNAS API connectivity failed${NC}"
+        echo "           Error: $error_msg"
+        echo "           Check TrueNAS host, API key, and network connectivity"
+        checks_passed=false
+    else
+        echo -e "        ${YELLOW}⚠️  TrueNAS API test inconclusive${NC}"
+        echo "           API may be accessible but using different transport"
+    fi
+
     # Check permissions
     echo "  🔐 Checking permissions..."
     if [[ $EUID -eq 0 ]]; then
@@ -1170,6 +1297,17 @@ main() {
     echo -e "${GREEN}✅ Pre-flight checks passed${NC}"
 
     print_stage_header "MAIN TEST EXECUTION" "🧪"
+
+    # Find available VM IDs
+    log_test "Finding available VM IDs for testing"
+    if ! find_available_vm_ids; then
+        log_error "Could not find available VM IDs for testing"
+        echo -e "${RED}❌ Unable to find consecutive available VM IDs${NC}"
+        echo -e "   Consider setting TEST_VM_BASE_HINT environment variable to a different starting ID"
+        echo -e "   Example: ${BLUE}TEST_VM_BASE_HINT=1000 $0 $STORAGE_NAME${NC}"
+        exit 1
+    fi
+    log_success "Selected test VM IDs: $TEST_VM_BASE (base), $TEST_VM_CLONE (clone)"
 
     log_to_file "INFO" "Starting TrueNAS plugin test suite"
     log_to_file "INFO" "Storage: $STORAGE_NAME"
