@@ -498,7 +498,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
             # This is a job ID from an async operation - wait for completion
             syslog('info', "TrueNAS bulk snapshot deletion started (job ID: $results)");
 
-            my $job_result = _wait_for_job_completion($scfg, $results, 90); # 90 second timeout for bulk snapshots
+            my $job_result = _wait_for_job_completion($scfg, $results, 30); # 30 second timeout for bulk snapshots
 
             if ($job_result->{success}) {
                 syslog('info', "TrueNAS bulk snapshot deletion completed successfully");
@@ -1011,10 +1011,15 @@ sub _cleanup_vm_snapshot_config {
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running) = @_;
 
+    # Feature capability check for Proxmox
+
     my $features = {
         snapshot => { current => 1 },
         clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
         copy => { snap => 1, current => 1 },   # Support copying from snapshots and current volumes
+        discard => { current => 1 },           # ZFS handles secure deletion when zvol is destroyed
+        erase => { current => 1 },             # Alternative feature name for secure deletion
+        wipe => { current => 1 },              # Another alternative feature name
     };
 
     # Parse volume information to determine context
@@ -1384,13 +1389,12 @@ sub _run_lines {
 # Check if target sessions are already active
 sub _target_sessions_active($scfg) {
     my $iqn = $scfg->{target_iqn};
-    my $active_sessions = eval {
-        PVE::Tools::run_command(['iscsiadm', '-m', 'session'], outfunc => sub {}, errfunc => sub {})
-    };
-    return 0 if $@; # If command fails, assume no sessions
+
+    # Use eval to safely check for existing sessions
+    my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
+    return 0 if $@; # If command fails (no sessions exist), return false
 
     # Check if our target has active sessions
-    my @session_lines = _run_lines(['iscsiadm', '-m', 'session']);
     for my $line (@session_lines) {
         return 1 if $line =~ /\Q$iqn\E/;
     }
@@ -1670,8 +1674,13 @@ sub alloc_image {
     my $lun = $tx_map ? $tx_map->{lunid} : undef;
     die "could not determine assigned LUN for $zname\n" if !defined $lun;
 
-    # 5) Refresh initiator view on this node (login already exists; rescan & multipath)
-    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    # 5) Refresh initiator view on this node (only if sessions exist)
+    if (_target_sessions_active($scfg)) {
+        eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+    } else {
+        # No sessions exist yet - this is normal for new volume creation
+        syslog('info', "Skipping session rescan - no active sessions for target $scfg->{target_iqn}");
+    }
     if ($scfg->{use_multipath}) {
         eval { _try_run(['multipath','-r'], "multipath reload failed"); };
     }
@@ -1829,8 +1838,8 @@ sub free_image {
                     my $snap_id = URI::Escape::uri_escape($snap_name);
                     my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
                         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
-                    # Handle potential async job for snapshot deletion
-                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 30);
+                    # Handle potential async job for snapshot deletion with shorter timeout
+                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 15);
                     if (!$job_result->{success}) {
                         die $job_result->{error};
                     }
@@ -1852,21 +1861,27 @@ sub free_image {
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
-        # Handle potential async job for dataset deletion
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 60);
+        # Handle potential async job for dataset deletion with shorter timeout
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 20);
         if (!$job_result->{success}) {
             die $job_result->{error};
         }
 
-        syslog('info', "Dataset $full_ds deletion completed successfully (with forced logout)");
+        syslog('info', "Dataset $full_ds deletion completed successfully");
 
         # Mark that we need to re-login
         $need_force_logout = 1;
     } or warn "warning: delete dataset $full_ds failed: $@";
 
-    # 5) Re-login & refresh (only if we did the forced logout)
+    # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
     if ($need_force_logout) {
-        _login_target_all_portals($scfg);
+        syslog('info', "Skipping re-login after volume deletion (device is gone)");
+
+        # Just clean up any stale multipath mappings without reconnecting
+        if ($scfg->{use_multipath}) {
+            eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
+        }
+        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     } else {
         eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
         if ($scfg->{use_multipath}) {
