@@ -1674,13 +1674,18 @@ sub alloc_image {
     my $lun = $tx_map ? $tx_map->{lunid} : undef;
     die "could not determine assigned LUN for $zname\n" if !defined $lun;
 
-    # 5) Refresh initiator view on this node (only if sessions exist)
-    if (_target_sessions_active($scfg)) {
-        eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-    } else {
-        # No sessions exist yet - this is normal for new volume creation
-        syslog('info', "Skipping session rescan - no active sessions for target $scfg->{target_iqn}");
+    # 5) Ensure iSCSI login, then refresh initiator view on this node
+    if (!_target_sessions_active($scfg)) {
+        # No sessions exist yet - login first
+        syslog('info', "No active iSCSI sessions detected - attempting login to target $scfg->{target_iqn}");
+        eval { _iscsi_login_all($scfg); };
+        if ($@) {
+            syslog('warning', "iSCSI login failed during alloc_image: $@");
+            die "Failed to establish iSCSI session: $@\n";
+        }
     }
+    # Now rescan to detect the new LUN
+    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
     if ($scfg->{use_multipath}) {
         eval { _try_run(['multipath','-r'], "multipath reload failed"); };
     }
