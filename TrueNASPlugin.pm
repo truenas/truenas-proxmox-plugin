@@ -796,9 +796,20 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
 }
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full); # encode '/' as %2F for REST
-    return _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
+
+    syslog('info', "Deleting dataset $full with recursive=true (via _tn_dataset_delete)");
+    my $result = _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
     );
+
+    # Handle potential async job for dataset deletion
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion (helper) for $full", 60);
+    if (!$job_result->{success}) {
+        die $job_result->{error};
+    }
+
+    syslog('info', "Dataset $full deletion completed successfully (via _tn_dataset_delete)");
+    return $job_result->{result};
 }
 sub _tn_dataset_get($scfg, $full) {
     my $id = uri_escape($full);
@@ -1683,12 +1694,22 @@ sub free_image {
         }
     }
 
-    # 4) Delete the zvol dataset (recursive/force as safety)
+    # 4) Delete the zvol dataset (recursive/force as safety) with job completion waiting
     eval {
         my $id = URI::Escape::uri_escape($full_ds);
         my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-        _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+
+        syslog('info', "Deleting dataset $full_ds with recursive=true");
+        my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+
+        # Handle potential async job for dataset deletion
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", 60);
+        if (!$job_result->{success}) {
+            die $job_result->{error};
+        }
+
+        syslog('info', "Dataset $full_ds deletion completed successfully");
     } or warn "warning: delete dataset $full_ds failed: $@";
 
     # 5) Re-login & refresh (only if we did the forced logout)
