@@ -5,43 +5,43 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 ## Features
 
 ### 🚀 Core Functionality
-- **iSCSI Block Storage**: Direct integration with TrueNAS SCALE iSCSI targets
-- **ZFS Snapshots**: Instant, space-efficient snapshots via TrueNAS ZFS
-- **Live Snapshots**: Full VM state snapshots including RAM (vmstate)
-- **Cluster Compatible**: Full support for Proxmox VE clusters
-- **Automatic Volume Management**: Dynamic zvol creation and iSCSI extent mapping
+- **iSCSI Block Storage** - Direct integration with TrueNAS SCALE iSCSI targets
+- **ZFS Snapshots** - Instant, space-efficient snapshots via TrueNAS ZFS
+- **Live Snapshots** - Full VM state snapshots including RAM (vmstate)
+- **Cluster Compatible** - Full support for Proxmox VE clusters
+- **Automatic Volume Management** - Dynamic zvol creation and iSCSI extent mapping
 
 ### 🔧 Advanced Features
-- **Dual API Support**: WebSocket (JSON-RPC) and REST API transports
-- **Rate Limiting Protection**: Automatic retry with backoff for TrueNAS API limits
-- **Storage Efficiency**: Thin provisioning and ZFS compression support
-- **Flexible vmstate Storage**: Configurable local or shared vmstate storage
-- **Multi-path Support**: Native support for iSCSI multipathing
-- **CHAP Authentication**: Optional CHAP security for iSCSI connections
+- **Dual API Support** - WebSocket (JSON-RPC) and REST API transports
+- **Rate Limiting Protection** - Automatic retry with backoff for TrueNAS API limits
+- **Storage Efficiency** - Thin provisioning and ZFS compression support
+- **Flexible vmstate Storage** - Configurable local or shared vmstate storage
+- **Multi-path Support** - Native support for iSCSI multipathing
+- **CHAP Authentication** - Optional CHAP security for iSCSI connections
 
 ### 📊 Enterprise Features
-- **Volume Resize**: Grow-only resize with 80% headroom preflight checks
-- **Error Recovery**: Comprehensive error handling and automatic cleanup
-- **Performance Optimization**: Configurable block sizes and sparse volumes
-- **Monitoring Integration**: Full integration with Proxmox storage status
+- **Volume Resize** - Grow-only resize with 80% headroom preflight checks
+- **Error Recovery** - Comprehensive error handling and automatic cleanup
+- **Performance Optimization** - Configurable block sizes and sparse volumes
+- **Monitoring Integration** - Full integration with Proxmox storage status
 
 ## Requirements
 
-### Software Requirements
-- **Proxmox VE**: 8.x or later (9.x recommended for volume chains)
-- **TrueNAS SCALE**: 22.x or later (25.04+ recommended)
-- **Perl**: 5.36 or later
+### Software
+- **Proxmox VE** - 8.x or later (9.x recommended for volume chains)
+- **TrueNAS SCALE** - 22.x or later (25.04+ recommended)
+- **Perl** - 5.36 or later
 
-### Network Requirements
-- **iSCSI Connectivity**: TCP/3260 between Proxmox nodes and TrueNAS
-- **TrueNAS API Access**: HTTPS/443 or HTTP/80 for management API
-- **Cluster Networks**: Shared storage network for cluster deployments
+### Network
+- **iSCSI Connectivity** - TCP/3260 between Proxmox nodes and TrueNAS
+- **TrueNAS API Access** - HTTPS/443 or HTTP/80 for management API
+- **Cluster Networks** - Shared storage network for cluster deployments
 
 ### TrueNAS Configuration
-- **iSCSI Service**: Enabled and configured
-- **API Key**: User-linked API key with appropriate permissions
-- **ZFS Dataset**: Parent dataset for Proxmox volumes
-- **iSCSI Target**: Configured target with portal access
+- **iSCSI Service** - Enabled and configured
+- **API Key** - User-linked API key with appropriate permissions
+- **ZFS Dataset** - Parent dataset for Proxmox volumes
+- **iSCSI Target** - Configured target with portal access
 
 ## Installation
 
@@ -77,7 +77,7 @@ sudo systemctl restart pvedaemon
 sudo systemctl restart pveproxy
 ```
 
-## Configuration Options
+## Configuration
 
 ### Required Parameters
 
@@ -91,27 +91,27 @@ sudo systemctl restart pveproxy
 
 ### Optional Parameters
 
-| Parameter | Description | Default | Available Options |
-|-----------|-------------|---------|-------------------|
+| Parameter | Description | Default | Options |
+|-----------|-------------|---------|---------|
 | `api_transport` | API transport method | `ws` | `ws`, `rest` |
 | `api_scheme` | API scheme | `wss/https` | `wss`, `ws`, `https`, `http` |
-| `api_port` | API port | `443/80` | `443`, `8443`, `80`, `8080`, any valid port |
+| `api_port` | API port | `443/80` | Any valid port |
 | `api_insecure` | Skip TLS verification | `0` | `0`, `1` |
 | `prefer_ipv4` | Prefer IPv4 DNS resolution | `1` | `0`, `1` |
-| `portals` | Additional iSCSI portals | - | `IP:PORT,IP:PORT` (comma-separated) |
+| `portals` | Additional iSCSI portals | - | `IP:PORT,IP:PORT` |
 | `use_multipath` | Enable multipath | `1` | `0`, `1` |
 | `use_by_path` | Use by-path device names | `0` | `0`, `1` |
 | `ipv6_by_path` | Normalize IPv6 by-path names | `0` | `0`, `1` |
 | `force_delete_on_inuse` | Force delete when target in use | `0` | `0`, `1` |
 | `logout_on_free` | Logout target when no LUNs remain | `0` | `0`, `1` |
-| `zvol_blocksize` | ZFS volume block size | - | `4K`, `8K`, `16K`, `32K`, `64K`, `128K`, `256K`, `512K`, `1M` |
+| `zvol_blocksize` | ZFS volume block size | - | `4K` to `1M` |
 | `tn_sparse` | Create sparse volumes | `1` | `0`, `1` |
-| `chap_user` | CHAP username | - | any valid username |
-| `chap_password` | CHAP password | - | any valid password |
+| `chap_user` | CHAP username | - | Any valid username |
+| `chap_password` | CHAP password | - | Any valid password |
 | `vmstate_storage` | vmstate storage location | `local` | `local`, `shared` |
 | `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
 | `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
-| `enable_bulk_operations` | Enable bulk API operations for performance | `1` | `0`, `1` |
+| `enable_bulk_operations` | Enable bulk API operations | `1` | `0`, `1` |
 
 ## Usage Examples
 
@@ -180,11 +180,10 @@ truenasplugin: production-storage
 
 ### Network Optimization
 
-- **Dedicated Storage Network**: Use dedicated 10GbE+ network for iSCSI
-- **Jumbo Frames**: Enable 9000 MTU for better throughput
-- **Multiple Portals**: Configure multiple iSCSI portals for redundancy
-- **MPIO**: Enable multipath I/O for better performance and availability
-
+- **Dedicated Storage Network** - Use dedicated 10GbE+ network for iSCSI
+- **Jumbo Frames** - Enable 9000 MTU for better throughput
+- **Multiple Portals** - Configure multiple iSCSI portals for redundancy
+- **MPIO** - Enable multipath I/O for better performance and availability
 
 ## Cluster Configuration
 
@@ -205,16 +204,15 @@ truenasplugin: shared-storage
 
 ### High Availability
 
-- **Multiple Portals**: Configure redundant iSCSI portals
-- **Network Redundancy**: Use bonded network interfaces
-- **TrueNAS HA**: Deploy TrueNAS in HA configuration
-- **Cluster Quorum**: Ensure proper Proxmox cluster quorum
+- **Multiple Portals** - Configure redundant iSCSI portals
+- **Network Redundancy** - Use bonded network interfaces
+- **TrueNAS HA** - Deploy TrueNAS in HA configuration
+- **Cluster Quorum** - Ensure proper Proxmox cluster quorum
 
 ## Troubleshooting
 
-### Common Issues
+### Connection Problems
 
-#### Connection Problems
 ```bash
 # Test iSCSI connectivity
 iscsiadm -m discovery -t sendtargets -p YOUR_TRUENAS_IP:3260
@@ -226,7 +224,8 @@ iscsiadm -m session
 multipath -ll
 ```
 
-#### API Issues
+### API Issues
+
 ```bash
 # Test TrueNAS API
 curl -k -H "Authorization: Bearer YOUR_API_KEY" \
@@ -236,7 +235,8 @@ curl -k -H "Authorization: Bearer YOUR_API_KEY" \
 tail -f /var/log/syslog | grep -i truenas
 ```
 
-#### Storage Issues
+### Storage Issues
+
 ```bash
 # Check storage status
 pvesm status your-storage-name
@@ -248,32 +248,22 @@ pvesm list your-storage-name
 ls -la /dev/disk/by-path/ | grep iscsi
 ```
 
-### Debug Mode
-
-Enable debug logging by adding to the storage configuration:
-
-```ini
-truenasplugin: your-storage-name
-    # ... other options ...
-    # Enable verbose logging for troubleshooting
-```
-
 ## Security Considerations
 
 ### Network Security
-- **VLAN Isolation**: Use dedicated VLANs for storage traffic
-- **Firewall Rules**: Restrict access to iSCSI and API ports
-- **CHAP Authentication**: Enable CHAP for iSCSI security
+- **VLAN Isolation** - Use dedicated VLANs for storage traffic
+- **Firewall Rules** - Restrict access to iSCSI and API ports
+- **CHAP Authentication** - Enable CHAP for iSCSI security
 
 ### API Security
-- **API Key Rotation**: Regularly rotate TrueNAS API keys
-- **Least Privilege**: Use API keys with minimal required permissions
-- **TLS Verification**: Keep `api_insecure` disabled in production
+- **API Key Rotation** - Regularly rotate TrueNAS API keys
+- **Least Privilege** - Use API keys with minimal required permissions
+- **TLS Verification** - Keep `api_insecure` disabled in production
 
 ### Access Control
-- **User Permissions**: Limit TrueNAS user permissions
-- **Network ACLs**: Use TrueNAS iSCSI authorized networks
-- **Audit Logging**: Enable comprehensive audit logging
+- **User Permissions** - Limit TrueNAS user permissions
+- **Network ACLs** - Use TrueNAS iSCSI authorized networks
+- **Audit Logging** - Enable comprehensive audit logging
 
 ## Known Limitations
 
@@ -282,18 +272,19 @@ truenasplugin: your-storage-name
 #### VM Deletion Behavior
 **Important**: Different VM deletion methods have different cleanup behaviors:
 
-**✅ GUI Deletion (Recommended)**:
+**✅ GUI Deletion (Recommended)**
 - Deleting VMs through the Proxmox web interface properly calls storage plugin cleanup methods
 - Achieves 100% cleanup of both Proxmox volumes and TrueNAS zvols/snapshots
 - **This is the recommended method for production use**
 
-**❌ CLI `qm destroy` Command**:
+**❌ CLI `qm destroy` Command**
 - The `qm destroy` command does NOT call storage plugin cleanup methods
 - Leaves orphaned zvols and snapshots on TrueNAS
 - Proxmox removes internal references but TrueNAS storage remains
 
-**Manual Cleanup Required**:
+**Manual Cleanup Required**
 When using `qm destroy`, you must manually clean up storage:
+
 ```bash
 # After qm destroy, manually free remaining volumes
 pvesm list your-storage-name | grep vm-ID
@@ -320,24 +311,24 @@ pvesm free your-storage-name:vol-vm-ID-disk-N-lunX
 - Ensure adequate network bandwidth between Proxmox and TrueNAS
 - ZFS snapshots within TrueNAS are still instant and space-efficient
 
-### Other Current Limitations
-- **Shrink Operations**: Volume shrinking is not supported (ZFS limitation)
-- **Live Migration**: Requires shared storage configuration
-- **Backup Integration**: Snapshots are not included in Proxmox backups
+### Other Limitations
+- **Shrink Operations** - Volume shrinking is not supported (ZFS limitation)
+- **Live Migration** - Requires shared storage configuration
+- **Backup Integration** - Snapshots are not included in Proxmox backups
 
 ### TrueNAS Specific
-- **API Rate Limits**: TrueNAS limits API requests to 20 calls per 60 seconds with a 10-minute cooldown when exceeded. Automatic retry with backoff is implemented. During heavy operations or testing, you may see harmless rate limit messages.
-- **Persistent Connections**: WebSocket connections are cached and reused to minimize authentication overhead and reduce API calls
-- **Bulk Operations**: When `enable_bulk_operations=1`, multiple operations of the same type are batched using TrueNAS core.bulk API for improved performance
-- **WebSocket Stability**: REST fallback available for unreliable WebSocket connections
-- **Version Compatibility**: Some features require TrueNAS SCALE 25.04+
+- **API Rate Limits** - TrueNAS limits API requests to 20 calls per 60 seconds with a 10-minute cooldown when exceeded. Automatic retry with backoff is implemented.
+- **Persistent Connections** - WebSocket connections are cached and reused to minimize authentication overhead and reduce API calls
+- **Bulk Operations** - When `enable_bulk_operations=1`, multiple operations are batched using TrueNAS core.bulk API for improved performance
+- **WebSocket Stability** - REST fallback available for unreliable WebSocket connections
+- **Version Compatibility** - Some features require TrueNAS SCALE 25.04+
 
 ## Contributing
 
 ### Reporting Issues
-- **Bug Reports**: Include Proxmox and TrueNAS versions
-- **Feature Requests**: Describe use case and benefits
-- **Performance Issues**: Include storage and network configuration
+- **Bug Reports** - Include Proxmox and TrueNAS versions
+- **Feature Requests** - Describe use case and benefits
+- **Performance Issues** - Include storage and network configuration
 
 ---
 
