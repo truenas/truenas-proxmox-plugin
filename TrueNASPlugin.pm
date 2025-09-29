@@ -1686,8 +1686,33 @@ sub alloc_image {
     }
     eval { run_command(['udevadm','settle'], outfunc => sub {}); };
 
-    # 6) Return our encoded volname so Proxmox can store it in the VM config
-    # We use the same naming scheme we handle elsewhere: vol-<zname>-lun<lun>
+    # 6) Verify device is accessible before returning success
+    my $device_ready = 0;
+    for my $attempt (1..20) { # Wait up to 10 seconds for device to appear
+        eval {
+            my $dev = _device_for_lun($scfg, $lun);
+            if ($dev && -e $dev && -b $dev) {
+                syslog('info', "Device $dev is ready for LUN $lun");
+                $device_ready = 1;
+            }
+        };
+        last if $device_ready;
+
+        if ($attempt % 5 == 0) {
+            # Extra discovery/rescan every 2.5 seconds
+            eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
+            if ($scfg->{use_multipath}) {
+                eval { _try_run(['multipath','-r'], "multipath reload"); };
+            }
+            eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+        }
+
+        usleep(500_000); # 500ms between attempts
+    }
+
+    die "Volume created but device not accessible for LUN $lun after 10 seconds\n" unless $device_ready;
+
+    # 7) Return our encoded volname so Proxmox can store it in the VM config
     my $volname = "vol-$zname-lun$lun";
     return $volname;
 }
