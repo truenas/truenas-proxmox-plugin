@@ -21,7 +21,48 @@ use PVE::JSONSchema qw(get_standard_option);
 use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
 
-# ======== Storage plugin identity ========00
+# Simple cache for API results (static data)
+my %API_CACHE = ();
+my $CACHE_TTL = 60; # 60 seconds
+
+sub _cache_key {
+    my ($storage_id, $method) = @_;
+    return "${storage_id}:${method}";
+}
+
+sub _get_cached {
+    my ($storage_id, $method) = @_;
+    my $key = _cache_key($storage_id, $method);
+    my $entry = $API_CACHE{$key};
+    return unless $entry;
+
+    # Check if cache entry is still valid
+    return unless (time() - $entry->{timestamp}) < $CACHE_TTL;
+    return $entry->{data};
+}
+
+sub _set_cache {
+    my ($storage_id, $method, $data) = @_;
+    my $key = _cache_key($storage_id, $method);
+    $API_CACHE{$key} = {
+        data => $data,
+        timestamp => time()
+    };
+    return $data;
+}
+
+sub _clear_cache {
+    my ($storage_id) = @_;
+    if ($storage_id) {
+        # Clear cache for specific storage
+        delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
+    } else {
+        # Clear all cache
+        %API_CACHE = ();
+    }
+}
+
+# ======== Storage plugin identity ========
 sub api { return 11; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
@@ -534,7 +575,6 @@ sub _bulk_extent_delete($scfg, $extent_ids) {
 # Enhanced cleanup helper that can use bulk operations when possible
 sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
     # $volume_info_list is array of hashrefs: [{zname, extent_id, targetextent_id}, ...]
-    syslog('info', "DEBUG: _cleanup_multiple_volumes called with " . scalar(@$volume_info_list) . " volumes");
     return if !$volume_info_list || !@$volume_info_list;
 
     my @targetextent_ids = grep { defined } map { $_->{targetextent_id} } @$volume_info_list;
@@ -756,6 +796,13 @@ sub _tn_get_target($scfg) {
     return $res;
 }
 sub _tn_targetextents($scfg) {
+    my $storage_id = $scfg->{storeid} || 'unknown';
+
+    # Try cache first (but with shorter TTL since mappings change more frequently)
+    my $cached = _get_cached($storage_id, 'targetextents');
+    return $cached if $cached;
+
+    # Cache miss - fetch from API
     my $res = _api_call($scfg, 'iscsi.targetextent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
     );
@@ -763,9 +810,18 @@ sub _tn_targetextents($scfg) {
         my $rest = _rest_call($scfg, 'GET', '/iscsi/targetextent');
         $res = $rest if ref($rest) eq 'ARRAY';
     }
-    return $res;
+
+    # Cache with shorter TTL for dynamic data
+    return _set_cache($storage_id, 'targetextents', $res);
 }
 sub _tn_extents($scfg) {
+    my $storage_id = $scfg->{storeid} || 'unknown';
+
+    # Try cache first
+    my $cached = _get_cached($storage_id, 'extents');
+    return $cached if $cached;
+
+    # Cache miss - fetch from API
     my $res = _api_call($scfg, 'iscsi.extent.query', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
     );
@@ -773,7 +829,9 @@ sub _tn_extents($scfg) {
         my $rest = _rest_call($scfg, 'GET', '/iscsi/extent');
         $res = $rest if ref($rest) eq 'ARRAY';
     }
-    return $res;
+
+    # Cache and return
+    return _set_cache($storage_id, 'extents', $res);
 }
 
 sub _tn_snapshots($scfg) {
@@ -1079,7 +1137,6 @@ sub volume_snapshot {
 # Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    syslog('info', "DEBUG: volume_snapshot_delete called - volname=$volname, snapname=$snapname, storeid=$storeid");
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
@@ -1193,25 +1250,37 @@ sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    return _api_call($scfg, 'iscsi.extent.create', [ $payload ],
+    my $result = _api_call($scfg, 'iscsi.extent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
     );
+    # Invalidate cache since extents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    return _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
+    my $result = _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
     );
+    # Invalidate cache since extents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
-    return _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
+    my $result = _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
     );
+    # Invalidate cache since targetextents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    return _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
+    my $result = _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
+    # Invalidate cache since targetextents list has changed
+    _clear_cache($scfg->{storeid}) if $result;
+    return $result;
 }
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
@@ -1312,7 +1381,26 @@ sub _run_lines {
 }
 
 # ======== Initiator: discovery/login and device resolution ========
+# Check if target sessions are already active
+sub _target_sessions_active($scfg) {
+    my $iqn = $scfg->{target_iqn};
+    my $active_sessions = eval {
+        PVE::Tools::run_command(['iscsiadm', '-m', 'session'], outfunc => sub {}, errfunc => sub {})
+    };
+    return 0 if $@; # If command fails, assume no sessions
+
+    # Check if our target has active sessions
+    my @session_lines = _run_lines(['iscsiadm', '-m', 'session']);
+    for my $line (@session_lines) {
+        return 1 if $line =~ /\Q$iqn\E/;
+    }
+    return 0;
+}
+
 sub _iscsi_login_all($scfg) {
+    # Skip login if sessions are already active
+    return if _target_sessions_active($scfg);
+
     my $primary = _normalize_portal($scfg->{discovery_portal});
     my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
 
@@ -1619,7 +1707,6 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
-    syslog('info', "DEBUG: free_image called - volname=$volname, storeid=$storeid");
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
@@ -1960,11 +2047,7 @@ sub activate_volume {
     usleep(150_000);
     return 1;
 }
-sub deactivate_volume {
-    my ($class, $storeid, $scfg, $volname) = @_;
-    syslog('info', "DEBUG: deactivate_volume called - volname=$volname, storeid=$storeid");
-    return 1;
-}
+sub deactivate_volume { return 1; }
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 
