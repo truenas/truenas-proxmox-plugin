@@ -1071,11 +1071,21 @@ sub volume_snapshot_delete {
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
     my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
-    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap>
-    _api_call(
+    syslog('info', "Deleting individual snapshot: $snap_full");
+
+    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap> with job completion waiting
+    my $result = _api_call(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
     );
+
+    # Handle potential async job for snapshot deletion
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", 30);
+    if (!$job_result->{success}) {
+        die $job_result->{error};
+    }
+
+    syslog('info', "Individual snapshot deletion completed successfully: $snap_full");
     return undef;
 }
 
@@ -1694,12 +1704,19 @@ sub free_image {
         }
     }
 
-    # 4) Delete the zvol dataset (recursive/force as safety) with job completion waiting
+    # 4) Ensure disconnection, then delete the zvol dataset (recursive/force as safety)
     eval {
+        # Force logout to ensure dataset isn't busy during deletion
+        syslog('info', "Forcing logout before dataset deletion to prevent 'busy' state");
+        _logout_target_all_portals($scfg);
+
+        # Small delay to ensure logout completes
+        sleep(2);
+
         my $id = URI::Escape::uri_escape($full_ds);
         my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
 
-        syslog('info', "Deleting dataset $full_ds with recursive=true");
+        syslog('info', "Deleting dataset $full_ds with recursive=true (after forced logout)");
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
@@ -1709,7 +1726,10 @@ sub free_image {
             die $job_result->{error};
         }
 
-        syslog('info', "Dataset $full_ds deletion completed successfully");
+        syslog('info', "Dataset $full_ds deletion completed successfully (with forced logout)");
+
+        # Mark that we need to re-login
+        $need_force_logout = 1;
     } or warn "warning: delete dataset $full_ds failed: $@";
 
     # 5) Re-login & refresh (only if we did the forced logout)
