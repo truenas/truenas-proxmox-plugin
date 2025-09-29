@@ -534,6 +534,7 @@ sub _bulk_extent_delete($scfg, $extent_ids) {
 # Enhanced cleanup helper that can use bulk operations when possible
 sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
     # $volume_info_list is array of hashrefs: [{zname, extent_id, targetextent_id}, ...]
+    syslog('info', "DEBUG: _cleanup_multiple_volumes called with " . scalar(@$volume_info_list) . " volumes");
     return if !$volume_info_list || !@$volume_info_list;
 
     my @targetextent_ids = grep { defined } map { $_->{targetextent_id} } @$volume_info_list;
@@ -774,6 +775,18 @@ sub _tn_extents($scfg) {
     }
     return $res;
 }
+
+sub _tn_snapshots($scfg) {
+    my $res = _api_call($scfg, 'zfs.snapshot.query', [],
+        sub { _rest_call($scfg, 'GET', '/zfs/snapshot') }
+    );
+    if (ref($res) eq 'ARRAY' && !@$res) {
+        my $rest = _rest_call($scfg, 'GET', '/zfs/snapshot');
+        $res = $rest if ref($rest) eq 'ARRAY';
+    }
+    return $res;
+}
+
 sub _tn_global($scfg) {
     return _api_call($scfg, 'iscsi.global.config', [],
         sub { _rest_call($scfg, 'GET', '/iscsi/global') }
@@ -1066,6 +1079,7 @@ sub volume_snapshot {
 # Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
+    syslog('info', "DEBUG: volume_snapshot_delete called - volname=$volname, snapname=$snapname, storeid=$storeid");
     my (undef, $zname) = $class->parse_volname($volname);
     my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
@@ -1605,6 +1619,7 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+    syslog('info', "DEBUG: free_image called - volname=$volname, storeid=$storeid");
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
@@ -1704,7 +1719,7 @@ sub free_image {
         }
     }
 
-    # 4) Ensure disconnection, then delete the zvol dataset (recursive/force as safety)
+    # 4) Ensure disconnection, then delete all snapshots before deleting the zvol dataset
     eval {
         # Force logout to ensure dataset isn't busy during deletion
         syslog('info', "Forcing logout before dataset deletion to prevent 'busy' state");
@@ -1713,10 +1728,40 @@ sub free_image {
         # Small delay to ensure logout completes
         sleep(2);
 
-        my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
+        # First, delete ALL snapshots for this zvol to ensure clean deletion
+        syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
+        my $snapshots = _tn_snapshots($scfg) // [];
+        my @volume_snapshots = grep { $_->{name} && $_->{name} =~ /^\Q$full_ds\E@/ } @$snapshots;
 
-        syslog('info', "Deleting dataset $full_ds with recursive=true (after forced logout)");
+        if (@volume_snapshots) {
+            syslog('info', "Found " . scalar(@volume_snapshots) . " snapshots for $full_ds, deleting them first");
+            for my $snap (@volume_snapshots) {
+                my $snap_name = $snap->{name};
+                syslog('info', "Deleting snapshot $snap_name before volume deletion");
+                eval {
+                    my $snap_id = URI::Escape::uri_escape($snap_name);
+                    my $result = _api_call($scfg, 'zfs.snapshot.delete', [ $snap_name ],
+                        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$snap_id", undef) });
+                    # Handle potential async job for snapshot deletion
+                    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot deletion for $snap_name", 30);
+                    if (!$job_result->{success}) {
+                        die $job_result->{error};
+                    }
+                    syslog('info', "Successfully deleted snapshot $snap_name");
+                };
+                if ($@) {
+                    syslog('warning', "Failed to delete snapshot $snap_name: $@");
+                }
+            }
+        } else {
+            syslog('info', "No snapshots found for $full_ds");
+        }
+
+        # Now delete the zvol dataset
+        my $id = URI::Escape::uri_escape($full_ds);
+        my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+
+        syslog('info', "Deleting dataset $full_ds (after snapshot cleanup)");
         my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
             sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
@@ -1915,7 +1960,11 @@ sub activate_volume {
     usleep(150_000);
     return 1;
 }
-sub deactivate_volume { return 1; }
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    syslog('info', "DEBUG: deactivate_volume called - volname=$volname, storeid=$storeid");
+    return 1;
+}
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 

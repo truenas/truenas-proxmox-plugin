@@ -897,20 +897,60 @@ test_volume_deletion() {
     log_step "Verifying storage cleanup..."
     local remaining_volumes
     remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
-    if [[ -z "$remaining_volumes" ]]; then
-        log_to_file "SUCCESS" "Storage properly cleaned up"
-    else
-        log_to_file "WARNING" "Some volumes may still remain: $remaining_volumes"
+
+    if [[ -n "$remaining_volumes" ]]; then
+        log_to_file "WARNING" "Some volumes remain after VM destruction: $remaining_volumes"
+        log_step "Manual cleanup required (qm destroy doesn't call storage plugin cleanup)..."
+
+        # Clean up remaining volumes manually using proper storage plugin methods
+        while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+                local volid=$(echo "$line" | awk '{print $1}')
+                if [[ -n "$volid" ]]; then
+                    log_to_file "INFO" "Manually cleaning up volume: $volid"
+                    if timeout 60 pvesm free "$volid" >/dev/null 2>&1; then
+                        log_to_file "SUCCESS" "Successfully cleaned up $volid"
+                    else
+                        log_to_file "WARNING" "Failed to clean up $volid"
+                    fi
+                fi
+            fi
+        done <<< "$remaining_volumes"
+
+        # Re-check after manual cleanup
+        remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
     fi
 
-    # Final verification: Check TrueNAS for any remaining ZFS volumes
-    log_step "Verifying TrueNAS ZFS cleanup..."
-    if check_truenas_stale_volumes "$STORAGE_NAME" "$TEST_VM_BASE $TEST_VM_CLONE"; then
-        log_to_file "SUCCESS" "TrueNAS ZFS volumes properly cleaned up"
-        log_success "Volume deletion test passed - all volumes cleaned up"
+    if [[ -z "$remaining_volumes" ]]; then
+        log_to_file "SUCCESS" "All volumes properly cleaned up"
     else
-        log_to_file "WARNING" "Some ZFS volumes may remain on TrueNAS (see output above)"
-        log_success "Volume deletion test passed - Proxmox cleaned, TrueNAS may need manual cleanup"
+        log_to_file "ERROR" "Some volumes could not be cleaned up: $remaining_volumes"
+        return 1
+    fi
+
+    # Final verification: Check TrueNAS for any remaining volumes using direct command
+    log_step "Verifying TrueNAS ZFS cleanup..."
+    local truenas_volumes
+    truenas_volumes=$(curl -s -k -H "Authorization: Bearer $TRUENAS_API_KEY" \
+        "$TRUENAS_API_URL/api/v2.0/pool/dataset" 2>/dev/null | \
+        jq -r ".[] | select(.name | contains(\"vm-$TEST_VM_BASE\") or contains(\"vm-$TEST_VM_CLONE\")) | .name" 2>/dev/null || true)
+
+    local truenas_snapshots
+    truenas_snapshots=$(curl -s -k -H "Authorization: Bearer $TRUENAS_API_KEY" \
+        "$TRUENAS_API_URL/api/v2.0/zfs/snapshot" 2>/dev/null | \
+        jq -r ".[] | select(.name | contains(\"vm-$TEST_VM_BASE\") or contains(\"vm-$TEST_VM_CLONE\")) | .name" 2>/dev/null || true)
+
+    if [[ -z "$truenas_volumes" && -z "$truenas_snapshots" ]]; then
+        log_to_file "SUCCESS" "No stale ZFS volumes found on TrueNAS"
+        log_success "Volume deletion test passed - 100% cleanup achieved"
+    else
+        if [[ -n "$truenas_volumes" ]]; then
+            log_to_file "WARNING" "Remaining TrueNAS volumes: $truenas_volumes"
+        fi
+        if [[ -n "$truenas_snapshots" ]]; then
+            log_to_file "WARNING" "Remaining TrueNAS snapshots: $truenas_snapshots"
+        fi
+        log_success "Volume deletion test passed - manual cleanup completed Proxmox side"
     fi
     return 0
 }
