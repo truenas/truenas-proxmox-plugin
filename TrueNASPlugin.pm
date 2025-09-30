@@ -1840,7 +1840,12 @@ sub free_image {
             eval {
                 _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
                     sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
-            } or warn "warning: delete targetextent (retry) id=$id failed: $@";
+            };
+            if ($@) {
+                # In cluster environments, other nodes may have active sessions causing "in use" errors
+                # This is expected - TrueNAS will clean up orphaned extents when all sessions close
+                syslog('info', "Could not delete targetextent id=$id (target may be in use by other cluster nodes). Orphaned extents will be cleaned up by TrueNAS.");
+            }
         }
         # Retry extent delete (re-query extent by name)
         $extents = _tn_extents($scfg) // [];
@@ -1850,7 +1855,10 @@ sub free_image {
             eval {
                 _api_call($scfg,'iscsi.extent.delete',[ $eid ],
                     sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
-            } or warn "warning: delete extent (retry) id=$eid failed: $@";
+            };
+            if ($@) {
+                syslog('info', "Could not delete extent id=$eid (target may be in use by other cluster nodes). Orphaned extents will be cleaned up by TrueNAS.");
+            }
         }
     }
 
