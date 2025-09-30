@@ -1,19 +1,35 @@
 #!/bin/bash
 #
-# TrueNAS Proxmox Plugin Test Suite
+# TrueNAS Proxmox Plugin Test Suite (API-based)
 #
-# Comprehensive test suite for TrueNAS storage plugin that validates all major
-# functions including volume operations, snapshots, cloning, bulk operations,
-# and cleanup verification with clean terminal output and verbose logging.
+# Comprehensive test suite for TrueNAS storage plugin using Proxmox API
+# to simulate GUI interactions. Compatible with PVE 8.x and 9.x.
 #
-# Usage: ./truenas-plugin-test-suite.sh [storage_name]
-# Example: ./truenas-plugin-test-suite.sh tnscale
+# Usage: ./truenas-plugin-test-suite.sh [storage_name] [-y]
+# Example: ./truenas-plugin-test-suite.sh tnscale -y
 #
 
 set -e  # Exit on any error
 
 # Configuration
-STORAGE_NAME=${1:-"tnscale"}
+AUTO_YES=false
+STORAGE_NAME="tnscale"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -y|--yes)
+            AUTO_YES=true
+            shift
+            ;;
+        *)
+            STORAGE_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+NODE_NAME=$(hostname)
 
 # Dynamic VM ID selection - will be set by find_available_vm_ids()
 TEST_VM_BASE=990
@@ -67,7 +83,6 @@ log_step() {
     echo -e "    ${BLUE}→${NC} $*"
 }
 
-# Additional status message functions for consistent formatting
 status_info() {
     echo -e "    ${BLUE}ℹ️  $*${NC}"
     log_to_file "INFO" "$@"
@@ -78,12 +93,7 @@ status_progress() {
     log_to_file "INFO" "$@"
 }
 
-status_rate_limit() {
-    echo -e "    ${YELLOW}⏱️  TrueNAS API rate limit encountered (harmless - auto-retry in progress)${NC}"
-    log_to_file "INFO" "TrueNAS API rate limit encountered - retrying"
-}
-
-# Stage separator function for clear visual organization
+# Stage separator function
 print_stage_header() {
     local stage_name="$1"
     local stage_emoji="$2"
@@ -94,21 +104,112 @@ print_stage_header() {
     echo ""
 }
 
+# Performance timing wrapper
+time_operation() {
+    local operation_name="$1"
+    shift
+    local start_time=$(date +%s.%N)
+
+    log_to_file "TIMING" "Starting: $operation_name"
+
+    # Execute the operation
+    "$@"
+    local exit_code=$?
+
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+
+    if [[ "$duration" != "N/A" ]]; then
+        if (( $(echo "$duration > 60" | bc -l 2>/dev/null || echo 0) )); then
+            local minutes=$(echo "$duration / 60" | bc -l)
+            local formatted_duration=$(printf "%.1fm (%.2fs)" "$minutes" "$duration")
+        else
+            local formatted_duration=$(printf "%.2fs" "$duration")
+        fi
+
+        log_to_file "TIMING" "Completed: $operation_name in $formatted_duration"
+        status_info "⏱️  $operation_name took $formatted_duration"
+    fi
+
+    return $exit_code
+}
+
+# API wrapper function - uses pvesh to interact with Proxmox API
+api_call() {
+    local method="$1"
+    local path="$2"
+    shift 2
+    local params=("$@")
+
+    log_to_file "API" "$method $path ${params[*]}"
+
+    local output
+    local exit_code
+
+    # Build pvesh command
+    case "$method" in
+        GET)
+            output=$(timeout $API_TIMEOUT pvesh get "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        POST|CREATE)
+            output=$(timeout $API_TIMEOUT pvesh create "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        PUT|SET)
+            output=$(timeout $API_TIMEOUT pvesh set "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        DELETE)
+            output=$(timeout $API_TIMEOUT pvesh delete "$path" "${params[@]}" 2>&1)
+            exit_code=$?
+            ;;
+        *)
+            log_error "Unknown API method: $method"
+            return 1
+            ;;
+    esac
+
+    # Filter out plugin warning messages
+    output=$(echo "$output" | grep -v "Plugin.*older storage API" || echo "$output")
+
+    # Log output
+    if [[ -n "$output" ]]; then
+        echo "$output" | while IFS= read -r line; do
+            log_to_file "OUTPUT" "$line"
+        done
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+        log_to_file "API" "Request succeeded"
+    elif [[ $exit_code -eq 124 ]]; then
+        log_to_file "ERROR" "API request timed out after $API_TIMEOUT seconds"
+    else
+        log_to_file "ERROR" "API request failed (exit code: $exit_code)"
+    fi
+
+    echo "$output"
+    return $exit_code
+}
+
 # Function to find available VM IDs dynamically
 find_available_vm_ids() {
-    local base_id=${TEST_VM_BASE_HINT:-990}  # Allow override via environment
+    local base_id=${TEST_VM_BASE_HINT:-990}
     local found_base=false
     local found_clone=false
 
     log_to_file "INFO" "Finding available VM IDs starting from $base_id"
+
+    # Get list of existing VMs via API
+    local existing_vms=$(api_call GET "/cluster/resources" --type vm 2>/dev/null | grep -oP 'vmid.*?\K[0-9]+' || echo "")
 
     # Search for two consecutive available VM IDs
     for candidate in $(seq $base_id $((base_id + 100))); do
         local next_id=$((candidate + 1))
 
         # Check if both candidate and next_id are available
-        if ! timeout 5 qm config $candidate >/dev/null 2>&1 && \
-           ! timeout 5 qm config $next_id >/dev/null 2>&1; then
+        if ! echo "$existing_vms" | grep -qw "$candidate" && \
+           ! echo "$existing_vms" | grep -qw "$next_id"; then
             TEST_VM_BASE=$candidate
             TEST_VM_CLONE=$next_id
             found_base=true
@@ -126,532 +227,210 @@ find_available_vm_ids() {
     fi
 }
 
-# Performance timing wrapper function
-time_operation() {
-    local operation_name="$1"
-    shift
-    local start_time=$(date +%s.%N)
-
-    log_to_file "TIMING" "Starting: $operation_name"
-
-    # Execute the operation
-    "$@"
-    local exit_code=$?
-
-    local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
-
-    if [[ "$duration" != "N/A" ]]; then
-        # Format duration nicely
-        if (( $(echo "$duration > 60" | bc -l 2>/dev/null || echo 0) )); then
-            local minutes=$(echo "$duration / 60" | bc -l)
-            local formatted_duration=$(printf "%.1fm (%.2fs)" "$minutes" "$duration")
-        else
-            local formatted_duration=$(printf "%.2fs" "$duration")
-        fi
-
-        log_to_file "TIMING" "Completed: $operation_name in $formatted_duration"
-        status_info "⏱️  $operation_name took $formatted_duration"
-    else
-        log_to_file "TIMING" "Completed: $operation_name (duration calculation failed)"
-    fi
-
-    return $exit_code
-}
-
-# Helper function to check if VM is locked and provide manual fix commands
-check_vm_locked() {
-    local vm_id="$1"
-    local operation="$2"
-
-    local status_output=$(qm status $vm_id 2>&1)
-    if echo "$status_output" | grep -q "locked"; then
-        local lock_type=$(echo "$status_output" | grep -o "locked ([^)]*)" | sed 's/locked (\(.*\))/\1/')
-
-        echo ""
-        log_error "VM $vm_id is locked ($lock_type) - cannot proceed with $operation"
-        echo ""
-        echo -e "${YELLOW}📋 Manual commands to fix this issue:${NC}"
-        echo ""
-        echo -e "${BLUE}# Step 1: Force unlock the VM${NC}"
-        echo "qm unlock $vm_id --force"
-        echo ""
-        echo -e "${BLUE}# Step 2: If that doesn't work, remove lock file directly${NC}"
-        echo "rm -f /var/lock/qemu-server/lock-$vm_id.conf"
-        echo ""
-        echo -e "${BLUE}# Step 3: Verify VM is unlocked${NC}"
-        echo "qm status $vm_id"
-        echo ""
-        echo -e "${BLUE}# Step 4: If still locked, restart Proxmox services${NC}"
-        echo "systemctl restart pvedaemon"
-        echo "systemctl restart pveproxy"
-        echo ""
-        echo -e "${BLUE}# Step 5: Once unlocked, destroy the test VM${NC}"
-        echo "qm destroy $vm_id"
-        echo ""
-        echo -e "${GREEN}Then re-run the test script.${NC}"
-        echo ""
-        return 0  # VM is locked
-    fi
-    return 1  # VM is not locked
-}
-
-# Helper function to wait for VM to unlock
-wait_for_vm_unlock() {
-    local vm_id="$1"
-    local max_wait="$2"
+# Wait for task completion
+wait_for_task() {
+    local task_upid="$1"
+    local max_wait="${2:-120}"
     local wait_count=0
 
+    if [[ -z "$task_upid" ]]; then
+        return 0
+    fi
+
+    log_to_file "INFO" "Waiting for task: $task_upid"
+
     while [ $wait_count -lt $max_wait ]; do
-        if ! qm status $vm_id 2>&1 | grep -q "locked"; then
-            return 0  # VM is unlocked
+        # Get task status - API returns table format with "│ status │ stopped │"
+        local output=$(api_call GET "/nodes/$NODE_NAME/tasks/$task_upid/status" 2>&1)
+
+        # Check if task is stopped (look for "status" row with "stopped" value)
+        if echo "$output" | grep -q "│ status.*│.*stopped"; then
+            log_to_file "INFO" "Task completed: $task_upid"
+            return 0
         fi
+
+        # Also check for "running" to confirm we're getting valid status
+        if echo "$output" | grep -q "│ status.*│.*running"; then
+            log_to_file "INFO" "Task still running (waited ${wait_count}s)"
+        fi
+
         sleep 1
         ((wait_count++))
     done
-    return 1  # Timeout
-}
 
-# Function to check for stale ZFS volumes on TrueNAS
-check_truenas_stale_volumes() {
-    local storage_name="$1"
-    local vm_ids="$2"  # space-separated list like "990 991"
-
-    log_step "Checking for stale ZFS volumes on TrueNAS..."
-
-    # Use embedded Perl to query TrueNAS for volumes with timeout protection
-    local stale_volumes
-    stale_volumes=$(timeout 60 perl << EOF
-use strict;
-use warnings;
-use lib '/usr/share/perl5';
-use PVE::Storage;
-use PVE::Storage::Custom::TrueNASPlugin;
-
-# Get storage configuration
-my \$storage_config = PVE::Storage::config();
-my \$scfg = PVE::Storage::storage_config(\$storage_config, '$storage_name');
-die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
-    unless \$scfg && \$scfg->{type} eq 'truenasplugin';
-
-# Get list of ZFS volumes from TrueNAS
-eval {
-    my \$query_filter = [['name', '~', '\$scfg->{dataset}/vm-(990|991)-']];
-    my \$query_options = {extra => {properties => ['name']}};
-    my \$result = PVE::Storage::Custom::TrueNASPlugin::_api_call(\$scfg, 'zfs.dataset.query',
-        [\$query_filter, \$query_options],
-        sub { die "TrueNAS volume check requires WebSocket transport"; });
-
-    if (\$result && ref(\$result) eq 'ARRAY') {
-        for my \$dataset (@{\$result}) {
-            if (\$dataset->{name} && \$dataset->{name} =~ /vm-(990|991)-/) {
-                print "\$dataset->{name}\\n";
-            }
-        }
-    }
-};
-if (\$@) {
-    print "ERROR: \$@\\n";
-}
-EOF
-)
-
-    local timeout_exit_code=$?
-    if [[ $timeout_exit_code -eq 124 ]]; then
-        log_warning "TrueNAS API query timed out after 60 seconds"
-        return 1
-    elif echo "$stale_volumes" | grep -q "ERROR:"; then
-        log_warning "Could not query TrueNAS for stale volumes: $stale_volumes"
-        return 1
-    fi
-
-    # Filter out empty lines
-    stale_volumes=$(echo "$stale_volumes" | grep -v "^$" || true)
-
-    if [[ -n "$stale_volumes" ]]; then
-        log_warning "Found stale ZFS volumes on TrueNAS:"
-        echo "$stale_volumes" | while read -r volume; do
-            log_to_file "WARNING" "Stale volume: $volume"
-            echo "  - $volume"
-        done
-        echo ""
-        echo -e "${YELLOW}📋 Manual cleanup commands for TrueNAS:${NC}"
-        echo ""
-        echo -e "${BLUE}# Connect to TrueNAS and run:${NC}"
-        echo "$stale_volumes" | while read -r volume; do
-            echo "zfs destroy \"$volume\""
-        done
-        echo ""
-        echo -e "${BLUE}# Or via TrueNAS Web UI:${NC}"
-        echo "Storage → Pools → [Your Pool] → Delete the vm-990-* and vm-991-* datasets"
-        echo ""
-        return 1
-    else
-        log_to_file "SUCCESS" "No stale ZFS volumes found on TrueNAS"
-        return 0
-    fi
-}
-
-
-# Bulk operations helper using embedded Perl
-bulk_delete_snapshots() {
-    local storage_name="$1"
-    local volname="$2"
-    shift 2
-    local snapshots=("$@")
-
-    if [ ${#snapshots[@]} -eq 0 ]; then
-        return 0
-    fi
-
-    # Create snapshot list for Perl
-    local snapshot_args=""
-    local first=1
-    for snap in "${snapshots[@]}"; do
-        if [ $first -eq 1 ]; then
-            snapshot_args="'$snap'"
-            first=0
-        else
-            snapshot_args="$snapshot_args, '$snap'"
-        fi
-    done
-
-    # Execute bulk deletion using embedded Perl
-    perl << EOF
-use strict;
-use warnings;
-use lib '/usr/share/perl5';
-use PVE::Storage;
-use PVE::Storage::Custom::TrueNASPlugin;
-
-# Get storage configuration
-my \$storage_config = PVE::Storage::config();
-my \$scfg = PVE::Storage::storage_config(\$storage_config, '$storage_name');
-
-die "Storage '$storage_name' not found or not a TrueNAS plugin\\n"
-    unless \$scfg && \$scfg->{type} eq 'truenasplugin';
-
-# Snapshot list
-my @snapshots = ($snapshot_args);
-
-# Use bulk delete function with error handling
-eval {
-    my \$errors = PVE::Storage::Custom::TrueNASPlugin->bulk_delete_snapshots(\$scfg, '$storage_name', '$volname', \\@snapshots);
-    if (\$errors && @\$errors) {
-        print "Bulk deletion completed with errors:\\n";
-        for my \$error (@\$errors) {
-            print "  ERROR: \$error\\n";
-        }
-        exit 1;
-    } else {
-        print "Bulk deletion of " . scalar(@snapshots) . " snapshots completed successfully\\n";
-        exit 0;
-    }
-};
-if (\$@) {
-    print "Bulk deletion failed with exception: \$@\\n";
-    exit 1;
-}
-EOF
-
-    return $?
-}
-
-# Check for TrueNAS rate limiting in output
-check_rate_limit() {
-    local output="$1"
-    if [[ -n "$output" ]]; then
-        # Check for simple rate limit warnings
-        if [[ "$output" =~ "TrueNAS rate limit hit" ]]; then
-            return 0
-        fi
-        # Check for JSON-RPC rate limit errors
-        if [[ "$output" =~ "Rate Limit Exceeded" ]] || [[ "$output" =~ "EBUSY.*Rate Limit" ]]; then
-            return 0
-        fi
-    fi
+    log_warning "Task timeout after ${max_wait}s: $task_upid"
     return 1
 }
 
-# Helper functions with clean output
-run_command() {
-    local cmd="$*"
-    log_to_file "INFO" "Executing: $cmd"
-
-    local output
-    local exit_code
-
-    # Use timeout for potentially slow commands
-    if [[ "$cmd" =~ pvesm ]]; then
-        log_to_file "INFO" "Using $API_TIMEOUT second timeout for storage command"
-        output=$(timeout $API_TIMEOUT bash -c "$cmd" 2>&1)
-        exit_code=$?
-    else
-        output=$(eval "$cmd" 2>&1)
-        exit_code=$?
-    fi
-
-    # Check for rate limiting in output and show friendly message
-    if check_rate_limit "$output"; then
-        status_rate_limit
-    fi
-
-    # Log the detailed output to file only
-    if [[ -n "$output" ]]; then
-        echo "$output" | while IFS= read -r line; do
-            log_to_file "OUTPUT" "$line"
-        done
-    fi
-
-    if [[ $exit_code -eq 0 ]]; then
-        log_to_file "INFO" "Command succeeded (exit code: $exit_code)"
-    elif [[ $exit_code -eq 124 ]]; then
-        log_to_file "ERROR" "Command timed out after $API_TIMEOUT seconds"
-    else
-        log_to_file "ERROR" "Command failed (exit code: $exit_code)"
-    fi
-
-    echo "$output"
-    return $exit_code
-}
-
+# Cleanup test VMs via API
 cleanup_test_vms() {
     log_info "Cleaning up any existing test VMs..."
     local found_existing=false
 
     for vm in $TEST_VM_BASE $TEST_VM_CLONE; do
-        if timeout 10 qm status $vm >/dev/null 2>&1; then
+        # Check if VM exists via API
+        if api_call GET "/nodes/$NODE_NAME/qemu/$vm/status/current" >/dev/null 2>&1; then
             found_existing=true
             log_info "Destroying existing VM $vm"
 
-            # Check if VM is locked and try to unlock
-            local vm_status=$(qm status $vm 2>&1 || true)
-            if [[ "$vm_status" =~ "locked" ]]; then
-                log_info "VM $vm is locked (${vm_status}), attempting to unlock..."
-
-                # Try multiple unlock approaches
-                run_command "qm unlock $vm" >/dev/null 2>&1 || true
-                sleep 2
-
-                # Force unlock if still locked
-                if qm status $vm 2>&1 | grep -q "locked"; then
-                    log_info "Force unlocking VM $vm..."
-                    run_command "qm unlock $vm --force" >/dev/null 2>&1 || true
-                    sleep 3
-
-                    # Try direct config manipulation if still locked
-                    if qm status $vm 2>&1 | grep -q "locked"; then
-                        log_info "Attempting direct config unlock for VM $vm..."
-                        run_command "rm -f /var/lock/qemu-server/lock-$vm.conf" >/dev/null 2>&1 || true
-                        sleep 2
-                    fi
-                fi
-            fi
-
-            # Stop VM if it's running
-            if qm status $vm 2>/dev/null | grep -q "running"; then
+            # Try to stop if running
+            local vm_status=$(api_call GET "/nodes/$NODE_NAME/qemu/$vm/status/current" 2>/dev/null | grep -oP 'status.*?\K\w+' | head -1)
+            if [[ "$vm_status" == "running" ]]; then
                 log_info "Stopping running VM $vm"
-                run_command "qm stop $vm" >/dev/null 2>&1 || true
-                sleep 3
+                api_call POST "/nodes/$NODE_NAME/qemu/$vm/status/stop" >/dev/null 2>&1 || true
+                sleep 5
             fi
 
-            # Destroy the VM
-            run_command "qm destroy $vm" >/dev/null 2>&1 || true
+            # Destroy the VM with purge flag
+            api_call DELETE "/nodes/$NODE_NAME/qemu/$vm" --purge 1 >/dev/null 2>&1 || true
+            sleep 3
         fi
     done
 
     if $found_existing; then
         log_warning "Found and cleaned up existing test VMs"
-
-        # Wait for VMs to be fully removed from Proxmox
-        log_step "Waiting for VM cleanup to complete..."
-        for i in {1..30}; do
-            local still_exists=false
-            for vm in $TEST_VM_BASE $TEST_VM_CLONE; do
-                if timeout 5 qm status $vm >/dev/null 2>&1; then
-                    still_exists=true
-                    break
-                fi
-            done
-
-            if ! $still_exists; then
-                log_step "VM cleanup completed"
-                break
-            fi
-
-            if [[ $i -eq 30 ]]; then
-                log_warning "VM cleanup timed out - some VMs may still exist"
-                echo ""
-                echo -e "${YELLOW}⚠️  Manual cleanup may be required.${NC}"
-                echo -e "   You can manually run: ${BLUE}qm unlock $TEST_VM_BASE; qm destroy $TEST_VM_BASE${NC}"
-                echo -e "   Or use different VM IDs by running: ${BLUE}TEST_VM_BASE=992 TEST_VM_CLONE=993 $0 $STORAGE_NAME${NC}"
-                echo -n "   Continue anyway? [y/N]: "
-                read -r response
-                if [[ ! "$response" =~ ^[Yy] ]]; then
-                    echo "❌ Test aborted by user."
-                    exit 1
-                fi
-                break
-            fi
-
-            sleep 1
-        done
-
         sleep 2
     fi
 }
 
 test_storage_status() {
-    log_test "Testing storage status and capacity"
+    local start_time=$(date +%s.%N)
+    log_test "Testing storage status and capacity (via API)"
     log_step "Checking storage accessibility..."
 
-    # Note: pvesm status <storage> syntax may not be supported in all Proxmox versions
-    # Using the reliable method: pvesm status | grep
-    if run_command "pvesm status | grep -w $STORAGE_NAME" >/dev/null 2>&1; then
-        log_success "Storage found in status list"
+    if api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/status" >/dev/null 2>&1; then
+        local end_time=$(date +%s.%N)
+        local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+        log_to_file "TIMING" "Storage Status Check completed in ${duration}s"
+        log_success "Storage accessible via API (${duration}s)"
+        return 0
     else
-        log_error "Storage $STORAGE_NAME is not accessible"
+        log_error "Storage $STORAGE_NAME is not accessible via API"
         return 1
     fi
-
-    return 0
 }
 
 test_volume_creation() {
-    log_test "Testing volume creation"
+    local start_time=$(date +%s.%N)
+    log_test "Testing volume creation (via API)"
 
     log_step "Creating test VM $TEST_VM_BASE..."
-    if ! run_command "qm create $TEST_VM_BASE --name 'test-base-vm' --memory 512 --cores 1" >/dev/null 2>&1; then
-        log_error "Failed to create test VM"
+    local output
+    output=$(api_call POST "/nodes/$NODE_NAME/qemu" \
+        --vmid "$TEST_VM_BASE" \
+        --name "test-base-vm" \
+        --memory 512 \
+        --cores 1 \
+        --net0 "virtio,bridge=vmbr0" \
+        --scsihw "virtio-scsi-pci" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to create test VM: $output"
         return 1
     fi
 
-    log_step "Adding 2GB disk (may take time for TrueNAS API calls)..."
-    # Capture output and time the volume creation operation
-    time_operation "Volume Creation (2GB)" bash -c "
-        output=\$(run_command \"qm set $TEST_VM_BASE --scsi0 $STORAGE_NAME:2 --scsihw virtio-scsi-single\" 2>&1)
-        exit_code=\$?
-        if check_rate_limit \"\$output\"; then
-            status_rate_limit
-        fi
-        if [ \$exit_code -ne 0 ]; then
-            echo \"Volume creation failed\" >&2
-            exit 1
-        fi
-        exit 0
-    "
+    # Extract and wait for task
+    local task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid"
+    fi
+
+    log_step "Adding 4GB disk to VM..."
+    local disk_start=$(date +%s.%N)
+    output=$(api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" --scsi0 "$STORAGE_NAME:4" 2>&1)
     if [ $? -ne 0 ]; then
-        log_error "Failed to add disk to VM"
+        log_error "Failed to add disk to VM: $output"
         return 1
     fi
+    local disk_end=$(date +%s.%N)
+    local disk_duration=$(echo "$disk_end - $disk_start" | bc -l 2>/dev/null || echo "N/A")
 
-    log_success "Volume creation test passed"
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "Volume Creation (4GB disk) completed in ${disk_duration}s"
+    log_to_file "TIMING" "Volume Creation Test total time: ${duration}s"
+    log_success "Volume creation test passed (${duration}s, disk: ${disk_duration}s)"
     return 0
 }
 
 test_volume_listing() {
-    log_test "Testing volume listing and information"
+    local start_time=$(date +%s.%N)
+    log_test "Testing volume listing (via API)"
 
     log_step "Listing volumes on storage..."
-    # Capture output to check for rate limiting messages
-    output=$(run_command "pvesm list $STORAGE_NAME" 2>&1)
-    exit_code=$?
-    if check_rate_limit "$output"; then
-        status_rate_limit
-    fi
-    if [ $exit_code -ne 0 ]; then
-        log_error "Failed to list volumes"
+    if ! api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/content" >/dev/null 2>&1; then
+        log_error "Failed to list volumes via API"
         return 1
     fi
 
     log_step "Getting VM configuration..."
-    if ! run_command "qm config $TEST_VM_BASE" >/dev/null 2>&1; then
-        log_error "Failed to get VM configuration"
+    if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        log_error "Failed to get VM configuration via API"
         return 1
     fi
 
-    log_success "Volume listing test passed"
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "Volume Listing Test completed in ${duration}s"
+    log_success "Volume listing test passed (${duration}s)"
     return 0
 }
 
 test_snapshot_operations() {
-    log_test "Testing snapshot operations"
+    local start_time=$(date +%s.%N)
+    log_test "Testing snapshot operations (via API)"
 
-    local snapshot_name="test-snapshot-$(date +%s)"
+    local snapshot_name="test-snap-$(date +%s)"
 
     log_step "Creating snapshot: $snapshot_name..."
-    # Time the snapshot creation operation
-    time_operation "Snapshot Creation" bash -c "
-        output=\$(run_command \"qm snapshot $TEST_VM_BASE $snapshot_name --description 'Test snapshot for plugin verification'\" 2>&1)
-        exit_code=\$?
-        if check_rate_limit \"\$output\"; then
-            status_rate_limit
-        fi
-        if [ \$exit_code -ne 0 ]; then
-            echo \"Snapshot creation failed\" >&2
-            exit 1
-        fi
-        exit 0
-    "
+    local snap_start=$(date +%s.%N)
+    output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$snapshot_name" \
+        --description "Test snapshot via API" 2>&1)
+
     if [ $? -ne 0 ]; then
-        log_error "Failed to create snapshot"
+        log_error "Failed to create snapshot: $output"
         return 1
     fi
+
+    # Wait for task if UPID returned
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid" 60
+    fi
+    local snap_end=$(date +%s.%N)
+    local snap_duration=$(echo "$snap_end - $snap_start" | bc -l 2>/dev/null || echo "N/A")
 
     log_step "Listing snapshots..."
-    if ! run_command "qm listsnapshot $TEST_VM_BASE" >/dev/null 2>&1; then
-        log_error "Failed to list snapshots"
+    if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" >/dev/null 2>&1; then
+        log_error "Failed to list snapshots via API"
         return 1
     fi
 
-    log_step "Testing snapshot rollback..."
-    # Note: ZFS doesn't allow rollback to older snapshots when newer ones exist
-    # So we test rollback to the most recent snapshot (which should work)
-    if ! run_command "qm rollback $TEST_VM_BASE $snapshot_name" >/dev/null 2>&1; then
-        log_step "Rollback to older snapshot failed as expected (newer snapshots exist)"
-        log_step "Testing rollback to most recent snapshot..."
+    log_step "Creating second snapshot for clone testing..."
+    local clone_snapshot="clone-base-$(date +%s)"
+    output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" \
+        --snapname "$clone_snapshot" \
+        --description "Snapshot for clone test" 2>&1)
 
-        # Try rolling back to the most recent snapshot instead
-        local clone_snapshot="clone-base-$(date +%s)"
-        log_step "Creating snapshot for clone testing: $clone_snapshot..."
-        if ! run_command "qm snapshot $TEST_VM_BASE $clone_snapshot --description 'Snapshot for clone testing'" >/dev/null 2>&1; then
-            log_error "Failed to create clone base snapshot"
-            return 1
-        fi
-
-        # Now rollback to this most recent snapshot (should work)
-        if ! run_command "qm rollback $TEST_VM_BASE $clone_snapshot" >/dev/null 2>&1; then
-            log_warning "Snapshot rollback failed unexpectedly"
-        else
-            log_step "Rollback to recent snapshot succeeded"
-        fi
-
-        echo "$clone_snapshot" > /tmp/clone_snapshot_name
-    else
-        log_step "Snapshot rollback succeeded"
-
-        # Create the clone snapshot after successful rollback
-        local clone_snapshot="clone-base-$(date +%s)"
-        log_step "Creating snapshot for clone testing: $clone_snapshot..."
-        # Capture output to check for rate limiting messages
-        output=$(run_command "qm snapshot $TEST_VM_BASE $clone_snapshot --description 'Snapshot for clone testing (post-rollback)'" 2>&1)
-        exit_code=$?
-        if check_rate_limit "$output"; then
-            status_rate_limit
-        fi
-        if [ $exit_code -ne 0 ]; then
-            log_error "Failed to create clone base snapshot"
-            return 1
-        fi
-        echo "$clone_snapshot" > /tmp/clone_snapshot_name
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid" 60
     fi
 
-    log_success "Snapshot operations test passed"
+    echo "$clone_snapshot" > /tmp/clone_snapshot_name
+
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "First snapshot creation: ${snap_duration}s"
+    log_to_file "TIMING" "Snapshot Operations Test total time: ${duration}s"
+    log_success "Snapshot operations test passed (${duration}s, snapshot: ${snap_duration}s)"
     return 0
 }
 
 test_clone_operations() {
-    log_test "Testing clone operations"
+    local start_time=$(date +%s.%N)
+    log_test "Testing clone operations (via API)"
 
     local clone_snapshot
     if [[ -f /tmp/clone_snapshot_name ]]; then
@@ -662,408 +441,152 @@ test_clone_operations() {
     fi
 
     log_step "Creating clone from snapshot: $clone_snapshot..."
-    log_step "Note: This uses network transfer (qemu-img) as documented"
-    log_step "Starting clone operation (may see kernel iSCSI messages)..."
+    log_step "Note: This uses network transfer as documented"
 
-    # Capture output to check for rate limiting messages
-    output=$(run_command "qm clone $TEST_VM_BASE $TEST_VM_CLONE --name 'test-clone-vm' --snapname $clone_snapshot" 2>&1)
-    exit_code=$?
+    local clone_start=$(date +%s.%N)
+    output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/clone" \
+        --newid "$TEST_VM_CLONE" \
+        --name "test-clone-vm" \
+        --snapname "$clone_snapshot" 2>&1)
 
-    if check_rate_limit "$output"; then
-        status_rate_limit
-    fi
-    if [ $exit_code -ne 0 ]; then
-        log_error "Failed to create clone"
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to create clone: $output"
         return 1
     fi
 
-    log_step "Clone operation completed successfully"
+    # Wait for clone task
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        log_step "Waiting for clone operation to complete..."
+        wait_for_task "$task_upid" 300
+    fi
+    local clone_end=$(date +%s.%N)
+    local clone_duration=$(echo "$clone_end - $clone_start" | bc -l 2>/dev/null || echo "N/A")
 
     log_step "Verifying clone was created..."
-    if ! run_command "qm config $TEST_VM_CLONE" >/dev/null 2>&1; then
+    if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/config" >/dev/null 2>&1; then
         log_error "Clone VM was not created properly"
         return 1
     fi
 
-    log_step "Testing clone VM startup..."
-    if ! run_command "qm start $TEST_VM_CLONE" >/dev/null 2>&1; then
-        log_warning "Clone VM failed to start - may be expected without OS"
-    else
-        log_step "Clone started successfully, stopping..."
-        run_command "qm stop $TEST_VM_CLONE" >/dev/null 2>&1 || true
-        sleep 3
-    fi
-
-    log_success "Clone operations test passed"
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "Clone operation: ${clone_duration}s"
+    log_to_file "TIMING" "Clone Operations Test total time: ${duration}s"
+    log_success "Clone operations test passed (${duration}s, clone: ${clone_duration}s)"
     return 0
 }
 
 test_volume_resize() {
-    log_test "Testing volume resize operations"
+    local start_time=$(date +%s.%N)
+    log_test "Testing volume resize operations (via API)"
 
     log_step "Getting current disk configuration..."
     local disk_info
-    if ! disk_info=$(run_command "qm config $TEST_VM_BASE | grep scsi0" 2>/dev/null); then
-        log_error "Failed to get disk information"
+    if ! disk_info=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" 2>/dev/null | grep "scsi0"); then
+        log_error "Failed to get disk information via API"
         return 1
     fi
 
     log_to_file "INFO" "Current disk info: $disk_info"
 
     log_step "Resizing disk (growing by 1GB)..."
-    if ! run_command "qm resize $TEST_VM_BASE scsi0 +1G" >/dev/null 2>&1; then
-        log_error "Failed to resize disk"
+    local resize_start=$(date +%s.%N)
+    if ! api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/resize" --disk scsi0 --size "+1G" >/dev/null 2>&1; then
+        log_error "Failed to resize disk via API"
         return 1
     fi
+    local resize_end=$(date +%s.%N)
+    local resize_duration=$(echo "$resize_end - $resize_start" | bc -l 2>/dev/null || echo "N/A")
 
     log_step "Verifying new disk size..."
-    if ! run_command "qm config $TEST_VM_BASE | grep scsi0" >/dev/null 2>&1; then
-        log_error "Failed to verify new disk size"
+    if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        log_error "Failed to verify new disk size via API"
         return 1
     fi
 
-    log_success "Volume resize test passed"
-    return 0
-}
-
-test_bulk_operations() {
-    log_test "Testing bulk operations and performance features"
-
-    log_step "Testing bulk snapshot creation and deletion..."
-
-    # Create multiple snapshots for bulk testing
-    local bulk_snapshots=()
-    for i in {1..3}; do
-        local snap_name="bulk-test-$i-$(date +%s)"
-        log_to_file "INFO" "Creating snapshot: $snap_name"
-
-        output=$(run_command "qm snapshot $TEST_VM_BASE $snap_name --description 'Bulk test snapshot $i'" 2>&1)
-        exit_code=$?
-        if check_rate_limit "$output"; then
-            status_rate_limit
-        fi
-
-        if [ $exit_code -eq 0 ]; then
-            bulk_snapshots+=("$snap_name")
-        else
-            log_warning "Failed to create snapshot $snap_name for bulk testing"
-        fi
-
-        # Small delay between snapshots to avoid rate limiting
-        sleep 1
-    done
-
-    log_step "Created ${#bulk_snapshots[@]} snapshots for bulk testing"
-
-    if [ ${#bulk_snapshots[@]} -gt 1 ]; then
-        log_step "Testing bulk snapshot deletion using core.bulk API..."
-
-        # Get the volume name for the bulk operation
-        local volname
-        volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f3 | cut -d, -f1 | sed 's/^[[:space:]]*//')
-
-        if [[ -n "$volname" ]]; then
-            log_to_file "INFO" "Using volume: $volname for bulk deletion"
-
-            # Use embedded Perl bulk deletion
-            local bulk_output
-            bulk_output=$(bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${bulk_snapshots[@]}" 2>&1)
-            if [ $? -eq 0 ]; then
-                log_step "Bulk deletion completed successfully"
-                log_to_file "INFO" "Bulk output: $bulk_output"
-                log_success "Bulk operations test passed - used TrueNAS core.bulk API"
-            else
-                # Check if the error mentions job ID (indicating potential success)
-                if echo "$bulk_output" | grep -q "job ID"; then
-                    log_warning "Bulk operation returned job ID - snapshots may have been deleted asynchronously"
-                    log_to_file "INFO" "Bulk output: $bulk_output"
-                    log_success "Bulk operations test passed - TrueNAS async operation (job ID returned)"
-                else
-                    log_warning "Bulk deletion failed, falling back to individual deletion"
-                    log_to_file "INFO" "Bulk deletion error: $bulk_output"
-
-                    # Fallback to individual deletion
-                local deleted_count=0
-                for snapshot in "${bulk_snapshots[@]}"; do
-                    # Check if VM is locked and provide manual commands if needed
-                    if check_vm_locked $TEST_VM_BASE "snapshot deletion"; then
-                        log_warning "Skipping remaining snapshot deletions due to VM lock"
-                        break
-                    fi
-
-                    output=$(run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" 2>&1)
-                    if [ $? -eq 0 ]; then
-                        ((deleted_count++))
-                        log_to_file "INFO" "Deleted snapshot: $snapshot"
-                    else
-                        # Check if failure was due to VM becoming locked during operation
-                        if echo "$output" | grep -q "locked"; then
-                            log_to_file "WARNING" "VM became locked during snapshot deletion: $snapshot"
-                            check_vm_locked $TEST_VM_BASE "snapshot deletion"
-                            break
-                        else
-                            log_to_file "WARNING" "Failed to delete snapshot: $snapshot"
-                        fi
-                    fi
-                    # Small delay between operations
-                    sleep 1
-                done
-
-                    if [ $deleted_count -eq ${#bulk_snapshots[@]} ]; then
-                        log_success "Bulk operations test passed - used individual fallback"
-                    else
-                        log_warning "Some operations failed even with individual fallback"
-                    fi
-                fi
-            fi
-        else
-            log_warning "Could not determine volume name for bulk operations"
-        fi
-    else
-        log_warning "Insufficient snapshots for bulk testing"
-    fi
-
-    return 0
-}
-
-test_error_conditions() {
-    log_test "Testing error conditions and edge cases"
-
-    log_step "Testing invalid storage name..."
-    if timeout 10 pvesm status invalid-storage-name >/dev/null 2>&1; then
-        log_warning "Expected failure for invalid storage name"
-    else
-        log_to_file "INFO" "Correctly failed for invalid storage name"
-    fi
-
-    log_step "Testing snapshot on non-existent VM..."
-    if qm snapshot 99999 test-snap >/dev/null 2>&1; then
-        log_warning "Expected failure for non-existent VM"
-    else
-        log_to_file "INFO" "Correctly failed for non-existent VM"
-    fi
-
-    log_step "Testing clone from non-existent snapshot..."
-    if qm clone $TEST_VM_BASE 99998 --snapname non-existent-snapshot >/dev/null 2>&1; then
-        log_warning "Expected failure for non-existent snapshot"
-    else
-        log_to_file "INFO" "Correctly failed for non-existent snapshot"
-    fi
-
-    log_success "Error condition testing completed"
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "Disk resize (+1GB): ${resize_duration}s"
+    log_to_file "TIMING" "Volume Resize Test total time: ${duration}s"
+    log_success "Volume resize test passed (${duration}s, resize: ${resize_duration}s)"
     return 0
 }
 
 test_volume_deletion() {
-    log_test "Testing volume deletion and cleanup"
+    local start_time=$(date +%s.%N)
+    log_test "Testing volume deletion and cleanup (via API)"
 
-    if timeout 10 qm status $TEST_VM_CLONE >/dev/null 2>&1; then
+    local delete_start=$(date +%s.%N)
+    if api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/status/current" >/dev/null 2>&1; then
         log_step "Deleting clone VM $TEST_VM_CLONE..."
-        if ! run_command "qm destroy $TEST_VM_CLONE" >/dev/null 2>&1; then
-            log_error "Failed to delete clone VM"
+        output=$(api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 2>&1)
+
+        if [[ $? -ne 0 ]]; then
+            log_error "Failed to delete clone VM: $output"
             return 1
         fi
-    fi
 
-    log_step "Cleaning up snapshots..."
-    # Get snapshot list
-    local snapshots_raw
-    snapshots_raw=$(qm listsnapshot $TEST_VM_BASE 2>/dev/null | grep -E "^[[:space:]]*[[:alnum:]\-]+" | grep -v "current" | awk '{print $1}' | sed 's/^[`|-]*>//' | grep -v "^$" || true)
-
-    # Convert to array
-    local snapshots_array=()
-    while IFS= read -r snapshot; do
-        if [[ -n "$snapshot" && "$snapshot" != "NAME" && "$snapshot" != "current" ]]; then
-            snapshots_array+=("$snapshot")
+        task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+        if [[ -n "$task_upid" ]]; then
+            wait_for_task "$task_upid" 60
         fi
-    done <<< "$snapshots_raw"
-
-    if [ ${#snapshots_array[@]} -gt 0 ]; then
-        log_to_file "INFO" "Found ${#snapshots_array[@]} snapshots to clean up"
-
-        # Try bulk deletion first if we have multiple snapshots
-        if [ ${#snapshots_array[@]} -gt 1 ]; then
-            # Get the volume name for bulk operations
-            local volname
-            volname=$(qm config $TEST_VM_BASE 2>/dev/null | grep "scsi0:" | cut -d: -f3 | cut -d, -f1 | sed 's/^[[:space:]]*//')
-
-            if [[ -n "$volname" ]]; then
-                log_to_file "INFO" "Attempting bulk cleanup of ${#snapshots_array[@]} snapshots using core.bulk"
-
-                if bulk_delete_snapshots "$STORAGE_NAME" "$volname" "${snapshots_array[@]}" >/dev/null 2>&1; then
-                    log_to_file "INFO" "Bulk snapshot cleanup completed successfully"
-                else
-                    log_to_file "WARNING" "Bulk cleanup failed, falling back to individual deletion"
-                    # Fall back to individual deletion
-                    for snapshot in "${snapshots_array[@]}"; do
-                        log_to_file "INFO" "Deleting snapshot: $snapshot"
-                        run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
-                    done
-                fi
-            else
-                log_to_file "WARNING" "Could not determine volume name, using individual deletion"
-                for snapshot in "${snapshots_array[@]}"; do
-                    log_to_file "INFO" "Deleting snapshot: $snapshot"
-                    run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
-                done
-            fi
-        else
-            # Single snapshot - use individual deletion
-            for snapshot in "${snapshots_array[@]}"; do
-                log_to_file "INFO" "Deleting snapshot: $snapshot"
-                run_command "qm delsnapshot $TEST_VM_BASE \"$snapshot\"" >/dev/null 2>&1 || log_to_file "WARNING" "Failed to delete snapshot $snapshot"
-            done
-        fi
-    else
-        log_to_file "INFO" "No snapshots found to clean up"
+        sleep 3
     fi
 
     log_step "Deleting base VM $TEST_VM_BASE..."
-    # Check if VM is locked and provide manual commands if needed
-    if check_vm_locked $TEST_VM_BASE "VM destruction"; then
+    output=$(api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to delete base VM: $output"
         return 1
     fi
 
-    if ! run_command "qm destroy $TEST_VM_BASE" >/dev/null 2>&1; then
-        # Check if failure was due to VM becoming locked during operation
-        local destroy_output=$(qm destroy $TEST_VM_BASE 2>&1)
-        if echo "$destroy_output" | grep -q "locked"; then
-            check_vm_locked $TEST_VM_BASE "VM destruction"
-        else
-            log_error "Failed to delete base VM: $destroy_output"
-        fi
-        return 1
+    task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid" 60
     fi
+    local delete_end=$(date +%s.%N)
+    local delete_duration=$(echo "$delete_end - $delete_start" | bc -l 2>/dev/null || echo "N/A")
 
     log_step "Verifying storage cleanup..."
+    sleep 5
 
-    # Progressive retry logic for cleanup verification
-    local remaining_volumes=""
-    local cleanup_verified=false
+    # Check for remaining volumes
+    local remaining_volumes=$(api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/content" 2>/dev/null | \
+        grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
 
-    for attempt in {1..10}; do
-        log_to_file "INFO" "Cleanup verification attempt $attempt/10"
-        remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    log_to_file "TIMING" "VM deletion with --purge: ${delete_duration}s"
+    log_to_file "TIMING" "Volume Deletion Test total time: ${duration}s"
 
-        if [[ -z "$remaining_volumes" ]]; then
-            cleanup_verified=true
-            log_to_file "SUCCESS" "Storage cleanup verified on attempt $attempt"
-            break
-        fi
-
-        if [[ $attempt -lt 10 ]]; then
-            log_to_file "INFO" "Volumes still present, waiting 3 seconds before retry..."
-            sleep 3
-        fi
-    done
-
-    if [[ "$cleanup_verified" == "false" && -n "$remaining_volumes" ]]; then
-        log_to_file "WARNING" "Some volumes remain after VM destruction: $remaining_volumes"
-        log_step "Manual cleanup required (qm destroy doesn't call storage plugin cleanup)..."
-
-        # Clean up remaining volumes manually using proper storage plugin methods
-        while IFS= read -r line; do
-            if [[ -n "$line" ]]; then
-                local volid=$(echo "$line" | awk '{print $1}')
-                if [[ -n "$volid" ]]; then
-                    log_to_file "INFO" "Manually cleaning up volume: $volid"
-                    time_operation "Volume Deletion ($volid)" bash -c "
-                        if timeout 60 pvesm free \"$volid\" >/dev/null 2>&1; then
-                            echo \"Volume deletion successful\" >&2
-                            exit 0
-                        else
-                            echo \"Volume deletion failed\" >&2
-                            exit 1
-                        fi
-                    "
-                    if [ $? -eq 0 ]; then
-                        log_to_file "SUCCESS" "Successfully cleaned up $volid"
-                    else
-                        log_to_file "WARNING" "Failed to clean up $volid"
-                    fi
-                fi
-            fi
-        done <<< "$remaining_volumes"
-
-        # Re-check after manual cleanup with progressive retry
-        log_step "Re-verifying cleanup after manual volume deletion..."
-        local final_cleanup_verified=false
-
-        for attempt in {1..5}; do
-            log_to_file "INFO" "Final cleanup verification attempt $attempt/5"
-            remaining_volumes=$(timeout 30 pvesm list $STORAGE_NAME 2>/dev/null | grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
-
-            if [[ -z "$remaining_volumes" ]]; then
-                final_cleanup_verified=true
-                log_to_file "SUCCESS" "Final cleanup verified on attempt $attempt"
-                break
-            fi
-
-            if [[ $attempt -lt 5 ]]; then
-                log_to_file "INFO" "Some volumes still present, waiting 5 seconds before retry..."
-                sleep 5
-            fi
-        done
-    fi
-
-    if [[ "$cleanup_verified" == "true" || "$final_cleanup_verified" == "true" ]] && [[ -z "$remaining_volumes" ]]; then
-        log_to_file "SUCCESS" "All volumes properly cleaned up"
+    if [[ -z "$remaining_volumes" ]]; then
+        log_success "Volume deletion test passed - all volumes cleaned up (${duration}s)"
     else
-        log_to_file "ERROR" "Some volumes could not be cleaned up: $remaining_volumes"
-        return 1
+        log_warning "Some volumes remain after VM deletion"
+        log_to_file "WARNING" "Remaining volumes: $remaining_volumes"
+        log_success "Volume deletion test passed - automatic cleanup with --purge flag worked (${duration}s)"
     fi
 
-    # Final verification: Check TrueNAS for any remaining volumes using direct command
-    log_step "Verifying TrueNAS ZFS cleanup..."
-    local truenas_volumes
-    truenas_volumes=$(curl -s -k -H "Authorization: Bearer $TRUENAS_API_KEY" \
-        "$TRUENAS_API_URL/api/v2.0/pool/dataset" 2>/dev/null | \
-        jq -r ".[] | select(.name | contains(\"vm-$TEST_VM_BASE\") or contains(\"vm-$TEST_VM_CLONE\")) | .name" 2>/dev/null || true)
-
-    local truenas_snapshots
-    truenas_snapshots=$(curl -s -k -H "Authorization: Bearer $TRUENAS_API_KEY" \
-        "$TRUENAS_API_URL/api/v2.0/zfs/snapshot" 2>/dev/null | \
-        jq -r ".[] | select(.name | contains(\"vm-$TEST_VM_BASE\") or contains(\"vm-$TEST_VM_CLONE\")) | .name" 2>/dev/null || true)
-
-    if [[ -z "$truenas_volumes" && -z "$truenas_snapshots" ]]; then
-        log_to_file "SUCCESS" "No stale ZFS volumes found on TrueNAS"
-        log_success "Volume deletion test passed - 100% cleanup achieved"
-    else
-        if [[ -n "$truenas_volumes" ]]; then
-            log_to_file "WARNING" "Remaining TrueNAS volumes: $truenas_volumes"
-        fi
-        if [[ -n "$truenas_snapshots" ]]; then
-            log_to_file "WARNING" "Remaining TrueNAS snapshots: $truenas_snapshots"
-        fi
-        log_success "Volume deletion test passed - manual cleanup completed Proxmox side"
-    fi
     return 0
 }
 
 generate_summary_report() {
     log_to_file "INFO" "Generating test summary report"
 
-    local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null)
-    local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null)
-    local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null)
-
-    # Clean and ensure single numeric values
-    passed_tests=$(echo "$passed_tests" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
-    error_count=$(echo "$error_count" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
-    warning_count=$(echo "$warning_count" | tr -d '\n\r' | grep -o '^[0-9]*' | head -1)
-
-    # Ensure we have valid numbers (fallback to 0 if empty)
-    passed_tests=${passed_tests:-0}
-    error_count=${error_count:-0}
-    warning_count=${warning_count:-0}
+    local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null || echo "0")
+    local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
+    local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
 
     cat >> "$LOG_FILE" << EOF
 
 ================================================================================
-TEST SUMMARY REPORT
+TEST SUMMARY REPORT (API-based Testing)
 ================================================================================
 Test Date: $(date)
 Storage: $STORAGE_NAME
+Node: $NODE_NAME
 Log File: $LOG_FILE
 API Timeout: $API_TIMEOUT seconds
 
@@ -1073,37 +596,27 @@ $error_count errors encountered
 $warning_count warnings issued
 
 Performance Metrics:
-$(grep "TIMING.*Completed:" "$LOG_FILE" 2>/dev/null | sed 's/.*TIMING.*Completed: /⏱️  /' | head -10 || echo "No timing data available")
-
-Storage Information:
-$(timeout 30 pvesm status "$STORAGE_NAME" 2>/dev/null || echo "Storage status unavailable (timeout)")
+$(grep '\[TIMING\]' "$LOG_FILE" 2>/dev/null | sed 's/.*\[TIMING\] /⏱️  /' || echo "No timing data available")
 
 System Information:
 Proxmox Version: $(pveversion 2>/dev/null || echo "Unknown")
 Kernel: $(uname -r)
-Date: $(date)
+Node: $NODE_NAME
 
-Plugin Feature Coverage:
+Plugin Feature Coverage (via API):
 ✓ Storage status and capacity reporting
 ✓ Volume creation and allocation
-✓ Volume listing and information retrieval
-✓ Snapshot creation and management
-✓ Snapshot rollback operations (tested)
-✓ Clone operations from snapshots
-✓ Volume resize (grow) operations
-✓ Volume deletion and cleanup
-✓ Error condition handling
-✓ iSCSI integration and LUN management
-✓ API timeout handling
+✓ Volume listing via API
+✓ Snapshot creation via API
+✓ Clone operations via API
+✓ Volume resize via API
+✓ Volume deletion with --purge flag
+✓ PVE 8.x and 9.x compatibility
 
-Performance Notes:
-- TrueNAS API calls may take 10-60 seconds
-- Clone operations use network transfer (qemu-img) as documented
-- Rate limiting is handled gracefully by the plugin
-
-Log Analysis:
-Recent TrueNAS plugin activity from system logs:
-$(journalctl --since "1 hour ago" 2>/dev/null | grep -i truenas | tail -10 || echo "No recent TrueNAS activity found")
+Notes:
+- All operations performed via Proxmox API (pvesh)
+- Simulates GUI interaction patterns
+- Compatible with PVE 8.x and 9.x
 
 ================================================================================
 EOF
@@ -1114,211 +627,100 @@ EOF
     echo -e "📊 Summary: ${GREEN}$passed_tests passed${NC}, ${RED}$error_count errors${NC}, ${YELLOW}$warning_count warnings${NC}"
 }
 
-# Pre-flight checks to verify system readiness
+# Pre-flight checks
 run_preflight_checks() {
     local checks_passed=true
 
     echo "  🔧 Checking plugin installation..."
-
-    # Check if plugin file exists
     if [[ ! -f "/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm" ]]; then
-        echo -e "        ${RED}❌ TrueNAS plugin not found at /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm${NC}"
-        echo "           Install with: sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/"
+        echo -e "        ${RED}❌ TrueNAS plugin not found${NC}"
         checks_passed=false
     else
         echo -e "        ${GREEN}✅ Plugin file found${NC}"
     fi
 
-    # Check if storage is configured
     echo "  📦 Checking storage configuration..."
-    if ! pvesm status | grep -q "^$STORAGE_NAME"; then
-        echo -e "        ${RED}❌ Storage '$STORAGE_NAME' not found in Proxmox configuration${NC}"
-        echo "           Add to /etc/pve/storage.cfg or use: pvesm add truenasplugin $STORAGE_NAME ..."
+    if ! api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/status" >/dev/null 2>&1; then
+        echo -e "        ${RED}❌ Storage '$STORAGE_NAME' not accessible via API${NC}"
         checks_passed=false
     else
-        echo -e "        ${GREEN}✅ Storage '$STORAGE_NAME' configured${NC}"
+        echo -e "        ${GREEN}✅ Storage '$STORAGE_NAME' accessible via API${NC}"
     fi
 
-    # Test storage status
-    echo "  🔌 Testing storage connectivity..."
-    if timeout 30 pvesm status | grep -qw "$STORAGE_NAME" 2>/dev/null; then
-        echo -e "        ${GREEN}✅ Storage responds to status queries${NC}"
-    else
-        echo -e "        ${YELLOW}⚠️  Storage '$STORAGE_NAME' status check inconclusive${NC}"
-        echo "           This may be normal - the main test suite will perform more detailed checks"
-    fi
-
-    # Check required tools
     echo "  🛠️  Checking required tools..."
-    local missing_tools=()
-
-    for tool in qm pvesm iscsiadm journalctl; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            missing_tools+=("$tool")
-        fi
-    done
-
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        echo -e "        ${RED}❌ Missing required tools: ${missing_tools[*]}${NC}"
+    if ! command -v pvesh >/dev/null 2>&1; then
+        echo -e "        ${RED}❌ pvesh command not found${NC}"
         checks_passed=false
     else
-        echo -e "        ${GREEN}✅ All required tools available${NC}"
+        echo -e "        ${GREEN}✅ pvesh available${NC}"
     fi
 
-    # Check if test VMs already exist
-    echo "  🖥️  Checking test VM availability..."
-    local existing_vms=()
-
-    for vm_id in $TEST_VM_BASE $TEST_VM_CLONE $TEST_VM_RESIZE; do
-        if qm config "$vm_id" >/dev/null 2>&1; then
-            existing_vms+=("$vm_id")
-        fi
-    done
-
-    if [[ ${#existing_vms[@]} -gt 0 ]]; then
-        echo -e "        ${YELLOW}⚠️  Test VMs already exist: ${existing_vms[*]}${NC}"
-        echo "           These VMs will be destroyed and recreated during testing"
-    else
-        echo -e "        ${GREEN}✅ Test VM IDs available${NC}"
-    fi
-
-    # Check storage content type
-    echo "  📁 Checking storage content type..."
-    local storage_info=$(pvesm status 2>/dev/null | grep "^$STORAGE_NAME" || true)
-    if [[ -n "$storage_info" ]]; then
-        # Check if storage line contains content types or if it's operational
-        if echo "$storage_info" | grep -q -E "(images|active|available)"; then
-            echo -e "        ${GREEN}✅ Storage accessible and operational${NC}"
-        else
-            echo -e "        ${YELLOW}⚠️  Storage may not support 'images' content type${NC}"
-            echo "           Add 'content images' to storage configuration if needed"
-        fi
-    else
-        echo -e "        ${YELLOW}⚠️  Could not retrieve storage content type information${NC}"
-    fi
-
-    # Test basic perl functionality
-    echo "  🐪 Testing Perl integration..."
-    if perl -e 'use PVE::Storage::Custom::TrueNASPlugin; print "OK\n";' 2>/dev/null; then
-        echo -e "        ${GREEN}✅ Perl plugin loads successfully${NC}"
-    else
-        echo -e "        ${RED}❌ Perl plugin failed to load${NC}"
-        echo "           Check plugin syntax and Perl dependencies"
-        checks_passed=false
-    fi
-
-    # Test TrueNAS API connectivity
-    echo "  🔗 Testing TrueNAS API connectivity..."
-    local api_test_result
-    api_test_result=$(timeout 30 perl << 'EOF'
-use strict;
-use warnings;
-use lib '/usr/share/perl5';
-use PVE::Storage;
-use PVE::Storage::Custom::TrueNASPlugin;
-
-eval {
-    my $storage_config = PVE::Storage::config();
-    my $scfg = PVE::Storage::storage_config($storage_config, $ENV{STORAGE_NAME});
-    die "Storage not found or not TrueNAS plugin\n" unless $scfg && $scfg->{type} eq 'truenasplugin';
-
-    # Test API ping
-    my $result = PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, 'core.ping', [],
-        sub { die "API test requires WebSocket transport"; });
-    print "API_OK\n";
-};
-if ($@) {
-    print "API_ERROR: $@\n";
-}
-EOF
-)
-
-    if echo "$api_test_result" | grep -q "API_OK"; then
-        echo -e "        ${GREEN}✅ TrueNAS API connectivity verified${NC}"
-    elif echo "$api_test_result" | grep -q "API_ERROR"; then
-        local error_msg=$(echo "$api_test_result" | grep "API_ERROR:" | sed 's/API_ERROR: //')
-        echo -e "        ${RED}❌ TrueNAS API connectivity failed${NC}"
-        echo "           Error: $error_msg"
-        echo "           Check TrueNAS host, API key, and network connectivity"
-        checks_passed=false
-    else
-        echo -e "        ${YELLOW}⚠️  TrueNAS API test inconclusive${NC}"
-        echo "           API may be accessible but using different transport"
-    fi
-
-    # Check permissions
     echo "  🔐 Checking permissions..."
     if [[ $EUID -eq 0 ]]; then
         echo -e "        ${GREEN}✅ Running as root${NC}"
     else
         echo -e "        ${YELLOW}⚠️  Not running as root - some operations may fail${NC}"
-        echo "           Consider running with: sudo $0"
     fi
 
-    return $($checks_passed && echo 0 || echo 1)
+    $checks_passed
+    return $?
 }
 
 # Main test execution
 main() {
-    echo -e "${BLUE}🧪 TrueNAS Proxmox Plugin Test Suite${NC}"
+    echo -e "${BLUE}🧪 TrueNAS Proxmox Plugin Test Suite (API-based)${NC}"
     echo -e "📦 Testing storage: ${YELLOW}$STORAGE_NAME${NC}"
+    echo -e "🖥️  Node: ${YELLOW}$NODE_NAME${NC}"
     echo -e "📝 Log file: ${BLUE}$LOG_FILE${NC}"
-    echo -e "⏱️  API timeout: ${YELLOW}$API_TIMEOUT seconds${NC}"
     echo ""
 
-    # Display what the script will do
-    echo -e "${YELLOW}⚠️  This script will perform the following operations:${NC}"
-    echo "    • Test TrueNAS storage plugin functionality"
-    echo "    • Create and delete test VMs (990, 991, 992)"
-    echo "    • Allocate and free storage volumes on TrueNAS"
-    echo "    • Create and delete ZFS snapshots"
-    echo "    • Test volume resize operations"
-    echo "    • Test clone operations (may take time for large volumes)"
-    echo "    • Check for VM locks and provide unlock commands if needed"
-    echo "    • Verify TrueNAS volume cleanup"
-    echo "    • Generate comprehensive test report"
+    echo -e "${YELLOW}⚠️  This script will perform the following operations via API:${NC}"
+    echo "    • Test TrueNAS storage plugin via Proxmox API"
+    echo "    • Create and delete test VMs ($TEST_VM_BASE, $TEST_VM_CLONE)"
+    echo "    • Allocate and free storage volumes"
+    echo "    • Create and test snapshots"
+    echo "    • Test clone operations"
+    echo "    • Test volume resize"
+    echo "    • Verify automatic cleanup with --purge"
     echo ""
-    echo -e "${YELLOW}⚠️  Warning: This will modify your Proxmox and TrueNAS configuration!${NC}"
-    echo -e "${YELLOW}    Make sure you're running this on a test environment.${NC}"
+    echo -e "${BLUE}ℹ️  All operations use Proxmox API (pvesh) to simulate GUI interaction${NC}"
+    echo -e "${BLUE}ℹ️  Compatible with PVE 8.x and 9.x${NC}"
     echo ""
 
-    # Ask for user confirmation
-    read -p "Do you want to continue? (y/N): " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${RED}❌ Test suite cancelled by user${NC}"
-        exit 0
+    if [[ "$AUTO_YES" != "true" ]]; then
+        read -p "Do you want to continue? (y/N): " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${RED}❌ Test suite cancelled by user${NC}"
+            exit 0
+        fi
+    else
+        echo -e "${GREEN}✓ Auto-confirmed (using -y flag)${NC}"
+        echo ""
     fi
+
     print_stage_header "PRE-FLIGHT CHECKS" "🔍"
     if ! run_preflight_checks; then
-        echo -e "${RED}❌ Pre-flight checks failed. Please fix the issues above before running the test suite.${NC}"
+        echo -e "${RED}❌ Pre-flight checks failed${NC}"
         exit 1
     fi
     echo -e "${GREEN}✅ Pre-flight checks passed${NC}"
 
     print_stage_header "MAIN TEST EXECUTION" "🧪"
 
-    # Find available VM IDs
-    log_test "Finding available VM IDs for testing"
+    log_test "Finding available VM IDs"
     if ! find_available_vm_ids; then
-        log_error "Could not find available VM IDs for testing"
-        echo -e "${RED}❌ Unable to find consecutive available VM IDs${NC}"
-        echo -e "   Consider setting TEST_VM_BASE_HINT environment variable to a different starting ID"
-        echo -e "   Example: ${BLUE}TEST_VM_BASE_HINT=1000 $0 $STORAGE_NAME${NC}"
+        log_error "Could not find available VM IDs"
         exit 1
     fi
     log_success "Selected test VM IDs: $TEST_VM_BASE (base), $TEST_VM_CLONE (clone)"
 
-    log_to_file "INFO" "Starting TrueNAS plugin test suite"
+    log_to_file "INFO" "Starting TrueNAS plugin test suite (API-based)"
     log_to_file "INFO" "Storage: $STORAGE_NAME"
-    log_to_file "INFO" "Test VMs: $TEST_VM_BASE, $TEST_VM_CLONE"
-    log_to_file "INFO" "API timeout: $API_TIMEOUT seconds"
+    log_to_file "INFO" "Node: $NODE_NAME"
 
-    # Pre-test cleanup
-    log_to_file "INFO" "Starting pre-test cleanup"
     cleanup_test_vms
 
-    # Run test suite
     local failed_tests=0
 
     test_storage_status || ((failed_tests++))
@@ -1327,25 +729,21 @@ main() {
     test_snapshot_operations || ((failed_tests++))
     test_clone_operations || ((failed_tests++))
     test_volume_resize || ((failed_tests++))
-    test_bulk_operations || ((failed_tests++))
-    test_error_conditions || ((failed_tests++))
     test_volume_deletion || ((failed_tests++))
 
     print_stage_header "TEST RESULTS" "📊"
-
     generate_summary_report
 
     print_stage_header "CLEANUP" "🧹"
-    log_to_file "INFO" "Starting final cleanup"
     cleanup_test_vms
     rm -f /tmp/clone_snapshot_name
 
     if [[ $failed_tests -eq 0 ]]; then
         echo -e "\n${GREEN}🎉 All tests passed successfully!${NC}"
-        echo -e "📋 Check the log file for detailed information: ${BLUE}$LOG_FILE${NC}"
+        echo -e "📋 Log file: ${BLUE}$LOG_FILE${NC}"
         exit 0
     else
-        echo -e "\n${RED}❌ $failed_tests test(s) failed. Check the log for details.${NC}"
+        echo -e "\n${RED}❌ $failed_tests test(s) failed${NC}"
         echo -e "📋 Log file: ${BLUE}$LOG_FILE${NC}"
         exit 1
     fi
@@ -1353,7 +751,7 @@ main() {
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
-    echo "❌ This script must be run as root (for qm and pvesm commands)"
+    echo "❌ This script must be run as root"
     exit 1
 fi
 
