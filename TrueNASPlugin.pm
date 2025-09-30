@@ -230,6 +230,15 @@ sub options {
     };
 }
 
+# Force shared storage behavior for cluster migration support
+sub check_config {
+    my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
+    my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+    # Always set shared=1 since this is iSCSI-based shared storage
+    $opts->{shared} = 1;
+    return $opts;
+}
+
 # ======== DNS/IPv4 helper ========
 sub _host_ipv4($host) {
     return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
