@@ -1583,7 +1583,7 @@ sub parse_volname {
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
-    my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
+    my (undef, $zname, $vmid, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     _iscsi_login_all($scfg);
     my $dev;
     eval { $dev = _device_for_lun($scfg, $lun); };
@@ -1598,7 +1598,7 @@ sub path {
             die "Could not locate device for LUN $lun (IQN $scfg->{target_iqn})\n";
         }
     }
-    return ($dev, undef, 'images');
+    return ($dev, $vmid, 'images');
 }
 
 # Create a new VM disk (zvol + iSCSI extent + mapping) and hand it to Proxmox.
