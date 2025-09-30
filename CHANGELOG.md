@@ -1,5 +1,21 @@
 # TrueNAS Plugin Changelog
 
+## Cluster Support Fix (September 2025)
+
+### 🔧 **Cluster Environment Improvements**
+- **Fixed storage status in PVE clusters**: Storage now correctly reports inactive status when TrueNAS API is unreachable from a node
+- **Enhanced error handling**: Added syslog logging for failed status checks to aid troubleshooting
+- **Proper cluster behavior**: Nodes without API access now show storage as inactive instead of displaying `?` in GUI
+
+### 🛠️ **Tools**
+- **Added `update-cluster.sh`**: Automated script to deploy plugin updates across all cluster nodes
+- **Cluster deployment**: Simplifies plugin updates with automatic file copying and service restarts
+
+### 📊 **Impact**
+- **Multi-node clusters**: Storage status now displays correctly on all nodes
+- **Diagnostics**: Failed status checks are logged to syslog for easier debugging
+- **Deployment**: Faster plugin updates across cluster with automated script
+
 ## Performance & Reliability Improvements (September 2025)
 
 ### 🚀 **Major Performance Optimizations**

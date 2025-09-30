@@ -2072,10 +2072,12 @@ sub status {
         }
     };
     if ($@) {
-        # Conservative fallback to avoid blocking VM starts if stats fail
-        $total = 1024*1024*1024*1024; # 1 TiB
-        $avail = 900*1024*1024*1024;  # 900 GiB
-        $used  = $total - $avail;
+        # Mark storage as inactive if API call fails (e.g., network issue, unreachable from this node)
+        syslog('warning', "TrueNAS storage '$storeid' status check failed: $@");
+        $active = 0;
+        $total = 0;
+        $avail = 0;
+        $used  = 0;
     }
     return ($total, $avail, $used, $active);
 }
