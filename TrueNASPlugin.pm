@@ -1675,6 +1675,9 @@ sub alloc_image {
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
     );
 
+    # Invalidate cache after creating new mapping to ensure we get fresh data
+    _clear_cache($scfg->{storeid} || 'unknown');
+
     # 4) Find the lunid that TrueNAS assigned for this (target, extent)
     my $maps = _tn_targetextents($scfg) // [];
     my ($tx_map) = grep {
@@ -1831,9 +1834,26 @@ sub free_image {
         }
     }
 
-    # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, temporarily logout → retry
+    # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, check if safe to logout
+    # Don't logout if there are other active LUNs - this breaks multi-disk operations
     if ($need_force_logout) {
-        _logout_target_all_portals($scfg);
+        # Check how many LUNs are currently mapped to this target
+        my $active_luns = 0;
+        eval {
+            my $all_maps = _tn_targetextents($scfg) // [];
+            my @target_maps = grep { ($_->{target}//-1) == $target_id } @$all_maps;
+            $active_luns = scalar(@target_maps);
+        };
+
+        # Only logout if this is the last LUN, or if we can't determine LUN count
+        # This prevents breaking multi-disk restore/creation operations
+        if ($active_luns <= 1 || $@) {
+            syslog('info', "Logging out to retry extent deletion (active LUNs: $active_luns)");
+            _logout_target_all_portals($scfg);
+        } else {
+            syslog('info', "Skipping logout during extent deletion - $active_luns other LUNs active (preserves multi-disk operations)");
+            $need_force_logout = 0;  # Skip retry since we're not logging out
+        }
         # Retry mapping delete
         if ($tx && defined $tx->{id}) {
             my $id = $tx->{id};
@@ -1862,15 +1882,9 @@ sub free_image {
         }
     }
 
-    # 4) Ensure disconnection, then delete all snapshots before deleting the zvol dataset
+    # 4) Delete all snapshots before deleting the zvol dataset
+    # Note: Don't logout preemptively as it breaks multi-disk restore operations
     eval {
-        # Force logout to ensure dataset isn't busy during deletion
-        syslog('info', "Forcing logout before dataset deletion to prevent 'busy' state");
-        _logout_target_all_portals($scfg);
-
-        # Small delay to ensure logout completes
-        sleep(2);
-
         # First, delete ALL snapshots for this zvol to ensure clean deletion
         syslog('info', "Searching for and deleting all snapshots of $full_ds before dataset deletion");
         my $snapshots = _tn_snapshots($scfg) // [];
@@ -1918,7 +1932,29 @@ sub free_image {
 
         # Mark that we need to re-login
         $need_force_logout = 1;
-    } or warn "warning: delete dataset $full_ds failed: $@";
+    };
+
+    # If dataset deletion failed due to "busy", retry with logout
+    if ($@ && $@ =~ /busy|in use/i) {
+        syslog('info', "Dataset deletion failed (device busy), retrying with logout");
+        _logout_target_all_portals($scfg);
+        sleep(2);
+
+        eval {
+            my $id = URI::Escape::uri_escape($full_ds);
+            my $payload = { recursive => JSON::PP::false, force => JSON::PP::true };
+            my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+                sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion retry for $full_ds", 20);
+            if (!$job_result->{success}) {
+                die $job_result->{error};
+            }
+            syslog('info', "Dataset $full_ds deletion completed successfully after retry");
+            $need_force_logout = 1;
+        } or warn "warning: delete dataset $full_ds failed after retry: $@";
+    } elsif ($@) {
+        warn "warning: delete dataset $full_ds failed: $@";
+    }
 
     # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
     if ($need_force_logout) {
