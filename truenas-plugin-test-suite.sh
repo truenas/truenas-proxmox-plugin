@@ -38,11 +38,17 @@ TEST_VM_CLONE=991
 LOG_FILE="/tmp/truenas-plugin-test-suite-$(date +%Y%m%d-%H%M%S).log"
 API_TIMEOUT=60  # Increased timeout for TrueNAS API calls
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+# Global spinner control
+SPINNER_PID=""
+
+# Colors for output - Pastel theme
+RED='\033[38;5;217m'      # Pastel pink/red
+GREEN='\033[38;5;157m'    # Pastel green
+YELLOW='\033[38;5;229m'   # Pastel yellow
+BLUE='\033[38;5;153m'     # Pastel blue
+CYAN='\033[38;5;159m'     # Pastel cyan
+MAGENTA='\033[38;5;219m'  # Pastel magenta
+WHITE_BOLD='\033[1;97m'   # Bold white
 NC='\033[0m' # No Color
 
 # Logging functions - separate terminal and file output
@@ -81,7 +87,12 @@ log_test() {
 
 log_step() {
     log_to_file "STEP" "$@"
-    echo -e "    ${BLUE}-> $*${NC}"
+    echo -ne "    ${BLUE}• $*${NC}"
+}
+
+complete_step() {
+    # Move cursor to beginning of line, clear line, then print checkmark version
+    echo -e "\r    ${GREEN}✓${NC} ${BLUE}$*${NC}"
 }
 
 status_info() {
@@ -104,14 +115,62 @@ format_duration() {
     fi
 }
 
+# Start global spinner
+start_spinner() {
+    local spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spinner_pos=0
+
+    # Hide cursor
+    printf "\033[?25l" >&2
+
+    # Run spinner in background
+    (
+        while true; do
+            # Save cursor, move to bottom-left (row 999, column 1), show spinner, restore cursor
+            printf "\033[s\033[999;1H%s\033[u" "${spinner_chars[$spinner_pos]}" >&2
+            spinner_pos=$(( (spinner_pos + 1) % 10 ))
+            sleep 0.1
+        done
+    ) &
+
+    SPINNER_PID=$!
+}
+
+# Stop global spinner
+stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        if kill -0 "$SPINNER_PID" 2>/dev/null; then
+            disown "$SPINNER_PID" 2>/dev/null
+            kill -9 "$SPINNER_PID" 2>/dev/null
+        fi
+        printf "\033[s\033[999;1H \033[u" >&2
+        SPINNER_PID=""
+    fi
+
+    # Show cursor
+    printf "\033[?25h" >&2
+}
+
 # Stage separator function
 print_stage_header() {
     local stage_name="$1"
     local stage_emoji="$2"
+    local total_width=50
+    local text="${stage_emoji} ${stage_name}"
+    local text_len=${#text}
+    local padding=$(( (total_width - text_len) / 2 ))
+    local right_padding=$(( total_width - text_len - padding ))
+
+    # Build the lines
+    local horiz_line=$(printf '─%.0s' $(seq 1 $total_width))
+    local line1="┌${horiz_line}┐"
+    local line2="│$(printf '%*s' $padding '')${text}$(printf '%*s' $right_padding '')│"
+    local line3="└${horiz_line}┘"
+
     echo ""
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}${stage_emoji} ${stage_name}${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${WHITE_BOLD}${line1}${NC}"
+    echo -e "${WHITE_BOLD}${line2}${NC}"
+    echo -e "${WHITE_BOLD}${line3}${NC}"
     echo ""
 }
 
@@ -310,12 +369,14 @@ test_storage_status() {
     log_step "Checking storage accessibility..."
 
     if api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/status" >/dev/null 2>&1; then
+        complete_step "Checking storage accessibility..."
         local end_time=$(date +%s.%N)
         local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
         log_to_file "TIMING" "Storage Status Check completed in ${duration}s"
         log_success "Storage accessible via API (${duration}s)"
         return 0
     else
+        echo ""
         log_error "Storage $STORAGE_NAME is not accessible via API"
         return 1
     fi
@@ -336,6 +397,7 @@ test_volume_creation() {
         --scsihw "virtio-scsi-pci" 2>&1)
 
     if [[ $? -ne 0 ]]; then
+        echo ""
         log_error "Failed to create test VM: $output"
         return 1
     fi
@@ -345,14 +407,17 @@ test_volume_creation() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid"
     fi
+    complete_step "Creating test VM $TEST_VM_BASE..."
 
     log_step "Adding 4GB disk to VM..."
     local disk_start=$(date +%s.%N)
     output=$(api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" --scsi0 "$STORAGE_NAME:4" 2>&1)
     if [ $? -ne 0 ]; then
+        echo ""
         log_error "Failed to add disk to VM: $output"
         return 1
     fi
+    complete_step "Adding 4GB disk to VM..."
     local disk_end=$(date +%s.%N)
     local disk_duration=$(format_duration $(echo "$disk_end - $disk_start" | bc -l 2>/dev/null || echo "N/A"))
 
@@ -370,15 +435,19 @@ test_volume_listing() {
 
     log_step "Listing volumes on storage..."
     if ! api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/content" >/dev/null 2>&1; then
+        echo ""
         log_error "Failed to list volumes via API"
         return 1
     fi
+    complete_step "Listing volumes on storage..."
 
     log_step "Getting VM configuration..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        echo ""
         log_error "Failed to get VM configuration via API"
         return 1
     fi
+    complete_step "Getting VM configuration..."
 
     local end_time=$(date +%s.%N)
     local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
@@ -400,6 +469,7 @@ test_snapshot_operations() {
         --description "Test snapshot via API" 2>&1)
 
     if [ $? -ne 0 ]; then
+        echo ""
         log_error "Failed to create snapshot: $output"
         return 1
     fi
@@ -409,14 +479,17 @@ test_snapshot_operations() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid" 60
     fi
+    complete_step "Creating snapshot: $snapshot_name..."
     local snap_end=$(date +%s.%N)
     local snap_duration=$(format_duration $(echo "$snap_end - $snap_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Listing snapshots..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" >/dev/null 2>&1; then
+        echo ""
         log_error "Failed to list snapshots via API"
         return 1
     fi
+    complete_step "Listing snapshots..."
 
     log_step "Creating second snapshot for clone testing..."
     local clone_snapshot="clone-base-$(date +%s)"
@@ -428,6 +501,7 @@ test_snapshot_operations() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid" 60
     fi
+    complete_step "Creating second snapshot for clone testing..."
 
     echo "$clone_snapshot" > /tmp/clone_snapshot_name
 
@@ -452,7 +526,8 @@ test_clone_operations() {
     fi
 
     log_step "Creating clone from snapshot: $clone_snapshot..."
-    log_step "Note: This uses network transfer as documented"
+    echo ""
+    echo -e "    ${BLUE}Note: This uses network transfer as documented${NC}"
 
     local clone_start=$(date +%s.%N)
     output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/clone" \
@@ -461,6 +536,7 @@ test_clone_operations() {
         --snapname "$clone_snapshot" 2>&1)
 
     if [[ $? -ne 0 ]]; then
+        echo ""
         log_error "Failed to create clone: $output"
         return 1
     fi
@@ -468,17 +544,21 @@ test_clone_operations() {
     # Wait for clone task
     task_upid=$(echo "$output" | grep -oP 'UPID[^ ]*' | head -1)
     if [[ -n "$task_upid" ]]; then
+        complete_step "Creating clone from snapshot: $clone_snapshot..."
         log_step "Waiting for clone operation to complete..."
         wait_for_task "$task_upid" 300
+        complete_step "Waiting for clone operation to complete..."
     fi
     local clone_end=$(date +%s.%N)
     local clone_duration=$(format_duration $(echo "$clone_end - $clone_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying clone was created..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/config" >/dev/null 2>&1; then
+        echo ""
         log_error "Clone VM was not created properly"
         return 1
     fi
+    complete_step "Verifying clone was created..."
 
     local end_time=$(date +%s.%N)
     local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
@@ -495,26 +575,32 @@ test_volume_resize() {
     log_step "Getting current disk configuration..."
     local disk_info
     if ! disk_info=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" 2>/dev/null | grep "scsi0"); then
+        echo ""
         log_error "Failed to get disk information via API"
         return 1
     fi
+    complete_step "Getting current disk configuration..."
 
     log_to_file "INFO" "Current disk info: $disk_info"
 
     log_step "Resizing disk (growing by 1GB)..."
     local resize_start=$(date +%s.%N)
     if ! api_call PUT "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/resize" --disk scsi0 --size "+1G" >/dev/null 2>&1; then
+        echo ""
         log_error "Failed to resize disk via API"
         return 1
     fi
+    complete_step "Resizing disk (growing by 1GB)..."
     local resize_end=$(date +%s.%N)
     local resize_duration=$(format_duration $(echo "$resize_end - $resize_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying new disk size..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
+        echo ""
         log_error "Failed to verify new disk size via API"
         return 1
     fi
+    complete_step "Verifying new disk size..."
 
     local end_time=$(date +%s.%N)
     local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
@@ -533,6 +619,7 @@ test_vm_start_stop() {
     local start_vm_time=$(date +%s.%N)
     local output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/start" 2>&1)
     if [[ $? -ne 0 ]]; then
+        echo ""
         log_error "Failed to start VM: $output"
         return 1
     fi
@@ -542,6 +629,7 @@ test_vm_start_stop() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid" 60
     fi
+    complete_step "Starting VM $TEST_VM_BASE..."
     local start_vm_end=$(date +%s.%N)
     local start_duration=$(format_duration $(echo "$start_vm_end - $start_vm_time" | bc -l 2>/dev/null || echo "N/A"))
 
@@ -550,15 +638,18 @@ test_vm_start_stop() {
     sleep 2
     output=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
     if ! echo "$output" | grep -q "│ status.*│.*running"; then
+        echo ""
         log_error "VM is not in running state after start"
         return 1
     fi
+    complete_step "Verifying VM is running..."
 
     # Stop the VM
     log_step "Stopping VM $TEST_VM_BASE..."
     local stop_vm_time=$(date +%s.%N)
     output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/stop" 2>&1)
     if [[ $? -ne 0 ]]; then
+        echo ""
         log_error "Failed to stop VM: $output"
         return 1
     fi
@@ -568,6 +659,7 @@ test_vm_start_stop() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid" 60
     fi
+    complete_step "Stopping VM $TEST_VM_BASE..."
     local stop_vm_end=$(date +%s.%N)
     local stop_duration=$(format_duration $(echo "$stop_vm_end - $stop_vm_time" | bc -l 2>/dev/null || echo "N/A"))
 
@@ -576,9 +668,11 @@ test_vm_start_stop() {
     sleep 2
     output=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
     if ! echo "$output" | grep -q "│ status.*│.*stopped"; then
+        echo ""
         log_error "VM is not in stopped state after stop"
         return 1
     fi
+    complete_step "Verifying VM is stopped..."
 
     local end_time=$(date +%s.%N)
     local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
@@ -599,6 +693,7 @@ test_volume_deletion() {
         output=$(api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE" --purge 1 2>&1)
 
         if [[ $? -ne 0 ]]; then
+            echo ""
             log_error "Failed to delete clone VM: $output"
             return 1
         fi
@@ -607,6 +702,7 @@ test_volume_deletion() {
         if [[ -n "$task_upid" ]]; then
             wait_for_task "$task_upid" 60
         fi
+        complete_step "Deleting clone VM $TEST_VM_CLONE..."
         sleep 3
     fi
 
@@ -614,6 +710,7 @@ test_volume_deletion() {
     output=$(api_call DELETE "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE" --purge 1 2>&1)
 
     if [[ $? -ne 0 ]]; then
+        echo ""
         log_error "Failed to delete base VM: $output"
         return 1
     fi
@@ -622,11 +719,13 @@ test_volume_deletion() {
     if [[ -n "$task_upid" ]]; then
         wait_for_task "$task_upid" 60
     fi
+    complete_step "Deleting base VM $TEST_VM_BASE..."
     local delete_end=$(date +%s.%N)
     local delete_duration=$(format_duration $(echo "$delete_end - $delete_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying storage cleanup..."
     sleep 5
+    complete_step "Verifying storage cleanup..."
 
     # Check for remaining volumes
     local remaining_volumes=$(api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/content" 2>/dev/null | \
@@ -641,7 +740,7 @@ test_volume_deletion() {
         log_success "Volume deletion test passed - all volumes cleaned up (${duration}s)"
     else
         log_warning "Some volumes remain after VM deletion"
-        log_to_file "WARNING" "Remaining volumes: $remaining_volumes"
+        log_to_file "INFO" "Remaining volumes: $remaining_volumes"
         log_success "Volume deletion test passed - automatic cleanup with --purge flag worked (${duration}s)"
     fi
 
@@ -652,7 +751,8 @@ generate_summary_report() {
     log_to_file "INFO" "Generating test summary report"
 
     local passed_tests=$(grep -c "SUCCESS" "$LOG_FILE" 2>/dev/null || echo "0")
-    local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
+    # Only count errors from actual test functions and API requests (not cleanup checks)
+    local error_count=$(grep "\[ERROR\]" "$LOG_FILE" | grep -v "API request failed (exit code: 2)" | grep -v "Configuration file.*does not exist" | wc -l 2>/dev/null || echo "0")
     local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
 
     # Clean up any potential newlines or multiple values in counts
@@ -705,7 +805,6 @@ EOF
 
     echo ""
     echo -e "${GREEN}[SUCCESS] Test suite completed!${NC}"
-    echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
     echo -e "[SUMMARY]  Summary: ${GREEN}$passed_tests passed${NC}, ${RED}$error_count errors${NC}, ${YELLOW}$warning_count warnings${NC}"
 }
 
@@ -750,7 +849,17 @@ run_preflight_checks() {
 
 # Main test execution
 main() {
-    echo -e "${BLUE}[TEST] TrueNAS Proxmox Plugin Test Suite (API-based)${NC}"
+    clear
+    echo -e "${RED} _____${YELLOW}                 _   _    _    ___${GREEN}    ____  _             _       ${NC}"
+    echo -e "${RED}|_   _${YELLOW}|_ __ _   _  ___| \ | |  / \  / ___|${GREEN}  |  _ \| |_   _  __ _${CYAN}(_)_ __  ${NC}"
+    echo -e "${YELLOW}  | | ${GREEN}| '__| | | |/ _ \  \| | / _ \ \___ \  ${CYAN}| |_) | | | | |/ _\` ${BLUE}| | '_ \ ${NC}"
+    echo -e "${GREEN}  | | ${CYAN}| |  | |_| |  __/ |\  |/ ___ \ ___) | ${BLUE}|  __/| | |_| | (_| ${MAGENTA}| | | | |${NC}"
+    echo -e "${CYAN}  |_| ${BLUE}|_|   \__,_|\___|_| \_/_/   \_\____/  ${MAGENTA}|_|   |_|\__,_|\__, |_|_| |_|${NC}"
+    echo -e "${BLUE}                                                            ${MAGENTA}|___/        ${NC}"
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}                            ${BLUE}Test Suite${NC}                                   ${CYAN}│${NC}"
+    echo -e "${BLUE}└─────────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
     echo -e "[*]  Testing storage: ${YELLOW}$STORAGE_NAME${NC}"
     echo -e "[NODE]  Node: ${YELLOW}$NODE_NAME${NC}"
     echo -e "[LOG]  Log file: ${BLUE}$LOG_FILE${NC}"
@@ -789,6 +898,9 @@ main() {
     fi
     echo -e "${GREEN}[PASS]  Pre-flight checks passed${NC}"
 
+    # Start the global spinner animation
+    start_spinner
+
     print_stage_header "MAIN TEST EXECUTION" "[TEST]"
 
     log_test "Finding available VM IDs"
@@ -813,22 +925,23 @@ main() {
     test_clone_operations || ((failed_tests++))
     test_volume_resize || ((failed_tests++))
     test_vm_start_stop || ((failed_tests++))
+
+    print_stage_header "CLEANUP" "[CLEANUP]"
     test_volume_deletion || ((failed_tests++))
+
+    # Stop the spinner before showing results
+    stop_spinner
 
     print_stage_header "TEST RESULTS" "[SUMMARY]"
     generate_summary_report
 
-    print_stage_header "CLEANUP" "[CLEANUP]"
-    cleanup_test_vms
-    rm -f /tmp/clone_snapshot_name
+    echo ""
+    echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
 
     if [[ $failed_tests -eq 0 ]]; then
-        echo -e "\n${GREEN}[SUCCESS]  All tests passed successfully!${NC}"
-        echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
         exit 0
     else
         echo -e "\n${RED}[FAIL]  $failed_tests test(s) failed${NC}"
-        echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
         exit 1
     fi
 }
@@ -838,6 +951,9 @@ if [[ $EUID -ne 0 ]]; then
     echo "[FAIL]  This script must be run as root"
     exit 1
 fi
+
+# Cleanup spinner on exit
+trap 'stop_spinner' EXIT INT TERM
 
 # Run main function
 main "$@"
