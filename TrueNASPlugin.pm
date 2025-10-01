@@ -1612,8 +1612,37 @@ sub _resolve_target_id {
         if ($full && $full eq $want) { $found = $t; last; }
         if ($name && $want =~ /:\Q$name\E$/) { $found = $t; last; }
     }
-    die "could not resolve target id for IQN $want (saw ".scalar(@$targets)." target(s))\n"
-        if !$found;
+    if (!$found) {
+        my @available_iqns = map {
+            my $name = $_->{name} // 'unnamed';
+            my $iqn = $_->{iqn} // ($basename ? "$basename:$name" : $name);
+            "  - $iqn (ID: $_->{id})";
+        } @$targets;
+
+        die sprintf(
+            "Could not resolve iSCSI target ID for configured IQN\n\n" .
+            "Configured IQN: %s\n" .
+            "TrueNAS base name: %s\n" .
+            "Targets found: %d\n\n" .
+            "Available targets:\n%s\n\n" .
+            "Troubleshooting steps:\n" .
+            "  1. Verify target exists in TrueNAS:\n" .
+            "     -> GUI: Shares > Block Shares (iSCSI) > Targets\n" .
+            "  2. Check target_iqn in storage config matches exactly:\n" .
+            "     -> File: /etc/pve/storage.cfg\n" .
+            "     -> Current: target_iqn %s\n" .
+            "  3. Ensure iSCSI service is running:\n" .
+            "     -> GUI: System Settings > Services > iSCSI\n" .
+            "  4. Verify API key has 'Sharing' read permissions:\n" .
+            "     -> GUI: Credentials > API Keys\n\n" .
+            "Note: IQN format is typically: iqn.YYYY-MM.tld.domain:identifier\n",
+            $want,
+            $basename || '(not set)',
+            scalar(@$targets),
+            (@available_iqns ? join("\n", @available_iqns) : "  (none)"),
+            $want
+        );
+    }
     return $found->{id};
 }
 
@@ -1895,7 +1924,22 @@ sub alloc_image {
             my $exists = eval { _tn_dataset_get($scfg, $full) };
             if ($@ || !$exists) { $zname = $candidate; last; }
         }
-        die "unable to find free disk name\n" if !$zname;
+        if (!$zname) {
+            die sprintf(
+                "Unable to find free disk name after 1000 attempts (VM %d)\n\n" .
+                "This usually indicates:\n" .
+                "  1. Too many disks already exist for this VM (max: 1000)\n" .
+                "  2. TrueNAS dataset query failures preventing name verification\n" .
+                "  3. Naming conflicts with existing volumes\n\n" .
+                "Dataset: %s\n" .
+                "Pattern attempted: vm-%d-disk-0 through vm-%d-disk-999\n\n" .
+                "Troubleshooting:\n" .
+                "  - Check TrueNAS dataset '%s' for orphaned volumes\n" .
+                "  - Verify API connectivity and permissions\n" .
+                "  - Check TrueNAS logs: /var/log/middlewared.log\n",
+                $vmid, $scfg->{dataset}, $vmid, $vmid, $scfg->{dataset}
+            );
+        }
     }
 
     my $full_ds = $scfg->{dataset} . '/' . $zname;
@@ -1939,7 +1983,25 @@ sub alloc_image {
         # normalize id from either WS result or REST (hashref)
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
     }
-    die "failed to create extent for $zname\n" if !defined $extent_id;
+    if (!defined $extent_id) {
+        die sprintf(
+            "Failed to create iSCSI extent for disk '%s'\n\n" .
+            "Dataset: %s\n" .
+            "zvol path: %s\n" .
+            "Extent name: %s\n\n" .
+            "Common causes:\n" .
+            "  1. TrueNAS iSCSI service is not running\n" .
+            "     -> Check: System Settings > Services > iSCSI (should be RUNNING)\n" .
+            "  2. ZFS dataset creation succeeded but zvol is not accessible\n" .
+            "     -> Verify zvol exists: zfs list -t volume | grep %s\n" .
+            "  3. API key lacks 'Sharing' write permissions\n" .
+            "     -> Check: Credentials > API Keys > Verify permissions\n" .
+            "  4. Extent name conflict with existing extent\n" .
+            "     -> Check: Shares > iSCSI > Extents for duplicate names\n\n" .
+            "TrueNAS logs: /var/log/middlewared.log\n",
+            $zname, $full_ds, $zvol_path, $zname, $zname
+        );
+    }
 
     # 3) Map extent to our shared target (targetextent.create); lunid is auto-assigned if not given
     my $target_id = _resolve_target_id($scfg);
@@ -1960,7 +2022,25 @@ sub alloc_image {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
     my $lun = $tx_map ? $tx_map->{lunid} : undef;
-    die "could not determine assigned LUN for $zname\n" if !defined $lun;
+    if (!defined $lun) {
+        die sprintf(
+            "Could not determine assigned LUN for disk '%s'\n\n" .
+            "Target ID: %d\n" .
+            "Extent ID: %d\n" .
+            "Extent name: %s\n" .
+            "Total target-extent mappings found: %d\n\n" .
+            "This usually means:\n" .
+            "  1. Target-extent mapping creation failed silently\n" .
+            "  2. TrueNAS cache not yet updated (rare)\n" .
+            "  3. API query returned stale data\n\n" .
+            "Troubleshooting:\n" .
+            "  - Check TrueNAS GUI: Shares > iSCSI > Targets > Associated Targets\n" .
+            "  - Verify extent '%s' is mapped to target ID %d\n" .
+            "  - Check TrueNAS logs: /var/log/middlewared.log\n" .
+            "  - Verify API has 'Sharing' read permissions\n",
+            $zname, $target_id, $extent_id, $zname, scalar(@$maps), $zname, $target_id
+        );
+    }
 
     # 5) Ensure iSCSI login, then refresh initiator view on this node
     if (!_target_sessions_active($scfg)) {
@@ -2003,7 +2083,32 @@ sub alloc_image {
         usleep(500_000); # 500ms between attempts
     }
 
-    die "Volume created but device not accessible for LUN $lun after 10 seconds\n" unless $device_ready;
+    if (!$device_ready) {
+        die sprintf(
+            "Volume created but device not accessible after 10 seconds\n\n" .
+            "LUN: %d\n" .
+            "Target IQN: %s\n" .
+            "Dataset: %s\n" .
+            "Disk name: %s\n\n" .
+            "The zvol and iSCSI configuration were created successfully,\n" .
+            "but the Linux block device did not appear on this node.\n\n" .
+            "Common causes:\n" .
+            "  1. iSCSI session not logged in or stale\n" .
+            "     -> Check: iscsiadm -m session\n" .
+            "     -> Fix: iscsiadm -m node -T %s -p %s --login\n" .
+            "  2. udev rules preventing device creation\n" .
+            "     -> Check: ls -la /dev/disk/by-path/ | grep %s\n" .
+            "  3. Multipath misconfiguration (if enabled)\n" .
+            "     -> Check: multipath -ll\n" .
+            "  4. Firewall blocking iSCSI traffic (port 3260)\n" .
+            "     -> Check: iptables -L | grep 3260\n\n" .
+            "The volume exists on TrueNAS but needs manual cleanup or\n" .
+            "re-login to iSCSI target to become accessible.\n",
+            $lun, $scfg->{target_iqn}, $full_ds, $zname,
+            $scfg->{target_iqn}, $scfg->{discovery_portal},
+            $scfg->{target_iqn}
+        );
+    }
 
     # 7) Return our encoded volname so Proxmox can store it in the VM config
     my $volname = "vol-$zname-lun$lun";

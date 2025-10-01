@@ -366,65 +366,48 @@ truenasplugin: tnscale
 
 ---
 
-## 9. Detailed Error Context ⭐ HIGH PRIORITY
+## 9. Detailed Error Context ✅ COMPLETED
 
 **Goal**: Provide actionable error messages with troubleshooting hints.
 
-**Implementation Location**: Throughout the plugin, replace generic error messages
+**Status**: Implemented throughout plugin with enhanced error messages
 
-**Examples**:
+**Enhanced Error Messages Implemented:**
 
-```perl
-# Old: die "failed to create extent for $zname\n"
-# New:
-die sprintf(
-    "Failed to create iSCSI extent for %s\n" .
-    "  Dataset: %s\n" .
-    "  zvol path: %s\n\n" .
-    "Common causes:\n" .
-    "  1. TrueNAS iSCSI service not running\n" .
-    "  2. Dataset creation failed or incomplete\n" .
-    "  3. API key lacks 'Sharing' permissions\n" .
-    "  4. Extent name conflict\n\n" .
-    "Check TrueNAS logs: /var/log/middlewared.log\n",
-    $zname, $full_ds, $zvol_path
-);
+1. **Unable to find free disk name** (lines 1898-1913)
+   - Shows 1000 attempts, VM ID, dataset, and pattern
+   - Lists 3 common causes with troubleshooting steps
+   - Mentions orphan detection and log locations
 
-# Old: die "could not resolve target id for IQN $want\n"
-# New:
-die sprintf(
-    "Could not resolve iSCSI target ID for IQN: %s\n\n" .
-    "Found %d target(s) in TrueNAS, but none match.\n\n" .
-    "Troubleshooting steps:\n" .
-    "  1. Verify target exists: TrueNAS GUI -> Shares -> iSCSI -> Targets\n" .
-    "  2. Check target_iqn in /etc/pve/storage.cfg matches exactly\n" .
-    "  3. Ensure iSCSI service is running\n" .
-    "  4. Check API key has 'Sharing' read permissions\n\n" .
-    "Expected IQN: %s\n" .
-    "Available IQNs: %s\n",
-    $want, scalar(@$targets), $want,
-    join(", ", map { $_->{name} // 'unnamed' } @$targets)
-);
+2. **Failed to create iSCSI extent** (lines 1957-1975)
+   - Shows dataset, zvol path, extent name
+   - Lists 4 common causes with TrueNAS GUI navigation
+   - Includes zfs command for verification
 
-# Old: die "unable to find free disk name\n"
-# New:
-die sprintf(
-    "Unable to find free disk name after %d attempts\n\n" .
-    "This usually means:\n" .
-    "  1. Storage is full (no available LUN numbers)\n" .
-    "  2. Name conflicts with existing volumes\n" .
-    "  3. Dataset query failed\n\n" .
-    "Current VM ID: %d\n" .
-    "Attempted pattern: vm-%d-disk-*\n",
-    $attempts, $vmid, $vmid
-);
-```
+3. **Could not determine assigned LUN** (lines 1996-2014)
+   - Shows target ID, extent ID, extent name, mapping count
+   - Lists 3 causes and exact GUI path
+   - Provides verification steps
 
-**Benefits**:
-- Users can self-diagnose common issues
-- Reduces support burden
-- Faster problem resolution
-- Better user experience
+4. **Could not resolve target ID** (lines 1615-1645)
+   - Shows configured IQN, base name, available targets
+   - Lists ALL available IQNs with IDs
+   - 4-step troubleshooting guide with exact GUI paths
+   - IQN format notes
+
+5. **Volume created but device not accessible** (lines 2086-2111)
+   - Shows LUN, IQN, dataset, disk name
+   - Lists 4 common causes
+   - Provides exact iSCSI commands for diagnosis
+   - Notes about manual cleanup if needed
+
+**Benefits:**
+✅ Users can self-diagnose common issues without support
+✅ Reduced support burden with self-service troubleshooting
+✅ Faster problem resolution (minutes vs hours)
+✅ Better user experience with clear guidance
+✅ TrueNAS GUI navigation paths in every error
+✅ Exact commands for verification and fixes
 
 ---
 
@@ -484,10 +467,10 @@ Pre-flight validation failed:
 
 ## Implementation Priority
 
-### Phase 1 (Critical - Implement First)
+### Phase 1 (Critical - Implement First) ✅ **ALL COMPLETED!**
 1. ✅ Configuration Validation on Load (#1) - **COMPLETED**
 2. ✅ Dataset Space Check Before Allocation (#3) - **COMPLETED** (integrated into #10)
-3. ⏸️ Detailed Error Context (#9) - Needs implementation
+3. ✅ Detailed Error Context (#9) - **COMPLETED**
 4. ✅ Pre-flight Checks on Critical Operations (#10) - **COMPLETED**
 
 ### Phase 2 (Important - Implement Soon)

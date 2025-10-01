@@ -21,6 +21,7 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 
 ### 📊 Enterprise Features
 - **Configuration Validation** - Validates storage settings at creation time with clear error messages
+- **Detailed Error Messages** - Actionable troubleshooting guidance for all common failure scenarios
 - **Volume Resize** - Grow-only resize with 80% headroom preflight checks
 - **Pre-flight Validation** - Comprehensive checks before volume operations prevent failures
 - **Space Validation** - Pre-allocation space checks with 20% ZFS overhead margin
@@ -421,6 +422,73 @@ pvesm free your-storage-name:vol-vm-ID-disk-N-lunX
 ```
 
 **Production Recommendation**: Use the Proxmox GUI for VM deletion, or implement cleanup procedures when using CLI automation.
+
+## Troubleshooting
+
+### Error Messages and Solutions
+
+The plugin provides detailed, actionable error messages with specific troubleshooting steps. Below are common error scenarios:
+
+#### "Could not resolve iSCSI target ID for configured IQN"
+
+**Example:**
+```
+Configured IQN: iqn.2005-10.org.freenas.ctl:mytar get
+Available targets:
+  - iqn.2005-10.org.freenas.ctl:proxmox (ID: 2)
+```
+
+**Solutions:**
+1. Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets
+2. Check `/etc/pve/storage.cfg` - IQN must match exactly
+3. Ensure iSCSI service is running in TrueNAS
+
+#### "Failed to create iSCSI extent for disk"
+
+**Common Causes:**
+- iSCSI service not running → Check System Settings > Services > iSCSI
+- Zvol exists but not accessible → Verify with `zfs list -t volume`
+- API key lacks Sharing permissions → Check Credentials > API Keys
+- Extent name conflict → Check Shares > iSCSI > Extents
+
+#### "Unable to find free disk name after 1000 attempts"
+
+**This indicates:**
+- VM has 1000+ disks (very unlikely)
+- TrueNAS dataset queries failing
+- Orphaned volumes preventing name assignment
+
+**Fix:** Check TrueNAS dataset for orphaned `vm-XXX-disk-*` volumes
+
+#### "Volume created but device not accessible after 10 seconds"
+
+**The zvol exists on TrueNAS but Linux can't see it.**
+
+**Solutions:**
+1. Check iSCSI session: `iscsiadm -m session`
+2. Re-login: `iscsiadm -m node -T <IQN> -p <portal> --login`
+3. Check by-path devices: `ls -la /dev/disk/by-path/`
+4. Verify multipath: `multipath -ll` (if enabled)
+
+### Logs and Debugging
+
+**TrueNAS Logs:**
+```bash
+tail -f /var/log/middlewared.log
+```
+
+**Proxmox Logs:**
+```bash
+journalctl -u pvedaemon -f
+journalctl -u pveproxy -f
+```
+
+**Storage Operations:**
+```bash
+pvesm status              # Check storage status
+pvesm list <storage>      # List volumes
+iscsiadm -m session      # Check iSCSI sessions
+```
 
 #### Fast Clone Limitation
 **VM cloning does not use instant ZFS clones**. Instead, Proxmox performs network-based copying using `qemu-img convert`.

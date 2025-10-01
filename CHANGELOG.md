@@ -10,6 +10,16 @@
 - **Security warnings** - Logs warnings when using insecure HTTP or WS transport instead of HTTPS/WSS
 - **Implementation**: Enhanced `check_config()` function (lines 338-416)
 
+### 📖 **Detailed Error Context & Troubleshooting**
+- **Actionable error messages** - Every error includes specific causes and troubleshooting steps
+- **Enhanced disk naming errors** - Shows attempted pattern, dataset, and orphan detection guidance
+- **Enhanced extent creation errors** - Lists 4 common causes with TrueNAS GUI navigation paths
+- **Enhanced LUN assignment errors** - Shows target/extent IDs and mapping troubleshooting
+- **Enhanced target resolution errors** - Lists all available IQNs and exact match requirements
+- **Enhanced device accessibility errors** - Provides iSCSI session commands and diagnostic steps
+- **TrueNAS GUI navigation** - All errors include exact menu paths for verification
+- **Implementation**: Enhanced error messages in `alloc_image`, `_resolve_target_id`, and related functions
+
 ### 🛡️ **Comprehensive Pre-flight Validation**
 - **5-point validation system** runs before volume creation (~200ms overhead)
 - **TrueNAS API connectivity check** - Verifies API is reachable via `core.ping`
