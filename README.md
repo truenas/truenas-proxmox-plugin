@@ -145,6 +145,39 @@ sudo zfs create tank/proxmox
 | `enable_live_snapshots` | Enable live snapshots | `1` | `0`, `1` |
 | `snapshot_volume_chains` | Use volume chains for snapshots | `1` | `0`, `1` |
 | `enable_bulk_operations` | Enable bulk API operations | `1` | `0`, `1` |
+| `api_retry_max` | Maximum API retry attempts | `3` | `0`-`10` |
+| `api_retry_delay` | Initial retry delay in seconds | `1` | `0.1`-`60` |
+
+### Retry Configuration
+
+The plugin includes automatic retry logic with exponential backoff for transient failures. This improves reliability in production environments where network glitches or temporary API unavailability can occur.
+
+**Retryable errors include:**
+- Network timeouts and connection failures
+- SSL/TLS errors
+- HTTP 502/503/504 Gateway errors
+- Rate limiting errors
+
+**Non-retryable errors:**
+- Authentication failures (401/403)
+- Not found errors (404)
+- Validation errors
+
+**Retry behavior:**
+- Each retry uses exponential backoff: `delay * 2^(attempt-1)`
+- Random jitter (0-20%) is added to prevent thundering herd
+- Maximum delay caps at `initial_delay * 2^(max_retries-1)`
+- Example with defaults: 1s → 2s → 4s (total ~7s of retries)
+
+**Example configuration for high-latency networks:**
+```ini
+truenasplugin: your-storage-name
+    ... other settings ...
+    api_retry_max 5
+    api_retry_delay 2
+```
+
+This configuration allows up to 5 retries with delays: 2s → 4s → 8s → 16s → 32s.
 
 ## Usage Examples
 

@@ -62,6 +62,79 @@ sub _clear_cache {
     }
 }
 
+# ======== Retry logic with exponential backoff ========
+sub _is_retryable_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+
+    # Retry on network errors, timeouts, connection issues
+    return 1 if $error =~ /timeout|timed out/i;
+    return 1 if $error =~ /connection refused|connection reset|broken pipe/i;
+    return 1 if $error =~ /network is unreachable|host is unreachable/i;
+    return 1 if $error =~ /temporary failure|service unavailable/i;
+    return 1 if $error =~ /502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout/i;
+    return 1 if $error =~ /rate limit/i;
+    return 1 if $error =~ /ssl.*error/i; # Transient SSL errors
+    return 1 if $error =~ /connection.*failed/i;
+
+    # Do NOT retry on authentication errors, not found, or validation errors
+    return 0 if $error =~ /401 Unauthorized|403 Forbidden|404 Not Found/i;
+    return 0 if $error =~ /ENOENT|InstanceNotFound|does not exist/i;
+    return 0 if $error =~ /invalid.*key|authentication.*failed/i;
+    return 0 if $error =~ /validation.*error|invalid.*parameter/i;
+    return 0 if $error =~ /EINVAL|Invalid params/i;
+
+    return 0; # Default: don't retry unknown errors
+}
+
+sub _retry_with_backoff {
+    my ($scfg, $operation_name, $code_ref) = @_;
+
+    my $max_retries = $scfg->{api_retry_max} // 3;
+    my $initial_delay = $scfg->{api_retry_delay} // 1;
+
+    my $attempt = 0;
+    my $last_error;
+    my $result;
+
+    while ($attempt <= $max_retries) {
+        $result = eval {
+            return $code_ref->();
+        };
+
+        $last_error = $@;
+
+        # Success - no error, return the result
+        return $result if !$last_error;
+
+        $attempt++;
+
+        # Check if error is retryable
+        if (!_is_retryable_error($last_error)) {
+            syslog('debug', "Non-retryable error for $operation_name: $last_error");
+            die $last_error; # Not retryable, fail immediately
+        }
+
+        # Max retries exhausted
+        if ($attempt > $max_retries) {
+            syslog('error', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
+            die "Operation failed after $max_retries retries: $last_error";
+        }
+
+        # Calculate delay with exponential backoff
+        my $delay = $initial_delay * (2 ** ($attempt - 1));
+        # Add jitter (0-20% random variation) to prevent thundering herd
+        my $jitter = $delay * 0.2 * rand();
+        $delay += $jitter;
+
+        syslog('info', "Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
+        sleep($delay);
+    }
+
+    # Should never reach here, but just in case
+    die $last_error;
+}
+
 # ======== Storage plugin identity ========
 sub api { return 11; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
@@ -178,6 +251,16 @@ sub properties {
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
+
+        # Retry configuration
+        api_retry_max => {
+            description => "Maximum number of API call retries on transient failures.",
+            type => 'integer', optional => 1, default => 3,
+        },
+        api_retry_delay => {
+            description => "Initial retry delay in seconds (doubles with each retry).",
+            type => 'number', optional => 1, default => 1,
+        },
     };
 }
 sub options {
@@ -227,6 +310,10 @@ sub options {
 
         # Bulk operations
         enable_bulk_operations => { optional => 1 },
+
+        # Retry configuration
+        api_retry_max => { optional => 1 },
+        api_retry_delay => { optional => 1 },
     };
 }
 
@@ -268,17 +355,19 @@ sub _rest_base($scfg) {
     return "$scheme://$scfg->{api_host}:$port/api/v2.0";
 }
 sub _rest_call($scfg, $method, $path, $payload=undef) {
-    my $ua  = _ua($scfg);
-    my $url = _rest_base($scfg) . $path;
-    my $req = HTTP::Request->new(uc($method) => $url);
-    $req->header('Authorization' => "Bearer $scfg->{api_key}");
-    $req->header('Content-Type'  => 'application/json');
-    $req->content(encode_json($payload)) if defined $payload;
-    my $res = $ua->request($req);
-    die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
-        if !$res->is_success;
-    my $content = $res->decoded_content // '';
-    return length($content) ? decode_json($content) : undef;
+    return _retry_with_backoff($scfg, "REST $method $path", sub {
+        my $ua  = _ua($scfg);
+        my $url = _rest_base($scfg) . $path;
+        my $req = HTTP::Request->new(uc($method) => $url);
+        $req->header('Authorization' => "Bearer $scfg->{api_key}");
+        $req->header('Content-Type'  => 'application/json');
+        $req->content(encode_json($payload)) if defined $payload;
+        my $res = $ua->request($req);
+        die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
+            if !$res->is_success;
+        my $content = $res->decoded_content // '';
+        return length($content) ? decode_json($content) : undef;
+    });
 }
 
 # ======== WebSocket JSON-RPC client ========
@@ -760,31 +849,14 @@ sub _handle_api_result_with_job_support {
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
     if ($transport eq 'ws') {
-        my ($res, $err);
-        eval {
+        # Wrap WebSocket call with retry logic
+        return _retry_with_backoff($scfg, "WS $ws_method", sub {
             my $conn = _ws_get_persistent($scfg);
-            $res = _ws_rpc($conn, {
+            my $res = _ws_rpc($conn, {
                 jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
-        };
-        $err = $@ if $@;
-
-        # Handle rate limiting with retry
-        if ($err && $err =~ /Rate Limit Exceeded/) {
-            warn "TrueNAS rate limit hit, waiting before retry...";
-            sleep(2); # Wait 2 seconds for rate limit to reset
-            eval {
-                my $conn = _ws_get_persistent($scfg);
-                $res = _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-                });
-            };
-            $err = $@ if $@;
-        }
-
-        return $res if !$err;
-        return $rest_fallback->() if $rest_fallback;
-        die $err;
+            return $res;
+        });
     } elsif ($transport eq 'rest') {
         return $rest_fallback->() if $rest_fallback;
         die "REST fallback not provided for $ws_method";
