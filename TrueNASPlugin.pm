@@ -1398,6 +1398,107 @@ sub _current_lun_for_zname($scfg, $zname) {
     return defined($tx) ? $tx->{lunid} : undef;
 }
 
+# Pre-flight validation checks before volume allocation
+# Returns arrayref of error messages (empty if all checks pass)
+sub _preflight_check_alloc {
+    my ($scfg, $size_kb) = @_;
+
+    my @errors;
+
+    # Check 1: TrueNAS API is reachable
+    eval {
+        _api_call($scfg, 'core.ping', [],
+            sub { _rest_call($scfg, 'GET', '/core/ping') });
+    };
+    if ($@) {
+        push @errors, "TrueNAS API is unreachable: $@";
+    }
+
+    # Check 2: iSCSI service is running
+    eval {
+        my $services = _api_call($scfg, 'service.query',
+            [[ ["service", "=", "iscsitarget"] ]],
+            sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
+
+        if (!$services || !@$services) {
+            push @errors, "Unable to query iSCSI service status";
+        } elsif ($services->[0]->{state} ne 'RUNNING') {
+            push @errors, sprintf(
+                "TrueNAS iSCSI service is not running (state: %s)\n" .
+                "  Start the service in TrueNAS: System Settings > Services > iSCSI",
+                $services->[0]->{state} // 'UNKNOWN'
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify iSCSI service status: $@";
+    }
+
+    # Check 3: Sufficient space available (with 20% overhead)
+    if (defined $size_kb) {
+        my $bytes = int($size_kb) * 1024;
+        my $required = $bytes * 1.2;
+
+        eval {
+            my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
+            if ($ds_info) {
+                my $norm = sub {
+                    my ($v) = @_;
+                    return 0 if !defined $v;
+                    return $v if !ref($v);
+                    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+                    return 0;
+                };
+                my $available = $norm->($ds_info->{available}) || 0;
+
+                if ($available < $required) {
+                    push @errors, sprintf(
+                        "Insufficient space on dataset '%s': need %s (with 20%% overhead), have %s available",
+                        $scfg->{dataset},
+                        _format_bytes($required),
+                        _format_bytes($available)
+                    );
+                }
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify available space: $@";
+        }
+    }
+
+    # Check 4: iSCSI target exists and is configured
+    eval {
+        my $target_id = _resolve_target_id($scfg);
+        if (!defined $target_id) {
+            push @errors, sprintf(
+                "iSCSI target not found: %s\n" .
+                "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
+                $scfg->{target_iqn}
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify iSCSI target: $@";
+    }
+
+    # Check 5: Parent dataset exists
+    eval {
+        my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
+        if (!$ds) {
+            push @errors, sprintf(
+                "Parent dataset does not exist: %s\n" .
+                "  Create the dataset in TrueNAS: Storage > Pools",
+                $scfg->{dataset}
+            );
+        }
+    };
+    if ($@) {
+        push @errors, "Cannot verify parent dataset: $@";
+    }
+
+    return \@errors;
+}
+
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
 sub _resolve_target_id {
     my ($scfg) = @_;
@@ -1697,49 +1798,20 @@ sub alloc_image {
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size) || $size <= 0;
 
-    # Pre-allocation space check: verify sufficient space is available
-    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
-    my $required = $bytes * 1.2;   # Add 20% headroom for ZFS overhead
-
-    eval {
-        my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
-        if ($ds_info) {
-            my $norm = sub {
-                my ($v) = @_;
-                return 0 if !defined $v;
-                return $v if !ref($v);
-                return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-                return 0;
-            };
-            my $available = $norm->($ds_info->{available}) || 0;
-
-            if ($available < $required) {
-                my $avail_fmt = _format_bytes($available);
-                my $need_fmt = _format_bytes($required);
-                my $req_base_fmt = _format_bytes($bytes);
-                die sprintf(
-                    "Insufficient space on dataset '%s':\n" .
-                    "  Requested: %s (with 20%% ZFS overhead: %s)\n" .
-                    "  Available: %s\n" .
-                    "  Shortfall: %s\n",
-                    $scfg->{dataset},
-                    $req_base_fmt,
-                    $need_fmt,
-                    $avail_fmt,
-                    _format_bytes($required - $available)
-                );
-            }
-
-            syslog('info', sprintf(
-                "Space check passed for %s volume on '%s': need %s (with overhead), have %s available",
-                _format_bytes($bytes), $scfg->{dataset}, _format_bytes($required), _format_bytes($available)
-            ));
-        }
-    };
-    if ($@) {
-        # If space check fails, propagate the error
-        die $@;
+    # Pre-flight checks: validate all prerequisites before expensive operations
+    my $errors = _preflight_check_alloc($scfg, $size);
+    if (@$errors) {
+        my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
+        syslog('error', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
+        die "$error_msg\n";
     }
+
+    # Log successful pre-flight checks
+    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
+    syslog('info', sprintf(
+        "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
+        _format_bytes($bytes), $scfg->{dataset}, $vmid
+    ));
 
     # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
     my $zname = $name;
