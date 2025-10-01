@@ -1,5 +1,25 @@
 # TrueNAS Plugin Changelog
 
+## Space Validation Enhancement (October 2025)
+
+### 🛡️ **Pre-allocation Space Checks**
+- **Added automatic space validation** before volume creation with 20% ZFS overhead margin
+- **Detailed error messages** showing requested size, required size with overhead, available space, and shortfall
+- **Audit logging** of all space check results for monitoring and capacity planning
+- **Fail-fast behavior** prevents partial allocations when insufficient space exists
+
+### 🔧 **Technical Implementation**
+- New `_format_bytes()` helper function for human-readable size display
+- Space check integrated into `alloc_image()` before disk name allocation
+- Queries parent dataset available space via TrueNAS API
+- Logs successful checks to syslog with detailed capacity information
+
+### 📊 **Impact**
+- **Better user experience**: Clear, actionable error messages instead of cryptic API failures
+- **Prevents partial failures**: No more orphaned extents from failed dataset creation
+- **Capacity planning**: Logged space checks provide historical usage data
+- **Production ready**: 20% overhead accounts for ZFS metadata and snapshot space
+
 ## Cluster Support Fix (September 2025)
 
 ### 🔧 **Cluster Environment Improvements**

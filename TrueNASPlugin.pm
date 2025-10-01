@@ -62,6 +62,23 @@ sub _clear_cache {
     }
 }
 
+# ======== Helper functions ========
+sub _format_bytes {
+    my ($bytes) = @_;
+    return '0 B' if !defined $bytes || $bytes == 0;
+
+    my @units = qw(B KB MB GB TB PB);
+    my $unit_idx = 0;
+    my $size = $bytes;
+
+    while ($size >= 1024 && $unit_idx < $#units) {
+        $size /= 1024;
+        $unit_idx++;
+    }
+
+    return sprintf("%.2f %s", $size, $units[$unit_idx]);
+}
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -1680,6 +1697,50 @@ sub alloc_image {
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size) || $size <= 0;
 
+    # Pre-allocation space check: verify sufficient space is available
+    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
+    my $required = $bytes * 1.2;   # Add 20% headroom for ZFS overhead
+
+    eval {
+        my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
+        if ($ds_info) {
+            my $norm = sub {
+                my ($v) = @_;
+                return 0 if !defined $v;
+                return $v if !ref($v);
+                return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+                return 0;
+            };
+            my $available = $norm->($ds_info->{available}) || 0;
+
+            if ($available < $required) {
+                my $avail_fmt = _format_bytes($available);
+                my $need_fmt = _format_bytes($required);
+                my $req_base_fmt = _format_bytes($bytes);
+                die sprintf(
+                    "Insufficient space on dataset '%s':\n" .
+                    "  Requested: %s (with 20%% ZFS overhead: %s)\n" .
+                    "  Available: %s\n" .
+                    "  Shortfall: %s\n",
+                    $scfg->{dataset},
+                    $req_base_fmt,
+                    $need_fmt,
+                    $avail_fmt,
+                    _format_bytes($required - $available)
+                );
+            }
+
+            syslog('info', sprintf(
+                "Space check passed for %s volume on '%s': need %s (with overhead), have %s available",
+                _format_bytes($bytes), $scfg->{dataset}, _format_bytes($required), _format_bytes($available)
+            ));
+        }
+    };
+    if ($@) {
+        # If space check fails, propagate the error
+        die $@;
+    }
+
     # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
     my $zname = $name;
     if (!$zname) {
@@ -1696,8 +1757,7 @@ sub alloc_image {
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
     # 1) Create the zvol (VOLUME) on TrueNAS with requested size
-    # Proxmox passes $size in KILOBYTES, TrueNAS expects bytes in volsize
-    my $bytes = int($size) * 1024;
+    # Note: $bytes already calculated above in space check (size in KiB * 1024)
     my $blocksize = $scfg->{zvol_blocksize};
 
     my $create_payload = {

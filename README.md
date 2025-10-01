@@ -21,6 +21,7 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 
 ### 📊 Enterprise Features
 - **Volume Resize** - Grow-only resize with 80% headroom preflight checks
+- **Space Validation** - Pre-allocation space checks with 20% ZFS overhead margin
 - **Error Recovery** - Comprehensive error handling and automatic cleanup
 - **Performance Optimization** - Configurable block sizes and sparse volumes
 - **Monitoring Integration** - Full integration with Proxmox storage status
@@ -229,6 +230,28 @@ qm resize 100 scsi0 +16G
 # Start VM
 qm start 100
 ```
+
+## Space Management
+
+### Automatic Space Validation
+
+The plugin automatically validates available space before creating volumes:
+
+**Pre-allocation Checks:**
+- Verifies sufficient space exists on the TrueNAS dataset
+- Adds 20% overhead margin for ZFS metadata and snapshots
+- Provides detailed error messages when space is insufficient
+- Logs successful validations for auditing
+
+**Example Error Message:**
+```
+Insufficient space on dataset 'tank/proxmox':
+  Requested: 100.00 GB (with 20% ZFS overhead: 120.00 GB)
+  Available: 80.00 GB
+  Shortfall: 40.00 GB
+```
+
+This prevents partial allocations and provides clear guidance when capacity planning is needed.
 
 ## Performance Tuning
 
