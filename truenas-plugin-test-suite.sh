@@ -60,37 +60,48 @@ log_info() {
 
 log_success() {
     log_to_file "SUCCESS" "$@"
-    echo -e "${GREEN}✅ $*${NC}"
+    echo -e "${GREEN}[PASS] $*${NC}"
 }
 
 log_warning() {
     log_to_file "WARNING" "$@"
-    echo -e "${YELLOW}⚠️  $*${NC}"
+    echo -e "${YELLOW}[WARN] $*${NC}"
 }
 
 log_error() {
     log_to_file "ERROR" "$@"
-    echo -e "${RED}❌ $*${NC}"
+    echo -e "${RED}[FAIL] $*${NC}"
 }
 
 log_test() {
     log_to_file "TEST" "$@"
-    echo -e "${BLUE}🧪 $*${NC}"
+    echo ""
+    echo -e "${BLUE}[TEST] $*${NC}"
 }
 
 log_step() {
     log_to_file "STEP" "$@"
-    echo -e "    ${BLUE}→${NC} $*"
+    echo -e "    ${BLUE}-> $*${NC}"
 }
 
 status_info() {
-    echo -e "    ${BLUE}ℹ️  $*${NC}"
+    echo -e "    ${BLUE}[INFO] $*${NC}"
     log_to_file "INFO" "$@"
 }
 
 status_progress() {
-    echo -e "    ${YELLOW}⏳ $*${NC}"
+    echo -e "    ${YELLOW}[WAIT] $*${NC}"
     log_to_file "INFO" "$@"
+}
+
+# Format duration to 2 decimal places
+format_duration() {
+    local duration="$1"
+    if [[ "$duration" == "N/A" ]]; then
+        echo "N/A"
+    else
+        printf "%.2f" "$duration" 2>/dev/null || echo "$duration"
+    fi
 }
 
 # Stage separator function
@@ -117,7 +128,7 @@ time_operation() {
     local exit_code=$?
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
 
     if [[ "$duration" != "N/A" ]]; then
         if (( $(echo "$duration > 60" | bc -l 2>/dev/null || echo 0) )); then
@@ -128,7 +139,7 @@ time_operation() {
         fi
 
         log_to_file "TIMING" "Completed: $operation_name in $formatted_duration"
-        status_info "⏱️  $operation_name took $formatted_duration"
+        status_info "[TIME]  $operation_name took $formatted_duration"
     fi
 
     return $exit_code
@@ -300,7 +311,7 @@ test_storage_status() {
 
     if api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/status" >/dev/null 2>&1; then
         local end_time=$(date +%s.%N)
-        local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+        local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
         log_to_file "TIMING" "Storage Status Check completed in ${duration}s"
         log_success "Storage accessible via API (${duration}s)"
         return 0
@@ -343,10 +354,10 @@ test_volume_creation() {
         return 1
     fi
     local disk_end=$(date +%s.%N)
-    local disk_duration=$(echo "$disk_end - $disk_start" | bc -l 2>/dev/null || echo "N/A")
+    local disk_duration=$(format_duration $(echo "$disk_end - $disk_start" | bc -l 2>/dev/null || echo "N/A"))
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "Volume Creation (4GB disk) completed in ${disk_duration}s"
     log_to_file "TIMING" "Volume Creation Test total time: ${duration}s"
     log_success "Volume creation test passed (${duration}s, disk: ${disk_duration}s)"
@@ -370,7 +381,7 @@ test_volume_listing() {
     fi
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "Volume Listing Test completed in ${duration}s"
     log_success "Volume listing test passed (${duration}s)"
     return 0
@@ -399,7 +410,7 @@ test_snapshot_operations() {
         wait_for_task "$task_upid" 60
     fi
     local snap_end=$(date +%s.%N)
-    local snap_duration=$(echo "$snap_end - $snap_start" | bc -l 2>/dev/null || echo "N/A")
+    local snap_duration=$(format_duration $(echo "$snap_end - $snap_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Listing snapshots..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/snapshot" >/dev/null 2>&1; then
@@ -421,7 +432,7 @@ test_snapshot_operations() {
     echo "$clone_snapshot" > /tmp/clone_snapshot_name
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "First snapshot creation: ${snap_duration}s"
     log_to_file "TIMING" "Snapshot Operations Test total time: ${duration}s"
     log_success "Snapshot operations test passed (${duration}s, snapshot: ${snap_duration}s)"
@@ -461,7 +472,7 @@ test_clone_operations() {
         wait_for_task "$task_upid" 300
     fi
     local clone_end=$(date +%s.%N)
-    local clone_duration=$(echo "$clone_end - $clone_start" | bc -l 2>/dev/null || echo "N/A")
+    local clone_duration=$(format_duration $(echo "$clone_end - $clone_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying clone was created..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_CLONE/config" >/dev/null 2>&1; then
@@ -470,7 +481,7 @@ test_clone_operations() {
     fi
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "Clone operation: ${clone_duration}s"
     log_to_file "TIMING" "Clone Operations Test total time: ${duration}s"
     log_success "Clone operations test passed (${duration}s, clone: ${clone_duration}s)"
@@ -497,7 +508,7 @@ test_volume_resize() {
         return 1
     fi
     local resize_end=$(date +%s.%N)
-    local resize_duration=$(echo "$resize_end - $resize_start" | bc -l 2>/dev/null || echo "N/A")
+    local resize_duration=$(format_duration $(echo "$resize_end - $resize_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying new disk size..."
     if ! api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/config" >/dev/null 2>&1; then
@@ -506,10 +517,75 @@ test_volume_resize() {
     fi
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "Disk resize (+1GB): ${resize_duration}s"
     log_to_file "TIMING" "Volume Resize Test total time: ${duration}s"
     log_success "Volume resize test passed (${duration}s, resize: ${resize_duration}s)"
+    return 0
+}
+
+test_vm_start_stop() {
+    local start_time=$(date +%s.%N)
+    log_test "Testing VM start and stop operations (via API)"
+
+    # Start the VM
+    log_step "Starting VM $TEST_VM_BASE..."
+    local start_vm_time=$(date +%s.%N)
+    local output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/start" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to start VM: $output"
+        return 1
+    fi
+
+    # Extract task ID and wait for start to complete
+    local task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid" 60
+    fi
+    local start_vm_end=$(date +%s.%N)
+    local start_duration=$(format_duration $(echo "$start_vm_end - $start_vm_time" | bc -l 2>/dev/null || echo "N/A"))
+
+    # Verify VM is running
+    log_step "Verifying VM is running..."
+    sleep 2
+    output=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*running"; then
+        log_error "VM is not in running state after start"
+        return 1
+    fi
+
+    # Stop the VM
+    log_step "Stopping VM $TEST_VM_BASE..."
+    local stop_vm_time=$(date +%s.%N)
+    output=$(api_call POST "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/stop" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to stop VM: $output"
+        return 1
+    fi
+
+    # Extract task ID and wait for stop to complete
+    task_upid=$(echo "$output" | grep "UPID:" | head -1 | awk '{print $1}')
+    if [[ -n "$task_upid" ]]; then
+        wait_for_task "$task_upid" 60
+    fi
+    local stop_vm_end=$(date +%s.%N)
+    local stop_duration=$(format_duration $(echo "$stop_vm_end - $stop_vm_time" | bc -l 2>/dev/null || echo "N/A"))
+
+    # Verify VM is stopped
+    log_step "Verifying VM is stopped..."
+    sleep 2
+    output=$(api_call GET "/nodes/$NODE_NAME/qemu/$TEST_VM_BASE/status/current" 2>&1)
+    if ! echo "$output" | grep -q "│ status.*│.*stopped"; then
+        log_error "VM is not in stopped state after stop"
+        return 1
+    fi
+
+    local end_time=$(date +%s.%N)
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
+    log_to_file "TIMING" "VM start: ${start_duration}s"
+    log_to_file "TIMING" "VM stop: ${stop_duration}s"
+    log_to_file "TIMING" "VM Start/Stop Test total time: ${duration}s"
+    log_success "VM start/stop test passed (${duration}s, start: ${start_duration}s, stop: ${stop_duration}s)"
     return 0
 }
 
@@ -547,7 +623,7 @@ test_volume_deletion() {
         wait_for_task "$task_upid" 60
     fi
     local delete_end=$(date +%s.%N)
-    local delete_duration=$(echo "$delete_end - $delete_start" | bc -l 2>/dev/null || echo "N/A")
+    local delete_duration=$(format_duration $(echo "$delete_end - $delete_start" | bc -l 2>/dev/null || echo "N/A"))
 
     log_step "Verifying storage cleanup..."
     sleep 5
@@ -557,7 +633,7 @@ test_volume_deletion() {
         grep -E "($TEST_VM_BASE|$TEST_VM_CLONE)" || true)
 
     local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    local duration=$(format_duration $(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A"))
     log_to_file "TIMING" "VM deletion with --purge: ${delete_duration}s"
     log_to_file "TIMING" "Volume Deletion Test total time: ${duration}s"
 
@@ -579,6 +655,11 @@ generate_summary_report() {
     local error_count=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
     local warning_count=$(grep -c "WARNING" "$LOG_FILE" 2>/dev/null || echo "0")
 
+    # Clean up any potential newlines or multiple values in counts
+    passed_tests=$(echo "$passed_tests" | head -1 | tr -d '\n\r ')
+    error_count=$(echo "$error_count" | head -1 | tr -d '\n\r ')
+    warning_count=$(echo "$warning_count" | head -1 | tr -d '\n\r ')
+
     cat >> "$LOG_FILE" << EOF
 
 ================================================================================
@@ -596,7 +677,7 @@ $error_count errors encountered
 $warning_count warnings issued
 
 Performance Metrics:
-$(grep '\[TIMING\]' "$LOG_FILE" 2>/dev/null | sed 's/.*\[TIMING\] /⏱️  /' || echo "No timing data available")
+$(grep '\[TIMING\]' "$LOG_FILE" 2>/dev/null | sed 's/.*\[TIMING\] /[TIME]  /' || echo "No timing data available")
 
 System Information:
 Proxmox Version: $(pveversion 2>/dev/null || echo "Unknown")
@@ -604,14 +685,15 @@ Kernel: $(uname -r)
 Node: $NODE_NAME
 
 Plugin Feature Coverage (via API):
-✓ Storage status and capacity reporting
-✓ Volume creation and allocation
-✓ Volume listing via API
-✓ Snapshot creation via API
-✓ Clone operations via API
-✓ Volume resize via API
-✓ Volume deletion with --purge flag
-✓ PVE 8.x and 9.x compatibility
+[*]  Storage status and capacity reporting
+[*]  Volume creation and allocation
+[*]  Volume listing via API
+[*]  Snapshot creation via API
+[*]  Clone operations via API
+[*]  Volume resize via API
+[*]  VM start and stop operations
+[*]  Volume deletion with --purge flag
+[*]  PVE 8.x and 9.x compatibility
 
 Notes:
 - All operations performed via Proxmox API (pvesh)
@@ -622,44 +704,44 @@ Notes:
 EOF
 
     echo ""
-    echo -e "${GREEN}🎉 Test suite completed!${NC}"
-    echo -e "📄 Log file: ${BLUE}$LOG_FILE${NC}"
-    echo -e "📊 Summary: ${GREEN}$passed_tests passed${NC}, ${RED}$error_count errors${NC}, ${YELLOW}$warning_count warnings${NC}"
+    echo -e "${GREEN}[SUCCESS] Test suite completed!${NC}"
+    echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
+    echo -e "[SUMMARY]  Summary: ${GREEN}$passed_tests passed${NC}, ${RED}$error_count errors${NC}, ${YELLOW}$warning_count warnings${NC}"
 }
 
 # Pre-flight checks
 run_preflight_checks() {
     local checks_passed=true
 
-    echo "  🔧 Checking plugin installation..."
+    echo "  [*]  Checking plugin installation..."
     if [[ ! -f "/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm" ]]; then
-        echo -e "        ${RED}❌ TrueNAS plugin not found${NC}"
+        echo -e "        ${RED}[FAIL]  TrueNAS plugin not found${NC}"
         checks_passed=false
     else
-        echo -e "        ${GREEN}✅ Plugin file found${NC}"
+        echo -e "        ${GREEN}[PASS]  Plugin file found${NC}"
     fi
 
-    echo "  📦 Checking storage configuration..."
+    echo "  [*]  Checking storage configuration..."
     if ! api_call GET "/nodes/$NODE_NAME/storage/$STORAGE_NAME/status" >/dev/null 2>&1; then
-        echo -e "        ${RED}❌ Storage '$STORAGE_NAME' not accessible via API${NC}"
+        echo -e "        ${RED}[FAIL]  Storage '$STORAGE_NAME' not accessible via API${NC}"
         checks_passed=false
     else
-        echo -e "        ${GREEN}✅ Storage '$STORAGE_NAME' accessible via API${NC}"
+        echo -e "        ${GREEN}[PASS]  Storage '$STORAGE_NAME' accessible via API${NC}"
     fi
 
-    echo "  🛠️  Checking required tools..."
+    echo "  [*]  Checking required tools..."
     if ! command -v pvesh >/dev/null 2>&1; then
-        echo -e "        ${RED}❌ pvesh command not found${NC}"
+        echo -e "        ${RED}[FAIL]  pvesh command not found${NC}"
         checks_passed=false
     else
-        echo -e "        ${GREEN}✅ pvesh available${NC}"
+        echo -e "        ${GREEN}[PASS]  pvesh available${NC}"
     fi
 
-    echo "  🔐 Checking permissions..."
+    echo "  [*]  Checking permissions..."
     if [[ $EUID -eq 0 ]]; then
-        echo -e "        ${GREEN}✅ Running as root${NC}"
+        echo -e "        ${GREEN}[PASS]  Running as root${NC}"
     else
-        echo -e "        ${YELLOW}⚠️  Not running as root - some operations may fail${NC}"
+        echo -e "        ${YELLOW}[WARN]  Not running as root - some operations may fail${NC}"
     fi
 
     $checks_passed
@@ -668,45 +750,46 @@ run_preflight_checks() {
 
 # Main test execution
 main() {
-    echo -e "${BLUE}🧪 TrueNAS Proxmox Plugin Test Suite (API-based)${NC}"
-    echo -e "📦 Testing storage: ${YELLOW}$STORAGE_NAME${NC}"
-    echo -e "🖥️  Node: ${YELLOW}$NODE_NAME${NC}"
-    echo -e "📝 Log file: ${BLUE}$LOG_FILE${NC}"
+    echo -e "${BLUE}[TEST] TrueNAS Proxmox Plugin Test Suite (API-based)${NC}"
+    echo -e "[*]  Testing storage: ${YELLOW}$STORAGE_NAME${NC}"
+    echo -e "[NODE]  Node: ${YELLOW}$NODE_NAME${NC}"
+    echo -e "[LOG]  Log file: ${BLUE}$LOG_FILE${NC}"
     echo ""
 
-    echo -e "${YELLOW}⚠️  This script will perform the following operations via API:${NC}"
-    echo "    • Test TrueNAS storage plugin via Proxmox API"
-    echo "    • Create and delete test VMs ($TEST_VM_BASE, $TEST_VM_CLONE)"
-    echo "    • Allocate and free storage volumes"
-    echo "    • Create and test snapshots"
-    echo "    • Test clone operations"
-    echo "    • Test volume resize"
-    echo "    • Verify automatic cleanup with --purge"
+    echo -e "${YELLOW}[WARN]  This script will perform the following operations via API:${NC}"
+    echo "    - Test TrueNAS storage plugin via Proxmox API"
+    echo "    - Create and delete test VMs ($TEST_VM_BASE, $TEST_VM_CLONE)"
+    echo "    - Allocate and free storage volumes"
+    echo "    - Create and test snapshots"
+    echo "    - Test clone operations"
+    echo "    - Test volume resize"
+    echo "    - Test VM start and stop operations"
+    echo "    - Verify automatic cleanup with --purge"
     echo ""
-    echo -e "${BLUE}ℹ️  All operations use Proxmox API (pvesh) to simulate GUI interaction${NC}"
-    echo -e "${BLUE}ℹ️  Compatible with PVE 8.x and 9.x${NC}"
+    echo -e "${BLUE}[INFO]  All operations use Proxmox API (pvesh) to simulate GUI interaction${NC}"
+    echo -e "${BLUE}[INFO]  Compatible with PVE 8.x and 9.x${NC}"
     echo ""
 
     if [[ "$AUTO_YES" != "true" ]]; then
         read -p "Do you want to continue? (y/N): " -n 1 -r
         echo ""
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo -e "${RED}❌ Test suite cancelled by user${NC}"
+            echo -e "${RED}[FAIL]  Test suite cancelled by user${NC}"
             exit 0
         fi
     else
-        echo -e "${GREEN}✓ Auto-confirmed (using -y flag)${NC}"
+        echo -e "${GREEN}[*]  Auto-confirmed (using -y flag)${NC}"
         echo ""
     fi
 
-    print_stage_header "PRE-FLIGHT CHECKS" "🔍"
+    print_stage_header "PRE-FLIGHT CHECKS" "[CHECK]"
     if ! run_preflight_checks; then
-        echo -e "${RED}❌ Pre-flight checks failed${NC}"
+        echo -e "${RED}[FAIL]  Pre-flight checks failed${NC}"
         exit 1
     fi
-    echo -e "${GREEN}✅ Pre-flight checks passed${NC}"
+    echo -e "${GREEN}[PASS]  Pre-flight checks passed${NC}"
 
-    print_stage_header "MAIN TEST EXECUTION" "🧪"
+    print_stage_header "MAIN TEST EXECUTION" "[TEST]"
 
     log_test "Finding available VM IDs"
     if ! find_available_vm_ids; then
@@ -729,29 +812,30 @@ main() {
     test_snapshot_operations || ((failed_tests++))
     test_clone_operations || ((failed_tests++))
     test_volume_resize || ((failed_tests++))
+    test_vm_start_stop || ((failed_tests++))
     test_volume_deletion || ((failed_tests++))
 
-    print_stage_header "TEST RESULTS" "📊"
+    print_stage_header "TEST RESULTS" "[SUMMARY]"
     generate_summary_report
 
-    print_stage_header "CLEANUP" "🧹"
+    print_stage_header "CLEANUP" "[CLEANUP]"
     cleanup_test_vms
     rm -f /tmp/clone_snapshot_name
 
     if [[ $failed_tests -eq 0 ]]; then
-        echo -e "\n${GREEN}🎉 All tests passed successfully!${NC}"
-        echo -e "📋 Log file: ${BLUE}$LOG_FILE${NC}"
+        echo -e "\n${GREEN}[SUCCESS]  All tests passed successfully!${NC}"
+        echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
         exit 0
     else
-        echo -e "\n${RED}❌ $failed_tests test(s) failed${NC}"
-        echo -e "📋 Log file: ${BLUE}$LOG_FILE${NC}"
+        echo -e "\n${RED}[FAIL]  $failed_tests test(s) failed${NC}"
+        echo -e "[FILE]  Log file: ${BLUE}$LOG_FILE${NC}"
         exit 1
     fi
 }
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
-    echo "❌ This script must be run as root"
+    echo "[FAIL]  This script must be run as root"
     exit 1
 fi
 
