@@ -4,50 +4,45 @@ This document contains suggested improvements to make the TrueNAS Proxmox Plugin
 
 ---
 
-## 1. Configuration Validation on Load ⭐ HIGH PRIORITY
+## 1. Configuration Validation on Load ✅ COMPLETED
 
 **Goal**: Validate critical configuration parameters at startup to catch misconfigurations early.
 
-**Implementation Location**: `check_config` function (currently around line 247)
+**Status**: Implemented in `check_config()` function (lines 338-416)
 
-**Changes**:
-```perl
-sub check_config {
-    my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
-    my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+**Validations Implemented:**
 
-    # Existing: Always set shared=1
-    $opts->{shared} = 1;
+1. **Required Fields** - Validates presence of `api_host`, `api_key`, `dataset`, `target_iqn`
+2. **Retry Parameters** - `api_retry_max` (0-10), `api_retry_delay` (0.1-60 seconds)
+3. **Dataset Naming** - ZFS-compliant characters only: `a-z A-Z 0-9 _ - . /`
+4. **Dataset Format** - No leading/trailing `/`, no `//`, no empty names
+5. **Security Warnings** - Logs warnings for insecure HTTP/WS transport
 
-    # NEW: Validate retry configuration
-    if (defined $opts->{api_retry_max}) {
-        die "api_retry_max must be between 0 and 10\n"
-            if $opts->{api_retry_max} < 0 || $opts->{api_retry_max} > 10;
-    }
-    if (defined $opts->{api_retry_delay}) {
-        die "api_retry_delay must be between 0.1 and 60 seconds\n"
-            if $opts->{api_retry_delay} < 0.1 || $opts->{api_retry_delay} > 60;
-    }
+**Example Error Messages:**
+```
+api_retry_max must be between 0 and 10 (got 15)
 
-    # NEW: Validate that dataset doesn't contain invalid characters
-    if ($opts->{dataset} && $opts->{dataset} =~ /[^a-zA-Z0-9_\-\/]/) {
-        die "dataset name contains invalid characters\n";
-    }
+dataset name contains invalid characters: 'tank/my storage'
+  Allowed characters: a-z A-Z 0-9 _ - . /
 
-    # NEW: Warn if using insecure transport
-    if ($opts->{api_scheme} && $opts->{api_scheme} =~ /^(ws|http)$/i) {
-        syslog('warning', "Storage '$sectionId' using insecure transport: $opts->{api_scheme}");
-    }
+dataset name must not contain '//': 'tank//test'
 
-    return $opts;
-}
+api_host is required
 ```
 
+**Testing Results:**
+✅ Invalid retry max (15) - Rejected
+✅ Invalid retry delay (100) - Rejected
+✅ Dataset with spaces - Rejected
+✅ Dataset with double slashes - Rejected
+✅ Valid config with all parameters - Accepted
+
 **Benefits**:
-- Catch configuration errors immediately instead of at first use
-- Prevent invalid retry values that could cause issues
-- Warn about security concerns (insecure transport)
-- Validate dataset naming conventions
+✅ Catch configuration errors at creation time, not at first use
+✅ Prevent invalid values that could cause runtime issues
+✅ Security warnings for insecure transport (HTTP/WS)
+✅ ZFS naming convention enforcement
+✅ Clear, actionable error messages
 
 ---
 
@@ -490,7 +485,7 @@ Pre-flight validation failed:
 ## Implementation Priority
 
 ### Phase 1 (Critical - Implement First)
-1. ⏸️ Configuration Validation on Load (#1) - Basic implementation exists, needs enhancement
+1. ✅ Configuration Validation on Load (#1) - **COMPLETED**
 2. ✅ Dataset Space Check Before Allocation (#3) - **COMPLETED** (integrated into #10)
 3. ⏸️ Detailed Error Context (#9) - Needs implementation
 4. ✅ Pre-flight Checks on Critical Operations (#10) - **COMPLETED**

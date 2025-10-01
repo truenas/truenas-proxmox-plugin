@@ -1,6 +1,14 @@
 # TrueNAS Plugin Changelog
 
-## Pre-flight Validation & Space Checks (October 2025)
+## Configuration Validation, Pre-flight Checks & Space Validation (October 2025)
+
+### 🔒 **Configuration Validation at Storage Creation**
+- **Required field validation** - Ensures `api_host`, `api_key`, `dataset`, `target_iqn` are present
+- **Retry parameter validation** - `api_retry_max` (0-10) and `api_retry_delay` (0.1-60s) bounds checking
+- **Dataset naming validation** - Validates ZFS naming conventions (alphanumeric, `_`, `-`, `.`, `/`)
+- **Dataset format validation** - Prevents leading/trailing slashes, double slashes, invalid characters
+- **Security warnings** - Logs warnings when using insecure HTTP or WS transport instead of HTTPS/WSS
+- **Implementation**: Enhanced `check_config()` function (lines 338-416)
 
 ### 🛡️ **Comprehensive Pre-flight Validation**
 - **5-point validation system** runs before volume creation (~200ms overhead)

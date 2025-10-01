@@ -338,8 +338,80 @@ sub options {
 sub check_config {
     my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
     my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
+
     # Always set shared=1 since this is iSCSI-based shared storage
     $opts->{shared} = 1;
+
+    # Validate retry configuration parameters
+    if (defined $opts->{api_retry_max}) {
+        die "api_retry_max must be between 0 and 10 (got $opts->{api_retry_max})\n"
+            if $opts->{api_retry_max} < 0 || $opts->{api_retry_max} > 10;
+    }
+    if (defined $opts->{api_retry_delay}) {
+        die "api_retry_delay must be between 0.1 and 60 seconds (got $opts->{api_retry_delay})\n"
+            if $opts->{api_retry_delay} < 0.1 || $opts->{api_retry_delay} > 60;
+    }
+
+    # Validate dataset name follows ZFS naming conventions
+    if ($opts->{dataset}) {
+        # ZFS datasets: alphanumeric, underscore, hyphen, period, slash (for hierarchy)
+        if ($opts->{dataset} =~ /[^a-zA-Z0-9_\-\.\/]/) {
+            die "dataset name contains invalid characters: '$opts->{dataset}'\n" .
+                "  Allowed characters: a-z A-Z 0-9 _ - . /\n";
+        }
+
+        # Must not start or end with slash
+        if ($opts->{dataset} =~ /^\/|\/$/) {
+            die "dataset name must not start or end with '/': '$opts->{dataset}'\n";
+        }
+
+        # Must not contain double slashes
+        if ($opts->{dataset} =~ /\/\//) {
+            die "dataset name must not contain '//': '$opts->{dataset}'\n";
+        }
+
+        # Must not be empty after trimming
+        if ($opts->{dataset} eq '') {
+            die "dataset name cannot be empty\n";
+        }
+    }
+
+    # Warn if using insecure transport (HTTP/WS instead of HTTPS/WSS)
+    if (defined $opts->{api_transport}) {
+        my $transport = lc($opts->{api_transport});
+        if ($transport eq 'rest' && defined $opts->{api_scheme}) {
+            my $scheme = lc($opts->{api_scheme});
+            if ($scheme eq 'http') {
+                syslog('warning',
+                    "Storage '$sectionId' is using insecure HTTP transport. " .
+                    "Consider using HTTPS for API communication."
+                );
+            }
+        } elsif ($transport eq 'ws') {
+            # WebSocket uses wss:// or ws:// - check if scheme is insecure
+            if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
+                syslog('warning',
+                    "Storage '$sectionId' is using insecure WebSocket (ws://). " .
+                    "Consider using secure WebSocket (wss://) for API communication."
+                );
+            }
+        }
+    }
+
+    # Validate required fields are present
+    if (!$opts->{api_host}) {
+        die "api_host is required\n";
+    }
+    if (!$opts->{api_key}) {
+        die "api_key is required\n";
+    }
+    if (!$opts->{dataset}) {
+        die "dataset is required\n";
+    }
+    if (!$opts->{target_iqn}) {
+        die "target_iqn is required\n";
+    }
+
     return $opts;
 }
 

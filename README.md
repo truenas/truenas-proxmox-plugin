@@ -20,6 +20,7 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 - **CHAP Authentication** - Optional CHAP security for iSCSI connections
 
 ### 📊 Enterprise Features
+- **Configuration Validation** - Validates storage settings at creation time with clear error messages
 - **Volume Resize** - Grow-only resize with 80% headroom preflight checks
 - **Pre-flight Validation** - Comprehensive checks before volume operations prevent failures
 - **Space Validation** - Pre-allocation space checks with 20% ZFS overhead margin
@@ -113,6 +114,32 @@ sudo zfs create tank/proxmox
   - Ensure the user has appropriate permissions for storage management
 
 ## Configuration
+
+### Configuration Validation
+
+The plugin validates all storage settings when you create or modify storage to catch errors early:
+
+**Automatic Validations:**
+- ✅ **Required fields** - Ensures `api_host`, `api_key`, `dataset`, `target_iqn` are present
+- ✅ **Retry limits** - `api_retry_max` must be 0-10, `api_retry_delay` must be 0.1-60 seconds
+- ✅ **Dataset naming** - Validates ZFS naming rules (alphanumeric, `_`, `-`, `.`, `/`)
+- ✅ **Dataset format** - No leading/trailing `/`, no `//`, no special characters
+- ✅ **Security warnings** - Logs warnings if using insecure HTTP/WS transport
+
+**Example Validation Errors:**
+```
+# Invalid retry value
+api_retry_max must be between 0 and 10 (got 15)
+
+# Invalid dataset name
+dataset name contains invalid characters: 'tank/my storage'
+  Allowed characters: a-z A-Z 0-9 _ - . /
+
+# Missing required field
+api_host is required
+```
+
+These validations run at storage creation/modification time, preventing misconfigured storage that would fail at runtime.
 
 ### Required Parameters
 
