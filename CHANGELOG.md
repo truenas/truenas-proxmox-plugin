@@ -20,6 +20,22 @@
 - **TrueNAS GUI navigation** - All errors include exact menu paths for verification
 - **Implementation**: Enhanced error messages in `alloc_image`, `_resolve_target_id`, and related functions
 
+### 🏥 **Intelligent Storage Health Monitoring**
+- **Smart error classification** in `status` function distinguishes failure types
+- **Connectivity issues** (timeouts, network errors) logged as INFO - temporary, auto-recovers
+- **Configuration errors** (dataset not found, auth failures) logged as ERROR - needs admin action
+- **Unknown failures** logged as WARNING for investigation
+- **Graceful degradation** - Storage marked inactive vs throwing errors to GUI
+- **No performance penalty** - Reuses existing dataset query, no additional API calls
+- **Implementation**: Enhanced `status` function (lines 2517-2543)
+
+### 🧹 **Cleanup Warning Suppression**
+- **Intelligent ENOENT handling** in `free_image` suppresses spurious warnings
+- **Idempotent cleanup** - Silently ignores "does not exist" errors for target-extents, extents, and datasets
+- **Cleaner logs** - No false warnings during VM deletion when resources already cleaned up
+- **Race condition safe** - Handles concurrent cleanup attempts gracefully
+- **Implementation**: Enhanced error handling in `free_image` (lines 2190-2346)
+
 ### 🛡️ **Comprehensive Pre-flight Validation**
 - **5-point validation system** runs before volume creation (~200ms overhead)
 - **TrueNAS API connectivity check** - Verifies API is reachable via `core.ping`

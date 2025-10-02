@@ -2191,9 +2191,11 @@ sub free_image {
             my $err = $@ // '';
             if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
-            } else {
+            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Only warn if resource actually exists - ENOENT means already cleaned up
                 warn "warning: delete targetextent id=$id failed: $err";
             }
+            # Silently ignore "does not exist" errors - resource already gone
         }
     }
 
@@ -2209,9 +2211,11 @@ sub free_image {
             my $err = $@ // '';
             if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
-            } else {
+            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                # Only warn if resource actually exists - ENOENT means already cleaned up
                 warn "warning: delete extent id=$eid failed: $err";
             }
+            # Silently ignore "does not exist" errors - resource already gone
         }
     }
 
@@ -2332,9 +2336,14 @@ sub free_image {
             }
             syslog('info', "Dataset $full_ds deletion completed successfully after retry");
             $need_force_logout = 1;
-        } or warn "warning: delete dataset $full_ds failed after retry: $@";
+        } or do {
+            my $err = $@ // '';
+            warn "warning: delete dataset $full_ds failed after retry: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        };
     } elsif ($@) {
-        warn "warning: delete dataset $full_ds failed: $@";
+        my $err = $@ // '';
+        # Only warn if dataset actually exists - ENOENT means already cleaned up
+        warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
     # 5) Skip re-login after volume deletion - the device is gone, no need to reconnect
@@ -2506,9 +2515,28 @@ sub status {
         }
     };
     if ($@) {
-        # Mark storage as inactive if API call fails (e.g., network issue, unreachable from this node)
-        syslog('warning', "TrueNAS storage '$storeid' status check failed: $@");
-        $active = 0;
+        my $err = $@;
+
+        # Distinguish between connectivity issues and actual errors
+        if ($err =~ /timeout|timed out|connection refused|connection reset|unreachable|network|ssl.*error/i) {
+            # Network/connectivity issue - mark as inactive (temporary)
+            syslog('info', "TrueNAS storage '$storeid' marked inactive (connectivity issue): $err");
+            $active = 0;
+        } elsif ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            # Dataset doesn't exist - this is a configuration error
+            syslog('error', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
+            $active = 0;
+        } elsif ($err =~ /401|403|authentication|unauthorized|forbidden/i) {
+            # Authentication/permission issue - configuration error
+            syslog('error', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
+            $active = 0;
+        } else {
+            # Other errors - mark inactive but log as warning for investigation
+            syslog('warning', "TrueNAS storage '$storeid' status check failed: $err");
+            $active = 0;
+        }
+
+        # Return zeros for all capacity metrics when inactive
         $total = 0;
         $avail = 0;
         $used  = 0;

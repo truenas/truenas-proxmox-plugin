@@ -470,6 +470,36 @@ Available targets:
 3. Check by-path devices: `ls -la /dev/disk/by-path/`
 4. Verify multipath: `multipath -ll` (if enabled)
 
+### Storage Status and Health
+
+The plugin provides intelligent health monitoring with graceful failure handling:
+
+**Status Behavior:**
+- **Active** - TrueNAS reachable, dataset accessible, normal operations
+- **Inactive** - Temporary failure (network issue, TrueNAS offline, etc.)
+
+**Error Classification:**
+```
+# Connectivity Issues (logged as INFO - temporary)
+- Network timeouts, connection refused, SSL errors
+- Storage marked inactive, operations suspended
+- Auto-recovers when connection restored
+
+# Configuration Errors (logged as ERROR - needs admin action)
+- Dataset not found (ENOENT)
+- Authentication failures (401/403 - check API key)
+- Storage marked inactive until config fixed
+
+# Other Failures (logged as WARNING - investigate)
+- Unexpected errors requiring investigation
+```
+
+**Checking Status:**
+```bash
+pvesm status              # Shows active/inactive state
+journalctl -u pvedaemon | grep "TrueNAS storage"  # View status logs
+```
+
 ### Logs and Debugging
 
 **TrueNAS Logs:**

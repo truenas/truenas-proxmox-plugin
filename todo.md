@@ -3,6 +3,9 @@
 This document contains suggested improvements to make the TrueNAS Proxmox Plugin more robust and reliable.
 
 ---
+Features to add:
+1. LXC support
+---
 
 ## 1. Configuration Validation on Load ✅ COMPLETED
 
@@ -46,13 +49,13 @@ api_host is required
 
 ---
 
-## 2. Connection Health Check ⭐ MEDIUM PRIORITY
+## 2. Connection Health Check ✅ NOT NEEDED (Alternative Implemented)
 
 **Goal**: Add a lightweight health check to verify TrueNAS connectivity.
 
-**Implementation Location**: New function after `_clear_cache`
+**Status**: Instead of adding a separate health check function, enhanced the existing `status` function with intelligent error classification (better solution, zero performance overhead).
 
-**Changes**:
+**Original Proposal** (Not Implemented):
 ```perl
 sub _check_connection_health {
     my ($scfg) = @_;
@@ -71,14 +74,30 @@ sub _check_connection_health {
 }
 ```
 
-**Benefits**:
-- Early detection of connectivity issues
-- Can be used in status checks to mark storage as inactive
-- Lightweight operation (simple ping)
+**Why Not Implemented:**
+- ❌ Redundant with pre-flight checks (already ping TrueNAS)
+- ❌ Adds unnecessary API call overhead
+- ❌ Natural failures already indicate connectivity issues
 
-**Usage**:
-- Call before expensive operations
-- Add to status function for better health reporting
+**Better Alternative Implemented:**
+Enhanced `status` function (lines 2517-2543) with intelligent error classification:
+- ✅ **Zero performance overhead** - Reuses existing dataset query
+- ✅ **Smart categorization** - Distinguishes connectivity vs configuration errors
+- ✅ **Appropriate log levels** - INFO for temporary issues, ERROR for config problems
+- ✅ **Graceful degradation** - Marks storage inactive instead of throwing errors
+
+**Error Classification:**
+```perl
+# Connectivity issues → INFO (temporary, auto-recovers)
+if ($err =~ /timeout|connection|unreachable|network|ssl.*error/i)
+
+# Configuration errors → ERROR (needs admin action)
+if ($err =~ /does not exist|ENOENT|401|403|authentication/i)
+
+# Unknown failures → WARNING (investigate)
+```
+
+**Result:** Better solution than proposed, no added API calls, production-ready.
 
 ---
 
