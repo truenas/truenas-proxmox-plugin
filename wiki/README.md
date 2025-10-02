@@ -21,6 +21,10 @@ Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 - **[Advanced Features](Advanced-Features.md)** - Performance tuning, cluster configuration, security hardening, and enterprise features
 - **[API Reference](API-Reference.md)** - Technical details on TrueNAS API integration, endpoints, and error handling
 
+### Development
+- **[Ideas and Feature Requests](Ideas.md)** - Proposed features, enhancements, and development roadmap
+- **[Changelog](Changelog.md)** - Version history and release notes
+
 ### Important Information
 - **[Known Limitations](Known-Limitations.md)** - Critical limitations, restrictions, and workarounds you should know
 
@@ -40,6 +44,8 @@ Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 
 **Tools**:
 - [Test Suite](Tools.md#test-suite)
+- [Health Check Tool](Tools.md#health-check-tool)
+- [Orphan Cleanup Tool](Tools.md#orphan-cleanup-tool)
 - [Cluster Update Script](Tools.md#cluster-update-script)
 - [Version Check Script](Tools.md#version-check-script)
 - [Deployment Automation](Tools.md#integration-with-cicd)
@@ -72,10 +78,12 @@ wiki/
 ├── Installation.md             # Installation and setup guide
 ├── Configuration.md            # Configuration reference
 ├── Testing.md                  # Test suite usage and validation
-├── Tools.md                    # Tools and utilities (test suite, cluster script)
+├── Tools.md                    # Tools and utilities (test suite, health check, orphan cleanup, cluster deployment)
 ├── Troubleshooting.md          # Common issues and solutions
 ├── Advanced-Features.md        # Performance, clustering, security
 ├── API-Reference.md            # TrueNAS API technical details
+├── Ideas.md                    # Feature ideas and development roadmap
+├── Changelog.md                # Version history and release notes
 └── Known-Limitations.md        # Important limitations
 ```
 
