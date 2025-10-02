@@ -4,9 +4,10 @@ Documentation for included tools and utilities to help manage the TrueNAS Proxmo
 
 ## Overview
 
-The plugin includes several tools to simplify installation, testing, and cluster management:
+The plugin includes several tools to simplify installation, testing, cluster management, and maintenance:
 
 - **[Test Suite](#test-suite)** - Automated testing and validation
+- **[Orphan Cleanup Tool](#orphan-cleanup-tool)** - Find and remove orphaned iSCSI resources
 - **[Version Check Script](#version-check-script)** - Check plugin version across cluster
 - **[Cluster Update Script](#cluster-update-script)** - Deploy plugin to all cluster nodes
 - **[Tools Directory](#tools-directory-structure)** - Location and organization
@@ -16,6 +17,7 @@ The plugin includes several tools to simplify installation, testing, and cluster
 ```
 tools/
 ├── truenas-plugin-test-suite.sh    # Automated test suite
+├── cleanup-orphans.sh               # Orphan resource cleanup
 ├── update-cluster.sh                # Cluster deployment script
 └── check-version.sh                 # Version checker for cluster
 ```
