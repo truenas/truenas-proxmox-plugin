@@ -318,10 +318,12 @@ cd tools/
 
 ---
 
-### 6. Orphan Resource Cleanup Tool ⭐⭐⭐
+### 6. Orphan Resource Cleanup Tool ⭐⭐⭐ ✅ COMPLETED
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
+
+**Status**: ✅ **COMPLETED** - Implemented and tested
 
 **Description**: Find and clean up orphaned resources on TrueNAS (referenced in todo.md #4).
 
@@ -1249,8 +1251,8 @@ truenasplugin: auto-storage
 
 ### Quick Wins (High Impact, Low Effort)
 1. ✅ **Version Counter** - COMPLETED
-2. **Health Check Tool** (#2)
-3. **Orphan Cleanup Tool** (#6)
+2. ✅ **Orphan Cleanup Tool** (#6) - COMPLETED
+3. **Health Check Tool** (#2)
 4. **Dry-Run Mode** (#5)
 
 ### High Value (High Impact, Medium Effort)
