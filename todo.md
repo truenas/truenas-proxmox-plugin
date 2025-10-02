@@ -205,37 +205,51 @@ sub cleanup_orphaned_extents {
 
 ---
 
-## 5. LUN Conflict Detection ⭐ MEDIUM PRIORITY
+## 5. LUN Conflict Detection ❌ NOT NEEDED
 
 **Goal**: Check for LUN conflicts before creating iSCSI target mappings.
 
-**Implementation Location**: `alloc_image` before creating targetextent (around line 1740)
+**Status**: NOT NEEDED - TrueNAS handles LUN auto-assignment internally with transactional safety.
 
-**Changes**:
+1. **Plugin uses TrueNAS auto-assignment** - Never specifies LUN numbers:
+   ```perl
+   # Current implementation (line 2008):
+   my $tx_payload = { target => $target_id, extent => $extent_id };
+   # NO lunid specified - TrueNAS picks next available LUN
+   ```
+
+2. **TrueNAS API prevents conflicts**:
+   - `iscsi.targetextent.create` auto-assigns next free LUN
+   - Transactional database operations prevent race conditions
+   - Returns assigned LUN in response
+
+3. **Cache-based check is unreliable**:
+   - `_tn_targetextents()` data may be stale (60s cache TTL)
+   - TOCTOU race: Even if we check, another node could allocate before we do
+   - Only TrueNAS has the authoritative LUN state
+
+4. **Current approach is correct**:
+   - Line 2008: Let TrueNAS assign LUN ✅
+   - Lines 2019-2024: Retrieve assigned LUN ✅
+   - Lines 2025-2043: Verify assignment succeeded ✅
+
+**Why Proposed Check Doesn't Help:**
 ```perl
-# Before creating targetextent in alloc_image:
-my $existing_maps = _tn_targetextents($scfg) || [];
+# Proposed check (NOT IMPLEMENTED):
+my $existing_maps = _tn_targetextents($scfg) || [];  # May be 60s stale
 my %used_luns;
-
 for my $map (@$existing_maps) {
-    next if $map->{target} != $target_id;
-    $used_luns{$map->{lunid}} = 1 if defined $map->{lunid};
+    $used_luns{$map->{lunid}} = 1;
 }
-
-# Verify our LUN isn't taken (if we're specifying one)
-if (defined $tx_payload->{lunid} && $used_luns{$tx_payload->{lunid}}) {
-    die "LUN $tx_payload->{lunid} already in use on target\n";
-}
-
-# Log LUN assignment for debugging
-syslog('info', "Creating targetextent mapping with LUN " .
-    ($tx_payload->{lunid} // 'auto-assigned'));
+# ❌ Stale data, race condition, false sense of security
 ```
 
-**Benefits**:
-- Prevents LUN conflicts
-- Better logging for troubleshooting
-- Clearer error messages when conflicts occur
+**Performance Impact If Added:**
+- ❌ +50ms cache query overhead
+- ❌ No actual benefit (TrueNAS handles this)
+- ❌ Can't prevent races (only TrueNAS can)
+
+**Conclusion:** The plugin's auto-assignment approach is the correct design pattern for iSCSI LUN management. Manual conflict checking would add overhead without preventing any actual conflicts.
 
 ---
 
@@ -493,14 +507,18 @@ Pre-flight validation failed:
 4. ✅ Pre-flight Checks on Critical Operations (#10) - **COMPLETED**
 
 ### Phase 2 (Important - Implement Soon)
-5. ⏸️ Connection Health Check (#2)
+5. ✅ Connection Health Check (#2) - **NOT NEEDED** (Enhanced status function instead)
 6. ⏸️ Timeout Configuration (#8)
 7. ⏸️ Orphaned Resource Detection (#4)
-8. ⏸️ LUN Conflict Detection (#5)
+8. ❌ LUN Conflict Detection (#5) - **NOT NEEDED** (TrueNAS auto-assigns safely)
 
 ### Phase 3 (Nice to Have - Implement Later)
 9. ⏸️ Rate Limit Backoff Improvement (#7)
 10. ⏸️ WebSocket Connection Staleness Check (#6)
+
+### Items Removed (Better Alternatives or Not Applicable)
+- ✅ #2 - Connection Health Check → Enhanced `status` function with error classification (zero overhead)
+- ❌ #5 - LUN Conflict Detection → TrueNAS handles auto-assignment transactionally
 
 ---
 
