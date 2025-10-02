@@ -731,25 +731,6 @@ cd tools/
 - Check snapshots: TrueNAS → Datasets → [dataset] → Snapshots
 - Use: `zfs list -t snapshot -o name,used tank/proxmox`
 
-### Integration with Plugin
-
-The plugin includes helper functions for orphan detection:
-
-```perl
-# In TrueNASPlugin.pm
-my $orphans = detect_orphaned_resources($scfg);
-
-for my $orphan (@$orphans) {
-    if ($orphan->{type} eq 'extent') {
-        cleanup_orphaned_extent($scfg, $orphan->{id});
-    } elsif ($orphan->{type} eq 'targetextent') {
-        cleanup_orphaned_targetextent($scfg, $orphan->{id});
-    } elsif ($orphan->{type} eq 'zvol') {
-        cleanup_orphaned_zvol($scfg, $orphan->{id});
-    }
-}
-```
-
 ### Best Practices
 
 1. **Run with --dry-run first** - Always preview before deleting
