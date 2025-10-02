@@ -569,6 +569,211 @@ done
 | Test Suite | Automated testing and validation | `tools/truenas-plugin-test-suite.sh` | [Testing Guide](Testing.md) |
 | Cluster Update | Deploy plugin to cluster nodes | `tools/update-cluster.sh` | This page |
 | Version Check | Check plugin version across cluster | `tools/check-version.sh` | This page |
+| Orphan Cleanup | Find and remove orphaned iSCSI resources | `tools/cleanup-orphans.sh` | This page |
+
+---
+
+## Orphan Cleanup Tool
+
+### Overview
+
+The orphan cleanup tool (`cleanup-orphans.sh`) detects and removes orphaned iSCSI resources on TrueNAS that result from failed operations or interrupted workflows.
+
+**Location**: `tools/cleanup-orphans.sh`
+
+### What Are Orphaned Resources?
+
+Orphaned resources occur when storage operations fail partway through:
+
+1. **Orphaned Extents** - iSCSI extents pointing to deleted/missing zvols
+2. **Orphaned Target-Extent Mappings** - Mappings referencing deleted extents
+3. **Orphaned Zvols** - Zvols without corresponding iSCSI extents
+
+**Common Causes**:
+- VM deletion failures
+- Network interruptions during volume creation
+- Manual cleanup on TrueNAS without updating Proxmox
+- Power failures during operations
+
+### Usage
+
+#### Basic Syntax
+```bash
+./cleanup-orphans.sh [storage-name] [--force] [--dry-run]
+```
+
+**Parameters**:
+- `storage-name`: Name of TrueNAS storage to scan
+- `--force`: Skip confirmation prompt
+- `--dry-run`: Show what would be deleted without deleting
+
+#### Examples
+
+**List Available Storages**:
+```bash
+cd tools/
+./cleanup-orphans.sh
+
+# Output:
+# === Available TrueNAS Storage ====
+# truenas-storage
+# truenas-backup
+```
+
+**Detect Orphans (Interactive)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage
+
+# Output:
+# === TrueNAS Orphan Resource Detection ===
+# Storage: truenas-storage
+#
+# Fetching iSCSI extents...
+# Fetching zvols...
+# Fetching target-extent mappings...
+#
+# === Analyzing Resources ===
+# Checking for extents without zvols...
+# Checking for target-extent mappings without extents...
+# Checking for zvols without extents...
+#
+# Found 3 orphaned resource(s):
+#
+#   [EXTENT] vm-999-disk-0 (ID: 42)
+#            Reason: zvol missing: tank/proxmox/vm-999-disk-0
+#   [TARGET-EXTENT] mapping-15 (ID: 15)
+#                   Reason: extent missing: 40 (target: 2)
+#   [ZVOL] vm-998-disk-1
+#          Reason: no extent pointing to this zvol
+#
+# WARNING: This will permanently delete these orphaned resources!
+#
+# Delete these orphaned resources? (yes/N):
+```
+
+**Dry Run (Preview Only)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage --dry-run
+
+# Shows what would be deleted without making changes
+# Dry run complete. No resources were deleted.
+```
+
+**Automated Cleanup (No Prompt)**:
+```bash
+cd tools/
+./cleanup-orphans.sh truenas-storage --force
+
+# Deletes all orphaned resources without confirmation
+```
+
+### Output Interpretation
+
+**Resource Types**:
+- `[EXTENT]` - Orphaned iSCSI extent
+- `[TARGET-EXTENT]` - Orphaned target-extent mapping
+- `[ZVOL]` - Orphaned zvol dataset
+
+**Status Messages**:
+- `✓ Deleted` - Resource successfully removed
+- `✗ Failed to delete` - Error during deletion (check permissions/API)
+
+### Safety Features
+
+1. **Interactive Confirmation** - Prompts before deletion (unless `--force`)
+2. **Dry Run Mode** - Preview changes without modifying anything
+3. **Dataset Isolation** - Only scans resources under configured dataset
+4. **Ordered Deletion** - Removes dependencies first (mappings → extents → zvols)
+5. **Error Logging** - Failed deletions are reported but don't stop cleanup
+
+### When to Run
+
+**Regular Maintenance**:
+```bash
+# Monthly check for orphans
+0 0 1 * * /path/to/tools/cleanup-orphans.sh truenas-storage --force
+```
+
+**After Issues**:
+- After failed VM deletions
+- After network interruptions during storage operations
+- After manual cleanup on TrueNAS
+- When storage space doesn't match expectations
+
+**Before Major Operations**:
+- Before storage migrations
+- Before cluster maintenance
+- Before TrueNAS upgrades
+
+### Troubleshooting
+
+**"Error: Storage 'name' not found"**:
+- Storage name is incorrect
+- Storage is not a TrueNAS plugin storage
+- Check: `grep truenasplugin /etc/pve/storage.cfg`
+
+**"Error: Failed to fetch extents from TrueNAS API"**:
+- TrueNAS is offline or unreachable
+- API key is invalid or expired
+- Check: `curl -k -H "Authorization: Bearer YOUR_KEY" https://TRUENAS_IP/api/v2.0/system/info`
+
+**"Failed to cleanup orphaned extent"**:
+- API key lacks permissions
+- Resource is in use (shouldn't happen for true orphans)
+- Check TrueNAS logs: System Settings → Shell → `tail -f /var/log/middlewared.log`
+
+**No Orphans Found But Space Is Missing**:
+- Snapshots may be consuming space (not considered orphans)
+- Check snapshots: TrueNAS → Datasets → [dataset] → Snapshots
+- Use: `zfs list -t snapshot -o name,used tank/proxmox`
+
+### Integration with Plugin
+
+The plugin includes helper functions for orphan detection:
+
+```perl
+# In TrueNASPlugin.pm
+my $orphans = detect_orphaned_resources($scfg);
+
+for my $orphan (@$orphans) {
+    if ($orphan->{type} eq 'extent') {
+        cleanup_orphaned_extent($scfg, $orphan->{id});
+    } elsif ($orphan->{type} eq 'targetextent') {
+        cleanup_orphaned_targetextent($scfg, $orphan->{id});
+    } elsif ($orphan->{type} eq 'zvol') {
+        cleanup_orphaned_zvol($scfg, $orphan->{id});
+    }
+}
+```
+
+### Best Practices
+
+1. **Run with --dry-run first** - Always preview before deleting
+2. **Schedule regular scans** - Monthly maintenance prevents accumulation
+3. **Run after incidents** - Clean up after failed operations
+4. **Backup before cleanup** - Snapshot TrueNAS pool before major cleanup
+5. **Check logs** - Review syslog for cleanup results
+
+**Example Maintenance Script**:
+```bash
+#!/bin/bash
+# Monthly orphan cleanup with notification
+cd /path/to/tools/
+STORAGE="truenas-storage"
+
+# Dry run to detect
+ORPHANS=$(./cleanup-orphans.sh "$STORAGE" --dry-run | grep -c "Found.*orphaned")
+
+if [ "$ORPHANS" -gt 0 ]; then
+    echo "Found $ORPHANS orphaned resources on $STORAGE" | \
+      mail -s "TrueNAS Orphan Alert" admin@example.com
+
+    # Cleanup
+    ./cleanup-orphans.sh "$STORAGE" --force
+fi
+```
 
 ---
 
