@@ -29,10 +29,10 @@ Before installing the plugin, ensure TrueNAS is properly configured:
 
 ```bash
 # Copy the plugin to Proxmox storage directory
-sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
 # Set proper permissions
-sudo chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 # Verify installation
 ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
@@ -57,12 +57,12 @@ truenasplugin: truenas-storage
 
 ```bash
 # Restart required services
-sudo systemctl restart pvedaemon
-sudo systemctl restart pveproxy
+systemctl restart pvedaemon
+systemctl restart pveproxy
 
 # Verify services are running
-sudo systemctl status pvedaemon
-sudo systemctl status pveproxy
+systemctl status pvedaemon
+systemctl status pveproxy
 ```
 
 #### 4. Verify Installation
@@ -100,9 +100,9 @@ Or manually on each node:
 
 ```bash
 # On each cluster node
-sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-sudo chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
-sudo systemctl restart pvedaemon pveproxy
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+systemctl restart pvedaemon pveproxy
 ```
 
 #### 3. Configure Shared Storage
@@ -150,9 +150,9 @@ Navigate to **Datasets** → Click **Add Dataset**:
 #### Via CLI
 ```bash
 # Create dataset with recommended settings
-sudo zfs create tank/proxmox
-sudo zfs set compression=lz4 tank/proxmox
-sudo zfs set atime=off tank/proxmox
+zfs create tank/proxmox
+zfs set compression=lz4 tank/proxmox
+zfs set atime=off tank/proxmox
 ```
 
 ### 2. Configure iSCSI Service
@@ -166,10 +166,10 @@ Navigate to **System Settings** → **Services**:
 #### Verify iSCSI Service
 ```bash
 # Check service status
-sudo systemctl status iscsitarget
+systemctl status iscsitarget
 
 # Verify iSCSI is listening
-sudo netstat -tuln | grep 3260
+netstat -tuln | grep 3260
 ```
 
 ### 3. Create iSCSI Target
@@ -335,10 +335,10 @@ pvesm free truenas-storage:vm-999-disk-0-lun1
 ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 # Check permissions
-sudo chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 # Restart services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 
 # Check for errors
 journalctl -u pvedaemon -n 50
@@ -355,7 +355,7 @@ curl -k -H "Authorization: Bearer YOUR_API_KEY" \
   https://YOUR_TRUENAS_IP/api/v2.0/system/info
 
 # Check firewall
-sudo iptables -L -n | grep 443
+iptables -L -n | grep 443
 
 # Verify TrueNAS API is accessible
 ping YOUR_TRUENAS_IP
@@ -406,14 +406,14 @@ telnet YOUR_TRUENAS_IP 3260
 ### Single Node Update
 ```bash
 # Backup current version
-sudo cp /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm \
+cp /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm \
   /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm.backup
 
 # Copy new version
-sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
 # Restart services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ### Cluster Update
@@ -434,13 +434,13 @@ done
 ### Remove Plugin
 ```bash
 # Remove plugin file
-sudo rm /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+rm /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 # Remove storage configuration from /etc/pve/storage.cfg
 # (edit manually to remove truenasplugin entries)
 
 # Restart services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ### Clean Up TrueNAS

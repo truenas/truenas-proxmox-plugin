@@ -2,6 +2,38 @@
 
 Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 
+## About Plugin Error Messages
+
+**The plugin provides enhanced error messages** with built-in troubleshooting guidance. When an error occurs, the plugin includes:
+- Specific cause of the failure
+- Step-by-step troubleshooting instructions
+- TrueNAS GUI navigation paths
+- Relevant commands for diagnosis
+
+**Example Enhanced Error**:
+```
+Failed to create iSCSI extent for disk 'vm-100-disk-0':
+
+Common causes:
+1. iSCSI service not running
+   → Check: TrueNAS → System Settings → Services → iSCSI (should be RUNNING)
+
+2. Zvol not accessible
+   → Verify: zfs list tank/proxmox/vm-100-disk-0
+
+3. API key lacks permissions
+   → Check: TrueNAS → Credentials → Local Users → [your user] → Edit
+   → Ensure user has full Sharing permissions
+
+4. Extent name conflict
+   → Check: TrueNAS → Shares → Block Shares (iSCSI) → Extents
+   → Look for existing extent named 'vm-100-disk-0'
+```
+
+**This guide supplements those built-in messages** with additional context and solutions for common scenarios.
+
+---
+
 ## Storage Status Issues
 
 ### Storage Shows as Inactive
@@ -64,7 +96,7 @@ curl -k -H "Authorization: Bearer YOUR_API_KEY" \
 
 # Update /etc/pve/storage.cfg with new key
 # Restart services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ## Connection and API Issues
@@ -87,7 +119,7 @@ curl -k -H "Authorization: Bearer YOUR_API_KEY" \
 #### 2. Check Firewall Rules
 ```bash
 # On Proxmox node
-sudo iptables -L -n | grep 443
+iptables -L -n | grep 443
 
 # On TrueNAS, verify firewall allows API port (443 or 80)
 ```
@@ -108,7 +140,7 @@ api_insecure 1
 api_transport rest
 
 # Restart services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ### API Rate Limiting
@@ -159,12 +191,12 @@ iscsiadm -m discovery -t sendtargets -p YOUR_TRUENAS_IP:3260
 #### 1. Verify iSCSI Service Running
 ```bash
 # On TrueNAS
-sudo systemctl status iscsitarget
+systemctl status iscsitarget
 
 # Via web UI: System Settings > Services > iSCSI (should show Running)
 
 # Start if not running
-sudo systemctl start iscsitarget
+systemctl start iscsitarget
 ```
 
 #### 2. Check Network Connectivity
@@ -284,7 +316,7 @@ iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
 # System Settings > Services > iSCSI (should be Running)
 
 # Or via CLI:
-sudo systemctl status iscsitarget
+systemctl status iscsitarget
 ```
 
 #### 2. Verify Zvol Exists

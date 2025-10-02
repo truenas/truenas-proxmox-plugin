@@ -1,6 +1,6 @@
-# TrueNAS Proxmox VE Storage Plugin
+<h1 align="center">TrueNAS Proxmox VE Storage Plugin</h1>
 
-A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI, featuring live snapshots, ZFS integration, and cluster compatibility.
+<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI, featuring live snapshots, ZFS integration, and cluster compatibility.</p>
 
 ## Features
 
@@ -19,6 +19,31 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 - **Error Recovery** - Comprehensive error handling with actionable error messages
 - **Performance Optimization** - Configurable block sizes and sparse volumes
 
+## Feature Comparison
+
+| Feature | TrueNAS Plugin | Standard iSCSI | NFS |
+|---------|:--------------:|:--------------:|:---:|
+| **Snapshots** | ✅ | ❌ | ⚠️ |
+| **Live Snapshots (RAM)** | ✅ | ❌ | ❌ |
+| **Clones** | ✅ | ❌ | ⚠️ |
+| **Thin Provisioning** | ✅ | ❌ | ⚠️ |
+| **Block-Level Performance** | ✅ | ✅ | ❌ |
+| **Shared Storage** | ✅ | ✅ | ✅ |
+| **Volume Management** | ✅ | ❌ | ❌ |
+| **Automatic Resize** | ✅ | ❌ | ❌ |
+| **Pre-flight Checks** | ✅ | ❌ | ❌ |
+| **Multi-path I/O** | ✅ | ✅ | ❌ |
+| **ZFS Compression** | ✅ | ❌ | ❌ |
+| **Container Storage** | ❌ | ❌ | ✅ |
+| **Raw Image Format** | ✅ | ✅ | ✅ |
+
+**Legend**: ✅ Yes | ⚠️ Via qcow2 | ❌ No
+
+**Notes**:
+- **Standard iSCSI**: Proxmox recommends using LVM on top of iSCSI LUNs for snapshots/clones
+- **NFS**: Snapshots/clones require qcow2 format (performance overhead vs raw)
+- **TrueNAS Plugin**: Native ZFS features with raw image performance
+
 ## Quick Start
 
 ### Proxmox VE Setup
@@ -26,13 +51,13 @@ A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE v
 #### 1. Install Plugin
 ```bash
 # Copy the plugin file
-sudo cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
 # Set permissions
-sudo chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 # Restart Proxmox services
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 #### 2. Configure Storage
@@ -42,6 +67,7 @@ Add to `/etc/pve/storage.cfg`:
 truenasplugin: truenas-storage
     api_host 192.168.1.100
     api_key 1-your-truenas-api-key-here
+    api_insecure 1
     target_iqn iqn.2005-10.org.freenas.ctl:proxmox
     dataset tank/proxmox
     discovery_portal 192.168.1.100:3260

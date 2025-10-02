@@ -575,7 +575,7 @@ done
 **Procedure**:
 ```bash
 # After editing /etc/pve/storage.cfg
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 **Impact**: Brief interruption to API (web UI may disconnect)

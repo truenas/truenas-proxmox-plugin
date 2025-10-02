@@ -570,6 +570,105 @@ done
 | Cluster Update | Deploy plugin to cluster nodes | `tools/update-cluster.sh` | This page |
 | Version Check | Check plugin version across cluster | `tools/check-version.sh` | This page |
 
+---
+
+## Version Check Script
+
+### Overview
+
+The version check script (`check-version.sh`) verifies plugin installation and version across cluster nodes.
+
+**Location**: `tools/check-version.sh`
+
+### Usage
+
+#### Basic Syntax
+```bash
+./check-version.sh [node1] [node2] [node3] ...
+```
+
+**Parameters**:
+- No arguments: Check local installation only
+- `node1 node2 ...`: Check specified cluster nodes via SSH
+
+#### Examples
+
+**Check Local Installation**:
+```bash
+cd tools/
+./check-version.sh
+
+# Output:
+# TrueNAS Plugin Version Check
+# ============================
+#
+# Local: '1.0.0'
+```
+
+**Check Cluster Nodes**:
+```bash
+cd tools/
+./check-version.sh pve1 pve2 pve3
+
+# Output:
+# TrueNAS Plugin Version Check
+# ============================
+#
+# Local: '1.0.0'
+#
+# pve1: '1.0.0'
+# pve2: '1.0.0'
+# pve3: '0.9.5'  # Outdated!
+```
+
+### Output Interpretation
+
+- **Green**: Plugin installed, version displayed
+- **Yellow**: Plugin not installed or version not found
+- **Cyan**: Section headers
+
+### Troubleshooting
+
+**"Plugin not installed"**:
+- Plugin file missing from `/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm`
+- Use `update-cluster.sh` to install
+
+**"Version string not found"**:
+- Plugin file exists but doesn't contain version marker
+- Manually check: `grep 'our $VERSION' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm`
+
+**SSH Connection Failed**:
+- Ensure SSH access configured: `ssh root@node1 "hostname"`
+- Set up passwordless SSH: `ssh-copy-id root@node1`
+
+### Integration
+
+**Pre-Deployment Verification**:
+```bash
+# Before update, check current versions
+./check-version.sh pve1 pve2 pve3 > versions-before.txt
+
+# Deploy update
+./update-cluster.sh pve1 pve2 pve3
+
+# Verify update successful
+./check-version.sh pve1 pve2 pve3 > versions-after.txt
+
+# Compare
+diff versions-before.txt versions-after.txt
+```
+
+**Monitoring Script**:
+```bash
+#!/bin/bash
+# Daily version verification
+NODES="pve1 pve2 pve3"
+./check-version.sh $NODES | grep -q "Plugin not installed" && \
+  echo "WARNING: Plugin missing on one or more nodes" | mail -s "PVE Plugin Alert" admin@example.com
+```
+
+---
+
 ### Common Tasks
 
 **Check Plugin Version**:
@@ -577,7 +676,6 @@ done
 cd tools/
 ./check-version.sh pve1 pve2 pve3
 ```
-
 
 **Test Plugin Installation**:
 ```bash

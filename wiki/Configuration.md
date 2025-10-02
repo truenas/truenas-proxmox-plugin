@@ -442,6 +442,72 @@ truenasplugin: truenas-dev
     vmstate_storage shared
 ```
 
+### Enterprise Production Configuration (All Features)
+
+Complete configuration showing all available features for enterprise production environments:
+
+```ini
+truenasplugin: enterprise-storage
+    # API Configuration
+    api_host truenas-ha-vip.corp.com
+    api_key 1-production-api-key-here
+    api_transport ws
+    api_scheme wss
+    api_port 443
+    api_insecure 0
+    api_retry_max 5
+    api_retry_delay 2
+    prefer_ipv4 1
+
+    # Storage Configuration
+    dataset tank/production/proxmox
+    zvol_blocksize 128K
+    tn_sparse 1
+    target_iqn iqn.2005-10.org.freenas.ctl:production-cluster
+
+    # iSCSI Network Configuration
+    discovery_portal 10.10.100.10:3260
+    portals 10.10.100.11:3260,10.10.100.12:3260,10.10.101.10:3260,10.10.101.11:3260
+    use_multipath 1
+    use_by_path 0
+    ipv6_by_path 0
+
+    # Security
+    chap_user production-proxmox
+    chap_password very-long-secure-chap-password-here
+
+    # iSCSI Behavior
+    force_delete_on_inuse 1
+    logout_on_free 0
+
+    # Cluster & HA
+    content images
+    shared 1
+
+    # Snapshot Configuration
+    enable_live_snapshots 1
+    snapshot_volume_chains 1
+    vmstate_storage local
+
+    # Performance Optimization
+    enable_bulk_operations 1
+```
+
+**Use Case**: Enterprise production environment with:
+- TrueNAS HA configuration (VIP for failover)
+- Secure WebSocket API transport
+- 4-path multipath I/O (2 controllers × 2 networks)
+- CHAP authentication for security
+- Aggressive retry for HA tolerance
+- Local vmstate for performance
+- Bulk operations for efficiency
+
+**Performance Tuning**: See [Advanced Features - Performance Tuning](Advanced-Features.md#performance-tuning) for detailed optimization guidance.
+
+**Security**: See [Advanced Features - Security Configuration](Advanced-Features.md#security-configuration) for hardening recommendations.
+
+**Clustering**: See [Advanced Features - Cluster Configuration](Advanced-Features.md#cluster-configuration) for HA setups.
+
 ## Configuration Validation
 
 The plugin validates configuration at storage creation/modification time:
@@ -479,7 +545,7 @@ nano /etc/pve/storage.cfg
 ### Restart Services After Changes
 ```bash
 # Restart Proxmox services to apply changes
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ### Verify Configuration

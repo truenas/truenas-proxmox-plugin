@@ -77,7 +77,7 @@ iface ens1f1 inet manual
     mtu 9000
 
 # On TrueNAS (via web UI or CLI)
-sudo ifconfig ix0 mtu 9000
+ifconfig ix0 mtu 9000
 
 # Verify
 ip link show ens1f1 | grep mtu
@@ -347,7 +347,7 @@ truenasplugin: secure-storage
 #### 3. Restart Services
 
 ```bash
-sudo systemctl restart pvedaemon pveproxy
+systemctl restart pvedaemon pveproxy
 ```
 
 ### API Security

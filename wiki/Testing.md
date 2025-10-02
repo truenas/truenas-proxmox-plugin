@@ -541,7 +541,7 @@ chmod +x tools/truenas-plugin-test-suite.sh
 
 **Not Running as Root**:
 ```bash
-sudo ./tools/truenas-plugin-test-suite.sh
+./tools/truenas-plugin-test-suite.sh
 ```
 
 ### API Timeout Errors
