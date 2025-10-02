@@ -60,90 +60,7 @@ sub get_metrics {
 
 ---
 
-### 2. Automated Backup/Restore for Configuration ⭐⭐⭐
-**Priority**: High
-**Effort**: Low
-**Impact**: High
-
-**Description**: Automatically backup storage configuration with versioning to enable easy rollback and change tracking.
-
-**Tool to Add**: `tools/config-backup.sh`
-```bash
-#!/bin/bash
-# Backup TrueNAS plugin storage configuration with versioning
-# Usage: ./config-backup.sh [backup|restore|list]
-
-BACKUP_DIR="/var/backups/truenas-plugin"
-DATE=$(date +%Y%m%d-%H%M%S)
-
-backup_config() {
-    mkdir -p "$BACKUP_DIR"
-
-    # Backup all truenasplugin storage configs
-    grep -A20 "^truenasplugin:" /etc/pve/storage.cfg > "$BACKUP_DIR/storage-$DATE.cfg"
-
-    # Store metadata
-    echo "Backup created: $DATE" > "$BACKUP_DIR/storage-$DATE.meta"
-    echo "Hostname: $(hostname)" >> "$BACKUP_DIR/storage-$DATE.meta"
-    echo "Plugin Version: $(grep 'our $VERSION' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm)" >> "$BACKUP_DIR/storage-$DATE.meta"
-
-    # Keep last 30 backups, delete older
-    ls -t "$BACKUP_DIR"/storage-*.cfg | tail -n +31 | xargs rm -f
-    ls -t "$BACKUP_DIR"/storage-*.meta | tail -n +31 | xargs rm -f
-
-    echo "Backup saved: $BACKUP_DIR/storage-$DATE.cfg"
-}
-
-restore_config() {
-    local backup_file="$1"
-    if [ -z "$backup_file" ]; then
-        echo "Available backups:"
-        ls -lh "$BACKUP_DIR"/storage-*.cfg
-        echo ""
-        echo "Usage: $0 restore <backup-file>"
-        exit 1
-    fi
-
-    # Backup current config before restore
-    backup_config
-
-    # Restore selected backup
-    # (Interactive process - show diff, confirm, apply)
-}
-
-list_backups() {
-    echo "Available configuration backups:"
-    for backup in $(ls -t "$BACKUP_DIR"/storage-*.cfg 2>/dev/null); do
-        echo "---"
-        basename "$backup"
-        cat "${backup%.cfg}.meta" 2>/dev/null
-    done
-}
-
-case "$1" in
-    backup) backup_config ;;
-    restore) restore_config "$2" ;;
-    list) list_backups ;;
-    *) echo "Usage: $0 {backup|restore|list}"; exit 1 ;;
-esac
-```
-
-**Features**:
-- Automatic daily backups via cron
-- 30-day retention policy
-- Metadata tracking (date, hostname, plugin version)
-- Interactive restore with diff preview
-- Git-style versioning support
-
-**Benefits**:
-- Quick rollback after failed changes
-- Configuration change auditing
-- Disaster recovery capability
-- Migration aid (export/import configs)
-
----
-
-### 3. Health Check Endpoint/Command ⭐⭐
+### 2. Health Check Endpoint/Command ⭐⭐
 **Priority**: High
 **Effort**: Low
 **Impact**: Medium
@@ -253,38 +170,7 @@ fi
 
 ## 🚀 Feature Enhancements
 
-### 4. Bandwidth Throttling ⭐⭐
-**Priority**: Medium
-**Effort**: Medium
-**Impact**: Medium
-
-**Description**: Prevent clone/migration operations from saturating network bandwidth.
-
-**Configuration Addition**:
-```ini
-truenasplugin: storage
-    api_host 192.168.1.100
-    api_key xxx
-    # ... existing config ...
-    bandwidth_limit 100M    # Limit network operations to 100MB/s
-    bandwidth_limit_clone 50M    # Separate limit for clones
-```
-
-**Implementation**:
-- Use `pv` (pipe viewer) to throttle `dd` operations
-- QoS integration with Linux traffic control
-- Per-operation bandwidth limits
-- Time-based limits (e.g., throttle during business hours)
-
-**Use Cases**:
-- Shared network environments
-- WAN links
-- Business hours restrictions
-- Multi-tenant systems
-
----
-
-### 5. Snapshot Lifecycle Management ⭐⭐⭐
+### 3. Snapshot Lifecycle Management ⭐⭐⭐
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
@@ -351,7 +237,7 @@ sub cleanup_old_snapshots {
 
 ---
 
-### 6. Multi-Storage Support in Tools ⭐
+### 4. Multi-Storage Support in Tools ⭐
 **Priority**: Low
 **Effort**: Low
 **Impact**: Low
@@ -395,7 +281,7 @@ Overall Score      GOOD        BEST        FAIR
 
 ## 🔧 Operational Improvements
 
-### 7. Dry-Run Mode ⭐⭐
+### 5. Dry-Run Mode ⭐⭐
 **Priority**: Medium
 **Effort**: Low
 **Impact**: Medium
@@ -432,7 +318,7 @@ cd tools/
 
 ---
 
-### 8. Orphan Resource Cleanup Tool ⭐⭐⭐
+### 6. Orphan Resource Cleanup Tool ⭐⭐⭐
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
@@ -535,64 +421,9 @@ sub detect_orphaned_resources {
 
 ---
 
-### 9. Migration Helper ⭐⭐
-**Priority**: Medium
-**Effort**: High
-**Impact**: Medium
-
-**Description**: Help users migrate VMs from other storage backends to TrueNAS.
-
-**Tool to Add**: `tools/migrate-storage.sh`
-```bash
-#!/bin/bash
-# Migrate VMs from LVM/Directory/Other storage to TrueNAS
-# Usage: ./migrate-storage.sh <source-storage> <dest-storage> [vmid1 vmid2 ...]
-
-SOURCE_STORAGE="$1"
-DEST_STORAGE="$2"
-shift 2
-VMIDS="$@"
-
-if [ -z "$VMIDS" ]; then
-    # List all VMs on source storage
-    echo "VMs on $SOURCE_STORAGE:"
-    pvesm list "$SOURCE_STORAGE" --vmid
-    exit 0
-fi
-
-for vmid in $VMIDS; do
-    echo "=== Migrating VM $vmid ==="
-    echo "  Source: $SOURCE_STORAGE"
-    echo "  Dest: $DEST_STORAGE"
-
-    # Stop VM if running
-    # Clone disks to TrueNAS storage
-    # Update VM config to use new storage
-    # Validate migration
-    # Optional: Remove from source storage
-done
-```
-
-**Features**:
-- Pre-migration validation
-- Progress tracking
-- Rollback on failure
-- Post-migration verification
-- Optional source cleanup
-
-**Supported Sources**:
-- LVM
-- LVM-thin
-- Directory
-- NFS
-- CIFS
-- Other iSCSI
-
----
-
 ## 📊 Monitoring and Alerting
 
-### 10. Alert Configuration Templates ⭐
+### 7. Alert Configuration Templates ⭐
 **Priority**: Low
 **Effort**: Low
 **Impact**: Medium
@@ -652,7 +483,7 @@ groups:
 
 ---
 
-### 11. Performance Baseline Tool ⭐⭐
+### 8. Performance Baseline Tool ⭐⭐
 **Priority**: Medium
 **Effort**: Medium
 **Impact**: Medium
@@ -732,7 +563,7 @@ EOF
 
 ## 🔐 Security Enhancements
 
-### 12. API Key Rotation Helper ⭐⭐
+### 9. API Key Rotation Helper ⭐⭐
 **Priority**: Medium
 **Effort**: Low
 **Impact**: High
@@ -794,7 +625,7 @@ echo "⚠ Don't forget to revoke old API key in TrueNAS!"
 
 ---
 
-### 13. Audit Logging ⭐
+### 10. Audit Logging ⭐
 **Priority**: Low
 **Effort**: Medium
 **Impact**: Low
@@ -875,7 +706,7 @@ _audit_log('config_change', {
 
 ## 📚 Documentation Enhancements
 
-### 14. Interactive Troubleshooting Guide ⭐⭐
+### 11. Interactive Troubleshooting Guide ⭐⭐
 **Priority**: Medium
 **Effort**: Low
 **Impact**: High
@@ -935,55 +766,9 @@ esac
 
 ---
 
-### 15. Migration Guide from TrueNAS CORE ⭐
-**Priority**: Low
-**Effort**: Low
-**Impact**: Low
-
-**Description**: Guide for users upgrading from TrueNAS CORE to SCALE.
-
-**Add**: `wiki/Migration-from-CORE.md`
-
-**Contents**:
-- CORE vs SCALE differences
-- API compatibility notes
-- Configuration migration steps
-- Testing checklist
-- Rollback procedures
-- Common migration issues
-
----
-
-### 16. Video Tutorial Links ⭐
-**Priority**: Low
-**Effort**: Very Low
-**Impact**: Low
-
-**Description**: Links to video tutorials for visual learners.
-
-**Add to README.md**:
-```markdown
-## Video Tutorials
-
-- [Initial Setup and Configuration](https://youtube.com/...)
-- [Cluster Deployment](https://youtube.com/...)
-- [Troubleshooting Common Issues](https://youtube.com/...)
-- [Performance Tuning](https://youtube.com/...)
-```
-
-**Topics to Cover**:
-- Initial TrueNAS setup
-- Plugin installation
-- Creating first VM
-- Snapshot workflow
-- Cluster configuration
-- Troubleshooting walkthrough
-
----
-
 ## 🧪 Testing Improvements
 
-### 17. Chaos Testing Mode ⭐⭐
+### 12. Chaos Testing Mode ⭐⭐
 **Priority**: Low
 **Effort**: High
 **Impact**: Medium
@@ -1035,7 +820,7 @@ sub _chaos_inject {
 
 ---
 
-### 18. Compatibility Matrix Testing ⭐
+### 13. Compatibility Matrix Testing ⭐
 **Priority**: Low
 **Effort**: High
 **Impact**: Low
@@ -1081,7 +866,7 @@ Proxmox  8.0     ✓      ✓      ✓      ✓
 
 ## 🔄 CI/CD Enhancements
 
-### 19. GitHub Actions Workflows ⭐⭐
+### 14. GitHub Actions Workflows ⭐⭐
 **Priority**: Medium
 **Effort**: Medium
 **Impact**: Medium
@@ -1169,7 +954,7 @@ jobs:
 
 ---
 
-### 20. Pre-commit Hooks ⭐
+### 15. Pre-commit Hooks ⭐
 **Priority**: Low
 **Effort**: Low
 **Impact**: Low
@@ -1213,7 +998,7 @@ echo "✓ Pre-commit checks passed"
 
 ## 🎨 User Experience
 
-### 21. Web UI for Tool Management ⭐⭐⭐
+### 16. Web UI for Tool Management ⭐⭐⭐
 **Priority**: High
 **Effort**: High
 **Impact**: High
@@ -1259,7 +1044,7 @@ echo "✓ Pre-commit checks passed"
 
 ---
 
-### 22. Configuration Wizard ⭐⭐
+### 17. Configuration Wizard ⭐⭐
 **Priority**: Medium
 **Effort**: Low
 **Impact**: Medium
@@ -1324,7 +1109,7 @@ fi
 
 ## 📦 Packaging and Distribution
 
-### 23. Debian/RPM Package ⭐⭐⭐
+### 18. Debian/RPM Package ⭐⭐⭐
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
@@ -1380,53 +1165,9 @@ apt-get install pve-storage-truenas
 
 ---
 
-### 24. Docker Container for Testing ⭐⭐
-**Priority**: Low
-**Effort**: Medium
-**Impact**: Low
-
-**Description**: Containerized test environment.
-
-**Add**: `Dockerfile`
-```dockerfile
-FROM debian:12
-
-# Install Proxmox repository
-RUN echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve.list
-
-# Install dependencies
-RUN apt-get update && apt-get install -y \
-    pve-manager \
-    perl \
-    open-iscsi \
-    multipath-tools
-
-# Copy plugin
-COPY TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-
-# Copy tools
-COPY tools/ /opt/truenas-plugin/tools/
-
-WORKDIR /opt/truenas-plugin
-
-CMD ["/bin/bash"]
-```
-
-**Usage**:
-```bash
-# Build image
-docker build -t truenas-plugin-test .
-
-# Run tests
-docker run -it --privileged truenas-plugin-test bash
-# Inside container: run test suite
-```
-
----
-
 ## 🔮 Advanced Features
 
-### 25. Thin Provisioning Monitoring ⭐⭐
+### 19. Thin Provisioning Monitoring ⭐⭐
 **Priority**: Medium
 **Effort**: Low
 **Impact**: High
@@ -1480,7 +1221,7 @@ WARNING: Thin provisioning ratio on 'tank/proxmox' is 3.2:1
 
 ---
 
-### 26. Automatic Pool Selection ⭐
+### 20. Automatic Pool Selection ⭐
 **Priority**: Low
 **Effort**: High
 **Impact**: Low
@@ -1504,59 +1245,30 @@ truenasplugin: auto-storage
 
 ---
 
-### 27. Snapshot Synchronization ⭐⭐
-**Priority**: Low
-**Effort**: High
-**Impact**: Medium
-
-**Description**: Replicate snapshots to backup TrueNAS for DR.
-
-**Configuration**:
-```ini
-truenasplugin: storage
-    # ... existing config ...
-    snapshot_replication 1
-    replication_target 192.168.2.100  # Backup TrueNAS
-    replication_target_dataset pool/backup/proxmox
-    replication_schedule hourly
-```
-
-**Features**:
-- Automatic ZFS replication
-- Incremental snapshot send/receive
-- Verification and monitoring
-- DR failover capability
-
----
-
 ## 🏆 Priority Matrix
 
 ### Quick Wins (High Impact, Low Effort)
 1. ✅ **Version Counter** - COMPLETED
-2. **Health Check Tool** (#3)
-3. **Orphan Cleanup Tool** (#8)
-4. **Config Backup Tool** (#2)
-5. **Dry-Run Mode** (#7)
+2. **Health Check Tool** (#2)
+3. **Orphan Cleanup Tool** (#6)
+4. **Dry-Run Mode** (#5)
 
 ### High Value (High Impact, Medium Effort)
-6. **Metrics Collection** (#1)
-7. **Snapshot Lifecycle** (#5)
-8. **Debian/RPM Packages** (#23)
-9. **API Key Rotation** (#12)
-10. **Performance Baseline** (#11)
+5. **Metrics Collection** (#1)
+6. **Snapshot Lifecycle** (#3)
+7. **Debian/RPM Packages** (#18)
+8. **API Key Rotation** (#9)
+9. **Performance Baseline** (#8)
 
 ### Strategic (High Impact, High Effort)
-11. **Web UI** (#21)
-12. **Migration Tools** (#9)
-13. **Monitoring Templates** (#10)
-14. **Chaos Testing** (#17)
+10. **Web UI** (#16)
+11. **Monitoring Templates** (#7)
+12. **Chaos Testing** (#12)
 
 ### Nice to Have (Lower Priority)
-- Configuration Wizard (#22)
-- Multi-storage Testing (#6)
-- Bandwidth Throttling (#4)
-- Video Tutorials (#16)
-- Documentation Improvements (#14, #15)
+- Configuration Wizard (#17)
+- Multi-storage Testing (#4)
+- Interactive Troubleshooting (#11)
 
 ---
 
