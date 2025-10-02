@@ -92,6 +92,7 @@ Use the included deployment script:
 chmod +x update-cluster.sh
 
 # Deploy to all nodes
+cd tools/
 ./update-cluster.sh node1 node2 node3
 ```
 
@@ -418,6 +419,7 @@ sudo systemctl restart pvedaemon pveproxy
 ### Cluster Update
 ```bash
 # Use the deployment script
+cd tools/
 ./update-cluster.sh node1 node2 node3
 
 # Or manually on each node

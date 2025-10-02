@@ -143,7 +143,7 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 
 - **[Installation Guide](wiki/Installation.md)** - Detailed installation steps for both Proxmox and TrueNAS
 - **[Configuration Reference](wiki/Configuration.md)** - Complete parameter reference and examples
-- **[Testing Guide](wiki/Testing.md)** - Using the automated test suite to validate functionality
+- **[Tools and Utilities](wiki/Tools.md)** - Test suite and cluster deployment scripts
 - **[Troubleshooting Guide](wiki/Troubleshooting.md)** - Common issues and solutions
 - **[Advanced Features](wiki/Advanced-Features.md)** - Performance tuning, clustering, security
 - **[API Reference](wiki/API-Reference.md)** - Technical details on TrueNAS API integration

@@ -8,6 +8,8 @@ set -e
 PLUGIN_FILE="TrueNASPlugin.pm"
 INSTALL_PATH="/usr/share/perl5/PVE/Storage/Custom/"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Look for plugin file in parent directory (since script is in tools/)
+PLUGIN_PATH="$(dirname "$SCRIPT_DIR")/$PLUGIN_FILE"
 
 # Colors for output
 RED='\033[0;31m'
@@ -18,9 +20,10 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}TrueNAS Plugin Cluster Update Script${NC}"
 echo "======================================"
 
-# Check if plugin file exists
-if [ ! -f "$SCRIPT_DIR/$PLUGIN_FILE" ]; then
-    echo -e "${RED}Error: $PLUGIN_FILE not found in $SCRIPT_DIR${NC}"
+# Check if plugin file exists (in parent directory)
+if [ ! -f "$PLUGIN_PATH" ]; then
+    echo -e "${RED}Error: $PLUGIN_FILE not found at $PLUGIN_PATH${NC}"
+    echo -e "${YELLOW}Expected location: $(dirname "$SCRIPT_DIR")/$PLUGIN_FILE${NC}"
     exit 1
 fi
 
@@ -50,7 +53,7 @@ for node in "${NODES[@]}"; do
 
     # Copy plugin file
     echo "  Copying $PLUGIN_FILE..."
-    if scp "$SCRIPT_DIR/$PLUGIN_FILE" "root@$node:$INSTALL_PATH" 2>/dev/null; then
+    if scp "$PLUGIN_PATH" "root@$node:$INSTALL_PATH" 2>/dev/null; then
         echo -e "  ${GREEN}✓ File copied${NC}"
     else
         echo -e "  ${RED}✗ Failed to copy file${NC}"

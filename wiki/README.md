@@ -12,6 +12,7 @@ Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 
 ### Testing and Validation
 - **[Testing Guide](Testing.md)** - Comprehensive guide for using the automated test suite to validate plugin functionality
+- **[Tools and Utilities](Tools.md)** - Test suite and cluster deployment script documentation
 
 ### Operations
 - **[Troubleshooting Guide](Troubleshooting.md)** - Common issues, error messages, and solutions with detailed diagnostic steps
@@ -36,6 +37,11 @@ Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 - [Running Test Suite](Testing.md#basic-usage)
 - [Understanding Test Results](Testing.md#interpreting-results)
 - [Performance Benchmarking](Testing.md#performance-benchmarking)
+
+**Tools**:
+- [Test Suite](Tools.md#test-suite)
+- [Cluster Update Script](Tools.md#cluster-update-script)
+- [Deployment Automation](Tools.md#integration-with-cicd)
 
 **Configuration**:
 - [Required Parameters](Configuration.md#required-parameters)
@@ -65,6 +71,7 @@ wiki/
 ├── Installation.md             # Installation and setup guide
 ├── Configuration.md            # Configuration reference
 ├── Testing.md                  # Test suite usage and validation
+├── Tools.md                    # Tools and utilities (test suite, cluster script)
 ├── Troubleshooting.md          # Common issues and solutions
 ├── Advanced-Features.md        # Performance, clustering, security
 ├── API-Reference.md            # TrueNAS API technical details

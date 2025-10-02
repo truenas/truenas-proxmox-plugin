@@ -19,7 +19,7 @@ The TrueNAS Plugin Test Suite is an automated testing tool that validates all ma
 
 The test suite is included in the plugin repository:
 ```
-truenas-plugin-test-suite.sh
+tools/truenas-plugin-test-suite.sh
 ```
 
 ## Prerequisites
@@ -41,22 +41,22 @@ truenas-plugin-test-suite.sh
 
 ```bash
 # Make executable
-chmod +x truenas-plugin-test-suite.sh
+chmod +x tools/truenas-plugin-test-suite.sh
 
 # Run with default storage name 'tnscale'
-./truenas-plugin-test-suite.sh
+./tools/truenas-plugin-test-suite.sh
 
 # Run with custom storage name
-./truenas-plugin-test-suite.sh your-storage-name
+./tools/truenas-plugin-test-suite.sh your-storage-name
 
 # Run with auto-confirmation (skip prompt)
-./truenas-plugin-test-suite.sh your-storage-name -y
+./tools/truenas-plugin-test-suite.sh your-storage-name -y
 ```
 
 ### Command Syntax
 
 ```bash
-./truenas-plugin-test-suite.sh [storage_name] [-y]
+./tools/truenas-plugin-test-suite.sh [storage_name] [-y]
 ```
 
 **Parameters**:
@@ -66,13 +66,13 @@ chmod +x truenas-plugin-test-suite.sh
 **Examples**:
 ```bash
 # Test storage named 'truenas-storage'
-./truenas-plugin-test-suite.sh truenas-storage
+./tools/truenas-plugin-test-suite.sh truenas-storage
 
 # Test with auto-confirmation
-./truenas-plugin-test-suite.sh truenas-storage -y
+./tools/truenas-plugin-test-suite.sh truenas-storage -y
 
 # Test default storage 'tnscale'
-./truenas-plugin-test-suite.sh
+./tools/truenas-plugin-test-suite.sh
 ```
 
 ## What Gets Tested
@@ -474,7 +474,7 @@ Set `TEST_VM_BASE_HINT` to change starting ID search range:
 
 ```bash
 # Search for available IDs starting from 500
-TEST_VM_BASE_HINT=500 ./truenas-plugin-test-suite.sh truenas-storage
+TEST_VM_BASE_HINT=500 ./tools/truenas-plugin-test-suite.sh truenas-storage
 ```
 
 ### Extended Timeout
@@ -483,7 +483,7 @@ Modify timeout for slow networks/systems:
 
 ```bash
 # Edit test suite
-nano truenas-plugin-test-suite.sh
+nano tools/truenas-plugin-test-suite.sh
 
 # Change line:
 API_TIMEOUT=60  # Increase to 120 for slow systems
@@ -510,7 +510,7 @@ Run test suite in CI/CD pipelines:
 # CI test script
 
 # Run test suite with auto-confirm
-if ./truenas-plugin-test-suite.sh production-storage -y; then
+if ./tools/truenas-plugin-test-suite.sh production-storage -y; then
     echo "Tests passed"
     exit 0
 else
@@ -527,7 +527,7 @@ Add to cron for periodic validation:
 
 ```bash
 # Daily test at 2 AM
-0 2 * * * /root/truenas-plugin-test-suite.sh production-storage -y >> /var/log/truenas-plugin-test.log 2>&1
+0 2 * * * /root/tools/truenas-plugin-test-suite.sh production-storage -y >> /var/log/truenas-plugin-test.log 2>&1
 ```
 
 ## Troubleshooting Test Suite
@@ -536,12 +536,12 @@ Add to cron for periodic validation:
 
 **Permission Denied**:
 ```bash
-chmod +x truenas-plugin-test-suite.sh
+chmod +x tools/truenas-plugin-test-suite.sh
 ```
 
 **Not Running as Root**:
 ```bash
-sudo ./truenas-plugin-test-suite.sh
+sudo ./tools/truenas-plugin-test-suite.sh
 ```
 
 ### API Timeout Errors
@@ -572,12 +572,12 @@ Use test suite to benchmark different configurations:
 # Test with 64K blocks
 # Edit /etc/pve/storage.cfg: zvol_blocksize 64K
 # systemctl restart pvedaemon pveproxy
-./truenas-plugin-test-suite.sh test-64k -y > bench-64k.log
+./tools/truenas-plugin-test-suite.sh test-64k -y > bench-64k.log
 
 # Test with 128K blocks
 # Edit /etc/pve/storage.cfg: zvol_blocksize 128K
 # systemctl restart pvedaemon pveproxy
-./truenas-plugin-test-suite.sh test-128k -y > bench-128k.log
+./tools/truenas-plugin-test-suite.sh test-128k -y > bench-128k.log
 
 # Compare timing results
 grep "TIMING" bench-64k.log > compare-64k.txt
@@ -590,10 +590,10 @@ Test different network configurations:
 
 ```bash
 # Test single portal
-./truenas-plugin-test-suite.sh single-portal -y
+./tools/truenas-plugin-test-suite.sh single-portal -y
 
 # Test multipath with multiple portals
-./truenas-plugin-test-suite.sh multipath -y
+./tools/truenas-plugin-test-suite.sh multipath -y
 
 # Compare clone operation times
 ```
