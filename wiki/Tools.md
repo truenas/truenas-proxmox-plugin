@@ -7,6 +7,7 @@ Documentation for included tools and utilities to help manage the TrueNAS Proxmo
 The plugin includes several tools to simplify installation, testing, and cluster management:
 
 - **[Test Suite](#test-suite)** - Automated testing and validation
+- **[Version Check Script](#version-check-script)** - Check plugin version across cluster
 - **[Cluster Update Script](#cluster-update-script)** - Deploy plugin to all cluster nodes
 - **[Tools Directory](#tools-directory-structure)** - Location and organization
 
@@ -15,7 +16,8 @@ The plugin includes several tools to simplify installation, testing, and cluster
 ```
 tools/
 ├── truenas-plugin-test-suite.sh    # Automated test suite
-└── update-cluster.sh                # Cluster deployment script
+├── update-cluster.sh                # Cluster deployment script
+└── check-version.sh                 # Version checker for cluster
 ```
 
 All tools are located in the `tools/` directory of the plugin repository.
@@ -566,8 +568,16 @@ done
 |------|---------|----------|---------------|
 | Test Suite | Automated testing and validation | `tools/truenas-plugin-test-suite.sh` | [Testing Guide](Testing.md) |
 | Cluster Update | Deploy plugin to cluster nodes | `tools/update-cluster.sh` | This page |
+| Version Check | Check plugin version across cluster | `tools/check-version.sh` | This page |
 
 ### Common Tasks
+
+**Check Plugin Version**:
+```bash
+cd tools/
+./check-version.sh pve1 pve2 pve3
+```
+
 
 **Test Plugin Installation**:
 ```bash

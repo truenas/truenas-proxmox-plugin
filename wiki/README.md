@@ -41,6 +41,7 @@ Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 **Tools**:
 - [Test Suite](Tools.md#test-suite)
 - [Cluster Update Script](Tools.md#cluster-update-script)
+- [Version Check Script](Tools.md#version-check-script)
 - [Deployment Automation](Tools.md#integration-with-cicd)
 
 **Configuration**:
