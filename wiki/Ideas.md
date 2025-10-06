@@ -1247,12 +1247,180 @@ truenasplugin: auto-storage
 
 ---
 
+### 21. NVMe-oF (NVMe over Fabrics) Support ⭐⭐⭐
+**Priority**: High
+**Effort**: High
+**Impact**: Very High
+
+**Description**: Add support for NVMe over Fabrics as an alternative to iSCSI, providing significantly lower latency and higher performance for VM storage.
+
+**Benefits**:
+- **Ultra-Low Latency** - Sub-100μs latency vs 200-500μs for iSCSI
+- **Higher IOPS** - 10x+ improvement in random I/O operations
+- **Lower CPU Usage** - Reduced overhead compared to iSCSI stack
+- **Better Queue Depth** - Native NVMe command queuing (64K queues vs iSCSI's single queue)
+- **Modern Protocol** - Purpose-built for flash storage and modern networks
+
+**Transport Options**:
+- **NVMe/TCP** - Works over standard Ethernet (most compatible, easiest to implement)
+- **NVMe/RDMA** - Requires RDMA-capable NICs (RoCE, iWARP) for absolute best performance
+- **NVMe/FC** - Fiber Channel variant (less common in Proxmox environments)
+
+**Configuration Example**:
+```ini
+truenasplugin: truenas-nvmeof
+    api_host 192.168.1.100
+    api_key xxx
+    transport nvme-tcp  # or nvme-rdma, nvme-fc
+    target_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    dataset tank/proxmox-nvme
+    discovery_portal 192.168.1.100:4420  # NVMe/TCP default port
+    content images
+    shared 1
+```
+
+**TrueNAS API Integration**:
+```perl
+# Create NVMe namespace (equivalent to zvol + iSCSI extent)
+sub create_nvme_namespace {
+    my ($scfg, $volname, $size) = @_;
+
+    # Create zvol
+    my $zvol_path = "$scfg->{dataset}/$volname";
+    _api_call($scfg, 'POST', '/pool/dataset', {
+        name => $zvol_path,
+        type => 'VOLUME',
+        volsize => $size,
+        volblocksize => '16K',  # Optimal for NVMe
+    });
+
+    # Create NVMe namespace
+    _api_call($scfg, 'POST', '/nvmeof/namespace', {
+        name => $volname,
+        device => "/dev/zvol/$zvol_path",
+        subsystem_id => $scfg->{subsystem_id},
+    });
+}
+
+# Attach namespace to subsystem
+sub attach_nvme_namespace {
+    my ($scfg, $namespace_id) = @_;
+
+    _api_call($scfg, 'POST', "/nvmeof/subsystem/$scfg->{subsystem_id}/namespace", {
+        namespace_id => $namespace_id,
+    });
+}
+```
+
+**Proxmox Integration**:
+```perl
+# Discover NVMe targets
+sub discover_nvme_targets {
+    my ($scfg) = @_;
+
+    run_command([
+        'nvme', 'discover',
+        '-t', $scfg->{transport},  # tcp, rdma, or fc
+        '-a', $scfg->{api_host},
+        '-s', $scfg->{discovery_port} // '4420',
+    ]);
+}
+
+# Connect to NVMe namespace
+sub connect_nvme_namespace {
+    my ($scfg, $namespace_nqn) = @_;
+
+    run_command([
+        'nvme', 'connect',
+        '-t', $scfg->{transport},
+        '-n', $namespace_nqn,
+        '-a', $scfg->{api_host},
+        '-s', $scfg->{discovery_port} // '4420',
+    ]);
+}
+
+# List connected NVMe devices
+sub list_nvme_devices {
+    my $output = run_command(['nvme', 'list', '-o', 'json']);
+    return decode_json($output);
+}
+```
+
+**Implementation Considerations**:
+
+1. **TrueNAS SCALE Support**:
+   - Verify NVMe-oF support in TrueNAS SCALE API (available in newer versions)
+   - Check API endpoints: `/nvmeof/namespace`, `/nvmeof/subsystem`, `/nvmeof/target`
+   - Support for NVMe/TCP should be prioritized (most compatible)
+
+2. **Proxmox Requirements**:
+   - Kernel support for NVMe-oF (present in modern kernels)
+   - `nvme-cli` package for nvme discovery/connect commands
+   - Configure NVMe multipathing via `/etc/nvme/hostnqn` and native NVMe multipath
+
+3. **Device Path Handling**:
+   - NVMe devices appear as `/dev/nvmeXnY` instead of `/dev/sdX`
+   - Need to track NQN to device mapping
+   - Handle device naming persistence across reboots
+
+4. **Multipath Configuration**:
+   - NVMe native multipath (ANA - Asymmetric Namespace Access)
+   - Configure via `nvme connect --dhchap-secret` and `--hostnqn`
+   - Simpler than iSCSI multipath (no dm-multipath needed)
+
+5. **Performance Tuning**:
+   - Adjust NVMe queue depth: `nvme connect --nr-io-queues=X`
+   - TCP tuning for NVMe/TCP: increase `net.core.rmem_max`, `net.ipv4.tcp_rmem`
+   - ZFS block size optimization (16K-128K recommended for NVMe)
+
+6. **Migration Path**:
+   - Provide tool to migrate existing iSCSI volumes to NVMe-oF
+   - Support running both iSCSI and NVMe-oF simultaneously
+   - Document performance comparison and migration process
+
+**Backward Compatibility**:
+- Keep existing iSCSI code path
+- Add transport detection in plugin: `transport_type` parameter (iscsi/nvme-tcp/nvme-rdma)
+- Auto-detect based on TrueNAS capabilities
+
+**Testing Requirements**:
+- Test with NVMe/TCP first (most compatible)
+- Validate multipath failover
+- Performance benchmarking vs iSCSI
+- Test with VMs doing heavy random I/O workloads
+
+**Performance Expectations**:
+```
+iSCSI Baseline:
+  Latency: 200-500μs
+  IOPS (4K random): 50,000-100,000
+  CPU Usage: 15-25%
+
+NVMe/TCP Target:
+  Latency: 50-150μs
+  IOPS (4K random): 200,000-500,000+
+  CPU Usage: 5-10%
+
+NVMe/RDMA Target:
+  Latency: 20-50μs
+  IOPS (4K random): 500,000-1,000,000+
+  CPU Usage: 2-5%
+```
+
+**Related Tools Updates**:
+- Update test suite to support NVMe-oF
+- Add NVMe-specific health checks
+- Orphan cleanup for NVMe namespaces
+- Performance comparison tool (iSCSI vs NVMe-oF)
+
+---
+
 ## 🏆 Priority Matrix
 
 ### Quick Wins (High Impact, Low Effort)
 1. ✅ **Version Counter** - COMPLETED
 2. ✅ **Orphan Cleanup Tool** (#6) - COMPLETED
-3. **Health Check Tool** (#2)
+3. ✅ **Health Check Tool** (#2) - COMPLETED
 4. **Dry-Run Mode** (#5)
 
 ### High Value (High Impact, Medium Effort)
@@ -1263,9 +1431,10 @@ truenasplugin: auto-storage
 9. **Performance Baseline** (#8)
 
 ### Strategic (High Impact, High Effort)
-10. **Web UI** (#16)
-11. **Monitoring Templates** (#7)
-12. **Chaos Testing** (#12)
+10. **NVMe-oF Support** (#21)
+11. **Web UI** (#16)
+12. **Monitoring Templates** (#7)
+13. **Chaos Testing** (#12)
 
 ### Nice to Have (Lower Priority)
 - Configuration Wizard (#17)
