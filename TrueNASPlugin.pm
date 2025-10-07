@@ -16,13 +16,15 @@ use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
 use Cwd qw(abs_path);
-use Sys::Syslog qw(syslog);
+use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
 use PVE::Tools qw(run_command trim);
 use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
-use Sys::Syslog qw(syslog);
 use base qw(PVE::Storage::Plugin);
+
+# Initialize syslog
+openlog('truenasplugin', 'pid', 'daemon');
 
 # Simple cache for API results (static data)
 my %API_CACHE = ();
@@ -1767,7 +1769,12 @@ sub _find_by_path_for_lun($scfg, $lun) {
     opendir(my $dh, "/dev/disk/by-path") or die "cannot open /dev/disk/by-path\n";
     my @paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
     closedir($dh);
-    return "/dev/disk/by-path/$paths[0]" if @paths;
+    if (@paths) {
+        # Untaint the path by validating it matches expected format
+        if ($paths[0] =~ m{^(ip-[\w.:,\[\]\-]+iscsi-[\w.:,\[\]\-]+lun-\d+)$}) {
+            return "/dev/disk/by-path/$1";
+        }
+    }
     return undef;
 }
 
@@ -1784,7 +1791,14 @@ sub _dm_map_for_leaf($leaf) {
             chomp($name = <$fh> // ''); close $fh;
         }
         closedir($dh);
-        return $name ? "/dev/mapper/$name" : "/dev/$e";
+        # Untaint the device mapper name
+        if ($name && $name =~ m{^([\w\-]+)$}) {
+            return "/dev/mapper/$1";
+        }
+        # Untaint dm-N device
+        if ($e =~ m{^(dm-\d+)$}) {
+            return "/dev/$1";
+        }
     }
     closedir($dh);
     return undef;
@@ -2238,6 +2252,10 @@ sub free_image {
         if ($active_luns <= 1 || $@) {
             syslog('info', "Logging out to retry extent deletion (active LUNs: $active_luns)");
             _logout_target_all_portals($scfg);
+            # Wait for iSCSI session to fully disconnect before retrying deletion
+            syslog('info', "Waiting for iSCSI session to disconnect...");
+            sleep(2);
+            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
         } else {
             syslog('info', "Skipping logout during extent deletion - $active_luns other LUNs active (preserves multi-disk operations)");
             $need_force_logout = 0;  # Skip retry since we're not logging out
