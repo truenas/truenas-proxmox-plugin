@@ -1,5 +1,21 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.2 (October 2025)
+
+### 🐛 **Bug Fixes**
+- **Fixed pre-flight check size calculation** - Corrected `_preflight_check_alloc` to treat size parameter as bytes instead of KiB, eliminating false "insufficient space" errors
+
+### ✅ **Verification**
+- **Confirmed all pre-flight checks working correctly**:
+  - Space validation with 20% overhead calculation
+  - API connectivity verification
+  - iSCSI service status check
+  - iSCSI target verification with detailed error messages
+  - Parent dataset existence validation
+- **Verified disk allocation accuracy** - 10GB disk request creates exactly 10,737,418,240 bytes on TrueNAS
+
+---
+
 ## Version 1.0.1 (October 2025)
 
 ### 🐛 **Bug Fixes**

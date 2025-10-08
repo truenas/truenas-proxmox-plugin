@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.1';
+our $VERSION = '1.0.2';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1480,7 +1480,7 @@ sub _current_lun_for_zname($scfg, $zname) {
 # Pre-flight validation checks before volume allocation
 # Returns arrayref of error messages (empty if all checks pass)
 sub _preflight_check_alloc {
-    my ($scfg, $size_kb) = @_;
+    my ($scfg, $size_bytes) = @_;
 
     my @errors;
 
@@ -1514,8 +1514,8 @@ sub _preflight_check_alloc {
     }
 
     # Check 3: Sufficient space available (with 20% overhead)
-    if (defined $size_kb) {
-        my $bytes = int($size_kb) * 1024;
+    if (defined $size_bytes) {
+        my $bytes = int($size_bytes);
         my $required = $bytes * 1.2;
 
         eval {
@@ -1915,6 +1915,7 @@ sub path {
 # Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_bytes)
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+    syslog('info', "alloc_image called: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size");
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size) || $size <= 0;
 
@@ -1927,7 +1928,7 @@ sub alloc_image {
     }
 
     # Log successful pre-flight checks
-    my $bytes = int($size) * 1024; # Proxmox passes size in KiB
+    my $bytes = int($size); # Size is in bytes
     syslog('info', sprintf(
         "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
         _format_bytes($bytes), $scfg->{dataset}, $vmid
