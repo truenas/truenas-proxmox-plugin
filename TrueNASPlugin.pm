@@ -1912,15 +1912,19 @@ sub path {
 }
 
 # Create a new VM disk (zvol + iSCSI extent + mapping) and hand it to Proxmox.
-# Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_bytes)
+# Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib)
+# NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
 sub alloc_image {
-    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
-    syslog('info', "alloc_image called: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size");
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
+    syslog('info', "alloc_image called: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size_kib KiB");
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
-    die "invalid size\n" if !defined($size) || $size <= 0;
+    die "invalid size\n" if !defined($size_kib) || $size_kib <= 0;
+
+    # Convert KiB to bytes for TrueNAS API
+    my $bytes = int($size_kib) * 1024;
 
     # Pre-flight checks: validate all prerequisites before expensive operations
-    my $errors = _preflight_check_alloc($scfg, $size);
+    my $errors = _preflight_check_alloc($scfg, $bytes);
     if (@$errors) {
         my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
         syslog('err', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
@@ -1928,7 +1932,6 @@ sub alloc_image {
     }
 
     # Log successful pre-flight checks
-    my $bytes = int($size); # Size is in bytes
     syslog('info', sprintf(
         "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
         _format_bytes($bytes), $scfg->{dataset}, $vmid
