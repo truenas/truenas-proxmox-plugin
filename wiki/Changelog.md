@@ -1,6 +1,20 @@
 # TrueNAS Plugin Changelog
 
-## Configuration Validation, Pre-flight Checks & Space Validation (October 2025)
+## Version 1.0.1 (October 2025)
+
+### 🐛 **Bug Fixes**
+- **Fixed syslog errors** - Changed all `syslog('error')` calls to `syslog('err')` (correct Perl Sys::Syslog priority)
+- **Fixed syslog initialization** - Moved `openlog()` to BEGIN block for compile-time initialization
+- **Fixed Perl taint mode security violations** - Added regex validation with capture groups to untaint device paths
+- **Fixed race condition in volume deletion** - Added 2-second delay and `udevadm settle` after iSCSI logout
+- **Fixed volume size calculation** - Corrected byte/KiB confusion in `_preflight_check_alloc` and `alloc_image`
+
+### ⚠️ **Known Issues**
+- **VM cloning size mismatch** - Clone operations fail due to size unit mismatch between `volume_size_info` and Proxmox expectations (investigation ongoing)
+
+---
+
+## Version 1.0.0 - Configuration Validation, Pre-flight Checks & Space Validation (October 2025)
 
 ### 🔒 **Configuration Validation at Storage Creation**
 - **Required field validation** - Ensures `api_host`, `api_key`, `dataset`, `target_iqn` are present
