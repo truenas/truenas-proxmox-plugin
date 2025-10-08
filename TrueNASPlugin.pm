@@ -23,8 +23,10 @@ use PVE::Storage::Plugin;
 use PVE::JSONSchema qw(get_standard_option);
 use base qw(PVE::Storage::Plugin);
 
-# Initialize syslog
-openlog('truenasplugin', 'pid', 'daemon');
+# Initialize syslog at compile time
+BEGIN {
+    openlog('truenasplugin', 'pid', 'daemon');
+}
 
 # Simple cache for API results (static data)
 my %API_CACHE = ();
@@ -139,7 +141,7 @@ sub _retry_with_backoff {
 
         # Max retries exhausted
         if ($attempt > $max_retries) {
-            syslog('error', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
+            syslog('err', "Max retries ($max_retries) exhausted for $operation_name: $last_error");
             die "Operation failed after $max_retries retries: $last_error";
         }
 
@@ -697,7 +699,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
                 return []; # Return empty error list (success)
             } else {
                 my $error = "Bulk snapshot deletion job failed: " . $job_result->{error};
-                syslog('error', $error);
+                syslog('err', $error);
                 return [$error]; # Return error list
             }
         } else {
@@ -890,7 +892,7 @@ sub _wait_for_job_completion {
                 return { success => 1 };
             } elsif ($state eq 'FAILED') {
                 my $error = $job->{error} // $job->{exc_info} // 'Unknown error';
-                syslog('error', "TrueNAS job $job_id failed: $error");
+                syslog('err', "TrueNAS job $job_id failed: $error");
                 return { success => 0, error => $error };
             } elsif ($state eq 'RUNNING' || $state eq 'WAITING') {
                 # Job still in progress, continue waiting
@@ -909,7 +911,7 @@ sub _wait_for_job_completion {
     }
 
     # Timeout reached
-    syslog('error', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
+    syslog('err', "TrueNAS job $job_id timed out after ${timeout_seconds} seconds");
     return { success => 0, error => "Job timed out after ${timeout_seconds} seconds" };
 }
 
@@ -930,7 +932,7 @@ sub _handle_api_result_with_job_support {
             return { success => 1, result => undef };
         } else {
             my $error = "TrueNAS $operation_name job failed: " . $job_result->{error};
-            syslog('error', $error);
+            syslog('err', $error);
             return { success => 0, error => $error };
         }
     }
@@ -1920,7 +1922,7 @@ sub alloc_image {
     my $errors = _preflight_check_alloc($scfg, $size);
     if (@$errors) {
         my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
-        syslog('error', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
+        syslog('err', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
         die "$error_msg\n";
     }
 
@@ -2545,11 +2547,11 @@ sub status {
             $active = 0;
         } elsif ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
             # Dataset doesn't exist - this is a configuration error
-            syslog('error', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
+            syslog('err', "TrueNAS storage '$storeid' configuration error (dataset not found): $err");
             $active = 0;
         } elsif ($err =~ /401|403|authentication|unauthorized|forbidden/i) {
             # Authentication/permission issue - configuration error
-            syslog('error', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
+            syslog('err', "TrueNAS storage '$storeid' authentication failed (check API key): $err");
             $active = 0;
         } else {
             # Other errors - mark inactive but log as warning for investigation
