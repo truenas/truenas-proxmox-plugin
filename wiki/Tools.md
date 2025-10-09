@@ -6,7 +6,9 @@ Documentation for included tools and utilities to help manage the TrueNAS Proxmo
 
 The plugin includes several tools to simplify installation, testing, cluster management, and maintenance:
 
-- **[Test Suite](#test-suite)** - Automated testing and validation
+- **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
+- **[Debug Logging System](#debug-logging-system)** - Diagnostic logging for troubleshooting
+- **[Production Test Suite](#production-test-suite)** - Automated testing and validation for production
 - **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring
 - **[Orphan Cleanup Tool](#orphan-cleanup-tool)** - Find and remove orphaned iSCSI resources
 - **[Version Check Script](#version-check-script)** - Check plugin version across cluster
@@ -17,18 +19,345 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 ```
 tools/
-├── truenas-plugin-test-suite.sh    # Automated test suite
-├── health-check.sh                  # Health validation tool
-├── cleanup-orphans.sh               # Orphan resource cleanup
-├── update-cluster.sh                # Cluster deployment script
-└── check-version.sh                 # Version checker for cluster
+├── truenas-plugin-test-suite.sh              # Production test suite
+├── health-check.sh                            # Health validation tool
+├── cleanup-orphans.sh                         # Orphan resource cleanup
+├── update-cluster.sh                          # Cluster deployment script
+├── check-version.sh                           # Version checker for cluster
+└── dev-truenas-plugin-full-function-test.sh  # Development test suite (⚠️ DEV ONLY)
 ```
 
 All tools are located in the `tools/` directory of the plugin repository.
 
 ---
 
-## Test Suite
+## Development Test Suite
+
+> ⚠️ **WARNING: DEVELOPMENT USE ONLY**
+> This test suite is designed for **plugin development and debugging only**.
+> **DO NOT run on production systems** - it creates/deletes test VMs and may interfere with running workloads.
+
+### Overview
+
+The Development Test Suite (`dev-truenas-plugin-full-function-test.sh`) is a comprehensive testing tool that validates the core functionality of the plugin, primarily used during plugin development to verify bug fixes and new features.
+
+**Location**: `tools/dev-truenas-plugin-full-function-test.sh`
+
+**Purpose**:
+- Plugin development and debugging
+- Regression testing after code changes
+- Size allocation verification
+- TrueNAS backend validation
+- Generating diagnostic data for bug reports
+
+### Features
+
+- **Machine-Readable Output** - JSON + CSV logs for analysis
+- **TrueNAS Size Verification** - Validates disk sizes on TrueNAS backend via API
+- **API-Only Testing** - Uses Proxmox API exclusively (pvesh)
+- **Detailed Timing** - Performance metrics for all operations
+- **Color-Coded Output** - Clear visual status indicators
+
+### Usage
+
+> ⚠️ **IMPORTANT**: Only run in isolated test/development environments
+
+```bash
+# Navigate to tools directory
+cd tools/
+
+# Basic usage (development environment only!)
+./dev-truenas-plugin-full-function-test.sh
+
+# Specify storage and node
+./dev-truenas-plugin-full-function-test.sh tnscale pve-test-node 9001
+
+# View results
+cat test-results-*.json | jq .
+```
+
+### Test Categories
+
+#### Disk Allocation Tests
+
+Tests disk creation via Proxmox API with various sizes (1GB, 10GB, 32GB, 100GB).
+
+**Verifies**:
+- Proxmox reports correct size (`pvesm list`)
+- Block device has correct size (`blockdev --getsize64`)
+- **TrueNAS zvol has correct size (via API)** ✓
+
+#### Disk Deletion Tests
+
+Tests disk deletion and verifies cleanup on TrueNAS backend.
+
+**Verifies**:
+- Zvol deleted from TrueNAS
+- iSCSI extent removed
+- No orphaned resources
+
+### Output Files
+
+**JSON Log** (`test-results-TIMESTAMP.json`):
+```json
+{
+  "test_run": {
+    "timestamp": "2025-10-08T07:15:00Z",
+    "storage_id": "tnscale",
+    "truenas_api": "10.15.14.172",
+    "node": "pve-test-node"
+  },
+  "tests": [
+    {
+      "test_id": "alloc_001",
+      "test_name": "Allocate 10GB disk via API",
+      "category": "disk_allocation",
+      "status": "PASS",
+      "duration_ms": 2341,
+      "results": {
+        "requested_bytes": 10737418240,
+        "truenas_bytes": 10737418240,
+        "size_match": true
+      }
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  }
+}
+```
+
+**CSV Log** (`test-results-TIMESTAMP.csv`):
+```csv
+test_id,test_name,category,status,duration_ms,requested_bytes,actual_bytes,size_match,error_message
+alloc_001,"Allocate 10GB disk via API",disk_allocation,PASS,2341,10737418240,10737418240,true,
+```
+
+### When to Use
+
+**✅ Appropriate Use Cases**:
+- Plugin development and testing
+- Verifying bug fixes (e.g., size allocation bug)
+- Regression testing after code changes
+- Generating diagnostic data for bug reports
+- CI/CD pipeline for plugin repository
+
+**❌ Do NOT Use For**:
+- Production environment validation (use Production Test Suite instead)
+- Running on live systems with active VMs
+- Routine health checks (use Health Check tool instead)
+
+### Development Workflow
+
+```bash
+# 1. Make code changes to plugin
+vim TrueNASPlugin.pm
+
+# 2. Deploy to test node
+scp TrueNASPlugin.pm root@pve-test:/usr/share/perl5/PVE/Storage/Custom/
+ssh root@pve-test "systemctl restart pvedaemon"
+
+# 3. Run development test suite
+cd tools/
+./dev-truenas-plugin-full-function-test.sh test-storage pve-test 9001
+
+# 4. Review results
+cat test-results-*.json | jq '.summary'
+
+# 5. Fix any failures and repeat
+```
+
+### CI/CD Integration
+
+```yaml
+# .github/workflows/test.yml
+name: Test Plugin
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to test node
+        run: |
+          scp TrueNASPlugin.pm root@pve-test:/usr/share/perl5/PVE/Storage/Custom/
+          ssh root@pve-test "systemctl restart pvedaemon"
+      - name: Run tests
+        run: |
+          cd tools/
+          ./dev-truenas-plugin-full-function-test.sh test-storage pve-test 9001
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: tools/test-results-*.json
+```
+
+### Limitations
+
+- Creates test VMs (VMIDs 9001-9025 by default)
+- Consumes storage space during tests
+- May interfere with existing VMs in VMID range
+- Requires API access to TrueNAS
+- Not suitable for concurrent execution
+
+### See Also
+
+- [Production Test Suite](#production-test-suite) - For production validation
+- [Debug Logging System](#debug-logging-system) - For detailed diagnostics
+- [Health Check Tool](#health-check-tool) - For quick health validation
+
+---
+
+## Debug Logging System
+
+### Overview
+
+The plugin includes a 3-level debug logging system that can be enabled without code changes by modifying the storage configuration. This is useful for troubleshooting issues in both development and production environments.
+
+**Debug Levels**:
+- **Level 0** (default): Errors only - Production mode
+- **Level 1**: Light diagnostic - Function calls and key operations
+- **Level 2**: Verbose - Full API payloads and detailed traces
+
+### Configuration
+
+Edit `/etc/pve/storage.cfg` and add the `debug` parameter:
+
+```ini
+truenasplugin: tnscale
+        api_host 10.15.14.172
+        api_key xxxxx
+        dataset pve_test/pve-storage
+        target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+        discovery_portal 10.15.14.172
+        debug 1
+```
+
+**Available Values**:
+- `debug 0` - Production mode (errors only) - **default**
+- `debug 1` - Light debugging (recommended for troubleshooting)
+- `debug 2` - Verbose mode (for deep diagnosis)
+
+### Viewing Debug Logs
+
+All debug output goes to syslog:
+
+```bash
+# View all plugin logs in real-time
+journalctl -t truenasplugin -f
+
+# View recent logs
+journalctl -t truenasplugin --since "5 minutes ago"
+
+# Filter by priority
+journalctl -t truenasplugin -p info
+journalctl -t truenasplugin -p debug
+```
+
+### Debug Level Examples
+
+#### Level 0 (Errors Only - Default)
+
+```
+Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image pre-flight check failed for VM 100: API unreachable
+```
+
+Minimal logging - only critical errors. **Recommended for production.**
+
+#### Level 1 (Light Diagnostic)
+
+```
+Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: vmid=100, name=undef, size=33554432 KiB
+Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: running pre-flight checks for 34359738368 bytes
+Oct 08 07:15:24 pve-node truenasplugin[12345]: alloc_image: pre-flight checks passed for 32.00 GB volume
+Oct 08 07:15:25 pve-node truenasplugin[12345]: free_image: volname=vol-vm-100-disk-0-lun5
+```
+
+Shows function entry/exit and key operations. **Recommended for troubleshooting.**
+
+#### Level 2 (Verbose)
+
+```
+Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: vmid=100, size=33554432 KiB
+Oct 08 07:15:23 pve-node truenasplugin[12345]: alloc_image: converting 33554432 KiB → 34359738368 bytes
+Oct 08 07:15:23 pve-node truenasplugin[12345]: _api_call: method=pool.dataset.create, transport=ws, params=[{"name":"pve_test/pve-storage/vm-100-disk-0","type":"VOLUME","volsize":34359738368}]
+Oct 08 07:15:24 pve-node truenasplugin[12345]: _api_call: response from pool.dataset.create: {"id":"pve_test/pve-storage/vm-100-disk-0"}
+Oct 08 07:15:24 pve-node truenasplugin[12345]: _api_call: method=iscsi.extent.create, params=[{"name":"vm-100-disk-0","disk":"zvol/pve_test/vm-100-disk-0"}]
+```
+
+Full API payloads and detailed traces. **Use for deep debugging only** (generates significant log volume).
+
+### Changing Debug Level at Runtime
+
+```bash
+# Enable level 1 debugging
+sed -i '/truenasplugin: tnscale/,/^$/s/debug [0-9]/debug 1/' /etc/pve/storage.cfg
+
+# Or add debug line if it doesn't exist
+sed -i '/truenasplugin: tnscale/a\        debug 1' /etc/pve/storage.cfg
+
+# Changes take effect immediately - no restart required
+```
+
+### Performance Impact
+
+**Level 0**: No performance impact
+**Level 1**: Negligible impact (<1%)
+**Level 2**: 10-20% slower due to JSON serialization, generates 1-10 MB per operation
+
+**Recommendation**: Use level 1 for troubleshooting, level 2 only for specific issue diagnosis.
+
+### Troubleshooting with Debug Logs
+
+**Problem**: Disk allocation fails
+```bash
+# Enable debug logging
+echo "        debug 1" >> /etc/pve/storage.cfg  # (add after storage entry)
+
+# Attempt operation and capture logs
+journalctl -t truenasplugin -f > debug.log &
+pvesh create /nodes/$(hostname)/storage/tnscale/content --vmid 100 --filename vm-100-disk-0 --size 10G
+
+# Review logs
+grep -A 5 "alloc_image" debug.log
+```
+
+**Problem**: Size mismatch
+```bash
+# Enable verbose logging
+sed -i '/truenasplugin: tnscale/a\        debug 2' /etc/pve/storage.cfg
+
+# Check unit conversion in logs
+journalctl -t truenasplugin | grep "converting"
+# Should show: "converting X KiB → Y bytes"
+```
+
+### Log Rotation
+
+With debug enabled, configure log rotation:
+
+```bash
+# /etc/logrotate.d/truenas-plugin
+/var/log/syslog {
+    rotate 7
+    daily
+    maxsize 100M
+    compress
+    delaycompress
+    postrotate
+        systemctl reload rsyslog > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+---
+
+## Production Test Suite
 
 ### Overview
 

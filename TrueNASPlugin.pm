@@ -86,6 +86,23 @@ sub _format_bytes {
     return sprintf("%.2f %s", $size, $units[$unit_idx]);
 }
 
+# Debug logging helper - respects debug level from storage config
+# Usage: _log($scfg, $level, $priority, $message)
+#   $level: 0=always, 1=light debug, 2=verbose debug
+#   $priority: syslog priority ('err', 'warning', 'info', 'debug')
+sub _log {
+    my ($scfg, $level, $priority, $message) = @_;
+
+    # Level 0 messages (errors) are always logged
+    return syslog($priority, $message) if $level == 0;
+
+    # For level 1+, check debug configuration
+    my $debug_level = $scfg->{debug} // 0;
+    return if $level > $debug_level;
+
+    syslog($priority, $message);
+}
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -244,6 +261,12 @@ sub properties {
             type => 'boolean', optional => 1, default => 0,
         },
 
+        # Debug level
+        debug => {
+            description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
+            type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
+        },
+
         # CHAP (optional)
         chap_user     => { type => 'string', optional => 1 },
         chap_password => { type => 'string', optional => 1 },
@@ -326,6 +349,9 @@ sub options {
 
         # Thin toggle
         tn_sparse => { optional => 1 },
+
+        # Debug
+        debug => { optional => 1 },
 
         # Live snapshots
         enable_live_snapshots => { optional => 1 },
@@ -944,6 +970,14 @@ sub _handle_api_result_with_job_support {
 # ======== Transport-agnostic API wrapper ========
 sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
     my $transport = lc($scfg->{api_transport} // 'ws');
+
+    # Level 2: Verbose - log all API calls with parameters
+    if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
+        _log($scfg, 2, 'debug', "_api_call: method=$ws_method, transport=$transport, params=" . encode_json($ws_params));
+    } else {
+        _log($scfg, 2, 'debug', "_api_call: method=$ws_method, transport=$transport");
+    }
+
     if ($transport eq 'ws') {
         # Wrap WebSocket call with retry logic
         return _retry_with_backoff($scfg, "WS $ws_method", sub {
@@ -951,6 +985,10 @@ sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
             my $res = _ws_rpc($conn, {
                 jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
             });
+
+            # Level 2: Verbose - log API response
+            _log($scfg, 2, 'debug', "_api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+
             return $res;
         });
     } elsif ($transport eq 'rest') {
@@ -1916,24 +1954,32 @@ sub path {
 # NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib) = @_;
-    syslog('info', "alloc_image called: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size_kib KiB");
+
+    # Level 0: Always log (errors only logged elsewhere)
+    # Level 1: Light - function entry with key parameters
+    _log($scfg, 1, 'info', "alloc_image: vmid=$vmid, name=" . ($name // 'undef') . ", size=$size_kib KiB");
+
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
     die "invalid size\n" if !defined($size_kib) || $size_kib <= 0;
 
     # Convert KiB to bytes for TrueNAS API
     my $bytes = int($size_kib) * 1024;
 
+    # Level 2: Verbose - unit conversion details
+    _log($scfg, 2, 'debug', "alloc_image: converting $size_kib KiB → $bytes bytes");
+
     # Pre-flight checks: validate all prerequisites before expensive operations
+    _log($scfg, 1, 'info', "alloc_image: running pre-flight checks for $bytes bytes");
     my $errors = _preflight_check_alloc($scfg, $bytes);
     if (@$errors) {
         my $error_msg = "Pre-flight validation failed:\n  - " . join("\n  - ", @$errors);
-        syslog('err', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
+        _log($scfg, 0, 'err', "alloc_image pre-flight check failed for VM $vmid: " . join("; ", @$errors));
         die "$error_msg\n";
     }
 
     # Log successful pre-flight checks
-    syslog('info', sprintf(
-        "Pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
+    _log($scfg, 1, 'info', sprintf(
+        "alloc_image: pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
         _format_bytes($bytes), $scfg->{dataset}, $vmid
     ));
 
@@ -2162,11 +2208,18 @@ sub volume_size_info {
 # clean up the initiator (flush multipath, rescan, optionally logout if no LUNs remain).
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+
+    # Level 1: Light - function entry
+    _log($scfg, 1, 'info', "free_image: volname=$volname");
+
     die "snapshots not supported on iSCSI zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
     my (undef, $zname, undef, undef, undef, undef, undef, $lun) = $class->parse_volname($volname);
     my $full_ds = $scfg->{dataset} . '/' . $zname;
+
+    # Level 2: Verbose - parsed details
+    _log($scfg, 2, 'debug', "free_image: zname=$zname, lun=$lun, full_ds=$full_ds");
 
     # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
     if ($scfg->{use_multipath}) {
