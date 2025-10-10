@@ -2624,7 +2624,196 @@ sub status {
     return ($total, $avail, $used, $active);
 }
 
-sub activate_storage { return 1; }
+# ======== Target Visibility Pre-flight Check ========
+# Ensures the iSCSI target is visible and discoverable.
+# If the target has no extents, it won't appear in discovery.
+# This function creates a small "weight" zvol to keep the target visible.
+sub _ensure_target_visible {
+    my ($scfg) = @_;
+
+    my $iqn = $scfg->{target_iqn};
+    my $portal = _normalize_portal($scfg->{discovery_portal});
+    my $weight_name = 'pve-plugin-weight';
+    my $weight_zname = $scfg->{dataset} . '/' . $weight_name;
+
+    # Level 1: Log pre-flight check start
+    _log($scfg, 1, 'info', "Pre-flight: Checking target visibility for $iqn");
+
+    # Step 1: Check if target exists on TrueNAS
+    # Note: TrueNAS stores the target name without the IQN prefix
+    # Extract target name from full IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
+    my $target_name = $iqn;
+    if ($iqn =~ /:([^:]+)$/) {
+        $target_name = $1;
+    }
+
+    my $target_exists = 0;
+    my $target_id;
+    eval {
+        my $targets = _tn_targets($scfg);
+        _log($scfg, 1, 'info', "Pre-flight: Retrieved " . scalar(@$targets) . " targets from TrueNAS");
+        for my $t (@$targets) {
+            my $tname = $t->{name} // 'undefined';
+            _log($scfg, 2, 'debug', "Pre-flight: Checking target '$tname' against '$target_name'");
+            if ($tname eq $target_name) {
+                $target_exists = 1;
+                $target_id = $t->{id};
+                last;
+            }
+        }
+    };
+    if ($@) {
+        _log($scfg, 0, 'err', "Pre-flight: Failed to query targets: $@");
+    }
+
+    if (!$target_exists) {
+        _log($scfg, 0, 'err', "Pre-flight: Target $target_name does not exist on TrueNAS");
+        die "iSCSI target $target_name not found on TrueNAS. Please configure the target first.\n";
+    }
+
+    _log($scfg, 1, 'info', "Pre-flight: Target $target_name exists on TrueNAS (ID: $target_id)");
+
+    # Step 2: Check if target is discoverable via iscsiadm
+    my $target_discoverable = 0;
+    eval {
+        # Try discovery
+        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
+        for my $line (@discovery_output) {
+            if ($line =~ /\b\Q$iqn\E\b/) {
+                $target_discoverable = 1;
+                last;
+            }
+        }
+    };
+
+    if ($target_discoverable) {
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is discoverable");
+        return 1; # Target is visible, nothing to do
+    }
+
+    _log($scfg, 1, 'info', "Pre-flight: Target $iqn is NOT discoverable - creating weight zvol");
+
+    # Step 3: Target exists but isn't discoverable - likely no extents
+    # Create weight zvol if it doesn't exist
+    my $weight_exists = 0;
+    eval {
+        my $ds = _tn_dataset_get($scfg, $weight_zname);
+        $weight_exists = 1 if $ds;
+    };
+
+    if (!$weight_exists) {
+        _log($scfg, 1, 'info', "Pre-flight: Creating weight zvol $weight_zname (1GB)");
+        eval {
+            _tn_dataset_create($scfg, $weight_zname, 1048576, '64K'); # 1GB in KiB
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "Pre-flight: Failed to create weight zvol: $@");
+            die "Failed to create weight zvol: $@\n";
+        }
+        _log($scfg, 1, 'info', "Pre-flight: Weight zvol created");
+    } else {
+        _log($scfg, 1, 'info', "Pre-flight: Weight zvol already exists");
+    }
+
+    # Step 4: Create extent for weight zvol if it doesn't exist
+    my $weight_extent_exists = 0;
+    eval {
+        my $extents = _tn_extents($scfg);
+        for my $ext (@$extents) {
+            if (($ext->{name} // '') eq $weight_name) {
+                $weight_extent_exists = 1;
+                last;
+            }
+        }
+    };
+
+    if (!$weight_extent_exists) {
+        _log($scfg, 1, 'info', "Pre-flight: Creating extent for weight zvol");
+        eval {
+            _tn_extent_create($scfg, $weight_name, $weight_zname);
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "Pre-flight: Failed to create weight extent: $@");
+            die "Failed to create weight extent: $@\n";
+        }
+        _log($scfg, 1, 'info', "Pre-flight: Weight extent created");
+    } else {
+        _log($scfg, 1, 'info', "Pre-flight: Weight extent already exists");
+    }
+
+    # Step 5: Ensure extent is mapped to target
+    my $weight_mapped = 0;
+    my $weight_extent_id;
+    eval {
+        my $extents = _tn_extents($scfg);
+        for my $ext (@$extents) {
+            if (($ext->{name} // '') eq $weight_name) {
+                $weight_extent_id = $ext->{id};
+                last;
+            }
+        }
+
+        if ($weight_extent_id) {
+            my $targetextents = _tn_targetextents($scfg);
+            for my $te (@$targetextents) {
+                if ($te->{extent} == $weight_extent_id) {
+                    $weight_mapped = 1;
+                    last;
+                }
+            }
+        }
+    };
+
+    if (!$weight_mapped && $weight_extent_id && $target_id) {
+        _log($scfg, 1, 'info', "Pre-flight: Mapping weight extent to target");
+        eval {
+            _tn_targetextent_create($scfg, $target_id, $weight_extent_id, 0);
+        };
+        if ($@) {
+            _log($scfg, 0, 'warning', "Pre-flight: Failed to map weight extent: $@");
+            # Non-fatal - extent may already be mapped
+        } else {
+            _log($scfg, 1, 'info', "Pre-flight: Weight extent mapped to target");
+        }
+    }
+
+    # Step 6: Verify target is now discoverable
+    sleep 2; # Give TrueNAS time to update
+    $target_discoverable = 0;
+    eval {
+        my @discovery_output = _run_lines(['iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $portal]);
+        for my $line (@discovery_output) {
+            if ($line =~ /\b\Q$iqn\E\b/) {
+                $target_discoverable = 1;
+                last;
+            }
+        }
+    };
+
+    if ($target_discoverable) {
+        _log($scfg, 1, 'info', "Pre-flight: Target $iqn is now discoverable");
+        return 1;
+    } else {
+        _log($scfg, 0, 'warning', "Pre-flight: Target $iqn still not discoverable after weight zvol creation");
+        # Don't die - let iSCSI login handle the error with better diagnostics
+        return 0;
+    }
+}
+
+sub activate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    # Run pre-flight check to ensure target is visible
+    eval {
+        _ensure_target_visible($scfg);
+    };
+    if ($@) {
+        syslog('warning', "Target visibility pre-flight check failed for $storeid: $@");
+    }
+
+    return 1;
+}
+
 sub deactivate_storage { return 1; }
 
 sub activate_volume {
