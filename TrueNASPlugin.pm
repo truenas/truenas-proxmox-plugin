@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.2';
+our $VERSION = '1.0.3';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -2547,9 +2547,26 @@ sub list_images {
             next MAPPING;
         }
 
-        # Ask TrueNAS for the zvol to get current size (bytes)
+        # Ask TrueNAS for the zvol to get current size (bytes) and creation time
         my $ds   = eval { _tn_dataset_get($scfg, $ds_full) } // {};
         my $size = $norm->($ds->{volsize}); # bytes (0 if missing)
+
+        # Extract creation time
+        # Try multiple possible locations for creation time
+        my $ctime = 0;
+        if (my $props = $ds->{properties}) {
+            if (ref($props->{creation}) eq 'HASH') {
+                $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
+            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+                $ctime = int($1);
+            }
+        }
+        # Fallback: try direct fields on dataset
+        if (!$ctime && defined $ds->{created}) {
+            $ctime = int($ds->{created});
+        }
+        # If still no time, use current time as fallback to avoid epoch display
+        $ctime = time() if !$ctime;
 
         # Format is always raw for block iSCSI zvols
         my %entry = (
@@ -2558,6 +2575,7 @@ sub list_images {
             format  => 'raw',
             content => 'images',
             vmid    => defined($owner) ? int($owner) : 0,
+            ctime   => $ctime,
         );
         push @$res, \%entry;
     }

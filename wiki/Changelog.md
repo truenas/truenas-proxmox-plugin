@@ -1,5 +1,28 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.3 (October 2025)
+
+### ✨ **New Features**
+- **Automatic target visibility management** - Plugin now automatically ensures iSCSI targets remain discoverable
+  - Creates a 1GB "pve-plugin-weight" zvol when target exists but has no extents
+  - Automatically creates extent and maps it to target to maintain visibility
+  - Runs during storage activation as a pre-flight check
+  - Implementation: `_ensure_target_visible()` function (lines 2627-2798)
+
+### 🐛 **Bug Fixes**
+- **Fixed Proxmox GUI display issues** - Added `ctime` (creation time) field to `list_images` output
+  - Resolves epoch date display and "?" status marks in GUI
+  - Extracts creation time from TrueNAS dataset properties
+  - Includes multiple fallbacks for robust time extraction
+  - Falls back to current time if no creation time available
+  - Implementation: Enhanced `list_images()` function (lines 2554-2569)
+
+### 📖 **Documentation**
+- **Weight zvol behavior** - Documented automatic weight zvol creation to prevent target disappearance
+- **GUI display fix** - Documented ctime field requirement for proper Proxmox GUI rendering
+
+---
+
 ## Version 1.0.2 (October 2025)
 
 ### 🐛 **Bug Fixes**
