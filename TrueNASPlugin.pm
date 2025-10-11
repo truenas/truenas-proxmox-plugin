@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.5';
+our $VERSION = '1.0.6';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -2152,18 +2152,20 @@ sub alloc_image {
 
     # 6) Verify device is accessible before returning success
     my $device_ready = 0;
-    for my $attempt (1..20) { # Wait up to 10 seconds for device to appear
+    # Progressive backoff: 0ms, 100ms, 250ms, 250ms, 250ms... (up to 5 seconds total)
+    my @retry_delays = (0, 100_000, 250_000);  # First 3 attempts: immediate, 100ms, 250ms
+    for my $attempt (1..20) { # Wait up to 5 seconds for device to appear
         eval {
             my $dev = _device_for_lun($scfg, $lun);
             if ($dev && -e $dev && -b $dev) {
-                syslog('info', "Device $dev is ready for LUN $lun");
+                syslog('info', "Device $dev is ready for LUN $lun (attempt $attempt)");
                 $device_ready = 1;
             }
         };
         last if $device_ready;
 
-        if ($attempt % 5 == 0) {
-            # Extra discovery/rescan every 2.5 seconds
+        if ($attempt % 4 == 0) {
+            # Extra discovery/rescan every second (every 4th attempt after initial burst)
             eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
             if ($scfg->{use_multipath}) {
                 eval { _try_run(['multipath','-r'], "multipath reload"); };
@@ -2171,12 +2173,14 @@ sub alloc_image {
             eval { run_command(['udevadm','settle'], outfunc => sub {}); };
         }
 
-        usleep(500_000); # 500ms between attempts
+        # Progressive backoff: first few attempts faster, then 250ms thereafter
+        my $delay = $retry_delays[$attempt - 1] // 250_000;
+        usleep($delay) if $delay > 0;
     }
 
     if (!$device_ready) {
         die sprintf(
-            "Volume created but device not accessible after 10 seconds\n\n" .
+            "Volume created but device not accessible after 5 seconds\n\n" .
             "LUN: %d\n" .
             "Target IQN: %s\n" .
             "Dataset: %s\n" .
@@ -2335,7 +2339,7 @@ sub free_image {
             _logout_target_all_portals($scfg);
             # Wait for iSCSI session to fully disconnect before retrying deletion
             syslog('info', "Waiting for iSCSI session to disconnect...");
-            sleep(2);
+            sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
         } else {
             syslog('info', "Skipping logout during extent deletion - $active_luns other LUNs active (preserves multi-disk operations)");
@@ -2425,7 +2429,7 @@ sub free_image {
     if ($@ && $@ =~ /busy|in use/i) {
         syslog('info', "Dataset deletion failed (device busy), retrying with logout");
         _logout_target_all_portals($scfg);
-        sleep(2);
+        sleep(1);  # Reduced from 2s to 1s - modern systems settle faster
 
         eval {
             my $id = URI::Escape::uri_escape($full_ds);
