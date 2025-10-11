@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.4';
+our $VERSION = '1.0.5';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -2555,9 +2555,10 @@ sub list_images {
         my $owner;
         $owner = $1 if $zname =~ /^vm-(\d+)-/;
 
-        # Honor $vmid filter if owner is known
-        if (defined $vmid && defined $owner && $owner != $vmid) {
-            next MAPPING;
+        # Honor $vmid filter
+        if (defined $vmid) {
+            # Skip if no owner detected (e.g., weight zvol) or owner doesn't match
+            next MAPPING if !defined $owner || $owner != $vmid;
         }
 
         # Compose plugin volname + volid

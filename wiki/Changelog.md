@@ -1,5 +1,23 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.5 (October 2025)
+
+### 🐛 **Bug Fixes**
+- **Fixed VMID filter in list_images** - Weight zvol and other non-VM volumes now properly excluded from VMID-specific queries
+  - Previously: Volumes without VM naming pattern (e.g., pve-plugin-weight) appeared in ALL VMID filters
+  - Root cause: Filter only checked `defined $owner` but skipped volumes where owner couldn't be determined
+  - Now: When VMID filter is specified, skip volumes without detectable owner OR with non-matching owner
+  - Impact: `pvesm list storage --vmid X` now only shows volumes belonging to VM X
+  - Prevents test scripts and tools from accidentally operating on weight zvol
+
+### 🔧 **Technical Details**
+- Modified `list_images()` function (lines 2558-2562)
+- Changed filter logic from `if (defined $vmid && defined $owner && $owner != $vmid)`
+- To: `if (defined $vmid) { next MAPPING if !defined $owner || $owner != $vmid; }`
+- Ensures volumes without vm-X-disk naming pattern are excluded when filtering by VMID
+
+---
+
 ## Version 1.0.4 (October 2025)
 
 ### ✨ **Improvements**
