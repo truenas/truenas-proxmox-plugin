@@ -109,6 +109,10 @@ cleanup_test_vms() {
             while read -r line; do
                 local volid
                 volid=$(echo "$line" | awk '{print $1}')
+                # Skip the weight zvol used for target visibility
+                if [[ "$volid" == *"pve-plugin-weight"* ]]; then
+                    continue
+                fi
                 if [[ -n "$volid" ]]; then
                     log_warning "Found orphaned disk $volid, removing..."
                     pvesm free "$volid" >/dev/null 2>&1 || true
