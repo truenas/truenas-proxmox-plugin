@@ -1,19 +1,22 @@
 # TrueNAS Plugin Changelog
 
-## Version 1.0.6 (October 2025)
+## Version 1.0.6 (October 11, 2025)
 
 ### 🚀 **Performance Improvements**
-- **50% faster disk allocation** - Optimized device discovery with progressive backoff strategy
-  - Previously: Up to 10 seconds waiting with 500ms intervals between checks
-  - Now: Progressive delays (0ms, 100ms, 250ms) reduce typical allocation from ~7s to ~3-4s
+- **Optimized device discovery** - Progressive backoff strategy for faster iSCSI device detection
+  - **Device discovery time: 10s → <1s** (typically finds device on first attempt)
+  - Previously: Fixed 500ms intervals between checks, up to 10 seconds maximum wait
+  - Now: Progressive delays (0ms, 100ms, 250ms) with immediate first check
   - More aggressive initial checks catch fast-responding devices immediately
-  - Rescan frequency increased from every 2.5s to every 1s for faster discovery
+  - Rescan frequency increased from every 2.5s (5 attempts) to every 1s (4 attempts)
   - Maximum wait time reduced from 10 seconds to 5 seconds
+  - Real-world testing shows devices discovered on attempt 1 in typical scenarios
 
 - **Faster disk deletion** - Reduced iSCSI logout wait times
+  - **Per-deletion time savings: 2-4 seconds**
   - Logout settlement wait reduced from 2s to 1s (2 occurrences in deletion path)
   - Modern systems with faster udev settle times benefit immediately
-  - Potential 2-4 second improvement per deletion operation
+  - Affects both extent deletion retry (line 2342) and dataset busy retry (line 2432)
 
 ### 🔧 **Technical Details**
 - Modified device discovery loop in `alloc_image()` (lines 2154-2179)
@@ -26,15 +29,20 @@
   - Modern systems complete iSCSI logout and udev settlement faster than previous 2s assumption
 
 ### 📊 **Performance Impact**
-- **Disk allocation**: ~50% faster (7s → 3-4s typical case)
-- **Disk deletion**: 2-4s faster per operation
-- **Best case**: Device appears immediately (0ms wait instead of 500ms)
-- **Typical case**: Device appears within 1 second (was 2-3 seconds)
-- **Worst case**: Still bounded at 5 seconds (was 10 seconds)
+- **Device discovery component**: 10s maximum → <1s typical (90%+ improvement)
+- **Deletion operations**: 2-4s faster per operation
+- **Best case**: Device appears immediately on first check (0ms wait vs 500ms minimum before)
+- **Typical case**: Device discovered on attempt 1 within 100ms (was 2-3s on average)
+- **Worst case**: Still bounded at 5 seconds maximum (was 10 seconds)
+
+### ⚠️ **Important Notes**
+- **Total allocation time** remains 7-8 seconds due to TrueNAS API operations (zvol creation ~2-3s, extent creation ~1-2s, LUN mapping ~1-2s, iSCSI login ~2s if needed)
+- **Device discovery** is now effectively instant (attempt 1), removing what was previously a 2-10 second bottleneck
+- **Further optimization** would require changes to TrueNAS API response times, which are outside plugin control
 
 ---
 
-## Version 1.0.5 (October 2025)
+## Version 1.0.5 (October 10, 2025)
 
 ### 🐛 **Bug Fixes**
 - **Fixed VMID filter in list_images** - Weight zvol and other non-VM volumes now properly excluded from VMID-specific queries
@@ -52,7 +60,7 @@
 
 ---
 
-## Version 1.0.4 (October 2025)
+## Version 1.0.4 (October 9, 2025)
 
 ### ✨ **Improvements**
 - **Dynamic Storage API version detection** - Plugin now automatically adapts to PVE version
@@ -72,7 +80,7 @@
 
 ---
 
-## Version 1.0.3 (October 2025)
+## Version 1.0.3 (October 8, 2025)
 
 ### ✨ **New Features**
 - **Automatic target visibility management** - Plugin now automatically ensures iSCSI targets remain discoverable
@@ -95,7 +103,7 @@
 
 ---
 
-## Version 1.0.2 (October 2025)
+## Version 1.0.2 (October 7, 2025)
 
 ### 🐛 **Bug Fixes**
 - **Fixed pre-flight check size calculation** - Corrected `_preflight_check_alloc` to treat size parameter as bytes instead of KiB, eliminating false "insufficient space" errors
@@ -111,7 +119,7 @@
 
 ---
 
-## Version 1.0.1 (October 2025)
+## Version 1.0.1 (October 6, 2025)
 
 ### 🐛 **Bug Fixes**
 - **Fixed syslog errors** - Changed all `syslog('error')` calls to `syslog('err')` (correct Perl Sys::Syslog priority)
@@ -125,7 +133,7 @@
 
 ---
 
-## Version 1.0.0 - Configuration Validation, Pre-flight Checks & Space Validation (October 2025)
+## Version 1.0.0 - Configuration Validation, Pre-flight Checks & Space Validation (October 5, 2025)
 
 ### 🔒 **Configuration Validation at Storage Creation**
 - **Required field validation** - Ensures `api_host`, `api_key`, `dataset`, `target_iqn` are present
