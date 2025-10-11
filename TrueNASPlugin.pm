@@ -177,8 +177,29 @@ sub _retry_with_backoff {
 }
 
 # ======== Storage plugin identity ========
-# Storage API version - PVE 9.x (APIVER 12), also compatible with PVE 8.x (11) via APIAGE
-sub api { return 12; } # storage plugin API version
+# Storage API version - dynamically adapts to PVE version
+# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 12)
+sub api {
+    my $tested_apiver = 12;  # Latest tested version (PVE 9.x)
+
+    # Get current system API version (safely, as PVE::Storage may not be loaded yet)
+    my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
+    my $system_apiage = eval { PVE::Storage::APIAGE() } // 2;
+
+    # If system API is within our tested range, return system version
+    # This ensures we never claim a higher version than the system supports
+    if ($system_apiver >= 11 && $system_apiver <= $tested_apiver) {
+        return $system_apiver;
+    }
+
+    # If we're within APIAGE of tested version, return tested version
+    if ($system_apiver - $system_apiage < $tested_apiver) {
+        return $tested_apiver;
+    }
+
+    # Fallback for very old systems (shouldn't happen with PVE 7+)
+    return 11;
+}
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
     return {

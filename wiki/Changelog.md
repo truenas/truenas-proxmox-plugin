@@ -3,14 +3,20 @@
 ## Version 1.0.4 (October 2025)
 
 ### ✨ **Improvements**
-- **Updated Storage API version** - Plugin now declares APIVER 12 (PVE 9.x) compatibility
+- **Dynamic Storage API version detection** - Plugin now automatically adapts to PVE version
   - Eliminates "implementing an older storage API" warning on PVE 9.x systems
-  - Maintains backward compatibility with PVE 8.x (APIVER 11) via APIAGE window
-  - Changed `api()` method from returning 11 to 12
-  - No functional changes - purely version declaration update
+  - Returns APIVER 12 on PVE 9.x, APIVER 11 on PVE 8.x
+  - Safely detects system API version using eval to handle module loading
+  - Prevents "newer than current" errors when running on older PVE versions
+  - Seamless compatibility across PVE 8.x and 9.x without code changes
+
+### 🐛 **Bug Fixes**
+- **Fixed PVE 8.x compatibility** - Hardcoded APIVER 12 caused rejection on PVE 8.4
+  - Plugin was returning version 12 on all systems, causing "newer than current (12 > 11)" error
+  - Now dynamically returns appropriate version based on system capabilities
 
 ### 📖 **Documentation**
-- Updated API version comments to reflect PVE 9.x support
+- Updated API version comments to reflect dynamic version detection
 
 ---
 
