@@ -1,5 +1,19 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.4 (October 2025)
+
+### ✨ **Improvements**
+- **Updated Storage API version** - Plugin now declares APIVER 12 (PVE 9.x) compatibility
+  - Eliminates "implementing an older storage API" warning on PVE 9.x systems
+  - Maintains backward compatibility with PVE 8.x (APIVER 11) via APIAGE window
+  - Changed `api()` method from returning 11 to 12
+  - No functional changes - purely version declaration update
+
+### 📖 **Documentation**
+- Updated API version comments to reflect PVE 9.x support
+
+---
+
 ## Version 1.0.3 (October 2025)
 
 ### ✨ **New Features**

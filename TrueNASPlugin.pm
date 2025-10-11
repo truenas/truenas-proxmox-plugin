@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.3';
+our $VERSION = '1.0.4';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -177,7 +177,8 @@ sub _retry_with_backoff {
 }
 
 # ======== Storage plugin identity ========
-sub api { return 11; } # storage plugin API version
+# Storage API version - PVE 9.x (APIVER 12), also compatible with PVE 8.x (11) via APIAGE
+sub api { return 12; } # storage plugin API version
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
     return {
