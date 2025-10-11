@@ -525,6 +525,119 @@ Pre-flight validation failed:
 Pre-flight checks passed for 10.00 GB volume allocation on 'tank/proxmox' (VM 100)
 ```
 
+## Automatic Target Visibility
+
+The plugin automatically maintains iSCSI target visibility to prevent discovery issues when targets have no extents.
+
+### The Problem
+
+iSCSI targets without any mapped extents become **undiscoverable**:
+- Target exists in TrueNAS but doesn't appear in `iscsiadm` discovery
+- Proxmox storage shows errors: "Could not resolve iSCSI target ID"
+- Occurs when all VM disks are deleted from a target
+- Prevents new disk allocation until manually fixed
+
+### Weight Zvol Solution
+
+The plugin automatically creates a 1GB "weight" zvol to keep targets visible:
+
+**Automatic Behavior**:
+1. **Detection** - During storage activation, checks if target exists but isn't discoverable
+2. **Weight Creation** - Creates `pve-plugin-weight` zvol (1GB) in storage dataset
+3. **Extent Mapping** - Creates extent and maps it to target automatically
+4. **Visibility Restored** - Target becomes discoverable again
+
+**Implementation Details**:
+- Runs in `activate_storage()` as a pre-flight check
+- Only creates weight if target exists on TrueNAS but isn't discoverable
+- Weight zvol uses same dataset as VM disks (e.g., `tank/proxmox/pve-plugin-weight`)
+- Automatically creates extent named `pve-plugin-weight`
+- Maps extent to configured target with next available LUN
+- Logs all actions to syslog for audit trail
+
+### Viewing Weight Zvol
+
+The weight zvol appears in storage listings:
+
+```bash
+# List all storage content
+pvesm list truenas-storage
+
+# Output shows weight zvol with VMID 0
+truenas-storage:vol-pve-plugin-weight-lun0    1GB    images    0
+```
+
+**Characteristics**:
+- **VMID**: Always `0` (excluded from VM disk listings)
+- **Size**: Fixed 1GB
+- **Format**: `raw`
+- **Persistent**: Remains until manually deleted
+- **Automatic Recreation**: Recreated if deleted while target has no other extents
+
+### Manual Management
+
+**View Weight Zvol**:
+```bash
+# Check if weight exists
+pvesm list truenas-storage | grep weight
+```
+
+**Delete Weight Zvol** (optional):
+```bash
+# Remove weight zvol
+pvesm free truenas-storage:vol-pve-plugin-weight-lun0
+
+# Warning: Will be recreated on next storage activation if target has no extents
+```
+
+**Prevent Recreation**:
+The weight is only needed when the target would otherwise have no extents. To prevent recreation:
+1. Create at least one VM disk on the storage, OR
+2. Manually create a different extent mapped to the target
+
+### Troubleshooting
+
+**Weight Not Created**:
+```bash
+# Check logs
+journalctl -u pvedaemon | grep -i "pre-flight"
+
+# Common reasons:
+# 1. Target doesn't exist on TrueNAS
+# 2. Target already has other extents (weight not needed)
+# 3. API connectivity issues
+# 4. Insufficient permissions
+```
+
+**Target Still Not Discoverable**:
+```bash
+# Verify target exists
+pvesh get /nodes/<nodename>/storage/<storageid>/iscsi-target
+
+# Manual discovery test
+iscsiadm -m discovery -t sendtargets -p <portal-ip>:<port>
+
+# Check TrueNAS:
+# 1. Navigate to Shares > Block Shares (iSCSI) > Targets
+# 2. Verify target exists with correct name
+# 3. Check Extents tab - should see pve-plugin-weight extent
+# 4. Check Target/Extents tab - verify mapping exists
+```
+
+**Network Issues**:
+- Weight creation requires API connectivity to TrueNAS
+- Check network between Proxmox node and TrueNAS
+- Verify API endpoint accessible: `curl -k https://<truenas-ip>/api/v2.0/system/info`
+
+### Benefits
+
+- **Zero Manual Intervention** - Automatic detection and resolution
+- **Production Ready** - Handles edge cases gracefully
+- **Minimal Overhead** - Only 1GB space used
+- **Transparent Operation** - No impact on normal VM operations
+- **Audit Trail** - All actions logged to syslog
+- **Cluster Compatible** - Works correctly across all cluster nodes
+
 ## Storage Status and Health Monitoring
 
 The plugin provides intelligent health monitoring:

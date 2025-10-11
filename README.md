@@ -163,33 +163,6 @@ pvesm list truenas-storage
 pvesm status
 ```
 
-## Automatic Target Visibility
-
-The plugin automatically maintains iSCSI target visibility to prevent discovery issues:
-
-### Weight Zvol Feature
-When an iSCSI target exists but has no extents (e.g., after deleting all VMs), it becomes undiscoverable. The plugin automatically:
-
-1. **Detects empty targets** - Checks if configured target exists but isn't discoverable during storage activation
-2. **Creates weight zvol** - Automatically creates a 1GB `pve-plugin-weight` zvol
-3. **Creates extent and mapping** - Maps the weight zvol to the target to maintain visibility
-4. **Maintains discoverability** - Ensures target remains visible in iSCSI discovery
-
-### Behavior
-- **Automatic**: Runs during storage activation (no manual intervention needed)
-- **Persistent**: Weight zvol remains until manually deleted
-- **Minimal overhead**: Only 1GB of storage space used
-- **Transparent**: Normal plugin operations continue without issues
-
-### Manual Management
-If you need to remove the weight zvol:
-```bash
-# The plugin will recreate it on next activation if target has no other extents
-pvesm free truenas-storage:vol-pve-plugin-weight-lun0
-```
-
-**Note**: The weight zvol is automatically excluded from VM disk listings (vmid = 0).
-
 ## Documentation
 
 Comprehensive documentation is available in the [Wiki](wiki/):
