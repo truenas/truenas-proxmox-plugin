@@ -19,13 +19,16 @@ api_scheme wss      # or ws for unencrypted
 api_port 443        # or 80 for unencrypted
 ```
 
-**Connection URL**: `wss://TRUENAS_HOST:443/websocket`
+**Connection URL**:
+- TrueNAS 24.10 and earlier: `wss://TRUENAS_HOST:443/websocket`
+- TrueNAS 25.04+: `wss://TRUENAS_HOST:443/api/current` (legacy `/websocket` still supported)
 
 **Benefits**:
 - Persistent connection (no repeated TLS handshake)
 - Lower latency (~20-30ms faster per operation)
 - Connection pooling and reuse
 - Real-time updates (not currently used)
+- **Required for TrueNAS 26.04+**
 
 **Limitations**:
 - May be unstable on some networks
@@ -33,7 +36,9 @@ api_port 443        # or 80 for unencrypted
 
 ### REST Transport
 
-**Configuration**:
+**⚠️ DEPRECATION NOTICE**: The TrueNAS REST API was deprecated in TrueNAS SCALE 25.04 and will be removed in version 26.04 (expected 2025). Use WebSocket transport for TrueNAS 25.04 and later.
+
+**Configuration** (Legacy - TrueNAS 24.10 and earlier only):
 ```ini
 api_transport rest
 api_scheme https    # or http for unencrypted
@@ -44,12 +49,13 @@ api_port 443        # or 80 for unencrypted
 
 **Benefits**:
 - More stable on unreliable networks
-- Compatible with all TrueNAS SCALE versions
+- Compatible with TrueNAS SCALE versions 22.x through 25.04
 - Standard HTTP semantics
 
 **Limitations**:
 - Higher latency (new connection per request)
 - Repeated TLS handshakes
+- **Not available in TrueNAS 26.04+**
 
 ## Authentication
 
@@ -626,13 +632,15 @@ API keys stored in `/etc/pve/storage.cfg`:
 
 ### TrueNAS SCALE Versions
 
-| Version | WebSocket | Bulk Ops | Notes |
-|---------|-----------|----------|-------|
-| 22.02 | Limited | No | Basic functionality only |
-| 22.12 | Yes | Limited | WebSocket stable |
-| 23.10 | Yes | Yes | Bulk operations available |
-| 24.04 | Yes | Yes | Improved performance |
-| 25.04+ | Yes | Yes | Recommended (optimal) |
+| Version | WebSocket | REST API | Bulk Ops | Recommended Transport | Notes |
+|---------|-----------|----------|----------|-----------------------|-------|
+| 22.02 | Limited | Yes | No | REST | Basic functionality only |
+| 22.12 | Yes | Yes | Limited | WebSocket | WebSocket stable |
+| 23.10 | Yes | Yes | Yes | WebSocket | Bulk operations available |
+| 24.04 | Yes | Yes | Yes | WebSocket | Improved performance |
+| 24.10 | Yes | Yes | Yes | WebSocket | Last version with full REST support |
+| 25.04 | Yes | Deprecated | Yes | **WebSocket only** | REST API deprecated, use WebSocket |
+| 26.04+ | Yes | Removed | Yes | **WebSocket only** | REST API removed, WebSocket required |
 
 ### API Endpoints
 

@@ -175,11 +175,19 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 - **[API Reference](wiki/API-Reference.md)** - Technical details on TrueNAS API integration
 - **[Known Limitations](wiki/Known-Limitations.md)** - Important limitations and workarounds
 
+## Important: TrueNAS API Changes
+
+**TrueNAS SCALE 25.04+ Users**: The TrueNAS REST API has been deprecated as of version 25.04 and will be completely removed in version 26.04. This plugin supports both WebSocket (recommended) and REST transports. **Ensure you use WebSocket transport (`api_transport ws`) for TrueNAS 25.04+**.
+
+For TrueNAS 26.04+, REST transport will no longer function.
+
 ## Requirements
 
 - **Proxmox VE** 8.x or later (9.x recommended)
 - **TrueNAS SCALE** 22.x or later (25.04+ recommended)
-- Network connectivity between Proxmox nodes and TrueNAS (iSCSI on port 3260, API on port 443/80)
+  - **For TrueNAS 25.04+**: Must use WebSocket transport (`api_transport ws`)
+  - **For TrueNAS 26.04+**: REST API will not be available
+- Network connectivity between Proxmox nodes and TrueNAS (iSCSI on port 3260, WebSocket API on port 443)
 
 ## Support
 
@@ -195,5 +203,5 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 ---
 
 **Version**: 1.0.6
-**Last Updated**: October 11, 2025
+**Last Updated**: October 16, 2025
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 22.x+
