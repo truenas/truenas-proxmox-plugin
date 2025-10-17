@@ -23,26 +23,29 @@
 
 | Feature | TrueNAS Plugin | Standard iSCSI | NFS |
 |---------|:--------------:|:--------------:|:---:|
-| **Snapshots** | ✅ | ❌ | ⚠️ |
-| **Live Snapshots (RAM)** | ✅ | ❌ | ❌ |
-| **Clones** | ✅ | ❌ | ⚠️ |
-| **Thin Provisioning** | ✅ | ❌ | ⚠️ |
+| **Snapshots** | ✅ | ⚠️ | ⚠️ |
+| **VM State Snapshots (vmstate)** | ✅ | ✅ | ✅ |
+| **Clones** | ✅ | ⚠️ | ⚠️ |
+| **Thin Provisioning** | ✅ | ⚠️ | ⚠️ |
 | **Block-Level Performance** | ✅ | ✅ | ❌ |
 | **Shared Storage** | ✅ | ✅ | ✅ |
-| **Volume Management** | ✅ | ❌ | ❌ |
+| **Automatic Volume Management** | ✅ | ❌ | ❌ |
 | **Automatic Resize** | ✅ | ❌ | ❌ |
 | **Pre-flight Checks** | ✅ | ❌ | ❌ |
 | **Multi-path I/O** | ✅ | ✅ | ❌ |
 | **ZFS Compression** | ✅ | ❌ | ❌ |
-| **Container Storage** | ❌ | ❌ | ✅ |
+| **Container Storage** | ❌ | ⚠️ | ✅ |
+| **Backup Storage** | ❌ | ❌ | ✅ |
+| **ISO Storage** | ❌ | ❌ | ✅ |
 | **Raw Image Format** | ✅ | ✅ | ✅ |
 
-**Legend**: ✅ Yes | ⚠️ Via qcow2 | ❌ No
+**Legend**: ✅ Native Support | ⚠️ Via Additional Layer | ❌ Not Supported
 
 **Notes**:
-- **Standard iSCSI**: Proxmox recommends using LVM on top of iSCSI LUNs for snapshots/clones
-- **NFS**: Snapshots/clones require qcow2 format (performance overhead vs raw)
-- **TrueNAS Plugin**: Native ZFS features with raw image performance
+- **Standard iSCSI**: Raw iSCSI lacks native snapshots/clones. Use LVM-thin on iSCSI for full snapshot/clone/thin-provisioning support, or volume chains (Proxmox VE 9+). Container storage available via LVM on iSCSI.
+- **NFS**: Snapshots/clones require qcow2 format (performance overhead vs raw). Supports backups, ISOs, and containers natively.
+- **TrueNAS Plugin**: Native ZFS features with raw image performance and automated zvol/iSCSI extent management via TrueNAS API.
+- **VM State Snapshots**: All storage types supporting the 'images' content type can store vmstate files for live snapshots with RAM.
 
 ## Quick Start
 
