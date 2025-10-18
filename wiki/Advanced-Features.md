@@ -2,6 +2,42 @@
 
 Advanced configuration, performance tuning, clustering, and security features of the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+
+- [Performance Tuning](#performance-tuning)
+  - [ZFS Block Size Optimization](#zfs-block-size-optimization)
+  - [Thin Provisioning](#thin-provisioning)
+  - [Network Optimization](#network-optimization)
+  - [Multipath I/O (MPIO)](#multipath-io-mpio)
+  - [vmstate Storage Location](#vmstate-storage-location)
+  - [API Performance](#api-performance)
+  - [Rate Limiting Strategy](#rate-limiting-strategy)
+- [Cluster Configuration](#cluster-configuration)
+  - [Shared Storage Setup](#shared-storage-setup)
+  - [Cluster Deployment Script](#cluster-deployment-script)
+  - [High Availability (HA)](#high-availability-ha)
+  - [Cluster Testing](#cluster-testing)
+- [Security Configuration](#security-configuration)
+  - [CHAP Authentication](#chap-authentication)
+  - [API Security](#api-security)
+  - [Network Security](#network-security)
+  - [Audit Logging](#audit-logging)
+- [Snapshot Features](#snapshot-features)
+  - [Live Snapshots](#live-snapshots)
+  - [Volume Snapshot Chains](#volume-snapshot-chains)
+  - [Snapshot Best Practices](#snapshot-best-practices)
+- [Pre-flight Validation](#pre-flight-validation)
+- [Automatic Target Visibility](#automatic-target-visibility)
+- [Storage Status and Health Monitoring](#storage-status-and-health-monitoring)
+- [Advanced Troubleshooting](#advanced-troubleshooting)
+  - [Force Delete on In-Use](#force-delete-on-inuse)
+  - [Logout on Free](#logout-on-free)
+- [Custom Configurations](#custom-configurations)
+  - [IPv6 Setup](#ipv6-setup)
+  - [Development Configuration](#development-configuration)
+
+---
+
 ## Performance Tuning
 
 ### ZFS Block Size Optimization

@@ -2,6 +2,45 @@
 
 Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+
+- [About Plugin Error Messages](#about-plugin-error-messages)
+- [Storage Status Issues](#storage-status-issues)
+  - [Storage Shows as Inactive](#storage-shows-as-inactive)
+- [Connection and API Issues](#connection-and-api-issues)
+  - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
+  - [API Rate Limiting](#api-rate-limiting)
+- [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
+  - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
+  - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
+  - [iSCSI Session Issues](#iscsi-session-issues)
+- [Volume Creation Issues](#volume-creation-issues)
+  - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
+  - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
+  - ["Unable to find free disk name after 1000 attempts"](#unable-to-find-free-disk-name-after-1000-attempts)
+  - ["Volume created but device not accessible after 10 seconds"](#volume-created-but-device-not-accessible-after-10-seconds)
+- [VM Deletion Issues](#vm-deletion-issues)
+  - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
+  - [Warnings During VM Deletion](#warnings-during-vm-deletion)
+- [Snapshot Issues](#snapshot-issues)
+  - [Snapshot Creation Fails](#snapshot-creation-fails)
+  - [Snapshot Rollback Fails](#snapshot-rollback-fails)
+- [Performance Issues](#performance-issues)
+  - [Slow VM Disk Performance](#slow-vm-disk-performance)
+  - [Slow Multipath Read Performance](#slow-multipath-read-performance)
+  - [Slow VM Cloning](#slow-vm-cloning)
+- [Cluster-Specific Issues](#cluster-specific-issues)
+  - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)
+  - [VM Migration Fails](#vm-migration-fails)
+- [Log Files and Debugging](#log-files-and-debugging)
+  - [Proxmox Logs](#proxmox-logs)
+  - [TrueNAS Logs](#truenas-logs)
+  - [Storage Diagnostics](#storage-diagnostics)
+  - [Enable Debug Logging](#enable-debug-logging)
+- [Getting Help](#getting-help)
+
+---
+
 ## About Plugin Error Messages
 
 **The plugin provides enhanced error messages** with built-in troubleshooting guidance. When an error occurs, the plugin includes:

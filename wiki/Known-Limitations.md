@@ -2,6 +2,51 @@
 
 Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+
+- [Critical Workflow Limitations](#critical-workflow-limitations)
+  - [VM Deletion Behavior](#vm-deletion-behavior)
+- [Storage Feature Limitations](#storage-feature-limitations)
+  - [No Fast Clone Support](#no-fast-clone-support)
+  - [No Volume Shrinking](#no-volume-shrinking)
+  - [Resize Headroom Limit](#resize-headroom-limit)
+- [Content Type Limitations](#content-type-limitations)
+  - [Images Only](#images-only)
+- [Snapshot Limitations](#snapshot-limitations)
+  - [No Backup Integration](#no-backup-integration)
+  - [Snapshots Don't Enable Fast Clones](#snapshots-dont-enable-fast-clones)
+- [Live Migration Limitations](#live-migration-limitations)
+  - [Requires Shared Storage](#requires-shared-storage)
+  - [vmstate Storage Considerations](#vmstate-storage-considerations)
+- [TrueNAS Specific Limitations](#truenas-specific-limitations)
+  - [API Rate Limits](#api-rate-limits)
+  - [WebSocket Connection Stability](#websocket-connection-stability)
+  - [Version Compatibility](#version-compatibility)
+- [Proxmox Specific Limitations](#proxmox-specific-limitations)
+  - [Proxmox Version Requirements](#proxmox-version-requirements)
+  - [Custom Storage Plugin Directory](#custom-storage-plugin-directory)
+- [Network Limitations](#network-limitations)
+  - [No NFS/CIFS Support](#no-nfscifs-support)
+  - [IPv6 Considerations](#ipv6-considerations)
+- [Security Limitations](#security-limitations)
+  - [No Mutual CHAP](#no-mutual-chap)
+  - [API Key Storage](#api-key-storage)
+- [Performance Limitations](#performance-limitations)
+  - [Clone Performance](#clone-performance)
+  - [Snapshot Overhead](#snapshot-overhead)
+  - [Network-Bound Performance](#network-bound-performance)
+  - [Multipath Read Performance Limitation](#multipath-read-performance-limitation)
+- [Platform Limitations](#platform-limitations)
+  - [Linux/Proxmox Only](#linuxproxmox-only)
+  - [ZFS Dependency](#zfs-dependency)
+- [Operational Limitations](#operational-limitations)
+  - [No Bulk Deletion](#no-bulk-deletion)
+  - [Configuration Changes Require Restart](#configuration-changes-require-restart)
+  - [No Storage Overcommit Protection](#no-storage-overcommit-protection)
+- [Workarounds Summary](#workarounds-summary)
+
+---
+
 ## Critical Workflow Limitations
 
 ### VM Deletion Behavior

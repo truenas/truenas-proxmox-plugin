@@ -2,6 +2,58 @@
 
 Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration parameters.
 
+## Table of Contents
+
+- [Configuration File](#configuration-file)
+- [Required Parameters](#required-parameters)
+  - [api_host](#api_host)
+  - [api_key](#api_key)
+  - [target_iqn](#target_iqn)
+  - [dataset](#dataset)
+  - [discovery_portal](#discovery_portal)
+- [Content Type](#content-type)
+  - [content](#content)
+  - [shared](#shared)
+- [API Configuration](#api-configuration)
+  - [api_transport](#api_transport)
+  - [api_scheme](#api_scheme)
+  - [api_port](#api_port)
+  - [api_insecure](#api_insecure)
+  - [api_retry_max](#api_retry_max)
+  - [api_retry_delay](#api_retry_delay)
+- [Network Configuration](#network-configuration)
+  - [prefer_ipv4](#prefer_ipv4)
+  - [portals](#portals)
+  - [use_multipath](#use_multipath)
+  - [use_by_path](#use_by_path)
+  - [ipv6_by_path](#ipv6_by_path)
+- [iSCSI Behavior](#iscsi-behavior)
+  - [force_delete_on_inuse](#force_delete_on_inuse)
+  - [logout_on_free](#logout_on_free)
+- [ZFS Volume Options](#zfs-volume-options)
+  - [zvol_blocksize](#zvol_blocksize)
+  - [tn_sparse](#tn_sparse)
+- [Snapshot Configuration](#snapshot-configuration)
+  - [vmstate_storage](#vmstate_storage)
+  - [enable_live_snapshots](#enable_live_snapshots)
+  - [snapshot_volume_chains](#snapshot_volume_chains)
+- [Performance Options](#performance-options)
+  - [enable_bulk_operations](#enable_bulk_operations)
+- [Security Options](#security-options)
+  - [chap_user](#chap_user)
+  - [chap_password](#chap_password)
+- [Configuration Examples](#configuration-examples)
+  - [Basic Single-Node Configuration](#basic-single-node-configuration)
+  - [Production Cluster Configuration](#production-cluster-configuration)
+  - [High Availability Configuration](#high-availability-configuration)
+  - [IPv6 Configuration](#ipv6-configuration)
+  - [Development/Testing Configuration](#developmenttesting-configuration)
+  - [Enterprise Production Configuration (All Features)](#enterprise-production-configuration-all-features)
+- [Configuration Validation](#configuration-validation)
+- [Modifying Configuration](#modifying-configuration)
+
+---
+
 ## Configuration File
 
 All storage configurations are stored in `/etc/pve/storage.cfg`. This file is automatically shared across all cluster nodes.
