@@ -112,36 +112,598 @@ Create multiple portals in **Shares** → **Block Shares (iSCSI)** → **Portals
 
 ### Multipath I/O (MPIO)
 
-Enable multipath for redundancy and performance:
+Multipath provides redundancy and load balancing across multiple network paths to your TrueNAS storage.
+
+#### Quick Start
 
 ```ini
 use_multipath 1
 portals 192.168.10.101:3260,192.168.10.102:3260
 ```
 
-**Verify Multipath**:
+#### Network Requirements (CRITICAL)
+
+**Each iSCSI path MUST be on a different subnet** for multipath to work correctly.
+
+✅ **Correct Configuration:**
+```
+TrueNAS:
+  - Interface 1: 10.15.14.172/23  (subnet: 10.15.14.0/23)
+  - Interface 2: 10.30.30.2/24    (subnet: 10.30.30.0/24)
+
+Proxmox Node:
+  - Interface 1: 10.15.14.89/23   (matches TrueNAS subnet)
+  - Interface 2: 10.30.30.3/24    (matches TrueNAS subnet)
+```
+
+❌ **Incorrect Configuration:**
+```
+TrueNAS:
+  - Interface 1: 10.1.101.10/24  (subnet: 10.1.101.0/24)
+  - Interface 2: 10.1.101.20/24  (subnet: 10.1.101.0/24)  ← Same subnet!
+
+Result: Only one path will be used (routing table limitation)
+```
+
+**Why different subnets are required**: If both interfaces are on the same subnet, the OS routing table will only send traffic out one interface, preventing multipath from functioning.
+
+#### TrueNAS Portal Configuration
+
+TrueNAS supports **two valid approaches** for configuring iSCSI portals for multipath:
+
+##### Approach 1: Single Portal Group (Simpler, Recommended)
+
+Configure all IPs in **one portal group**:
+
+```
+TrueNAS → Shares → Block Shares (iSCSI) → Portals → Add
+
+Portal Configuration:
+  Comment: "Proxmox Multipath"
+
+  Listen Addresses:
+    - IP: 10.15.14.172, Port: 3260  (Click Add to add second IP)
+    - IP: 10.30.30.2, Port: 3260
+
+  Discovery Authentication Method: None (or CHAP if required)
+
+Result: Portal ID 1 with both IPs
+```
+
+**Pros:**
+- Simpler configuration
+- Single portal to manage
+- Works reliably for multipath
+- Easier troubleshooting
+
+**Target Association:**
+```
+Target → Groups → Add:
+  Portal Group: 1
+  Initiator Group: (your initiator group)
+```
+
+##### Approach 2: Separate Portal Groups (Alternative)
+
+Create **separate portal groups** for each network path:
+
+```
+Portal 1:
+  Comment: "Proxmox Path 1"
+  Listen: 10.15.14.172:3260
+
+Portal 2:
+  Comment: "Proxmox Path 2"
+  Listen: 10.30.30.2:3260
+```
+
+**Pros:**
+- Explicit path separation
+- More granular control per path
+- Can set different authentication per path
+
+**Target Association:**
+```
+Target → Groups → Add both:
+  Portal Group: 1
+  Portal Group: 2
+```
+
+**Both approaches work correctly** - choose based on your preference and management needs.
+
+#### Network Topology Best Practices
+
+**Recommended Physical Setup:**
+```
+┌─────────────┐
+│  TrueNAS    │
+│             │
+│ eth0: 10.15.14.172/23 ──────┐
+│ eth1: 10.30.30.2/24 ─────┐  │
+└─────────────┘              │  │
+                             │  │
+                  ┌──────────┘  │
+                  │  ┌──────────┘
+                  │  │
+               ┌──▼──▼────────┐
+               │  Switch(es)  │
+               └──┬──┬────────┘
+                  │  │
+                  │  └──────────┐
+                  └──────────┐  │
+                             │  │
+┌─────────────┐              │  │
+│  Proxmox    │              │  │
+│             │              │  │
+│ eth2: 10.15.14.89/23 ◄─────┘  │
+│ eth3: 10.30.30.3/24 ◄──────────┘
+└─────────────┘
+```
+
+**Network Best Practices:**
+- Use dedicated physical NICs for storage (not shared with VM/management traffic)
+- Configure storage on dedicated VLANs for isolation
+- Use at least 1GbE per path (**10GbE strongly recommended**)
+- Enable jumbo frames (MTU 9000) on all storage interfaces and switches
+- Ensure physical network redundancy (separate cables, switches if possible)
+- Keep path bandwidths identical (don't mix 1GbE and 10GbE)
+
+**VLAN Configuration Example:**
+```
+VLAN 10 (Storage Path 1): 10.15.14.0/23
+VLAN 20 (Storage Path 2): 10.30.30.0/24
+
+TrueNAS:
+  - eth0: VLAN 10, IP 10.15.14.172
+  - eth1: VLAN 20, IP 10.30.30.2
+
+Proxmox:
+  - eth2: VLAN 10, IP 10.15.14.89
+  - eth3: VLAN 20, IP 10.30.30.3
+```
+
+#### Proxmox Host Configuration
+
+**1. Install Multipath Tools**
 ```bash
-# Check multipath devices
-multipath -ll
-
-# Example output:
-# mpatha (360014056789abcd...) dm-0 FREENAS,iSCSI Disk
-# size=100G features='0' hwhandler='0' wp=rw
-# |-+- policy='service-time 0' prio=1 status=active
-# | `- 3:0:0:0 sda 8:0 active ready running
-# `-+- policy='service-time 0' prio=1 status=enabled
-#   `- 4:0:0:0 sdb 8:16 active ready running
+apt-get update
+apt-get install multipath-tools
 ```
 
-**Multipath Configuration** (`/etc/multipath.conf`):
-```
+**2. Configure Multipath** (`/etc/multipath.conf`):
+```conf
 defaults {
     user_friendly_names yes
     path_grouping_policy multibus
+    path_selector "round-robin 0"
+    rr_min_io_rq 1
     failback immediate
-    no_path_retry 12
+    no_path_retry queue
+    find_multipaths no
+}
+
+blacklist {
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+    devnode "^hd[a-z]"
+    devnode "^sda"  # Exclude OS disk (adjust if needed)
+}
+
+# Optional: Specific device configuration for TrueNAS
+devices {
+    device {
+        vendor "TrueNAS"
+        product "iSCSI Disk"
+        path_grouping_policy multibus
+        path_selector "round-robin 0"
+        hardware_handler "0"
+        rr_weight uniform
+        rr_min_io_rq 1
+    }
 }
 ```
+
+**3. Enable and Start Multipath**
+```bash
+systemctl enable multipathd
+systemctl start multipathd
+systemctl status multipathd
+```
+
+**4. Network Interface Configuration**
+
+Enable jumbo frames on storage interfaces:
+```bash
+# Edit /etc/network/interfaces
+auto eth2
+iface eth2 inet static
+    address 10.15.14.89/23
+    mtu 9000
+
+auto eth3
+iface eth3 inet static
+    address 10.30.30.3/24
+    mtu 9000
+
+# Apply changes
+ifdown eth2 && ifup eth2
+ifdown eth3 && ifup eth3
+
+# Verify MTU
+ip link show eth2
+ip link show eth3
+```
+
+**Verify jumbo frames end-to-end:**
+```bash
+# Test MTU 9000 (8972 bytes + 28 byte header)
+ping -M do -s 8972 -c 3 10.15.14.172
+ping -M do -s 8972 -c 3 10.30.30.2
+
+# Should succeed without fragmentation
+```
+
+#### Storage Configuration
+
+Add to `/etc/pve/storage.cfg`:
+
+**For Single Portal Group (Approach 1):**
+```ini
+truenasplugin: truenas-storage
+    api_host 10.15.14.172
+    api_key YOUR_API_KEY
+    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    dataset tank/proxmox
+    discovery_portal 10.15.14.172:3260
+    portals 10.30.30.2:3260
+    content images
+    shared 1
+    use_multipath 1
+```
+
+**For Separate Portal Groups (Approach 2):**
+```ini
+truenasplugin: truenas-storage
+    api_host 10.15.14.172
+    api_key YOUR_API_KEY
+    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    dataset tank/proxmox
+    discovery_portal 10.15.14.172:3260
+    portals 10.30.30.2:3260
+    content images
+    shared 1
+    use_multipath 1
+```
+
+**Note**: The plugin configuration is identical for both approaches. `discovery_portal` specifies the primary portal for discovery, `portals` lists additional portals.
+
+#### Verification and Testing
+
+**1. Verify iSCSI Discovery**
+```bash
+# Discover targets from both portals
+iscsiadm -m discovery -t sendtargets -p 10.15.14.172:3260
+iscsiadm -m discovery -t sendtargets -p 10.30.30.2:3260
+
+# Should show the same target from both IPs
+```
+
+**2. Verify iSCSI Sessions**
+```bash
+# Should show 2 sessions (one per portal)
+iscsiadm -m session
+
+# Expected output:
+# tcp: [7] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:proxmox (non-flash)
+# tcp: [11] 10.30.30.2:3260,1 iqn.2005-10.org.freenas.ctl:proxmox (non-flash)
+```
+
+**3. Verify Multipath Devices**
+```bash
+# List all multipath devices
+multipath -ll
+
+# Expected output:
+# mpathe (36589cfc000000xyz...) dm-5 TrueNAS,iSCSI Disk
+# size=10G features='1 queue_if_no_path' hwhandler='0' wp=rw
+# `-+- policy='round-robin 0' prio=1 status=active
+#   |- 11:0:0:2 sdh 8:112 active ready running  ← Path 1
+#   `- 7:0:0:2  sdf 8:80  active ready running  ← Path 2
+```
+
+**Key indicators:**
+- Both paths show `active ready running`
+- Policy is `round-robin 0` for load balancing
+- Two different SCSI host numbers (7 and 11) indicate separate sessions
+
+**4. Verify Path Usage**
+
+Confirm both paths are actively used for I/O:
+```bash
+# Record initial stats
+grep -E '(sdh|sdf)' /proc/diskstats > /tmp/before.txt
+
+# Write test data (adjust device name to your multipath device)
+dd if=/dev/zero of=/dev/mapper/mpathe bs=1M count=1024 oflag=direct
+
+# Check stats again
+grep -E '(sdh|sdf)' /proc/diskstats > /tmp/after.txt
+
+# Both devices should show increased write sectors (field 10)
+# Calculate difference:
+awk 'NR==FNR{old[$3]=$10; next} {new=$10; dev=$3; print dev": sectors written =", new-old[dev]}' \
+    /tmp/before.txt /tmp/after.txt
+
+# Both should show roughly equal values (50/50 distribution)
+```
+
+**5. Performance Testing**
+
+```bash
+# Test write performance (should show ~100-110 MB/s on 2x 1GbE)
+fio --name=write-test --filename=/dev/mapper/mpathe \
+    --rw=write --bs=1M --size=2G --numjobs=4 --iodepth=16 \
+    --direct=1 --ioengine=libaio --runtime=30 --time_based --group_reporting
+
+# Test read performance with parallel I/O
+fio --name=read-test --filename=/dev/mapper/mpathe \
+    --rw=read --bs=1M --size=2G --numjobs=4 --iodepth=16 \
+    --direct=1 --ioengine=libaio --runtime=30 --time_based --group_reporting
+```
+
+#### Performance Expectations
+
+**Theoretical Maximum** (2x 1GbE):
+- Raw bandwidth: 2 Gbps = 250 MB/s
+- Realistic with TCP/IP overhead: ~200-220 MB/s
+
+**Observed Performance** (2x 1GbE with multipath):
+
+| Workload Type | Expected Performance | Notes |
+|---------------|---------------------|-------|
+| **Sequential Writes** | ~100-110 MB/s | Both paths utilized ✅ |
+| **Parallel Writes (4 jobs)** | ~100-110 MB/s | Full aggregate bandwidth ✅ |
+| **Sequential Reads** | ~50-100 MB/s | Limited by iSCSI protocol ⚠️ |
+| **Parallel Reads (4 jobs)** | ~100-110 MB/s | Multiple I/O streams help ✅ |
+| **Random I/O (mixed)** | ~80-100 MB/s | Natural parallelism ✅ |
+| **Multiple VMs** | Scales well | Each VM can use different paths ✅ |
+
+**With 10GbE** (2x 10GbE multipath):
+- Write performance: ~800-1000 MB/s
+- Read performance: ~800-1000 MB/s
+- Significantly better for all workload types
+- Bypasses most iSCSI protocol limitations
+
+**Important Performance Note**:
+
+Read performance may appear lower than expected in single-threaded benchmarks. This is due to TrueNAS SCALE's `MaxOutstandingR2T=1` setting, which limits read parallelism. **This is a platform limitation, not a configuration error.**
+
+- Both paths ARE being used (verify with diskstats)
+- Paths alternate rapidly (round-robin)
+- Real-world multi-VM workloads perform better than benchmarks
+- See [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation) for detailed explanation
+
+#### Failover Testing
+
+**Test automatic failover:**
+
+```bash
+# Terminal 1: Monitor multipath status
+watch -n 1 'multipath -ll'
+
+# Terminal 2: Simulate path failure
+# Disconnect cable, disable interface, or block traffic
+ip link set eth2 down
+
+# Observe in Terminal 1:
+# - Failed path marked as "failed faulty"
+# - I/O continues on remaining path
+# - No VM disruption
+
+# Restore path
+ip link set eth2 up
+
+# Observe:
+# - Path automatically restored to "active ready running"
+# - Load balancing resumes across both paths
+```
+
+**Monitor failover in logs:**
+```bash
+# Watch multipathd for failover events
+journalctl -u multipathd -f
+
+# Test path failure
+ip link set eth2 down
+
+# Should see messages like:
+# "sdh: path down"
+# "mpathe: Entering recovery mode"
+# "mpathe: 1 path(s) remaining"
+
+# Restore path
+ip link set eth2 up
+
+# Should see:
+# "sdh: path up"
+# "mpathe: Exiting recovery mode"
+```
+
+#### Troubleshooting
+
+**Problem**: Only one path shows up in `multipath -ll`
+
+**Diagnosis:**
+```bash
+# Check iSCSI discovery
+iscsiadm -m discovery -t sendtargets -p 10.15.14.172:3260
+
+# Should show target with both portal IPs
+```
+
+**Solutions:**
+1. Verify both portals are configured on TrueNAS (either in one portal group or separate groups)
+2. Ensure both networks are reachable from Proxmox:
+   ```bash
+   ping -c 3 10.15.14.172
+   ping -c 3 10.30.30.2
+   ```
+3. Check routing table shows both subnets:
+   ```bash
+   ip route
+   # Should show routes for both 10.15.14.0/23 and 10.30.30.0/24
+   ```
+4. Verify iSCSI login to both portals:
+   ```bash
+   iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox --login
+   ```
+
+**Problem**: Both paths present but only one is used
+
+**Diagnosis:**
+```bash
+# Check if interfaces are on same subnet
+ip addr show | grep inet
+
+# Check routing table
+ip route
+```
+
+**Solution:**
+- **Both interfaces MUST be on different subnets**
+- Reconfigure network to use separate subnets (e.g., 10.1.0.0/24 and 10.2.0.0/24)
+
+**Problem**: Performance is poor despite both paths active
+
+**Diagnosis:**
+```bash
+# Check MTU settings
+ip link show | grep mtu
+
+# Test jumbo frames
+ping -M do -s 8972 -c 3 10.15.14.172
+
+# Check for network errors
+ip -s link show eth2
+ip -s link show eth3
+```
+
+**Solutions:**
+1. Enable jumbo frames (MTU 9000) on all interfaces:
+   ```bash
+   ip link set eth2 mtu 9000
+   ip link set eth3 mtu 9000
+   ```
+2. Verify no packet loss:
+   ```bash
+   ping -c 100 -s 8972 10.15.14.172
+   ```
+3. Check multipath configuration uses round-robin:
+   ```bash
+   multipath -ll | grep policy
+   # Should show: policy='round-robin 0'
+   ```
+
+**Problem**: Path failover is slow
+
+**Diagnosis:**
+```bash
+# Check multipathd configuration
+multipath -t
+grep failback /etc/multipath.conf
+```
+
+**Solution:**
+- Ensure `failback immediate` is set in `/etc/multipath.conf`
+- Restart multipathd:
+  ```bash
+  systemctl restart multipathd
+  ```
+
+#### Common Mistakes to Avoid
+
+❌ **Don't**: Configure both interfaces on the same subnet
+✅ **Do**: Use different subnets for each path (e.g., 10.1.x.x and 10.2.x.x)
+
+❌ **Don't**: Use network bonding/LACP on storage interfaces
+✅ **Do**: Let multipath handle load balancing at the iSCSI layer
+
+❌ **Don't**: Share storage network with VM/management traffic
+✅ **Do**: Use dedicated VLANs for storage
+
+❌ **Don't**: Mix different network speeds (1GbE + 10GbE)
+✅ **Do**: Use identical NICs and speeds for all paths
+
+❌ **Don't**: Expect sequential read benchmarks to show full aggregate bandwidth
+✅ **Do**: Test with parallel I/O workloads or real-world VM usage
+
+❌ **Don't**: Forget to enable jumbo frames
+✅ **Do**: Set MTU 9000 on all storage interfaces and switches
+
+❌ **Don't**: Assume multipath is working without verification
+✅ **Do**: Verify both paths are active and load-balancing using `multipath -ll` and diskstats
+
+#### Advanced: Monitoring Path Performance
+
+**Real-time path monitoring script:**
+```bash
+#!/bin/bash
+# /usr/local/bin/monitor-multipath.sh
+
+MPATH=${1:-mpathe}
+INTERVAL=${2:-2}
+
+echo "Monitoring multipath device: $MPATH (Ctrl+C to stop)"
+echo "=========================================="
+echo ""
+
+# Get path devices
+PATHS=$(multipath -ll $MPATH | grep -E 'sd[a-z]' | awk '{print $3}')
+
+while true; do
+    clear
+    echo "=== $(date) ==="
+    echo ""
+
+    # Show multipath status
+    echo "Multipath Status:"
+    multipath -ll $MPATH | head -6
+    echo ""
+
+    # Show per-path I/O stats
+    echo "Path I/O Statistics:"
+    printf "%-8s %10s %10s %10s %10s\n" "Device" "Reads" "Read MB" "Writes" "Write MB"
+    echo "------------------------------------------------------------"
+
+    for dev in $PATHS; do
+        stats=$(grep " $dev " /proc/diskstats)
+        reads=$(echo $stats | awk '{print $4}')
+        read_sect=$(echo $stats | awk '{print $6}')
+        writes=$(echo $stats | awk '{print $8}')
+        write_sect=$(echo $stats | awk '{print $10}')
+
+        read_mb=$((read_sect / 2048))
+        write_mb=$((write_sect / 2048))
+
+        printf "%-8s %10s %10s %10s %10s\n" "$dev" "$reads" "$read_mb" "$writes" "$write_mb"
+    done
+
+    echo ""
+    echo "Press Ctrl+C to stop monitoring"
+    sleep $INTERVAL
+done
+```
+
+**Usage:**
+```bash
+chmod +x /usr/local/bin/monitor-multipath.sh
+/usr/local/bin/monitor-multipath.sh mpathe 2
+```
+
+#### See Also
+- [Configuration Reference - use_multipath](Configuration.md#use_multipath)
+- [Configuration Reference - portals](Configuration.md#portals)
+- [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation)
+- [Troubleshooting - Slow Multipath Read Performance](Troubleshooting.md#slow-multipath-read-performance)
 
 ### vmstate Storage Location
 

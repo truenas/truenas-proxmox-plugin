@@ -606,6 +606,69 @@ ip link show eth1
 # Configure VLANs to isolate storage traffic
 ```
 
+### Slow Multipath Read Performance
+
+**Symptom**: Read performance with multipath is lower than expected, even though both paths are configured correctly
+
+**Observed Behavior**:
+- Write speeds: ~100-110 MB/s (both paths utilized) ✅
+- Sequential read speeds: ~50-100 MB/s (lower than expected) ⚠️
+- Network monitoring shows both interfaces active during reads
+- Multipath configuration appears correct
+
+**Root Cause**:
+This is a **known limitation** of TrueNAS SCALE's iSCSI implementation. The `MaxOutstandingR2T` parameter is hardcoded to `1`, which limits read parallelism across multiple paths.
+
+**Verification**:
+```bash
+# Check iSCSI session parameters
+iscsiadm -m session -P 3 | grep MaxOutstandingR2T
+
+# You'll see:
+# MaxOutstandingR2T: 1
+
+# Verify multipath is working (both paths should be active)
+multipath -ll
+
+# Check actual I/O distribution (both paths should show activity)
+grep -E '(sdX|sdY)' /proc/diskstats  # Before test
+# Run read test
+grep -E '(sdX|sdY)' /proc/diskstats  # After test
+# Both paths should show increased read sectors
+```
+
+**Important**:
+- This is **NOT a configuration error** - your multipath setup is working correctly
+- Both paths ARE being used, they just can't operate fully in parallel for reads
+- Write performance is not affected by this limitation
+
+**Solutions**:
+
+#### 1. Upgrade to 10GbE (Recommended)
+```bash
+# Single 10GbE path provides ~1000 MB/s
+# Eliminates the bottleneck entirely
+# Best long-term solution
+```
+
+#### 2. Accept Current Performance
+- ~100 MB/s read is reasonable for many workloads
+- Real-world applications with multiple VMs perform better than single-threaded benchmarks
+- Most production workloads issue parallel I/O naturally
+
+#### 3. Test with Parallel I/O
+```bash
+# Verify performance improves with parallel workloads
+fio --name=parallel-read --filename=/dev/mapper/mpathX \
+    --rw=read --bs=1M --size=2G --numjobs=4 --iodepth=16 \
+    --direct=1 --ioengine=libaio --runtime=30 --time_based --group_reporting
+
+# Should show better performance (~100-110 MB/s)
+```
+
+**For More Information**:
+See [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation) for detailed explanation, technical details, and additional workarounds.
+
 ### Slow VM Cloning
 
 **Symptom**: VM cloning takes a long time

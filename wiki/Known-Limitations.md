@@ -524,6 +524,80 @@ ls -la /etc/pve/storage.cfg
 - Dedicated storage network
 - Multiple paths (multipath I/O)
 
+### Multipath Read Performance Limitation
+
+**Limitation**: Multipath read performance is constrained by iSCSI protocol limitations in TrueNAS SCALE
+
+**Explanation**:
+- TrueNAS SCALE (as of version 25.04) sets `MaxOutstandingR2T=1` on iSCSI targets
+- This limits each iSCSI session to **1 outstanding read request** at a time
+- Even with multiple paths configured, read operations cannot fully utilize aggregate bandwidth
+- Write operations are **not affected** (use immediate/unsolicited data transfer)
+
+**Observed Behavior**:
+```
+Configuration: 2x 1GbE multipath (theoretical 250 MB/s aggregate)
+
+Write Performance: ~100-110 MB/s ✅
+- Both paths utilized simultaneously
+- Full aggregate bandwidth achieved
+
+Sequential Read Performance: ~50-100 MB/s ⚠️
+- Paths alternate handling requests (round-robin)
+- Limited by serialized read operations (one R2T per session)
+- Both paths ARE being used, but not fully in parallel
+
+Parallel Read Performance: ~100-110 MB/s ✅
+- Multiple parallel I/O streams (e.g., fio with numjobs=4)
+- Can achieve near-full aggregate bandwidth
+```
+
+**Technical Details**:
+- `MaxOutstandingR2T=1` is an iSCSI protocol parameter
+- Controls how many read requests can be in-flight simultaneously per session
+- TrueNAS SCALE does not currently expose this parameter for configuration
+- Configuration files (`/etc/ctl.conf`, `/etc/scst.conf`) are auto-generated and manual edits are overwritten
+- This is a **known limitation** with an active feature request in the TrueNAS community
+
+**Impact**:
+- Single-threaded sequential reads (e.g., disk benchmarks like kdiskmark) show lower performance
+- Real-world workloads with multiple VMs or parallel I/O see better performance
+- Write-heavy workloads are not affected
+- Random I/O workloads naturally create parallelism and perform better
+
+**Workarounds**:
+
+1. **Upgrade to 10GbE Network** (Recommended)
+   - Single 10GbE path provides ~1000 MB/s
+   - Bypasses R2T bottleneck entirely
+   - Best long-term solution
+
+2. **Accept Current Performance**
+   - ~100 MB/s read is still reasonable for many workloads
+   - Most real-world applications do parallel I/O
+   - Multiple VMs naturally create parallel load
+
+3. **Add More Network Paths**
+   - 4x 1GbE = 4 concurrent read operations possible
+   - Diminishing returns, but may help read-heavy workloads
+
+4. **Optimize Workloads for Parallelism**
+   - Applications that issue multiple concurrent reads perform better
+   - Databases and random I/O workloads less affected
+   - Avoid single-threaded sequential read benchmarks as sole metric
+
+5. **Monitor TrueNAS Feature Requests**
+   - Feature request exists for configurable iSCSI parameters
+   - May be addressed in future TrueNAS SCALE releases
+   - Check TrueNAS forums for updates
+
+**Future Solutions**:
+- NVMe over TCP (NVMe-oF) would eliminate this limitation
+- NVMe protocol has better parallelism than iSCSI
+- Support depends on future TrueNAS SCALE versions
+
+**Note**: This is a TrueNAS SCALE platform limitation, not a plugin configuration issue. Multipath is configured correctly and both paths are being utilized - the bottleneck is at the iSCSI protocol layer.
+
 ## Platform Limitations
 
 ### Linux/Proxmox Only
@@ -610,6 +684,7 @@ zfs set quota=500G tank/proxmox
 | API rate limits | Enable bulk operations, increase retry limits, pace operations |
 | WebSocket instability | Use REST transport |
 | Clone performance | Faster network, smaller images, accept limitation |
+| Multipath read performance | Upgrade to 10GbE, accept ~100 MB/s, or use parallel workloads |
 
 ## See Also
 - [Troubleshooting Guide](Troubleshooting.md) - Solutions to common issues
