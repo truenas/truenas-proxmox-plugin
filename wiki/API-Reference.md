@@ -36,7 +36,7 @@ api_port 443        # or 80 for unencrypted
 
 ### REST Transport
 
-**⚠️ DEPRECATION NOTICE**: The TrueNAS REST API was deprecated in TrueNAS SCALE 25.04 and will be removed in version 26.04 (expected 2025). Use WebSocket transport for TrueNAS 25.04 and later.
+**⚠️ DEPRECATION NOTICE**: The TrueNAS REST API was deprecated in TrueNAS SCALE 25.04 and will be removed in version 26.04 (expected April 2026). Use WebSocket transport for TrueNAS 25.04 and later.
 
 **Configuration** (Legacy - TrueNAS 24.10 and earlier only):
 ```ini
@@ -640,7 +640,7 @@ API keys stored in `/etc/pve/storage.cfg`:
 | 24.04 | Yes | Yes | Yes | WebSocket | Improved performance |
 | 24.10 | Yes | Yes | Yes | WebSocket | Last version with full REST support |
 | 25.04 | Yes | Deprecated | Yes | **WebSocket only** | REST API deprecated, use WebSocket |
-| 26.04+ | Yes | Removed | Yes | **WebSocket only** | REST API removed, WebSocket required |
+| 26.04+ (Future) | Yes | Removed | Yes | **WebSocket only** | REST API removed, WebSocket required (Expected: April 2026) |
 
 ### API Endpoints
 

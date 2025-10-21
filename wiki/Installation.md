@@ -295,8 +295,8 @@ pvesm status
 
 ### 2. Create Test Volume
 ```bash
-# Allocate a small test volume
-pvesm alloc truenas-storage 999 test-disk-0 1073741824
+# Allocate a small test volume (1GB)
+pvesm alloc truenas-storage 999 test-disk-0 1G
 
 # List volumes
 pvesm list truenas-storage
