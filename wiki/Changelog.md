@@ -1,5 +1,42 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.7 (October 23, 2025)
+
+### 🐛 **Critical Bug Fix**
+- **Fixed duplicate LUN mapping error** - Plugin now handles existing iSCSI configurations gracefully
+  - **Error resolved**: "LUN ID is already being used for this target"
+  - **Issue**: Plugin attempted to create duplicate target-extent mappings without checking for existing ones
+  - **Impact**: Caused pvestatd crashes, prevented volume creation in environments with pre-existing iSCSI configs
+  - **Affected operations**: Volume creation (`alloc_image`), volume cloning (`clone_image`), weight extent mapping
+  - **Forum report**: https://forum.proxmox.com/threads/truenas-storage-plugin.174134/#post-810779
+
+### 🔧 **Technical Details**
+- Made all target-extent mapping operations **idempotent** (safe to call multiple times)
+- Modified `alloc_image()` function (lines 2097-2130)
+  - Now checks for existing mappings before attempting creation
+  - Reuses existing mapping if found (with info logging)
+  - Only creates new mapping when necessary
+- Modified `clone_image()` function (lines 2973-3007)
+  - Same idempotent logic applied to clone operations
+  - Prevents duplicate mapping errors during VM cloning
+- Enhanced `_tn_targetextent_create()` helper function (lines 1510-1531)
+  - Returns existing mapping instead of attempting duplicate creation
+  - Properly caches and invalidates mapping data
+- Added debug logging for mapping creation decisions
+
+### 📊 **Impact**
+- **Environments with pre-existing iSCSI configurations** - No longer fail with validation errors
+- **Systems with partial failed allocations** - Gracefully recover and reuse existing mappings
+- **Multipath I/O setups** - Weight extent mapping now idempotent
+- **Service stability** - Eliminates pvestatd crashes from duplicate mapping attempts
+
+### ⚠️ **Deployment Notes**
+- Update is backward compatible with existing configurations
+- No manual cleanup required for existing mappings
+- Recommended for all installations, especially those using shared TrueNAS systems
+
+---
+
 ## Version 1.0.6 (October 11, 2025)
 
 ### 🚀 **Performance Improvements**
