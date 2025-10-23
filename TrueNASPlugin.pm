@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.0.6';
+our $VERSION = '1.0.7';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -1508,6 +1508,19 @@ sub _tn_extent_delete($scfg, $extent_id) {
     return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
+    # Check if this mapping already exists
+    my $maps = _tn_targetextents($scfg) // [];
+    my ($existing_map) = grep {
+        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+    } @$maps;
+
+    if ($existing_map) {
+        # Mapping already exists - idempotent behavior
+        _log($scfg, 2, 'debug', "Target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
+        return $existing_map;
+    }
+
+    # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
     my $result = _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
@@ -2096,23 +2109,38 @@ sub alloc_image {
 
     # 3) Map extent to our shared target (targetextent.create); lunid is auto-assigned if not given
     my $target_id = _resolve_target_id($scfg);
-    my $tx_payload = { target => $target_id, extent => $extent_id };
-    my $tx = _api_call(
-        $scfg,
-        'iscsi.targetextent.create',
-        [ $tx_payload ],
-        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
-    );
 
-    # Invalidate cache after creating new mapping to ensure we get fresh data
-    _clear_cache($scfg->{storeid} || 'unknown');
-
-    # 4) Find the lunid that TrueNAS assigned for this (target, extent)
+    # First check if this mapping already exists
     my $maps = _tn_targetextents($scfg) // [];
-    my ($tx_map) = grep {
+    my ($existing_map) = grep {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
-    my $lun = $tx_map ? $tx_map->{lunid} : undef;
+
+    if (!$existing_map) {
+        # Mapping doesn't exist, create it
+        _log($scfg, 2, 'debug', "Creating target-extent mapping for extent_id=$extent_id to target_id=$target_id");
+        my $tx_payload = { target => $target_id, extent => $extent_id };
+        my $tx = _api_call(
+            $scfg,
+            'iscsi.targetextent.create',
+            [ $tx_payload ],
+            sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+        );
+
+        # Invalidate cache after creating new mapping to ensure we get fresh data
+        _clear_cache($scfg->{storeid} || 'unknown');
+
+        # Re-fetch mappings to get the newly created one
+        $maps = _tn_targetextents($scfg) // [];
+        ($existing_map) = grep {
+            (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+        } @$maps;
+    } else {
+        _log($scfg, 1, 'info', "Target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
+    }
+
+    # 4) Find the lunid that TrueNAS assigned for this (target, extent)
+    my $lun = $existing_map ? $existing_map->{lunid} : undef;
     if (!defined $lun) {
         die sprintf(
             "Could not determine assigned LUN for disk '%s'\n\n" .
@@ -2957,20 +2985,38 @@ sub clone_image {
 
     # 3) Map extent to target
     my $target_id = _resolve_target_id($scfg);
-    my $tx_payload = { target => $target_id, extent => $extent_id };
-    my $tx = _api_call(
-        $scfg,
-        'iscsi.targetextent.create',
-        [ $tx_payload ],
-        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
-    );
 
-    # 4) Find assigned LUN
+    # First check if this mapping already exists
     my $maps = _tn_targetextents($scfg) // [];
-    my ($tx_map) = grep {
+    my ($existing_map) = grep {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
-    my $lun = $tx_map ? $tx_map->{lunid} : undef;
+
+    if (!$existing_map) {
+        # Mapping doesn't exist, create it
+        _log($scfg, 2, 'debug', "Creating target-extent mapping for clone extent_id=$extent_id to target_id=$target_id");
+        my $tx_payload = { target => $target_id, extent => $extent_id };
+        my $tx = _api_call(
+            $scfg,
+            'iscsi.targetextent.create',
+            [ $tx_payload ],
+            sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
+        );
+
+        # Invalidate cache after creating new mapping
+        _clear_cache($scfg->{storeid} || 'unknown');
+
+        # Re-fetch mappings to get the newly created one
+        $maps = _tn_targetextents($scfg) // [];
+        ($existing_map) = grep {
+            (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+        } @$maps;
+    } else {
+        _log($scfg, 1, 'info', "Target-extent mapping already exists for clone extent_id=$extent_id (LUN $existing_map->{lunid})");
+    }
+
+    # 4) Find assigned LUN
+    my $lun = $existing_map ? $existing_map->{lunid} : undef;
     die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
 
     # 5) Refresh initiator view
