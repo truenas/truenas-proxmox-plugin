@@ -708,13 +708,27 @@ read_choice() {
 # Main menu for when plugin is not installed
 menu_not_installed() {
     while true; do
-        show_menu "TrueNAS Plugin - Not Installed" \
-            "Install latest version" \
-            "Install specific version" \
-            "View available versions"
+        # Check if backups exist
+        local backups
+        backups=$(list_backups 2>/dev/null | wc -l)
+        local has_backups=false
+        if [[ "$backups" -gt 0 ]]; then
+            has_backups=true
+        fi
+
+        # Build menu options dynamically
+        local menu_options=("Install latest version" "Install specific version" "View available versions")
+        local max_choice=3
+
+        if [[ "$has_backups" = true ]]; then
+            menu_options+=("Restore from backup ($backups available)")
+            max_choice=4
+        fi
+
+        show_menu "TrueNAS Plugin - Not Installed" "${menu_options[@]}"
 
         local choice
-        choice=$(read_choice 3)
+        choice=$(read_choice "$max_choice")
 
         case $choice in
             0)
@@ -722,8 +736,21 @@ menu_not_installed() {
                 exit $EXIT_SUCCESS
                 ;;
             1)
-                perform_installation "latest"
-                read -rp "Press Enter to continue..."
+                if perform_installation "latest"; then
+                    # Prompt to configure storage after successful installation
+                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                        echo
+                        read -rp "Would you like to configure storage now? (y/n): " response
+                        if [[ "$response" =~ ^[Yy] ]]; then
+                            menu_configure_storage
+                        else
+                            info "You can configure storage later from the main menu"
+                            read -rp "Press Enter to continue..."
+                        fi
+                    fi
+                else
+                    read -rp "Press Enter to continue..."
+                fi
                 return 0
                 ;;
             2)
@@ -731,6 +758,13 @@ menu_not_installed() {
                 ;;
             3)
                 menu_view_versions
+                ;;
+            4)
+                if [[ "$has_backups" = true ]]; then
+                    menu_rollback
+                else
+                    error "Invalid choice"
+                fi
                 ;;
         esac
     done
@@ -835,8 +869,21 @@ menu_install_specific_version() {
         return 1
     fi
 
-    perform_installation "$version"
-    read -rp "Press Enter to continue..."
+    if perform_installation "$version"; then
+        # Prompt to configure storage after successful installation
+        if [[ "$NON_INTERACTIVE" != "true" ]]; then
+            echo
+            read -rp "Would you like to configure storage now? (y/n): " response
+            if [[ "$response" =~ ^[Yy] ]]; then
+                menu_configure_storage
+            else
+                info "You can configure storage later from the main menu"
+                read -rp "Press Enter to continue..."
+            fi
+        fi
+    else
+        read -rp "Press Enter to continue..."
+    fi
 }
 
 # ============================================================================
@@ -977,25 +1024,30 @@ generate_storage_config() {
     local dataset="$4"
     local target="$5"
     local portal="${6:-}"
-    local blocksize="${7:-8k}"
-    local sparse="${8:-0}"
-    local content="${9:-images}"
+    local blocksize="${7:-16k}"
+    local sparse="${8:-1}"
 
     cat <<EOF
-truenas: ${name}
+truenasplugin: ${name}
+	api_host ${ip}
 	api_key ${apikey}
-	blocksize ${blocksize}
-	content ${content}
 	dataset ${dataset}
-	ip ${ip}
+	target_iqn ${target}
+	api_insecure 1
+	shared 1
 EOF
 
     if [[ -n "$portal" ]]; then
-        echo "	portal ${portal}"
+        echo "	discovery_portal ${portal}"
     fi
 
-    echo "	sparse ${sparse}"
-    echo "	target ${target}"
+    if [[ -n "$blocksize" ]]; then
+        echo "	zvol_blocksize ${blocksize}"
+    fi
+
+    if [[ -n "$sparse" ]]; then
+        echo "	tn_sparse ${sparse}"
+    fi
 }
 
 # Add storage configuration to storage.cfg
@@ -1098,25 +1150,20 @@ menu_configure_storage() {
 
     # Blocksize (optional)
     local blocksize
-    read -rp "Block size [8k]: " blocksize
-    blocksize="${blocksize:-8k}"
+    read -rp "Block size [16k]: " blocksize
+    blocksize="${blocksize:-16k}"
 
     # Sparse (optional)
     local sparse
-    read -rp "Enable sparse volumes? (0/1) [0]: " sparse
-    sparse="${sparse:-0}"
-
-    # Content type (optional)
-    local content
-    read -rp "Content type [images]: " content
-    content="${content:-images}"
+    read -rp "Enable sparse volumes? (0/1) [1]: " sparse
+    sparse="${sparse:-1}"
 
     # Generate configuration
     echo
     info "Configuration summary:"
     echo "─────────────────────────────────────────────────────────"
     local config
-    config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$content")
+    config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse")
     echo "$config"
     echo "─────────────────────────────────────────────────────────"
     echo
@@ -1134,8 +1181,10 @@ menu_configure_storage() {
         info "You can now use '$storage_name' storage in Proxmox"
         echo
         info "Next steps:"
-        echo "  1. Create a VM and select '$storage_name' for the disk"
-        echo "  2. Run health check: /root/install.sh or use tools/health-check.sh"
+        echo "  1. Test the storage by creating a VM disk:"
+        echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
+        echo "  2. Check storage status: pvesm status"
+        echo "  3. View storage details: pvesm list ${storage_name}"
     else
         error "Failed to add configuration"
         return 1
@@ -1213,10 +1262,14 @@ menu_rollback() {
         local filename
         filename=$(basename "$backup")
         # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
+        # Remove prefix to get VERSION.TIMESTAMP
+        local version_timestamp
+        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+        # Split on last underscore (timestamp starts with YYYYMMDD_)
         local version
-        version=$(echo "$filename" | sed -n 's/.*backup\.\([^.]*\)\..*/\1/p')
+        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
         local timestamp
-        timestamp=$(echo "$filename" | sed -n 's/.*backup\.[^.]*\.\(.*\)/\1/p')
+        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
 
         # Format timestamp for display
         local display_time
