@@ -1033,11 +1033,18 @@ menu_not_installed() {
                             fi
                         fi
                     fi
+                    read -rp "Press Enter to return to main menu..."
+                    # After successful installation, break out to re-detect state
+                    return 0
+                else
+                    read -rp "Press Enter to return to main menu..."
                 fi
-                read -rp "Press Enter to return to main menu..."
                 ;;
             2)
-                menu_install_specific_version
+                if menu_install_specific_version; then
+                    # After successful installation, break out to re-detect state
+                    return 0
+                fi
                 read -rp "Press Enter to return to main menu..."
                 ;;
             3)
@@ -1452,11 +1459,13 @@ menu_install_specific_version() {
                 menu_configure_storage
             else
                 info "You can configure storage later from the main menu"
-                read -rp "Press Enter to continue..."
             fi
         fi
+        read -rp "Press Enter to continue..."
+        return 0  # Return success
     else
         read -rp "Press Enter to continue..."
+        return 1  # Return failure
     fi
 }
 
