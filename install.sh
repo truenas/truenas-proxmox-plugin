@@ -1,8 +1,9 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
+# vim: noai:ts=4:sw=4:expandtab
+# shellcheck disable=SC2015,SC2016
+#
 # TrueNAS Proxmox VE Plugin Installer
 # Interactive installation, update, and configuration wizard
-# Version: 1.0.0
 
 set -euo pipefail
 
@@ -12,7 +13,7 @@ set -euo pipefail
 
 readonly INSTALLER_VERSION="1.0.0"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
-readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/TrueNASPlugin.pm"
+readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
 readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
 readonly LOG_FILE="/var/log/truenas-installer.log"
@@ -22,18 +23,73 @@ readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
 readonly EXIT_USER_CANCEL=2
 
-# Colors for output
-readonly COLOR_RESET='\033[0m'
-readonly COLOR_RED='\033[0;31m'
-readonly COLOR_GREEN='\033[0;32m'
-readonly COLOR_YELLOW='\033[0;33m'
-readonly COLOR_BLUE='\033[0;34m'
-readonly COLOR_CYAN='\033[0;36m'
-readonly COLOR_BOLD='\033[1m'
+# Escape sequence helper
+esc() {
+    case $1 in
+        CUU) printf '\033[%sA' "${2:-1}" ;;      # cursor up
+        CUD) printf '\033[%sB' "${2:-1}" ;;      # cursor down
+        CUF) printf '\033[%sC' "${2:-1}" ;;      # cursor forward
+        CUB) printf '\033[%sD' "${2:-1}" ;;      # cursor backward
+        SCP) printf '\033[s' ;;                   # save cursor position
+        RCP) printf '\033[u' ;;                   # restore cursor position
+        SGR) printf '\033[%sm' "$2" ;;            # Select Graphic Rendition
+    esac
+}
+
+# Color definitions (Dylan Araps style)
+c0=$(esc SGR 0)      # reset
+c1=$(esc SGR 31)     # red
+c2=$(esc SGR 32)     # green
+c3=$(esc SGR 33)     # yellow
+c4=$(esc SGR 34)     # blue
+c5=$(esc SGR 35)     # magenta
+c6=$(esc SGR 36)     # cyan
+c7=$(esc SGR 37)     # white
+c8=$(esc SGR 1)      # bold
+
+# Legacy color compatibility
+readonly COLOR_RESET="$c0"
+readonly COLOR_RED="$c1"
+readonly COLOR_GREEN="$c2"
+readonly COLOR_YELLOW="$c3"
+readonly COLOR_BLUE="$c4"
+readonly COLOR_CYAN="$c6"
+readonly COLOR_BOLD="$c8"
 
 # ============================================================================
 # LOGGING AND OUTPUT FUNCTIONS
 # ============================================================================
+
+# Clear screen
+clear_screen() {
+    printf '\033[2J\033[H'
+}
+
+# Display ASCII banner
+print_banner() {
+    cat << 'EOF'
+    
+   d8P                                                       
+d888888P                                                     
+  ?88'    88bd88b?88   d8P d8888b  88bd88b  d888b8b   .d888b,
+  88P     88P'  `d88   88 d8b_,dP  88P' ?8bd8P' ?88   ?8b,   
+  88b    d88     ?8(  d88 88b     d88   88P88b  ,88b    `?8b 
+  `?8b  d88'     `?88P'?8b`?888P'd88'   88b`?88P'`88b`?888P' 
+                                                                                                                                                                                      
+              d8b                      d8,          
+              88P                     `8P           
+             d88                                    
+   ?88,.d88b,888  ?88   d8P d888b8b    88b  88bd88b 
+   `?88'  ?88?88  d88   88 d8P' ?88    88P  88P' ?8b
+     88b  d8P 88b ?8(  d88 88b  ,88b  d88  d88   88P
+     888888P'  88b`?88P'?8b`?88P'`88bd88' d88'   88b
+     88P'                         )88               
+    d88                          ,88P     For Proxmox VE          
+    ?8P                      `?8888P                
+ 
+EOF
+    
+}
 
 # Initialize logging
 init_logging() {
@@ -55,34 +111,27 @@ log() {
     echo "[$timestamp] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# Print colored message
-print_color() {
-    local color="$1"
-    shift
-    echo -e "${color}$*${COLOR_RESET}"
-}
-
 # Info message (blue)
 info() {
-    print_color "$COLOR_BLUE" "ℹ  $*"
+    printf '%b\n' "${c4}  ${*}${c0}"
     log "INFO" "$*"
 }
 
 # Success message (green)
 success() {
-    print_color "$COLOR_GREEN" "✓ $*"
+    printf '%b\n' "${c2}  ${*}${c0}"
     log "SUCCESS" "$*"
 }
 
 # Warning message (yellow)
 warning() {
-    print_color "$COLOR_YELLOW" "⚠  $*"
+    printf '%b\n' "${c3}  ${*}${c0}"
     log "WARNING" "$*"
 }
 
 # Error message (red)
 error() {
-    print_color "$COLOR_RED" "✗ $*" >&2
+    printf '%b\n' "${c1}  ${*}${c0}" >&2
     log "ERROR" "$*"
 }
 
@@ -94,11 +143,8 @@ fatal() {
 
 # Print section header
 print_header() {
-    echo
-    print_color "$COLOR_BOLD$COLOR_CYAN" "═══════════════════════════════════════════════════════════"
-    print_color "$COLOR_BOLD$COLOR_CYAN" "  $*"
-    print_color "$COLOR_BOLD$COLOR_CYAN" "═══════════════════════════════════════════════════════════"
-    echo
+    printf '\n%b\n' "${c6}${c8}${*}${c0}"
+    printf '%b\n\n' "${c6}$(printf '%*s' ${#1} '' | tr ' ' '-')${c0}"
 }
 
 # ============================================================================
@@ -674,19 +720,15 @@ show_menu() {
     shift
     local options=("$@")
 
-    echo
-    print_color "$COLOR_BOLD$COLOR_CYAN" "╔════════════════════════════════════════════════════════╗"
-    print_color "$COLOR_BOLD$COLOR_CYAN" "  $title"
-    print_color "$COLOR_BOLD$COLOR_CYAN" "╚════════════════════════════════════════════════════════╝"
-    echo
+    printf '\n%b\n' "${c6}${c8}${title}${c0}"
+    printf '%b\n\n' "${c6}$(printf '%*s' ${#title} '' | tr ' ' '-')${c0}"
 
     local i=1
     for option in "${options[@]}"; do
-        echo "  $i) $option"
+        printf '  %b%s%b %s\n' "${c6}" "$i)" "${c0}" "$option"
         ((i++))
     done
-    echo "  0) Exit"
-    echo
+    printf '  %b%s%b %s\n\n' "${c3}" "0)" "${c0}" "Exit"
 }
 
 # Read user menu choice
@@ -708,6 +750,10 @@ read_choice() {
 # Main menu for when plugin is not installed
 menu_not_installed() {
     while true; do
+        # Clear screen and show banner
+        clear_screen
+        print_banner
+
         # Check if backups exist
         local backups
         backups=$(list_backups 2>/dev/null | wc -l)
@@ -743,18 +789,14 @@ menu_not_installed() {
                         read -rp "Would you like to configure storage now? (y/n): " response
                         if [[ "$response" =~ ^[Yy] ]]; then
                             menu_configure_storage
-                        else
-                            info "You can configure storage later from the main menu"
-                            read -rp "Press Enter to continue..."
                         fi
                     fi
-                else
-                    read -rp "Press Enter to continue..."
                 fi
-                return 0
+                read -rp "Press Enter to return to main menu..."
                 ;;
             2)
                 menu_install_specific_version
+                read -rp "Press Enter to return to main menu..."
                 ;;
             3)
                 menu_view_versions
@@ -775,6 +817,10 @@ menu_installed() {
     local current_version="$1"
 
     while true; do
+        # Clear screen and show banner
+        clear_screen
+        print_banner
+
         # Check for updates
         local update_notice=""
         local latest_version
@@ -800,10 +846,11 @@ menu_installed() {
                 ;;
             1)
                 perform_installation "latest"
-                return 0
+                read -rp "Press Enter to return to main menu..."
                 ;;
             2)
                 menu_install_specific_version
+                read -rp "Press Enter to return to main menu..."
                 ;;
             3)
                 menu_configure_storage
@@ -816,7 +863,7 @@ menu_installed() {
                 ;;
             6)
                 menu_uninstall
-                return 0
+                read -rp "Press Enter to return to main menu..."
                 ;;
         esac
     done
@@ -1470,10 +1517,11 @@ main() {
     # Initialize logging
     init_logging
 
-    # Print banner
-    print_header "TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}"
+    # Perform checks (with banner for non-interactive mode only)
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        print_banner
+    fi
 
-    # Perform checks
     info "Checking system requirements..."
     check_root
     check_dependencies
@@ -1484,21 +1532,18 @@ main() {
     install_state=$(get_install_state)
 
     if [[ "$install_state" == "not_installed" ]]; then
-        info "Plugin is not currently installed"
-
         if [[ "$NON_INTERACTIVE" == "true" ]]; then
             # Non-interactive mode: install latest version
             info "Non-interactive mode: Installing latest version..."
             perform_installation "latest"
             exit $?
         else
-            # Interactive mode: show menu
+            # Interactive mode: show menu (menu will handle banner and screen clearing)
             menu_not_installed
         fi
     else
         # Plugin is installed
         local current_version="${install_state#installed:}"
-        info "Plugin v${current_version} is currently installed"
 
         if [[ "$NON_INTERACTIVE" == "true" ]]; then
             # Non-interactive mode: check for updates and install if available
@@ -1512,7 +1557,7 @@ main() {
                 exit 0
             fi
         else
-            # Interactive mode: show menu
+            # Interactive mode: show menu (menu will handle banner and screen clearing)
             menu_installed "$current_version"
         fi
     fi
