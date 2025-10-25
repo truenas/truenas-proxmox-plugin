@@ -36,6 +36,58 @@ esc() {
     esac
 }
 
+# Detect terminal color support
+detect_color_support() {
+    # Check COLORTERM for truecolor support first (before TTY check)
+    if [[ "${COLORTERM:-}" =~ (truecolor|24bit) ]]; then
+        echo "truecolor"
+        return
+    fi
+
+    # Check TERM environment variable for explicit color capability
+    if [[ "$TERM" =~ 256color ]]; then
+        echo "256"
+        return
+    elif [[ "$TERM" =~ (xterm-color|.*-256|xterm-16color) ]]; then
+        echo "256"
+        return
+    fi
+
+    # Try tput if available
+    local colors
+    colors=$(tput colors 2>/dev/null || echo 0)
+
+    if [[ "$colors" -ge 256 ]]; then
+        echo "256"
+    elif [[ "$colors" -ge 16 ]]; then
+        echo "16"
+    elif [[ "$colors" -ge 8 ]]; then
+        echo "8"
+    else
+        # Enhanced fallback logic
+        # SSH sessions typically support 256 colors
+        if [[ -n "$SSH_CLIENT" || -n "$SSH_TTY" || -n "$SSH_CONNECTION" ]]; then
+            echo "256"
+        elif [[ "$TERM" =~ (xterm|screen|tmux|rxvt|linux|ansi|vt) ]]; then
+            echo "16"
+        else
+            # Check if we have a TTY - if so, assume basic colors
+            if [[ -t 1 ]] || [[ -t 0 ]]; then
+                echo "16"
+            else
+                echo "none"
+            fi
+        fi
+    fi
+}
+
+# Color support level (can be overridden with INSTALLER_COLORS env var)
+readonly COLOR_SUPPORT="${INSTALLER_COLORS:-$(detect_color_support)}"
+
+# Debug: Show detected color support (comment out in production)
+# Uncomment the line below to debug color detection:
+# echo "DEBUG: COLOR_SUPPORT=$COLOR_SUPPORT TERM=$TERM SSH_CLIENT=${SSH_CLIENT:-none}" >&2
+
 # Color definitions (Dylan Araps style)
 c0=$(esc SGR 0)      # reset
 c1=$(esc SGR 31)     # red
@@ -56,6 +108,61 @@ readonly COLOR_BLUE="$c4"
 readonly COLOR_CYAN="$c6"
 readonly COLOR_BOLD="$c8"
 
+# 256-color palette generator
+color256() {
+    printf '\033[38;5;%dm' "$1"
+}
+
+# RGB color (truecolor) generator
+rgb() {
+    printf '\033[38;2;%d;%d;%dm' "$1" "$2" "$3"
+}
+
+# Generate gradient color for line number (0-based)
+# Uses cyan to blue gradient (Neofetch-inspired)
+gradient_color() {
+    local line_num="$1"
+    local total_lines="${2:-15}"
+
+    case "$COLOR_SUPPORT" in
+        truecolor)
+            # Smooth RGB gradient: cyan (0,255,255) -> blue (0,100,255) -> deep blue (0,50,200)
+            local ratio=$((line_num * 100 / total_lines))
+            local r=0
+            local g=$((255 - ratio * 155 / 100))
+            local b=$((255 - ratio * 55 / 100))
+            rgb "$r" "$g" "$b"
+            ;;
+        256)
+            # Use 256-color palette: cyan spectrum
+            # Colors: 51(cyan) -> 45 -> 39 -> 33(blue)
+            local colors=(51 50 49 48 45 44 39 38 33 32 27 26 21 20 19)
+            local idx=$((line_num * ${#colors[@]} / total_lines))
+            [[ $idx -ge ${#colors[@]} ]] && idx=$((${#colors[@]} - 1))
+            color256 "${colors[$idx]}"
+            ;;
+        16|8)
+            # Gradient using basic colors: cyan -> blue
+            # Divide into thirds for smooth-ish transition
+            local third=$((total_lines / 3))
+            if [[ $line_num -lt $third ]]; then
+                # First third: bright cyan
+                printf '\033[1;36m'
+            elif [[ $line_num -lt $((third * 2)) ]]; then
+                # Middle third: cyan
+                printf '%s' "$c6"
+            else
+                # Last third: blue
+                printf '%s' "$c4"
+            fi
+            ;;
+        *)
+            # No color support - return empty string
+            :
+            ;;
+    esac
+}
+
 # ============================================================================
 # LOGGING AND OUTPUT FUNCTIONS
 # ============================================================================
@@ -65,30 +172,41 @@ clear_screen() {
     printf '\033[2J\033[H'
 }
 
-# Display ASCII banner
+# Display ASCII banner with gradient colors
 print_banner() {
-    cat << 'EOF'
-    
-   d8P                                                       
-d888888P                                                     
-  ?88'    88bd88b?88   d8P d8888b  88bd88b  d888b8b   .d888b,
-  88P     88P'  `d88   88 d8b_,dP  88P' ?8bd8P' ?88   ?8b,   
-  88b    d88     ?8(  d88 88b     d88   88P88b  ,88b    `?8b 
-  `?8b  d88'     `?88P'?8b`?888P'd88'   88b`?88P'`88b`?888P' 
-                                                                                                                                                                                      
-              d8b                      d8,          
-              88P                     `8P           
-             d88                                    
-   ?88,.d88b,888  ?88   d8P d888b8b    88b  88bd88b 
-   `?88'  ?88?88  d88   88 d8P' ?88    88P  88P' ?8b
-     88b  d8P 88b ?8(  d88 88b  ,88b  d88  d88   88P
-     888888P'  88b`?88P'?8b`?88P'`88bd88' d88'   88b
-     88P'                         )88               
-    d88                          ,88P     For Proxmox VE          
-    ?8P                      `?8888P                
- 
-EOF
-    
+    # Banner lines array
+    local -a lines=(
+        "    "
+        "   d8P                                                       "
+        "d888888P                                                     "
+        "  ?88'    88bd88b?88   d8P d8888b  88bd88b  d888b8b   .d888b,"
+        "  88P     88P'  \`d88   88 d8b_,dP  88P' ?8bd8P' ?88   ?8b,   "
+        "  88b    d88     ?8(  d88 88b     d88   88P88b  ,88b    \`?8b "
+        "  \`?8b  d88'     \`?88P'?8b\`?888P'd88'   88b\`?88P'\`88b\`?888P' "
+        "                                                              "
+        "              d8b                      d8,          "
+        "              88P                     \`8P           "
+        "             d88                                    "
+        "   ?88,.d88b,888  ?88   d8P d888b8b    88b  88bd88b "
+        "   \`?88'  ?88?88  d88   88 d8P' ?88    88P  88P' ?8b"
+        "     88b  d8P 88b ?8(  d88 88b  ,88b  d88  d88   88P"
+        "     888888P'  88b\`?88P'?8b\`?88P'\`88bd88' d88'   88b"
+        "     88P'                         )88               "
+        "    d88                          ,88P     For Proxmox VE"
+        "    ?8P                      \`?8888P                "
+        " "
+    )
+
+    local total_lines=${#lines[@]}
+
+    # Print each line with gradient color
+    local i=0
+    for line in "${lines[@]}"; do
+        local color
+        color=$(gradient_color "$i" "$total_lines")
+        printf '%b%s%b\n' "$color" "$line" "$c0"
+        i=$((i + 1))
+    done
 }
 
 # Initialize logging
@@ -191,6 +309,49 @@ check_dependencies() {
     fi
 
     log "INFO" "All dependencies satisfied"
+}
+
+# ============================================================================
+# CLUSTER DETECTION
+# ============================================================================
+
+# Detect if running on a Proxmox cluster node
+is_cluster_node() {
+    # Check if /etc/pve directory exists and has cluster configuration
+    if [[ -d "/etc/pve/nodes" ]] && [[ $(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Get cluster node count
+get_cluster_node_count() {
+    if [[ -d "/etc/pve/nodes" ]]; then
+        find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+    else
+        echo "0"
+    fi
+}
+
+# Display cluster warning
+show_cluster_warning() {
+    local node_count
+    node_count=$(get_cluster_node_count)
+
+    if [[ "$node_count" -gt 1 ]]; then
+        echo
+        warning "⚠️  Proxmox Cluster Detected (${node_count} nodes)"
+        echo
+        info "This installer only updates the current node."
+        info "To update all cluster nodes, use the cluster update script:"
+        echo
+        echo "  wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/tools/update-cluster.sh"
+        echo "  chmod +x update-cluster.sh"
+        echo "  ./update-cluster.sh node1 node2 node3"
+        echo
+        return 0
+    fi
+    return 1
 }
 
 # ============================================================================
@@ -707,7 +868,40 @@ perform_installation() {
 
     echo
     success "TrueNAS Plugin v${install_version} installed successfully!"
+
+    # Show cluster warning if applicable
+    if is_cluster_node; then
+        show_cluster_warning
+    fi
+
+    # Show next steps
+    show_next_steps
+
     return 0
+}
+
+# Display next steps and helpful information
+show_next_steps() {
+    echo
+    info "Next steps:"
+    echo "  1. Configure TrueNAS storage (if not done yet)"
+    echo "  2. Run health check to verify connectivity"
+    echo "  3. Create test VM to validate storage"
+    echo
+    info "Useful commands:"
+    echo "  • Check storage status:    pvesm status"
+    echo "  • List TrueNAS storage:    pvesm list <storage-name>"
+    echo "  • Check iSCSI sessions:    iscsiadm -m session"
+    echo
+    info "Documentation:"
+    echo "  • GitHub: https://github.com/${GITHUB_REPO}"
+    echo "  • Wiki: https://github.com/${GITHUB_REPO}/wiki"
+    echo
+    info "Example: Create a test VM"
+    echo "  qm create 999 --name test-vm --memory 2048 --net0 virtio,bridge=vmbr0"
+    echo "  qm set 999 --scsi0 <storage-name>:10"
+    echo "  qm start 999"
+    echo
 }
 
 # ============================================================================
@@ -789,6 +983,13 @@ menu_not_installed() {
                         read -rp "Would you like to configure storage now? (y/n): " response
                         if [[ "$response" =~ ^[Yy] ]]; then
                             menu_configure_storage
+                            # Offer health check after configuration
+                            echo
+                            read -rp "Would you like to run a health check now? (y/n): " hc_response
+                            if [[ "$hc_response" =~ ^[Yy] ]]; then
+                                echo
+                                menu_health_check
+                            fi
                         fi
                     fi
                 fi
@@ -832,12 +1033,13 @@ menu_installed() {
             "Update to latest version" \
             "Install specific version" \
             "Configure storage" \
+            "Run health check" \
             "View available versions" \
             "Rollback to backup" \
             "Uninstall plugin"
 
         local choice
-        choice=$(read_choice 6)
+        choice=$(read_choice 7)
 
         case $choice in
             0)
@@ -845,7 +1047,17 @@ menu_installed() {
                 exit $EXIT_SUCCESS
                 ;;
             1)
-                perform_installation "latest"
+                if perform_installation "latest"; then
+                    # Offer to run health check after successful update
+                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                        echo
+                        read -rp "Would you like to run a health check now? (y/n): " response
+                        if [[ "$response" =~ ^[Yy] ]]; then
+                            echo
+                            menu_health_check
+                        fi
+                    fi
+                fi
                 read -rp "Press Enter to return to main menu..."
                 ;;
             2)
@@ -856,12 +1068,15 @@ menu_installed() {
                 menu_configure_storage
                 ;;
             4)
-                menu_view_versions
+                menu_health_check
                 ;;
             5)
-                menu_rollback
+                menu_view_versions
                 ;;
             6)
+                menu_rollback
+                ;;
+            7)
                 menu_uninstall
                 read -rp "Press Enter to return to main menu..."
                 ;;
@@ -890,6 +1105,239 @@ menu_view_versions() {
     fi
 
     read -rp "Press Enter to continue..."
+}
+
+# Menu: Run health check
+menu_health_check() {
+    print_header "TrueNAS Plugin Health Check"
+
+    # List available TrueNAS storage
+    info "Detecting TrueNAS storage configurations..."
+    echo
+
+    if [[ ! -f "$STORAGE_CFG" ]]; then
+        warning "No storage.cfg found - please configure storage first"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    local storages
+    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+
+    if [[ -z "$storages" ]]; then
+        warning "No TrueNAS storage configured"
+        info "Please configure storage first from the main menu"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    # Show available storage
+    info "Available TrueNAS storage:"
+    echo "$storages" | while read -r storage; do
+        echo "  • $storage"
+    done
+    echo
+
+    # Prompt for storage name
+    local storage_name
+    read -rp "Enter storage name to check (or press Enter for first): " storage_name
+
+    if [[ -z "$storage_name" ]]; then
+        storage_name=$(echo "$storages" | head -1)
+        info "Using: $storage_name"
+    fi
+
+    # Verify storage exists
+    if ! echo "$storages" | grep -q "^${storage_name}$"; then
+        error "Storage '$storage_name' not found"
+        read -rp "Press Enter to continue..."
+        return 1
+    fi
+
+    echo
+    info "Running health check on storage: $storage_name"
+    echo
+
+    # Run health check
+    run_health_check "$storage_name"
+
+    echo
+    read -rp "Press Enter to continue..."
+}
+
+# Perform health check on a storage
+run_health_check() {
+    local storage_name="$1"
+    local warnings=0
+    local errors=0
+    local checks_passed=0
+    local checks_total=0
+
+    # Helper function for check output
+    check_result() {
+        local name="$1"
+        local status="$2"
+        local message="$3"
+
+        ((checks_total++))
+
+        printf "%-30s " "${name}:"
+        case "$status" in
+            OK)
+                echo -e "${COLOR_GREEN}✓${COLOR_RESET} $message"
+                ((checks_passed++))
+                ;;
+            WARNING)
+                echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} $message"
+                ((warnings++))
+                ;;
+            CRITICAL)
+                echo -e "${COLOR_RED}✗${COLOR_RESET} $message"
+                ((errors++))
+                ;;
+            SKIP)
+                echo -e "${COLOR_CYAN}-${COLOR_RESET} $message"
+                ;;
+        esac
+    }
+
+    # Check 1: Plugin file installed
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        local version
+        version=$(grep 'our $VERSION' "$PLUGIN_FILE" 2>/dev/null | grep -oP "[0-9.]+" || echo "unknown")
+        check_result "Plugin file" "OK" "Installed v$version"
+    else
+        check_result "Plugin file" "CRITICAL" "Not installed"
+    fi
+
+    # Check 2: Storage configured
+    if grep -q "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" 2>/dev/null; then
+        check_result "Storage configuration" "OK" "Configured"
+    else
+        check_result "Storage configuration" "CRITICAL" "Not configured"
+        echo
+        error "Storage '$storage_name' not found in configuration"
+        return 2
+    fi
+
+    # Check 3: Storage status
+    if pvesm status 2>/dev/null | grep -q "$storage_name.*active"; then
+        local space
+        space=$(pvesm status 2>/dev/null | grep "$storage_name" | awk '{print $5}')
+        check_result "Storage status" "OK" "Active (${space}% free)"
+    else
+        check_result "Storage status" "WARNING" "Inactive or not accessible"
+    fi
+
+    # Check 4: Content type
+    local content
+    content=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*content" | awk '{print $2}' | head -1)
+    if [[ "$content" == "images" ]]; then
+        check_result "Content type" "OK" "images"
+    elif [[ -n "$content" ]]; then
+        check_result "Content type" "WARNING" "$content (should be 'images')"
+    else
+        check_result "Content type" "WARNING" "Not configured"
+    fi
+
+    # Check 5: TrueNAS API reachability
+    local api_host
+    api_host=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*api_host" | awk '{print $2}' | head -1)
+    local api_port
+    api_port=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*api_port" | awk '{print $2}' | head -1)
+    api_port=${api_port:-443}
+
+    if [[ -n "$api_host" ]]; then
+        if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
+            check_result "TrueNAS API" "OK" "Reachable on $api_host:$api_port"
+        else
+            check_result "TrueNAS API" "CRITICAL" "Cannot reach $api_host:$api_port"
+        fi
+    else
+        check_result "TrueNAS API" "CRITICAL" "API host not configured"
+    fi
+
+    # Check 6: Dataset configuration
+    local dataset
+    dataset=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*dataset" | awk '{print $2}' | head -1)
+    if [[ -n "$dataset" ]]; then
+        check_result "Dataset" "OK" "$dataset"
+    else
+        check_result "Dataset" "CRITICAL" "Not configured"
+    fi
+
+    # Check 7: Target IQN configuration
+    local target_iqn
+    target_iqn=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*target_iqn" | awk '{print $2}' | head -1)
+    if [[ -n "$target_iqn" ]]; then
+        check_result "Target IQN" "OK" "$target_iqn"
+    else
+        check_result "Target IQN" "CRITICAL" "Not configured"
+    fi
+
+    # Check 8: Discovery portal
+    local discovery_portal
+    discovery_portal=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*discovery_portal" | awk '{print $2}' | head -1)
+    if [[ -n "$discovery_portal" ]]; then
+        check_result "Discovery portal" "OK" "$discovery_portal"
+    else
+        check_result "Discovery portal" "CRITICAL" "Not configured"
+    fi
+
+    # Check 9: iSCSI sessions
+    if [[ -n "$target_iqn" ]]; then
+        local session_count
+        session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
+        if [[ "$session_count" -gt 0 ]]; then
+            check_result "iSCSI sessions" "OK" "$session_count active session(s)"
+        else
+            check_result "iSCSI sessions" "WARNING" "No active sessions"
+        fi
+    else
+        check_result "iSCSI sessions" "SKIP" "Cannot check (no target IQN)"
+    fi
+
+    # Check 10: Multipath configuration
+    local use_multipath
+    use_multipath=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*use_multipath" | awk '{print $2}' | head -1)
+    if [[ "$use_multipath" == "1" ]]; then
+        if command -v multipath &> /dev/null; then
+            local mpath_count
+            mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" || echo "0")
+            if [[ "$mpath_count" -gt 0 ]]; then
+                check_result "Multipath" "OK" "$mpath_count device(s)"
+            else
+                check_result "Multipath" "WARNING" "Enabled but no devices"
+            fi
+        else
+            check_result "Multipath" "WARNING" "Enabled but multipath-tools not installed"
+        fi
+    else
+        check_result "Multipath" "SKIP" "Not enabled"
+    fi
+
+    # Check 11: PVE daemon status
+    if systemctl is-active --quiet pvedaemon; then
+        check_result "PVE daemon" "OK" "Running"
+    else
+        check_result "PVE daemon" "CRITICAL" "Not running"
+    fi
+
+    # Summary
+    echo
+    info "Health Summary:"
+    echo "  Checks passed: $checks_passed/$checks_total"
+
+    if [[ $errors -gt 0 ]]; then
+        error "Status: CRITICAL ($errors error(s), $warnings warning(s))"
+        return 2
+    elif [[ $warnings -gt 0 ]]; then
+        warning "Status: WARNING ($warnings warning(s))"
+        return 1
+    else
+        success "Status: HEALTHY"
+        return 0
+    fi
 }
 
 # Menu: Install specific version
@@ -1357,6 +1805,11 @@ menu_rollback() {
 
     if restore_plugin_from_backup "$selected_backup"; then
         success "Rollback completed successfully"
+
+        # Show cluster warning if applicable
+        if is_cluster_node; then
+            show_cluster_warning
+        fi
     else
         error "Rollback failed"
     fi
