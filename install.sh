@@ -167,6 +167,46 @@ gradient_color() {
 # LOGGING AND OUTPUT FUNCTIONS
 # ============================================================================
 
+# Global spinner control
+SPINNER_PID=""
+
+# Start spinner animation
+start_spinner() {
+    local spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spinner_pos=0
+
+    # Hide cursor
+    printf "\033[?25l" >&2
+
+    # Run spinner in background
+    (
+        while true; do
+            # Save cursor position, print spinner, restore cursor
+            printf "\033[s%s\033[u" "${spinner_chars[$spinner_pos]}" >&2
+            spinner_pos=$(( (spinner_pos + 1) % 10 ))
+            sleep 0.1
+        done
+    ) &
+
+    SPINNER_PID=$!
+}
+
+# Stop spinner animation
+stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        if kill -0 "$SPINNER_PID" 2>/dev/null; then
+            disown "$SPINNER_PID" 2>/dev/null
+            kill -9 "$SPINNER_PID" 2>/dev/null
+        fi
+        # Clear spinner character by printing space
+        printf "\033[s \033[u" >&2
+        SPINNER_PID=""
+    fi
+
+    # Show cursor
+    printf "\033[?25h" >&2
+}
+
 # Clear screen
 clear_screen() {
     printf '\033[2J\033[H'
@@ -410,8 +450,9 @@ cleanup_on_error() {
     fi
 }
 
-# Set up error trap
-trap cleanup_on_error EXIT
+# Set up error trap and cleanup
+trap 'stop_spinner; cleanup_on_error' EXIT
+trap 'stop_spinner' INT TERM
 
 # ============================================================================
 # ARGUMENT PARSING
@@ -980,12 +1021,12 @@ menu_not_installed() {
                     # Prompt to configure storage after successful installation
                     if [[ "$NON_INTERACTIVE" != "true" ]]; then
                         echo
-                        read -rp "Would you like to configure storage now? (y/n): " response
+                        read -rp "Would you like to configure storage now? (y/N): " response
                         if [[ "$response" =~ ^[Yy] ]]; then
                             menu_configure_storage
                             # Offer health check after configuration
                             echo
-                            read -rp "Would you like to run a health check now? (y/n): " hc_response
+                            read -rp "Would you like to run a health check now? (y/N): " hc_response
                             if [[ "$hc_response" =~ ^[Yy] ]]; then
                                 echo
                                 menu_health_check
@@ -1051,7 +1092,7 @@ menu_installed() {
                     # Offer to run health check after successful update
                     if [[ "$NON_INTERACTIVE" != "true" ]]; then
                         echo
-                        read -rp "Would you like to run a health check now? (y/n): " response
+                        read -rp "Would you like to run a health check now? (y/N): " response
                         if [[ "$response" =~ ^[Yy] ]]; then
                             echo
                             menu_health_check
@@ -1079,6 +1120,8 @@ menu_installed() {
             7)
                 menu_uninstall
                 read -rp "Press Enter to return to main menu..."
+                # After uninstall, break out of menu loop to re-detect installation state
+                return 0
                 ;;
         esac
     done
@@ -1158,8 +1201,9 @@ menu_health_check() {
     info "Running health check on storage: $storage_name"
     echo
 
-    # Run health check
-    run_health_check "$storage_name"
+    # Run health check and capture exit code
+    # Don't let non-zero returns trigger error trap
+    run_health_check "$storage_name" || true
 
     echo
     read -rp "Press Enter to continue..."
@@ -1172,6 +1216,7 @@ run_health_check() {
     local errors=0
     local checks_passed=0
     local checks_total=0
+    local checks_skipped=0
 
     # Helper function for check output
     check_result() {
@@ -1179,24 +1224,26 @@ run_health_check() {
         local status="$2"
         local message="$3"
 
-        ((checks_total++))
-
         printf "%-30s " "${name}:"
         case "$status" in
             OK)
                 echo -e "${COLOR_GREEN}✓${COLOR_RESET} $message"
                 ((checks_passed++))
+                ((checks_total++))
                 ;;
             WARNING)
                 echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} $message"
                 ((warnings++))
+                ((checks_total++))
                 ;;
             CRITICAL)
                 echo -e "${COLOR_RED}✗${COLOR_RESET} $message"
                 ((errors++))
+                ((checks_total++))
                 ;;
             SKIP)
                 echo -e "${COLOR_CYAN}-${COLOR_RESET} $message"
+                ((checks_skipped++))
                 ;;
         esac
     }
@@ -1221,13 +1268,24 @@ run_health_check() {
     fi
 
     # Check 3: Storage status
+    printf "%-30s " "Storage status:"
+    start_spinner
+    local space_result
     if pvesm status 2>/dev/null | grep -q "$storage_name.*active"; then
-        local space
-        space=$(pvesm status 2>/dev/null | grep "$storage_name" | awk '{print $5}')
-        check_result "Storage status" "OK" "Active (${space}% free)"
+        local total_kb used_kb percent
+        read -r total_kb used_kb percent < <(pvesm status 2>/dev/null | grep "$storage_name" | awk '{print $4, $5, $7}')
+        # Convert KB to GB
+        local used_gb=$(awk "BEGIN {printf \"%.2f\", $used_kb/1024/1024}")
+        local total_gb=$(awk "BEGIN {printf \"%.2f\", $total_kb/1024/1024}")
+        space_result="${COLOR_GREEN}✓${COLOR_RESET} Active (${used_gb}GB / ${total_gb}GB used, ${percent})"
+        ((checks_passed++))
     else
-        check_result "Storage status" "WARNING" "Inactive or not accessible"
+        space_result="${COLOR_YELLOW}⚠${COLOR_RESET} Inactive or not accessible"
+        ((warnings++))
     fi
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Storage status:")${space_result}"
+    ((checks_total++))
 
     # Check 4: Content type
     local content
@@ -1248,11 +1306,19 @@ run_health_check() {
     api_port=${api_port:-443}
 
     if [[ -n "$api_host" ]]; then
+        printf "%-30s " "TrueNAS API:"
+        start_spinner
+        local api_result
         if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
-            check_result "TrueNAS API" "OK" "Reachable on $api_host:$api_port"
+            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host:$api_port"
+            ((checks_passed++))
         else
-            check_result "TrueNAS API" "CRITICAL" "Cannot reach $api_host:$api_port"
+            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host:$api_port"
+            ((errors++))
         fi
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "TrueNAS API:")${api_result}"
+        ((checks_total++))
     else
         check_result "TrueNAS API" "CRITICAL" "API host not configured"
     fi
@@ -1286,13 +1352,21 @@ run_health_check() {
 
     # Check 9: iSCSI sessions
     if [[ -n "$target_iqn" ]]; then
+        printf "%-30s " "iSCSI sessions:"
+        start_spinner
         local session_count
         session_count=$(iscsiadm -m session 2>/dev/null | grep -c "$target_iqn" || echo "0")
+        local iscsi_result
         if [[ "$session_count" -gt 0 ]]; then
-            check_result "iSCSI sessions" "OK" "$session_count active session(s)"
+            iscsi_result="${COLOR_GREEN}✓${COLOR_RESET} $session_count active session(s)"
+            ((checks_passed++))
         else
-            check_result "iSCSI sessions" "WARNING" "No active sessions"
+            iscsi_result="${COLOR_YELLOW}⚠${COLOR_RESET} No active sessions"
+            ((warnings++))
         fi
+        stop_spinner
+        echo -e "\r$(printf "%-30s " "iSCSI sessions:")${iscsi_result}"
+        ((checks_total++))
     else
         check_result "iSCSI sessions" "SKIP" "Cannot check (no target IQN)"
     fi
@@ -1301,6 +1375,7 @@ run_health_check() {
     local use_multipath
     use_multipath=$(grep -A10 "^truenasplugin: ${storage_name}$" "$STORAGE_CFG" | grep "^\s*use_multipath" | awk '{print $2}' | head -1)
     if [[ "$use_multipath" == "1" ]]; then
+        ((checks_total++))
         if command -v multipath &> /dev/null; then
             local mpath_count
             mpath_count=$(multipath -ll 2>/dev/null | grep -c "dm-" || echo "0")
@@ -1326,7 +1401,11 @@ run_health_check() {
     # Summary
     echo
     info "Health Summary:"
-    echo "  Checks passed: $checks_passed/$checks_total"
+    if [[ $checks_skipped -gt 0 ]]; then
+        echo "  Checks passed: $checks_passed/$checks_total ($checks_skipped not applicable)"
+    else
+        echo "  Checks passed: $checks_passed/$checks_total"
+    fi
 
     if [[ $errors -gt 0 ]]; then
         error "Status: CRITICAL ($errors error(s), $warnings warning(s))"
@@ -1368,7 +1447,7 @@ menu_install_specific_version() {
         # Prompt to configure storage after successful installation
         if [[ "$NON_INTERACTIVE" != "true" ]]; then
             echo
-            read -rp "Would you like to configure storage now? (y/n): " response
+            read -rp "Would you like to configure storage now? (y/N): " response
             if [[ "$response" =~ ^[Yy] ]]; then
                 menu_configure_storage
             else
@@ -1430,7 +1509,8 @@ test_truenas_api() {
     local tool
     tool=$(get_download_tool)
 
-    info "Testing connection to TrueNAS at $ip..."
+    printf "  Testing connection to TrueNAS at %s..." "$ip"
+    start_spinner
 
     local response
     case "$tool" in
@@ -1441,10 +1521,14 @@ test_truenas_api() {
             response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
             ;;
         *)
+            stop_spinner
+            echo ""
             return 1
             ;;
     esac
 
+    stop_spinner
+    echo ""
     if [[ -n "$response" ]] && echo "$response" | jq -e '.version' >/dev/null 2>&1; then
         local version
         version=$(echo "$response" | jq -r '.version' 2>/dev/null)
@@ -1466,6 +1550,9 @@ verify_dataset() {
     local tool
     tool=$(get_download_tool)
 
+    printf "  Verifying dataset '%s'..." "$dataset"
+    start_spinner
+
     local response
     case "$tool" in
         curl)
@@ -1475,10 +1562,14 @@ verify_dataset() {
             response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
             ;;
         *)
+            stop_spinner
+            echo ""
             return 1
             ;;
     esac
 
+    stop_spinner
+    echo ""
     if [[ -n "$response" ]] && echo "$response" | jq -e '.[0].id' >/dev/null 2>&1; then
         success "Dataset '$dataset' verified"
         return 0
@@ -1585,8 +1676,8 @@ menu_configure_storage() {
         fi
         if storage_name_exists "$storage_name"; then
             error "Storage name '$storage_name' already exists in $STORAGE_CFG"
-            read -rp "Choose a different name? (y/n): " choice
-            [[ "$choice" =~ ^[Yy] ]] && continue || return 1
+            read -rp "Choose a different name? (Y/n): " choice
+            [[ ! "$choice" =~ ^[Nn] ]] && continue || return 1
         fi
         break
     done
@@ -1613,7 +1704,7 @@ menu_configure_storage() {
     # Test connectivity
     if ! test_truenas_api "$truenas_ip" "$api_key"; then
         error "Failed to connect to TrueNAS. Please check IP and API key."
-        read -rp "Continue anyway? (y/n): " choice
+        read -rp "Continue anyway? (y/N): " choice
         [[ "$choice" =~ ^[Yy] ]] || return 1
     fi
 
@@ -1663,8 +1754,8 @@ menu_configure_storage() {
     echo "─────────────────────────────────────────────────────────"
     echo
 
-    read -rp "Add this configuration to $STORAGE_CFG? (y/n): " confirm
-    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+    read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
         warning "Configuration cancelled"
         return 1
     fi
@@ -1795,7 +1886,7 @@ menu_rollback() {
 
     echo
     warning "This will replace the current plugin with the selected backup"
-    read -rp "Continue with rollback? (y/n): " confirm
+    read -rp "Continue with rollback? (y/N): " confirm
 
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Rollback cancelled"
@@ -1895,7 +1986,7 @@ uninstall_plugin() {
             done
             echo
 
-            read -rp "Remove all TrueNAS storage configurations? (y/n): " confirm
+            read -rp "Remove all TrueNAS storage configurations? (y/N): " confirm
             if [[ "$confirm" =~ ^[Yy] ]]; then
                 echo "$storages" | while read -r storage; do
                     remove_storage_config "$storage"
@@ -1938,14 +2029,14 @@ menu_uninstall() {
     echo "  • You can rollback using the backup if needed"
     echo
 
-    read -rp "Are you sure you want to uninstall? (y/n): " confirm
+    read -rp "Are you sure you want to uninstall? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Uninstallation cancelled"
         return 0
     fi
 
     echo
-    read -rp "Also remove storage configuration from $STORAGE_CFG? (y/n): " remove_config_choice
+    read -rp "Also remove storage configuration from $STORAGE_CFG? (y/N): " remove_config_choice
 
     local remove_config=false
     [[ "$remove_config_choice" =~ ^[Yy] ]] && remove_config=true
@@ -1955,8 +2046,6 @@ menu_uninstall() {
     else
         error "Uninstallation failed"
     fi
-
-    read -rp "Press Enter to continue..."
 }
 
 # ============================================================================
@@ -1980,40 +2069,44 @@ main() {
     check_dependencies
     success "System requirements satisfied"
 
-    # Get current installation state
-    local install_state
-    install_state=$(get_install_state)
+    # Main menu loop - re-detect state after certain operations
+    while true; do
+        # Get current installation state
+        local install_state
+        install_state=$(get_install_state)
 
-    if [[ "$install_state" == "not_installed" ]]; then
-        if [[ "$NON_INTERACTIVE" == "true" ]]; then
-            # Non-interactive mode: install latest version
-            info "Non-interactive mode: Installing latest version..."
-            perform_installation "latest"
-            exit $?
-        else
-            # Interactive mode: show menu (menu will handle banner and screen clearing)
-            menu_not_installed
-        fi
-    else
-        # Plugin is installed
-        local current_version="${install_state#installed:}"
-
-        if [[ "$NON_INTERACTIVE" == "true" ]]; then
-            # Non-interactive mode: check for updates and install if available
-            info "Non-interactive mode: Checking for updates..."
-            if latest_version=$(check_for_updates "$current_version" 2>/dev/null); then
-                info "Update available: v${latest_version}"
+        if [[ "$install_state" == "not_installed" ]]; then
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                # Non-interactive mode: install latest version
+                info "Non-interactive mode: Installing latest version..."
                 perform_installation "latest"
                 exit $?
             else
-                success "Already on latest version"
-                exit 0
+                # Interactive mode: show menu (menu will handle banner and screen clearing)
+                menu_not_installed
             fi
         else
-            # Interactive mode: show menu (menu will handle banner and screen clearing)
-            menu_installed "$current_version"
+            # Plugin is installed
+            local current_version="${install_state#installed:}"
+
+            if [[ "$NON_INTERACTIVE" == "true" ]]; then
+                # Non-interactive mode: check for updates and install if available
+                info "Non-interactive mode: Checking for updates..."
+                if latest_version=$(check_for_updates "$current_version" 2>/dev/null); then
+                    info "Update available: v${latest_version}"
+                    perform_installation "latest"
+                    exit $?
+                else
+                    success "Already on latest version"
+                    exit 0
+                fi
+            else
+                # Interactive mode: show menu (menu will handle banner and screen clearing)
+                menu_installed "$current_version"
+                # If menu returns, loop back to re-detect state
+            fi
         fi
-    fi
+    done
 
     log "INFO" "Installer completed successfully"
 }
