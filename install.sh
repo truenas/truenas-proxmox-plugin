@@ -763,6 +763,125 @@ list_backups() {
     find "$BACKUP_DIR" -name "TrueNASPlugin.pm.backup.*" -type f | sort -r
 }
 
+# Human-readable file size
+format_size() {
+    local bytes="$1"
+    local size
+
+    if [[ "$bytes" -lt 1024 ]]; then
+        echo "${bytes}B"
+    elif [[ "$bytes" -lt $((1024 * 1024)) ]]; then
+        size=$((bytes / 1024))
+        echo "${size}KB"
+    elif [[ "$bytes" -lt $((1024 * 1024 * 1024)) ]]; then
+        size=$((bytes / 1024 / 1024))
+        echo "${size}MB"
+    else
+        size=$((bytes / 1024 / 1024 / 1024))
+        echo "${size}GB"
+    fi
+}
+
+# Calculate backup age in days
+backup_age_days() {
+    local backup_file="$1"
+    local file_time
+    local current_time
+    local age_seconds
+
+    file_time=$(stat -c %Y "$backup_file" 2>/dev/null || stat -f %m "$backup_file" 2>/dev/null)
+    current_time=$(date +%s)
+    age_seconds=$((current_time - file_time))
+    echo $((age_seconds / 86400))
+}
+
+# Format age in human-readable form
+format_age() {
+    local days="$1"
+
+    if [[ "$days" -eq 0 ]]; then
+        echo "Today"
+    elif [[ "$days" -eq 1 ]]; then
+        echo "1 day ago"
+    elif [[ "$days" -lt 30 ]]; then
+        echo "${days} days ago"
+    elif [[ "$days" -lt 365 ]]; then
+        local months=$((days / 30))
+        if [[ "$months" -eq 1 ]]; then
+            echo "1 month ago"
+        else
+            echo "${months} months ago"
+        fi
+    else
+        local years=$((days / 365))
+        if [[ "$years" -eq 1 ]]; then
+            echo "1 year ago"
+        else
+            echo "${years} years ago"
+        fi
+    fi
+}
+
+# Scan backups and return statistics
+scan_backups() {
+    local backups
+    backups=$(list_backups)
+
+    if [[ -z "$backups" ]]; then
+        echo "0:0:0:0"  # count:total_size:oldest_age:newest_age
+        return
+    fi
+
+    local count=0
+    local total_size=0
+    local oldest_age=0
+    local newest_age=999999
+
+    while IFS= read -r backup; do
+        ((count++))
+        local size
+        size=$(stat -c %s "$backup" 2>/dev/null || stat -f %z "$backup" 2>/dev/null)
+        total_size=$((total_size + size))
+
+        local age
+        age=$(backup_age_days "$backup")
+
+        if [[ "$age" -gt "$oldest_age" ]]; then
+            oldest_age="$age"
+        fi
+
+        if [[ "$age" -lt "$newest_age" ]]; then
+            newest_age="$age"
+        fi
+    done <<< "$backups"
+
+    echo "${count}:${total_size}:${oldest_age}:${newest_age}"
+}
+
+# Check if backup cleanup should be offered
+should_offer_cleanup() {
+    local stats
+    stats=$(scan_backups)
+
+    IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+    # Thresholds (can be customized via env vars)
+    local max_backups="${BACKUP_MAX_COUNT:-10}"
+    local max_age_days="${BACKUP_MAX_AGE_DAYS:-90}"
+    local max_size_mb="${BACKUP_MAX_SIZE_MB:-100}"
+
+    local total_size_mb=$((total_size / 1024 / 1024))
+
+    # Offer cleanup if any threshold is exceeded
+    if [[ "$count" -gt "$max_backups" ]] || \
+       [[ "$oldest_age" -gt "$max_age_days" ]] || \
+       [[ "$total_size_mb" -gt "$max_size_mb" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
 # ============================================================================
 # PLUGIN INSTALLATION
 # ============================================================================
@@ -1006,6 +1125,14 @@ menu_not_installed() {
             max_choice=4
         fi
 
+        # Check if backup cleanup should be offered
+        local should_manage_backups=false
+        if should_offer_cleanup; then
+            should_manage_backups=true
+            menu_options+=("Manage backups")
+            max_choice=$((max_choice + 1))
+        fi
+
         show_menu "TrueNAS Plugin - Not Installed" "${menu_options[@]}"
 
         local choice
@@ -1053,6 +1180,15 @@ menu_not_installed() {
             4)
                 if [[ "$has_backups" = true ]]; then
                     menu_rollback
+                elif [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    error "Invalid choice"
+                fi
+                ;;
+            5)
+                if [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
                 else
                     error "Invalid choice"
                 fi
@@ -1077,17 +1213,28 @@ menu_installed() {
             update_notice=" (Update available: v${latest_version})"
         fi
 
-        show_menu "TrueNAS Plugin v${current_version} - Installed${update_notice}" \
-            "Update to latest version" \
-            "Install specific version" \
-            "Configure storage" \
-            "Run health check" \
-            "View available versions" \
-            "Rollback to backup" \
-            "Uninstall plugin"
+        # Check if backup cleanup should be offered
+        local should_manage_backups=false
+        if should_offer_cleanup; then
+            should_manage_backups=true
+        fi
+
+        # Build menu dynamically
+        local -a menu_items=("Update to latest version" "Install specific version" "Configure storage" "Run health check" "View available versions" "Rollback to backup")
+        local max_choice=6
+
+        if [[ "$should_manage_backups" = true ]]; then
+            menu_items+=("Manage backups")
+            max_choice=7
+        fi
+
+        menu_items+=("Uninstall plugin")
+        max_choice=$((max_choice + 1))
+
+        show_menu "TrueNAS Plugin v${current_version} - Installed${update_notice}" "${menu_items[@]}"
 
         local choice
-        choice=$(read_choice 7)
+        choice=$(read_choice "$max_choice")
 
         case $choice in
             0)
@@ -1125,6 +1272,16 @@ menu_installed() {
                 menu_rollback
                 ;;
             7)
+                if [[ "$should_manage_backups" = true ]]; then
+                    menu_manage_backups
+                else
+                    menu_uninstall
+                    read -rp "Press Enter to return to main menu..."
+                    # After uninstall, break out of menu loop to re-detect installation state
+                    return 0
+                fi
+                ;;
+            8)
                 menu_uninstall
                 read -rp "Press Enter to return to main menu..."
                 # After uninstall, break out of menu loop to re-detect installation state
@@ -1915,6 +2072,328 @@ menu_rollback() {
     fi
 
     read -rp "Press Enter to continue..."
+}
+
+# ============================================================================
+# BACKUP MANAGEMENT
+# ============================================================================
+
+# View all backups with detailed information
+view_all_backups() {
+    print_header "Backup Files"
+
+    local backups
+    backups=$(list_backups)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        info "Backups are stored in: $BACKUP_DIR"
+        return 1
+    fi
+
+    local stats
+    stats=$(scan_backups)
+    IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+    echo
+    echo "Total: $count backup(s) - $(format_size "$total_size")"
+    echo "─────────────────────────────────────────────────────────────────────────────"
+    printf "%-6s %-15s %-20s %-12s %s\n" "No." "Version" "Created" "Size" "Age"
+    echo "─────────────────────────────────────────────────────────────────────────────"
+
+    local index=1
+    while IFS= read -r backup; do
+        local filename
+        filename=$(basename "$backup")
+
+        # Extract version and timestamp
+        local version_timestamp
+        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+        local version
+        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
+        local timestamp
+        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
+
+        # Format timestamp for display
+        local display_time
+        if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+            display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}"
+        else
+            display_time="$timestamp"
+        fi
+
+        # Get file size
+        local size
+        size=$(stat -c %s "$backup" 2>/dev/null || stat -f %z "$backup" 2>/dev/null)
+
+        # Get age
+        local age
+        age=$(backup_age_days "$backup")
+
+        printf "%-6s %-15s %-20s %-12s %s\n" \
+            "$index)" \
+            "$version" \
+            "$display_time" \
+            "$(format_size "$size")" \
+            "$(format_age "$age")"
+
+        ((index++))
+    done <<< "$backups"
+
+    echo "─────────────────────────────────────────────────────────────────────────────"
+    echo
+}
+
+# Delete old backups by age threshold
+delete_old_backups() {
+    print_header "Delete Old Backups"
+
+    local backups
+    backups=$(list_backups)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    echo
+    read -rp "Delete backups older than how many days? (default: 30): " age_threshold
+    age_threshold=${age_threshold:-30}
+
+    # Validate input
+    if ! [[ "$age_threshold" =~ ^[0-9]+$ ]]; then
+        error "Invalid input. Please enter a number."
+        return 1
+    fi
+
+    # Find backups older than threshold
+    local old_backups=()
+    while IFS= read -r backup; do
+        local age
+        age=$(backup_age_days "$backup")
+        if [[ "$age" -gt "$age_threshold" ]]; then
+            old_backups+=("$backup")
+        fi
+    done <<< "$backups"
+
+    if [[ "${#old_backups[@]}" -eq 0 ]]; then
+        info "No backups older than $age_threshold days found"
+        return 0
+    fi
+
+    echo
+    warning "Found ${#old_backups[@]} backup(s) older than $age_threshold days:"
+    echo
+    for backup in "${old_backups[@]}"; do
+        local age
+        age=$(backup_age_days "$backup")
+        echo "  • $(basename "$backup") - $(format_age "$age")"
+    done
+    echo
+
+    read -rp "Delete these backups? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Delete old backups
+    local deleted=0
+    local failed=0
+    for backup in "${old_backups[@]}"; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted old backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted $deleted backup(s)"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Keep only latest N backups
+keep_latest_backups() {
+    print_header "Keep Latest N Backups"
+
+    local backups
+    backups=$(list_backups)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    local total_count
+    total_count=$(echo "$backups" | wc -l)
+
+    echo
+    echo "Current backup count: $total_count"
+    read -rp "How many backups would you like to keep? (default: 5): " keep_count
+    keep_count=${keep_count:-5}
+
+    # Validate input
+    if ! [[ "$keep_count" =~ ^[0-9]+$ ]]; then
+        error "Invalid input. Please enter a number."
+        return 1
+    fi
+
+    if [[ "$keep_count" -ge "$total_count" ]]; then
+        info "No backups need to be deleted (keeping $keep_count, have $total_count)"
+        return 0
+    fi
+
+    local delete_count=$((total_count - keep_count))
+
+    echo
+    warning "This will delete $delete_count backup(s), keeping only the $keep_count most recent"
+    read -rp "Continue? (y/N): " confirm
+
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Get backups to delete (oldest ones)
+    local -a backups_to_delete
+    mapfile -t backups_to_delete < <(echo "$backups" | tail -n "$delete_count")
+
+    # Delete backups
+    local deleted=0
+    local failed=0
+    for backup in "${backups_to_delete[@]}"; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted $deleted backup(s), kept $keep_count most recent"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Delete all backups with strong confirmation
+delete_all_backups() {
+    print_header "Delete All Backups"
+
+    local backups
+    backups=$(list_backups)
+
+    if [[ -z "$backups" ]]; then
+        warning "No backups found"
+        return 1
+    fi
+
+    local total_count
+    total_count=$(echo "$backups" | wc -l)
+
+    echo
+    warning "This will permanently delete ALL $total_count backup(s)!"
+    warning "This action cannot be undone!"
+    echo
+    echo "Type 'DELETE ALL' to confirm:"
+    read -r confirm
+
+    if [[ "$confirm" != "DELETE ALL" ]]; then
+        info "Deletion cancelled"
+        return 0
+    fi
+
+    # Delete all backups
+    local deleted=0
+    local failed=0
+    while IFS= read -r backup; do
+        if rm -f "$backup" 2>/dev/null; then
+            ((deleted++))
+            log "INFO" "Deleted backup: $backup"
+        else
+            ((failed++))
+            warning "Failed to delete: $(basename "$backup")"
+        fi
+    done <<< "$backups"
+
+    if [[ "$deleted" -gt 0 ]]; then
+        success "Deleted all $deleted backup(s)"
+    fi
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "Failed to delete $failed backup(s)"
+    fi
+}
+
+# Backup management submenu
+menu_manage_backups() {
+    while true; do
+        print_header "Manage Backups"
+
+        local stats
+        stats=$(scan_backups)
+        IFS=':' read -r count total_size oldest_age newest_age <<< "$stats"
+
+        if [[ "$count" -eq 0 ]]; then
+            warning "No backups found"
+            info "Backups are stored in: $BACKUP_DIR"
+            read -rp "Press Enter to return to main menu..."
+            return 0
+        fi
+
+        # Show backup statistics
+        echo
+        echo "Backup Statistics:"
+        echo "─────────────────────────────────────────────────────────"
+        echo "  Total backups: $count"
+        echo "  Total size: $(format_size "$total_size")"
+        echo "  Oldest backup: $(format_age "$oldest_age")"
+        echo "  Newest backup: $(format_age "$newest_age")"
+        echo "─────────────────────────────────────────────────────────"
+        echo
+
+        show_menu "Backup Management" \
+            "View all backups" \
+            "Delete old backups (by age)" \
+            "Keep only latest N backups" \
+            "Delete all backups"
+
+        local choice
+        choice=$(read_choice 4)
+
+        case $choice in
+            0)
+                return 0
+                ;;
+            1)
+                view_all_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            2)
+                delete_old_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            3)
+                keep_latest_backups
+                read -rp "Press Enter to continue..."
+                ;;
+            4)
+                delete_all_backups
+                read -rp "Press Enter to continue..."
+                ;;
+        esac
+    done
 }
 
 # ============================================================================
