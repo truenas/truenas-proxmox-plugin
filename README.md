@@ -49,11 +49,38 @@
 
 ## Quick Start
 
-### Proxmox VE Setup
+### Installation
 
-#### 1. Install Plugin
+**Recommended: One-Line Automated Installer**
+
+Install the plugin with a single command:
+
 ```bash
-# Copy the plugin file
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+Or using curl:
+```bash
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+The installer provides:
+- ✅ Interactive menu-driven setup
+- ✅ Automatic version detection and updates
+- ✅ Built-in configuration wizard
+- ✅ Health check validation
+- ✅ Backup and rollback support
+- ✅ Cluster node compatibility
+
+**Alternative: Manual Installation**
+
+If you prefer manual installation:
+
+```bash
+# Download the plugin
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+
+# Copy to plugin directory
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
 
 # Set permissions
@@ -63,7 +90,9 @@ chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 systemctl restart pvedaemon pveproxy
 ```
 
-#### 2. Configure Storage
+### Configuration
+
+#### Configure Storage
 Add to `/etc/pve/storage.cfg`:
 
 ```ini
@@ -165,6 +194,17 @@ pvesm list truenas-storage
 # Check available space
 pvesm status
 ```
+
+### Advanced Installation Options
+
+The installer supports additional features:
+- **Version management** - Install, update, or rollback to specific versions
+- **Configuration wizard** - Interactive guided setup with validation
+- **Health checks** - 11-point system validation
+- **Cluster support** - Automatic cluster detection and warnings
+- **Backup management** - Automatic backups with rollback capability
+
+For detailed installation instructions and troubleshooting, see the [Installation Guide](wiki/Installation.md).
 
 ## Documentation
 

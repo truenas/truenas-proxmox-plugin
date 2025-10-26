@@ -2,6 +2,341 @@
 
 Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 
+## Table of Contents
+- [Automated Installation (Recommended)](#automated-installation-recommended)
+- [Manual Installation](#manual-installation)
+- [Requirements](#requirements)
+- [TrueNAS SCALE Setup](#truenas-scale-setup)
+- [Post-Installation Verification](#post-installation-verification)
+- [Troubleshooting Installation](#troubleshooting-installation)
+
+## Automated Installation (Recommended)
+
+The TrueNAS plugin includes a comprehensive automated installer that handles installation, updates, configuration, and management through an interactive menu system.
+
+### Quick Start - One-Line Installation
+
+Install the plugin with a single command:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+Or using curl:
+```bash
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+```
+
+The installer will:
+1. ✅ Check for required dependencies (curl/wget, jq, perl)
+2. ✅ Download the latest plugin from GitHub
+3. ✅ Validate plugin syntax before installation
+4. ✅ Install to the correct directory with proper permissions
+5. ✅ Restart Proxmox services automatically
+6. ✅ Offer to configure storage immediately
+7. ✅ Run optional health checks
+
+### Installer Features
+
+#### Interactive Menu System
+After installation, the installer provides a full-featured management interface:
+
+```
+╔══════════════════════════════════════════════════════════╗
+║              TRUENAS PROXMOX VE PLUGIN                   ║
+║                  Installer v1.0.0                        ║
+╚══════════════════════════════════════════════════════════╝
+
+Plugin Status: Installed (v1.0.6)
+Update Available: v1.0.7
+
+Main Menu:
+  1) Update to latest version
+  2) Install specific version
+  3) Configure storage
+  4) Run health check
+  5) Manage backups
+  6) Rollback to previous version
+  7) Uninstall plugin
+  8) Exit
+
+Choose an option:
+```
+
+#### Available Operations
+
+**Installation & Updates**
+- Install latest version from GitHub
+- Install specific version (version selection menu)
+- Update to latest version (with backup)
+- Automatic update detection and notification
+
+**Configuration Management**
+- Interactive configuration wizard
+- Guided setup for all storage parameters
+- Input validation (IP addresses, API keys, dataset names)
+- TrueNAS API connectivity testing
+- Dataset verification via API
+- Automatic backup of storage.cfg
+
+**Health Checking**
+- 11-point comprehensive health validation
+- Plugin file verification and syntax check
+- Storage configuration validation
+- TrueNAS API connectivity test
+- iSCSI session monitoring
+- Multipath status check
+- Service verification (pvedaemon, pveproxy)
+- Color-coded status indicators
+- Animated spinners during checks
+
+**Backup & Recovery**
+- Automatic backup before any changes
+- Timestamped backup files with version info
+- View all backups with statistics
+- Rollback to any previous version
+- Backup management (delete old backups, keep latest N)
+- Smart cleanup with age/count/size thresholds
+
+**Cluster Support**
+- Automatic cluster node detection
+- Multi-node count display
+- Warning messages for cluster deployments
+- Instructions for cluster-wide updates
+- Reference to cluster update tools
+
+### Command-Line Options
+
+```bash
+# Display installer version
+./install.sh --version
+
+# Show help and usage information
+./install.sh --help
+
+# Non-interactive mode (for automation/scripts)
+./install.sh --non-interactive
+```
+
+### Non-Interactive Installation
+
+For automation or CI/CD pipelines:
+
+```bash
+# Download and install automatically
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash -s -- --non-interactive
+```
+
+Or download first:
+```bash
+# Download installer
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh
+chmod +x install.sh
+
+# Run in non-interactive mode
+./install.sh --non-interactive
+```
+
+Non-interactive mode will:
+- Install the latest plugin version automatically
+- Skip all interactive prompts
+- Use safe defaults for all options
+- Log all actions to `/var/log/truenas-installer.log`
+- Exit with appropriate status codes (0=success, 1=error)
+
+### Installer Workflow Examples
+
+#### First-Time Installation
+```bash
+# Run the one-liner
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+
+# Installer will:
+# 1. Download and install plugin v1.0.7 (latest)
+# 2. Prompt: "Would you like to configure storage now? (Y/n)"
+# 3. If yes: Launch configuration wizard
+# 4. Prompt: "Would you like to run a health check? (Y/n)"
+# 5. If yes: Run 11-point health validation
+# 6. Display next steps and documentation links
+```
+
+#### Updating Existing Installation
+```bash
+# Run the installer again
+./install.sh
+
+# Main menu will show:
+# "Plugin Status: Installed (v1.0.6)"
+# "Update Available: v1.0.7"
+
+# Choose option 1: "Update to latest version"
+# Installer will:
+# 1. Create backup of v1.0.6
+# 2. Download and install v1.0.7
+# 3. Validate syntax
+# 4. Restart services
+# 5. Offer to run health check
+```
+
+#### Configuration Wizard
+```bash
+# From main menu, choose "Configure storage"
+
+# Wizard will prompt for:
+Storage name (e.g., 'truenas-storage'): truenas-prod
+TrueNAS IP address: 192.168.1.100
+TrueNAS API key: 1-abc123def456...
+ZFS dataset path: tank/proxmox
+iSCSI target IQN: iqn.2005-10.org.freenas.ctl:proxmox
+Discovery portal (IP:PORT): 192.168.1.100:3260
+Enable multipath? (y/N): n
+Enable API insecure mode? (Y/n): y
+
+# Wizard then:
+# ✓ Tests TrueNAS API connectivity
+# ✓ Verifies dataset exists
+# ✓ Generates configuration block
+# ✓ Shows preview for review
+# ✓ Backs up /etc/pve/storage.cfg
+# ✓ Appends new configuration
+# ✓ Confirms success
+```
+
+#### Health Check
+```bash
+# From main menu, choose "Run health check"
+
+# Health check validates (with spinners):
+# ✓ Plugin file exists
+# ✓ Plugin syntax valid
+# ✓ Storage configuration found
+# ✓ TrueNAS API connectivity
+# ✓ Storage status active
+# ✓ Dataset exists on TrueNAS
+# ✓ iSCSI sessions established
+# ✓ Service pvedaemon running
+# ✓ Service pveproxy running
+# ✓ Multipath configuration (if enabled)
+# ✓ No critical errors in logs
+
+# Summary: 11/11 checks passed (0 warnings, 0 critical)
+```
+
+#### Rollback to Previous Version
+```bash
+# From main menu, choose "Rollback to previous version"
+
+# Displays available backups:
+Available Backups:
+  1) v1.0.7 - 2025-10-25 14:32:15 (2 hours ago) - 89.2 KB
+  2) v1.0.6 - 2025-10-24 09:15:42 (1 day ago) - 88.8 KB
+  3) v1.0.5 - 2025-10-20 11:22:03 (5 days ago) - 87.1 KB
+
+Select backup to restore (1-3):
+```
+
+#### Backup Management
+```bash
+# From main menu, choose "Manage backups"
+
+# Shows statistics:
+Total backups: 12 files (1.1 MB)
+Oldest: 2025-08-15 (70 days ago)
+Newest: 2025-10-25 (2 hours ago)
+
+# Options:
+1) View all backups
+2) Delete backups older than N days
+3) Keep only latest N backups
+4) Delete all backups
+5) Return to main menu
+
+# Example: Keep only latest 5
+# Installer will:
+# ✓ List backups to be deleted (7 files)
+# ✓ Confirm deletion
+# ✓ Delete old backups
+# ✓ Log actions
+# ✓ Show freed space
+```
+
+### Cluster Installation with Installer
+
+For Proxmox clusters, install on each node:
+
+```bash
+# On first node
+wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+
+# Installer will detect cluster and show:
+⚠ Cluster Detected: 3 nodes in cluster
+⚠ Remember to install on all cluster nodes!
+
+# On remaining nodes, run the same command:
+ssh root@node2 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
+ssh root@node3 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
+
+# Or use the cluster update script (see Tools and Utilities guide)
+```
+
+### Installer Logs
+
+All installer operations are logged for troubleshooting:
+
+```bash
+# View installer logs
+tail -f /var/log/truenas-installer.log
+
+# Check for errors
+grep ERROR /var/log/truenas-installer.log
+
+# View recent operations
+tail -n 100 /var/log/truenas-installer.log
+```
+
+### Installer Troubleshooting
+
+**Missing Dependencies**
+```bash
+# Installer checks for: curl or wget, jq, perl
+# If missing, installer will display clear error:
+
+ERROR: Required dependency 'jq' not found
+Please install: apt-get install jq
+
+# Install dependencies:
+apt-get update
+apt-get install curl jq perl
+```
+
+**Permission Issues**
+```bash
+# Installer must run as root
+# If not root, you'll see:
+
+ERROR: This script must be run as root
+Please run: sudo ./install.sh
+
+# Fix:
+sudo ./install.sh
+```
+
+**GitHub API Rate Limiting**
+```bash
+# If you hit GitHub rate limits:
+
+ERROR: GitHub API rate limit exceeded
+Please try again in 1 hour, or use a GitHub token
+
+# Wait or use authentication:
+export GITHUB_TOKEN=your_github_token
+./install.sh
+```
+
+## Manual Installation
+
+If you prefer manual installation or need more control over the process, follow these steps.
+
 ## Requirements
 
 ### Software Requirements
