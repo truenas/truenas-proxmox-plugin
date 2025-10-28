@@ -178,26 +178,81 @@ start_spinner() {
     # Hide cursor
     printf "\033[?25l" >&2
 
-    # Run spinner in background
-    (
-        while true; do
-            # Save cursor position, print spinner, restore cursor
-            printf "\033[s%s\033[u" "${spinner_chars[$spinner_pos]}" >&2
-            spinner_pos=$(( (spinner_pos + 1) % 10 ))
-            sleep 0.1
-        done
-    ) &
+    # Create a wrapper script that runs spinner in its own process group
+    # This ensures all children (including sleep) can be killed together
+    local spinner_script="/tmp/.installer-spinner-$$.sh"
+    cat > "$spinner_script" << 'SPINNER_EOF'
+#!/bin/bash
+# Create new process group
+set -m
 
+# Trap to kill entire process group on exit
+cleanup() {
+    # Kill all processes in this process group
+    kill -- -$$ 2>/dev/null || true
+    exit 0
+}
+trap cleanup TERM INT HUP EXIT
+
+# Spinner loop
+spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+spinner_pos=0
+max_iterations=3000
+iterations=0
+
+while [[ $iterations -lt $max_iterations ]]; do
+    printf "\033[s%s\033[u" "${spinner_chars[$spinner_pos]}" >&2
+    spinner_pos=$(( (spinner_pos + 1) % 10 ))
+    iterations=$((iterations + 1))
+    sleep 0.1
+done
+SPINNER_EOF
+
+    chmod +x "$spinner_script"
+
+    # Start spinner script in background
+    "$spinner_script" &
     SPINNER_PID=$!
+
+    # Give it a moment to set up its process group
+    sleep 0.05
 }
 
 # Stop spinner animation
 stop_spinner() {
-    if [[ -n "$SPINNER_PID" ]]; then
+    if [[ -n "$SPINNER_PID" ]] && [[ "$SPINNER_PID" != "0" ]]; then
+        # Check if process exists
         if kill -0 "$SPINNER_PID" 2>/dev/null; then
-            disown "$SPINNER_PID" 2>/dev/null
-            kill -9 "$SPINNER_PID" 2>/dev/null
+            # Kill the entire process group (negative PID)
+            # This kills the spinner script AND all its children (including sleep)
+            kill -- -"$SPINNER_PID" 2>/dev/null || true
+
+            # Also send to the process itself
+            kill -TERM "$SPINNER_PID" 2>/dev/null || true
+
+            # Wait briefly for termination (max 1 second)
+            local wait_count=0
+            while [[ $wait_count -lt 10 ]]; do
+                if ! kill -0 "$SPINNER_PID" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.1
+                wait_count=$((wait_count + 1))
+            done
+
+            # Force kill if still alive
+            if kill -0 "$SPINNER_PID" 2>/dev/null; then
+                kill -9 "$SPINNER_PID" 2>/dev/null || true
+                kill -9 -"$SPINNER_PID" 2>/dev/null || true
+            fi
+
+            # Final cleanup: kill any remaining children
+            pkill -P "$SPINNER_PID" 2>/dev/null || true
         fi
+
+        # Clean up temporary spinner script
+        rm -f "/tmp/.installer-spinner-$$.sh" 2>/dev/null || true
+
         # Clear spinner character by printing space
         printf "\033[s \033[u" >&2
         SPINNER_PID=""
@@ -450,9 +505,28 @@ cleanup_on_error() {
     fi
 }
 
+# Cleanup all background processes
+cleanup_all() {
+    # Stop spinner first
+    stop_spinner
+
+    # Kill any remaining background jobs
+    local jobs_pids
+    jobs_pids=$(jobs -p 2>/dev/null || true)
+    if [[ -n "$jobs_pids" ]]; then
+        # shellcheck disable=SC2086
+        kill $jobs_pids 2>/dev/null || true
+    fi
+
+    # Extra safety: kill any orphaned sleep 0.1 processes that belong to this script
+    # This is a safety net for any edge cases
+    pkill -f "sleep 0\.1" 2>/dev/null || true
+}
+
 # Set up error trap and cleanup
-trap 'stop_spinner; cleanup_on_error' EXIT
-trap 'stop_spinner' INT TERM
+trap 'cleanup_all; cleanup_on_error' EXIT
+trap 'cleanup_all; exit 130' INT
+trap 'cleanup_all; exit 143' TERM
 
 # ============================================================================
 # ARGUMENT PARSING
@@ -2546,6 +2620,11 @@ main() {
 
     # Initialize logging
     init_logging
+
+    # Clean up any orphaned processes from previous runs
+    # This prevents accumulation of zombie spinners
+    pkill -f "bash.*install\.sh.*while" 2>/dev/null || true
+    pkill -f "sleep 0\.1" 2>/dev/null || true
 
     # Perform checks (with banner for non-interactive mode only)
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
