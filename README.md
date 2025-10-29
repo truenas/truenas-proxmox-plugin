@@ -53,17 +53,24 @@
 
 ### Installation
 
-**Recommended: One-Line Automated Installer**
+**Recommended: Interactive Installer (One Command)**
 
-Install the plugin with a single command:
+Download and run the installer interactively:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+bash <(curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh)
 ```
 
-Or using curl:
+Or download first, then run:
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh
+chmod +x install.sh
+./install.sh
+```
+
+**For Non-Interactive/Automated Installation:**
+```bash
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:

@@ -551,8 +551,11 @@ EXAMPLES:
     # Non-interactive installation
     $0 --non-interactive
 
-    # One-liner installation from GitHub
-    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash
+    # One-liner installation from GitHub (auto-detects non-interactive)
+    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+
+    # Or with wget
+    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
 
 For more information, visit:
 https://github.com/${GITHUB_REPO}
@@ -2617,6 +2620,42 @@ menu_uninstall() {
 main() {
     # Parse arguments
     parse_arguments "$@"
+
+    # Detect if stdin is not a TTY (piped from curl/wget) and redirect to terminal
+    if [[ ! -t 0 ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+        # Try to reconnect stdin to the controlling terminal
+        if ( exec 0</dev/tty ) 2>/dev/null; then
+            # Successfully redirected to controlling terminal
+            exec 0</dev/tty
+            log "INFO" "Redirected stdin from pipe to /dev/tty for interactive mode"
+        else
+            # Cannot redirect - show helpful error
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            echo "This installer was piped from curl/wget but cannot access your"
+            echo "terminal for interactive prompts."
+            echo
+            echo "Please choose one of these methods instead:"
+            echo
+            echo "  ${COLOR_GREEN}1. Interactive (Recommended)${COLOR_RESET}"
+            echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+            echo
+            echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+            echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+            echo "     chmod +x install.sh"
+            echo "     ./install.sh"
+            echo
+            echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+            echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+            echo
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo
+            exit $EXIT_ERROR
+        fi
+    fi
 
     # Initialize logging
     init_logging
