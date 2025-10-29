@@ -103,6 +103,19 @@ sub _log {
     syslog($priority, $message);
 }
 
+# Normalize blocksize to uppercase format required by TrueNAS 25.10+
+# Converts: 16k -> 16K, 128k -> 128K, etc.
+# TrueNAS 25.10 requires: '512', '512B', '1K', '2K', '4K', '8K', '16K', '32K', '64K', '128K'
+sub _normalize_blocksize {
+    my ($blocksize) = @_;
+    return undef if !defined $blocksize;
+
+    # Convert to uppercase (16k -> 16K, 64k -> 64K, etc.)
+    $blocksize = uc($blocksize);
+
+    return $blocksize;
+}
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -1196,7 +1209,10 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
         volsize=> $bytes,
         sparse => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
-    $payload->{volblocksize} = $blocksize if $blocksize;
+    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
+    if ($blocksize) {
+        $payload->{volblocksize} = _normalize_blocksize($blocksize);
+    }
     return _api_call($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
@@ -1655,6 +1671,7 @@ sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
 
     my @errors;
+    my $mode = $scfg->{transport_mode} // 'iscsi';
 
     # Check 1: TrueNAS API is reachable
     eval {
@@ -1665,24 +1682,45 @@ sub _preflight_check_alloc {
         push @errors, "TrueNAS API is unreachable: $@";
     }
 
-    # Check 2: iSCSI service is running
-    eval {
-        my $services = _api_call($scfg, 'service.query',
-            [[ ["service", "=", "iscsitarget"] ]],
-            sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
+    # Check 2: Service is running (transport-specific)
+    if ($mode eq 'iscsi') {
+        eval {
+            my $services = _api_call($scfg, 'service.query',
+                [[ ["service", "=", "iscsitarget"] ]],
+                sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
 
-        if (!$services || !@$services) {
-            push @errors, "Unable to query iSCSI service status";
-        } elsif ($services->[0]->{state} ne 'RUNNING') {
-            push @errors, sprintf(
-                "TrueNAS iSCSI service is not running (state: %s)\n" .
-                "  Start the service in TrueNAS: System Settings > Services > iSCSI",
-                $services->[0]->{state} // 'UNKNOWN'
-            );
+            if (!$services || !@$services) {
+                push @errors, "Unable to query iSCSI service status";
+            } elsif ($services->[0]->{state} ne 'RUNNING') {
+                push @errors, sprintf(
+                    "TrueNAS iSCSI service is not running (state: %s)\n" .
+                    "  Start the service in TrueNAS: System Settings > Services > iSCSI",
+                    $services->[0]->{state} // 'UNKNOWN'
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify iSCSI service status: $@";
         }
-    };
-    if ($@) {
-        push @errors, "Cannot verify iSCSI service status: $@";
+    } elsif ($mode eq 'nvme-tcp') {
+        eval {
+            my $services = _api_call($scfg, 'service.query',
+                [[ ["service", "=", "nvmet"] ]],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+
+            if (!$services || !@$services) {
+                push @errors, "Unable to query NVMe-oF service status";
+            } elsif ($services->[0]->{state} ne 'RUNNING') {
+                push @errors, sprintf(
+                    "TrueNAS NVMe-oF service is not running (state: %s)\n" .
+                    "  Start the service in TrueNAS: System Settings > Services > NVMe-oF Target",
+                    $services->[0]->{state} // 'UNKNOWN'
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify NVMe-oF service status: $@";
+        }
     }
 
     # Check 3: Sufficient space available (with 20% overhead)
@@ -1717,20 +1755,23 @@ sub _preflight_check_alloc {
         }
     }
 
-    # Check 4: iSCSI target exists and is configured
-    eval {
-        my $target_id = _resolve_target_id($scfg);
-        if (!defined $target_id) {
-            push @errors, sprintf(
-                "iSCSI target not found: %s\n" .
-                "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
-                $scfg->{target_iqn}
-            );
+    # Check 4: Target/subsystem exists and is configured (transport-specific)
+    if ($mode eq 'iscsi') {
+        eval {
+            my $target_id = _resolve_target_id($scfg);
+            if (!defined $target_id) {
+                push @errors, sprintf(
+                    "iSCSI target not found: %s\n" .
+                    "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
+                    $scfg->{target_iqn}
+                );
+            }
+        };
+        if ($@) {
+            push @errors, "Cannot verify iSCSI target: $@";
         }
-    };
-    if ($@) {
-        push @errors, "Cannot verify iSCSI target: $@";
     }
+    # NVMe subsystem validation is done during activation, not pre-flight
 
     # Check 5: Parent dataset exists
     eval {
@@ -2248,13 +2289,10 @@ sub _nvme_ensure_subsystem {
     $name = $1 if $nqn =~ /:([^:]+)$/;
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
-    # Generate serial number
-    my $serial = substr(sha1($nqn), 0, 20);
-
+    # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
     my $subsys = _api_call($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
-        serial => $serial,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
     }], sub { die "REST API not supported for NVMe-oF operations\n"; });
 
@@ -2495,7 +2533,8 @@ sub alloc_image {
         volsize => $bytes,
         sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
     };
-    $create_payload->{volblocksize} = $blocksize if $blocksize;
+    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
+    $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
 
     _api_call(
         $scfg,
@@ -3098,6 +3137,22 @@ sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
     my $res = [];
 
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        return _list_images_iscsi($class, $storeid, $scfg, $vmid, $vollist, $cache);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _list_images_nvme($class, $storeid, $scfg, $vmid, $vollist, $cache);
+    }
+
+    return $res;
+}
+
+# iSCSI-specific list_images implementation
+sub _list_images_iscsi {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+    my $res = [];
+
     # ---- fetch fresh TrueNAS state (minimal caching for target_id only) ----
     my $extents    = _tn_extents($scfg) // [];
     my $maps       = _tn_targetextents($scfg) // [];
@@ -3188,6 +3243,119 @@ sub list_images {
         );
         push @$res, \%entry;
     }
+    return $res;
+}
+
+# NVMe-specific list_images implementation
+sub _list_images_nvme {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+    my $res = [];
+
+    # Get subsystem ID
+    my $nqn = $scfg->{subsystem_nqn};
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [["subnqn", "=", $nqn]]
+        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@) {
+        _log($scfg, 0, 'err', "list_images_nvme: failed to query subsystem: $@");
+        return $res;
+    }
+    if (!$subsystems || !@$subsystems) {
+        _log($scfg, 0, 'err', "list_images_nvme: subsystem $nqn not found");
+        return $res;
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    # Get all namespaces for this subsystem
+    # Note: Query without filter because TrueNAS API filter syntax is inconsistent
+    my $namespaces = eval {
+        _api_call($scfg, 'nvmet.namespace.query', [[]], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    } // [];
+
+    # Filter to only our subsystem
+    # Note: namespace has 'subsys' field which is a hash with 'id' field
+    $namespaces = [ grep {
+        my $ns_subsys = $_->{subsys};
+        my $ns_subsys_id = ref($ns_subsys) eq 'HASH' ? $ns_subsys->{id} : $ns_subsys;
+        ($ns_subsys_id // -1) == $subsys_id
+    } @$namespaces ];
+
+    # Optional include filter
+    my %want;
+    if ($vollist && ref($vollist) eq 'ARRAY' && @$vollist) {
+        %want = map { $_ => 1 } @$vollist;
+    }
+
+    # Normalizer for size fields
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+
+    # Process each namespace
+    for my $ns (@$namespaces) {
+        my $device_path = $ns->{device_path} // '';
+        next unless $device_path =~ m{^zvol/(.+)$};
+        my $ds_full = $1;  # e.g., "flash/nvme-test/vm-998-disk-0"
+
+        # Extract zvol name from path
+        next unless $ds_full =~ m{^\Q$scfg->{dataset}\E/(.+)$};
+        my $zname = $1;  # e.g., "vm-998-disk-0"
+
+        # Owner (vmid) from naming convention
+        my $owner;
+        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+
+        # Honor $vmid filter
+        if (defined $vmid) {
+            next if !defined $owner || $owner != $vmid;
+        }
+
+        # Compose volname using device_uuid
+        my $device_uuid = $ns->{device_uuid} // next;
+        my $volname = "vol-$zname-ns$device_uuid";
+        my $volid = "$storeid:$volname";
+
+        # Honor explicit include filter
+        if (%want && !$want{$volid}) {
+            next;
+        }
+
+        # Get zvol details for size and creation time
+        my $ds = eval { _tn_dataset_get($scfg, $ds_full) } // {};
+        my $size = $norm->($ds->{volsize});  # bytes
+
+        # Extract creation time
+        my $ctime = 0;
+        if (my $props = $ds->{properties}) {
+            if (ref($props->{creation}) eq 'HASH') {
+                $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
+            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+                $ctime = int($1);
+            }
+        }
+        if (!$ctime && defined $ds->{created}) {
+            $ctime = int($ds->{created});
+        }
+        $ctime = time() if !$ctime;
+
+        # Format is always raw for NVMe zvols
+        my %entry = (
+            volid   => $volid,
+            size    => $size || 0,
+            format  => 'raw',
+            content => 'images',
+            vmid    => defined($owner) ? int($owner) : 0,
+            ctime   => $ctime,
+        );
+        push @$res, \%entry;
+    }
+
     return $res;
 }
 
