@@ -2624,10 +2624,40 @@ main() {
     # Detect if stdin is not a TTY (piped from curl/wget) and redirect to terminal
     if [[ ! -t 0 ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
         # Try to reconnect stdin to the controlling terminal
-        if ( exec 0</dev/tty ) 2>/dev/null; then
-            # Successfully redirected to controlling terminal
-            exec 0</dev/tty
-            log "INFO" "Redirected stdin from pipe to /dev/tty for interactive mode"
+        if [[ -c /dev/tty ]] && ( : </dev/tty ) 2>/dev/null; then
+            # Test if /dev/tty is actually connected to a terminal
+            if [[ -t /dev/tty ]] 2>/dev/null || ( [[ -c /dev/tty ]] && tty -s </dev/tty 2>/dev/null ); then
+                # Successfully can use /dev/tty for interactive input
+                exec 0</dev/tty
+                log "INFO" "Redirected stdin from pipe to /dev/tty for interactive mode"
+            else
+                # /dev/tty exists but is not usable for interactive input
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "  TrueNAS Plugin Installer - Interactive Mode Not Available"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                echo "This installer was run in a non-interactive context (e.g., via SSH"
+                echo "without a pseudo-terminal) and cannot access your terminal for prompts."
+                echo
+                echo "Please choose one of these methods instead:"
+                echo
+                echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+                echo "     ssh root@your-proxmox-host"
+                echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+                echo
+                echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
+                echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+                echo "     chmod +x install.sh"
+                echo "     ./install.sh"
+                echo
+                echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
+                echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+                echo
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo
+                exit $EXIT_ERROR
+            fi
         else
             # Cannot redirect - show helpful error
             echo
@@ -2640,7 +2670,8 @@ main() {
             echo
             echo "Please choose one of these methods instead:"
             echo
-            echo "  ${COLOR_GREEN}1. Interactive (Recommended)${COLOR_RESET}"
+            echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+            echo "     ssh root@your-proxmox-host"
             echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
             echo
             echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
