@@ -11,7 +11,7 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.0.0"
+readonly INSTALLER_VERSION="1.0.2"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
@@ -995,6 +995,17 @@ install_plugin_file() {
     if ! validate_plugin "$source"; then
         error "Plugin validation failed. Installation aborted."
         return 1
+    fi
+
+    # Ensure target directory exists
+    local plugin_dir
+    plugin_dir="$(dirname "$PLUGIN_FILE")"
+    if [[ ! -d "$plugin_dir" ]]; then
+        info "Creating plugin directory $plugin_dir..."
+        mkdir -p "$plugin_dir" || {
+            error "Failed to create plugin directory"
+            return 1
+        }
     fi
 
     # Install plugin
