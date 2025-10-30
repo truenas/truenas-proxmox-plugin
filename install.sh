@@ -902,7 +902,7 @@ format_age() {
 # Scan backups and return statistics
 scan_backups() {
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         echo "0:0:0:0"  # count:total_size:oldest_age:newest_age
@@ -1187,7 +1187,7 @@ menu_not_installed() {
 
         # Check if backups exist
         local backups
-        backups=$(list_backups 2>/dev/null | wc -l)
+        backups=$(list_backups 2>/dev/null | wc -l || echo "0")
         local has_backups=false
         if [[ "$backups" -gt 0 ]]; then
             has_backups=true
@@ -2071,7 +2071,7 @@ menu_rollback() {
 
     info "Searching for available backups..."
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2160,7 +2160,7 @@ view_all_backups() {
     print_header "Backup Files"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2226,7 +2226,7 @@ delete_old_backups() {
     print_header "Delete Old Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2301,7 +2301,7 @@ keep_latest_backups() {
     print_header "Keep Latest N Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
@@ -2369,7 +2369,7 @@ delete_all_backups() {
     print_header "Delete All Backups"
 
     local backups
-    backups=$(list_backups)
+    backups=$(list_backups 2>/dev/null || true)
 
     if [[ -z "$backups" ]]; then
         warning "No backups found"
