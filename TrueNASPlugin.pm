@@ -1452,10 +1452,24 @@ sub volume_resize {
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) },
     );
 
-    # Initiator-side rescan so Linux + multipath see the new size
-    _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
-    if ($scfg->{use_multipath}) {
-        _try_run(['multipath','-r'], "multipath map reload failed");
+    # Initiator-side rescan so Linux sees the new size (transport-specific)
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
+        if ($scfg->{use_multipath}) {
+            _try_run(['multipath','-r'], "multipath map reload failed");
+        }
+    } elsif ($mode eq 'nvme-tcp') {
+        # NVMe namespace size updates automatically when zvol is resized
+        # Trigger device rescan to ensure kernel sees updated size
+        my $nqn = $scfg->{subsystem_nqn};
+        eval {
+            _try_run(['nvme', 'ns-rescan', '-n', $nqn], "nvme namespace rescan failed");
+        };
+        # Fallback: rescan all NVMe controllers if specific rescan fails
+        if ($@) {
+            eval { _try_run(['nvme', 'ns-rescan', '/dev/nvme0'], "nvme rescan failed"); };
+        }
     }
     run_command(['udevadm','settle'], outfunc => sub {});
     select(undef, undef, undef, 0.25); # ~250ms
@@ -3658,9 +3672,23 @@ sub deactivate_volume { return 1; }
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
 
-
     die "clone not supported without snapshot\n" unless $snapname;
     die "only raw format is supported\n" if defined($format) && $format ne 'raw';
+
+    # Dispatch by transport mode
+    my $mode = $scfg->{transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        return _clone_image_iscsi($class, $scfg, $storeid, $volname, $vmid, $snapname, $name);
+    } elsif ($mode eq 'nvme-tcp') {
+        return _clone_image_nvme($class, $scfg, $storeid, $volname, $vmid, $snapname, $name);
+    } else {
+        die "Unknown transport mode: $mode\n";
+    }
+}
+
+# iSCSI-specific clone implementation
+sub _clone_image_iscsi {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
 
     # Parse source volume information
     my (undef, $source_zname) = $class->parse_volname($volname);
@@ -3781,6 +3809,101 @@ sub clone_image {
 
     # 6) Return clone volume name
     my $clone_volname = "vol-$target_zname-lun$lun";
+    return $clone_volname;
+}
+
+# NVMe-specific clone implementation
+sub _clone_image_nvme {
+    my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
+
+    # Parse source volume information
+    my (undef, $source_zname) = $class->parse_volname($volname);
+    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_snapshot = $source_full . '@' . $snapname;
+
+    # Determine target dataset name
+    my $target_zname = $name;
+    if (!$target_zname) {
+        # Generate automatic name: vm-<vmid>-disk-<n>
+        for (my $n = 0; $n < 1000; $n++) {
+            my $candidate = "vm-$vmid-disk-$n";
+            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
+            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
+            if ($@ || !$exists) {
+                $target_zname = $candidate;
+                last;
+            }
+        }
+        die "unable to find free clone name\n" if !$target_zname;
+    }
+
+    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+
+    # 1) Create ZFS clone from snapshot
+    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # 2) Create NVMe namespace for the cloned zvol
+    my $nqn = $scfg->{subsystem_nqn};
+
+    # Get subsystem ID
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [["subnqn", "=", $nqn]]
+        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@ || !$subsystems || !@$subsystems) {
+        die "Failed to query NVMe subsystem $nqn: $@\n";
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    # Get zvol details for blocksize
+    my $ds = eval { _tn_dataset_get($scfg, $target_full) } // {};
+    my $norm = sub {
+        my ($v) = @_;
+        return 0 if !defined $v;
+        return $v if !ref($v);
+        return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
+        return 0;
+    };
+    my $volblocksize = $norm->($ds->{volblocksize}) || (128 * 1024);  # default 128K
+
+    # Normalize blocksize to uppercase format
+    my $blocksize_str = _normalize_blocksize($volblocksize);
+
+    # Create namespace
+    my $ns_payload = {
+        subsys_id => $subsys_id,
+        device_path => "zvol/$target_full",
+        device_type => 'ZVOL',
+        block_size => $blocksize_str,
+    };
+
+    my $ns = eval {
+        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
+            sub { die "REST API not supported for NVMe-oF operations\n"; });
+    };
+    if ($@) {
+        # Cleanup: delete the zvol clone if namespace creation failed
+        eval { _tn_dataset_delete($scfg, $target_full) };
+        die "Failed to create NVMe namespace for clone: $@\n";
+    }
+
+    my $device_uuid = $ns->{device_uuid} // die "No device_uuid returned from namespace creation\n";
+
+    # 3) Wait for device to appear
+    my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+    if (!$dev) {
+        # Cleanup on failure
+        eval {
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ],
+                sub { die "REST API not supported for NVMe-oF operations\n"; });
+        };
+        eval { _tn_dataset_delete($scfg, $target_full) };
+        die "Device did not appear for cloned namespace (UUID: $device_uuid)\n";
+    }
+
+    # 4) Return clone volume name
+    my $clone_volname = "vol-$target_zname-ns$device_uuid";
     return $clone_volname;
 }
 
