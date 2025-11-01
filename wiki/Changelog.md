@@ -1,5 +1,37 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.0.8 (October 31, 2025)
+
+### 🐛 **Bug Fix**
+- **Fixed EFI VM creation with non-standard zvol blocksizes** - Plugin now automatically aligns volume sizes
+  - **Error resolved**: "Volume size should be a multiple of volume block size"
+  - **Issue**: EFI VMs require 528 KiB disks which don't align with common blocksizes (16K, 64K, 128K)
+  - **Impact**: Users couldn't create UEFI/OVMF VMs when using custom `zvol_blocksize` configurations
+  - **Affected operations**: Volume creation (`alloc_image`) for small disks like EFI variables
+
+### 🔧 **Technical Details**
+- Added `_parse_blocksize()` helper function (lines 91-105)
+  - Converts blocksize strings (e.g., "128K", "64K") to bytes
+  - Handles case-insensitive K/M/G suffixes
+  - Returns 0 for invalid/undefined values
+- Modified `alloc_image()` function (lines 2024-2038)
+  - Automatically rounds up requested sizes to nearest blocksize multiple
+  - Uses same modulo-based algorithm as existing `volume_resize()` function
+  - Logs adjustments at info level: "alloc_image: size alignment: requested X bytes → aligned Y bytes"
+- Maintains consistency with existing `volume_resize` alignment (lines 1307-1311)
+
+### 📊 **Impact**
+- **EFI/OVMF VM creation** - Now works seamlessly with any zvol blocksize configuration
+- **Alignment is transparent** - No user intervention required, size adjustments logged automatically
+- **No regression** - Standard disk sizes (1GB+) already aligned, no performance impact
+
+### ✅ **Validation**
+Tested with multiple blocksize configurations:
+- 64K blocksize: 528 KiB → 576 KiB (aligned to 64K × 9)
+- 128K blocksize: 528 KiB → 640 KiB (aligned to 128K × 5)
+
+---
+
 ## Version 1.0.7 (October 23, 2025)
 
 ### 🐛 **Critical Bug Fix**

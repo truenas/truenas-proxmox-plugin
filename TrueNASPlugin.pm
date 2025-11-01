@@ -86,6 +86,24 @@ sub _format_bytes {
     return sprintf("%.2f %s", $size, $units[$unit_idx]);
 }
 
+# Parse ZFS blocksize string (e.g., "128K", "64K", "1M") to bytes
+# Returns integer bytes, or 0 if invalid/undefined
+sub _parse_blocksize {
+    my ($bs_str) = @_;
+    return 0 if !defined $bs_str || $bs_str eq '';
+
+    # Match: number followed by optional K/M/G suffix (case-insensitive)
+    if ($bs_str =~ /^(\d+)([KMG])?$/i) {
+        my ($num, $unit) = ($1, $2 // '');
+        my $bytes = int($num);
+        $bytes *= 1024 if uc($unit) eq 'K';
+        $bytes *= 1024 * 1024 if uc($unit) eq 'M';
+        $bytes *= 1024 * 1024 * 1024 if uc($unit) eq 'G';
+        return $bytes;
+    }
+    return 0;  # Invalid format
+}
+
 # Debug logging helper - respects debug level from storage config
 # Usage: _log($scfg, $level, $priority, $message)
 #   $level: 0=always, 1=light debug, 2=verbose debug
@@ -2491,6 +2509,22 @@ sub alloc_image {
 
     # Level 2: Verbose - unit conversion details
     _log($scfg, 2, 'debug', "alloc_image: converting $size_kib KiB → $bytes bytes");
+
+    # Parse configured blocksize to bytes for alignment
+    my $bs_bytes = _parse_blocksize($scfg->{zvol_blocksize});
+
+    # Align to volblocksize if configured (mirrors volume_resize logic at line 1307-1311)
+    if ($bs_bytes && $bs_bytes > 0) {
+        my $original_bytes = $bytes;
+        my $rem = $bytes % $bs_bytes;
+        if ($rem) {
+            $bytes += ($bs_bytes - $rem);
+            _log($scfg, 1, 'info', sprintf(
+                "alloc_image: size alignment: requested %d bytes → aligned %d bytes (volblocksize: %s)",
+                $original_bytes, $bytes, $scfg->{zvol_blocksize}
+            ));
+        }
+    }
 
     # Pre-flight checks: validate all prerequisites before expensive operations
     _log($scfg, 1, 'info', "alloc_image: running pre-flight checks for $bytes bytes");
