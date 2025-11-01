@@ -22,6 +22,15 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
   - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
   - [iSCSI Session Issues](#iscsi-session-issues)
+- [NVMe/TCP Connection Issues](#nvmetcp-connection-issues)
+  - ["nvme-cli is not installed"](#nvme-cli-is-not-installed)
+  - ["Could not determine host NQN"](#could-not-determine-host-nqn)
+  - ["Failed to connect to any NVMe/TCP portal"](#failed-to-connect-to-any-nvmetcp-portal)
+  - [DH-CHAP Authentication Failures](#dh-chap-authentication-failures)
+- [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
+  - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
+  - [Namespace Creation Fails](#namespace-creation-fails)
+  - ["REST API not supported for NVMe-oF operations"](#rest-api-not-supported-for-nvme-of-operations)
 - [Volume Creation Issues](#volume-creation-issues)
   - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
   - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
@@ -825,6 +834,417 @@ iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox --logout
 iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
   -p YOUR_TRUENAS_IP:3260 --login
 ```
+
+## NVMe/TCP Connection Issues
+
+These issues are specific to `transport_mode nvme-tcp` configurations. For iSCSI issues, see the previous section.
+
+### "nvme-cli is not installed"
+
+**Symptom**: Plugin reports nvme-cli package is missing
+
+**Error Message**:
+```
+ERROR: nvme-cli is not installed on this system
+NVMe/TCP transport requires nvme-cli package
+```
+
+**Solution**:
+```bash
+# Install nvme-cli package
+apt-get update
+apt-get install nvme-cli
+
+# Verify installation
+nvme version
+# Expected: nvme version 2.x or later
+```
+
+**Verify nvme-cli is working**:
+```bash
+# Check for NVMe devices (should work even without targets)
+nvme list
+
+# If command not found, reinstall
+apt-get install --reinstall nvme-cli
+```
+
+### "Could not determine host NQN"
+
+**Symptom**: Plugin cannot find the host NQN identifier
+
+**Error Message**:
+```
+ERROR: Could not determine host NQN
+No hostnqn configured and /etc/nvme/hostnqn does not exist
+```
+
+**Diagnosis**:
+```bash
+# Check if hostnqn file exists
+cat /etc/nvme/hostnqn
+
+# If missing or empty, generate one
+```
+
+**Solutions**:
+
+#### 1. Generate Host NQN
+```bash
+# Generate new host NQN
+nvme gen-hostnqn > /etc/nvme/hostnqn
+
+# Verify it was created
+cat /etc/nvme/hostnqn
+# Example output: nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400
+```
+
+#### 2. Configure Explicit Host NQN
+```bash
+# Alternative: Set hostnqn in storage.cfg
+nano /etc/pve/storage.cfg
+
+# Add to NVMe storage configuration:
+hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
+```
+
+### "Failed to connect to any NVMe/TCP portal"
+
+**Symptom**: Cannot establish NVMe/TCP connection to TrueNAS
+
+**Error Message**:
+```
+ERROR: Failed to connect to any NVMe/TCP portal
+Attempted portals:
+  - 192.168.1.100:4420 (failed: connection refused)
+```
+
+**Diagnosis**:
+```bash
+# Check if subsystem is already connected
+nvme list-subsys
+
+# Check for NVMe devices
+nvme list
+
+# Test network connectivity
+ping 192.168.1.100
+telnet 192.168.1.100 4420
+```
+
+**Solutions**:
+
+#### 1. Verify TrueNAS NVMe-oF Service
+```bash
+# Check service status via API
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Should show: "state": "RUNNING"
+
+# Start service if not running
+curl -k -X POST 'https://TRUENAS_IP/api/v2.0/service/start' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"service": "nvmet"}'
+```
+
+In TrueNAS Web UI:
+- Navigate to **System Settings** → **Services**
+- Find **NVMe-oF Target**
+- Click toggle to start
+- (Optional) Enable **Start Automatically**
+
+#### 2. Check Network Connectivity
+```bash
+# Verify portal IP is reachable
+ping -c 3 192.168.1.100
+
+# Test NVMe/TCP port (4420)
+telnet 192.168.1.100 4420
+# Should connect successfully (Ctrl+C to exit)
+
+# If blocked, check firewalls:
+# - TrueNAS firewall rules
+# - Network firewall/ACLs
+# - Proxmox iptables
+```
+
+#### 3. Verify Portal Configuration
+```bash
+# Check TrueNAS NVMe ports
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/port' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Should show port 4420 listening on 0.0.0.0 or specific IPs
+# Example output:
+# {
+#   "addr_trtype": "TCP",
+#   "addr_trsvcid": 4420,
+#   "addr_traddr": "0.0.0.0"
+# }
+```
+
+#### 4. Check Storage Configuration
+```bash
+# Verify discovery_portal in storage.cfg
+grep discovery_portal /etc/pve/storage.cfg
+
+# For NVMe/TCP, should be IP:4420 (not 3260)
+discovery_portal 192.168.1.100:4420
+
+# Verify subsystem_nqn is correctly formatted
+grep subsystem_nqn /etc/pve/storage.cfg
+# Should start with nqn.YYYY-MM.
+```
+
+#### 5. Manual Connection Test
+```bash
+# Try manual NVMe/TCP connection
+nvme connect -t tcp \
+  -n nqn.2005-10.org.freenas.ctl:proxmox-test \
+  -a 192.168.1.100 \
+  -s 4420
+
+# Check if connection succeeded
+nvme list-subsys | grep -A 5 "proxmox-test"
+
+# Disconnect after test
+nvme disconnect -n nqn.2005-10.org.freenas.ctl:proxmox-test
+```
+
+### DH-CHAP Authentication Failures
+
+**Symptom**: Connection fails with authentication errors when using DH-CHAP secrets
+
+**Error Message**:
+```
+ERROR: NVMe connect failed: authentication failed
+Controller rejected host authentication
+```
+
+**Diagnosis**:
+```bash
+# Check kernel logs for auth errors
+dmesg | grep -i nvme | grep -i auth
+
+# Verify secrets are configured
+grep nvme_dhchap /etc/pve/storage.cfg
+```
+
+**Solutions**:
+
+#### 1. Verify Secret Matching
+```bash
+# Check TrueNAS host configuration
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Compare hostnqn and dhchap_key with Proxmox configuration
+cat /etc/nvme/hostnqn
+grep nvme_dhchap_secret /etc/pve/storage.cfg
+```
+
+**The host NQN and secret must match exactly between Proxmox and TrueNAS.**
+
+#### 2. Regenerate Secrets
+```bash
+# Generate new host secret
+nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+# Output: DHHC-1:01:base64data...
+
+# Update on both sides:
+# 1. Proxmox: Add to storage.cfg as nvme_dhchap_secret
+# 2. TrueNAS: Update via API or GUI for the host NQN
+```
+
+#### 3. Check Subsystem Access Control
+```bash
+# Verify subsystem allows host
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Check allow_any_host setting
+# If false, host must be explicitly linked to subsystem
+```
+
+#### 4. Test Without Authentication
+```bash
+# Temporarily remove DH-CHAP secrets to test connectivity
+nano /etc/pve/storage.cfg
+
+# Comment out secrets:
+# nvme_dhchap_secret DHHC-1:01:...
+# nvme_dhchap_ctrl_secret DHHC-1:01:...
+
+# Set subsystem allow_any_host = true in TrueNAS
+
+# Restart pvedaemon
+systemctl restart pvedaemon
+
+# Try creating a test volume
+# If this works, the issue is with authentication configuration
+```
+
+## NVMe/TCP Namespace Issues
+
+### "Could not locate NVMe device for UUID"
+
+**Symptom**: Namespace created but device path not found
+
+**Error Message**:
+```
+ERROR: Could not locate NVMe device for UUID after 5 seconds
+Expected device: /dev/disk/by-id/nvme-uuid.550e8400-e29b-41d4-a716-446655440000
+```
+
+**Diagnosis**:
+```bash
+# Check if subsystem is connected
+nvme list-subsys | grep -i <subsystem_nqn>
+
+# List NVMe devices
+nvme list
+
+# Check for UUID symlinks
+ls -la /dev/disk/by-id/nvme-uuid.*
+```
+
+**Solutions**:
+
+#### 1. Verify Subsystem Connection
+```bash
+# Check if subsystem shows as connected
+nvme list-subsys
+
+# Look for your subsystem with "live" status:
+# nvme-subsysX - NQN=nqn.2005-10.org.freenas.ctl:proxmox-test
+# \
+#  +- nvmeX tcp traddr=192.168.1.100,trsvcid=4420 live
+
+# If not connected, connection failed
+# See "Failed to connect to any NVMe/TCP portal" section above
+```
+
+#### 2. Trigger udev Rescan
+```bash
+# Manually settle udev events
+udevadm settle
+
+# Wait a moment
+sleep 2
+
+# Check for device again
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Reload udev rules if needed
+udevadm control --reload-rules
+udevadm trigger
+```
+
+#### 3. Verify Namespace Exists on TrueNAS
+```bash
+# Check TrueNAS namespaces
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/namespace' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Look for namespace with matching device_uuid
+# Verify it's enabled and associated with correct subsystem
+```
+
+#### 4. Check Kernel Logs
+```bash
+# Look for NVMe errors
+dmesg | grep -i nvme | tail -50
+
+# Look for device discovery messages
+dmesg | grep -i "nvme.*namespace"
+```
+
+### Namespace Creation Fails
+
+**Symptom**: Cannot create NVMe namespace on TrueNAS
+
+**Error Messages**:
+```
+ERROR: Failed to create NVMe namespace
+TrueNAS API returned error: subsystem not found
+```
+
+**Solutions**:
+
+#### 1. Verify NVMe-oF Service Running
+```bash
+# Check service status
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Must show "state": "RUNNING"
+```
+
+#### 2. Check Dataset Exists
+```bash
+# Verify ZFS dataset configured in storage.cfg exists
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/pool/dataset/id/tank%2Fproxmox' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Replace tank/proxmox with your dataset path (URL-encoded)
+# %2F = / (slash)
+```
+
+#### 3. Verify WebSocket API Transport
+```bash
+# NVMe operations require WebSocket transport
+grep api_transport /etc/pve/storage.cfg
+
+# Must be:
+api_transport ws
+
+# NOT:
+# api_transport rest  (REST does not support nvmet.* API calls)
+```
+
+#### 4. Check Subsystem Exists
+```bash
+# List subsystems
+curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+
+# Verify subsystem with your configured subsystem_nqn exists
+# Plugin should auto-create it, but may fail if service issues
+```
+
+### "REST API not supported for NVMe-oF operations"
+
+**Symptom**: NVMe operations fail with API transport error
+
+**Error Message**:
+```
+ERROR: REST API not supported for NVMe-oF operations
+NVMe namespace management requires WebSocket transport
+Please set api_transport = ws in storage configuration
+```
+
+**Solution**:
+```bash
+# Edit storage configuration
+nano /etc/pve/storage.cfg
+
+# Find your NVMe storage configuration
+# Add or change to WebSocket transport:
+truenasplugin: truenas-nvme
+    api_transport ws
+    api_scheme wss
+    # ... other parameters
+
+# Restart Proxmox services
+systemctl restart pvedaemon pveproxy
+```
+
+**Why WebSocket is Required**:
+- TrueNAS `nvmet.*` API endpoints (subsystem, namespace, port) only work via WebSocket
+- REST API does not expose these endpoints
+- This is a TrueNAS SCALE limitation, not a plugin limitation
 
 ## Volume Creation Issues
 

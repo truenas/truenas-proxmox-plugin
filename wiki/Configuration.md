@@ -27,6 +27,13 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [use_multipath](#use_multipath)
   - [use_by_path](#use_by_path)
   - [ipv6_by_path](#ipv6_by_path)
+- [Transport Mode Selection](#transport-mode-selection)
+  - [transport_mode](#transport_mode)
+- [NVMe/TCP Configuration](#nvmetcp-configuration)
+  - [subsystem_nqn](#subsystem_nqn)
+  - [hostnqn](#hostnqn)
+  - [nvme_dhchap_secret](#nvme_dhchap_secret)
+  - [nvme_dhchap_ctrl_secret](#nvme_dhchap_ctrl_secret)
 - [iSCSI Behavior](#iscsi-behavior)
   - [force_delete_on_inuse](#force_delete_on_inuse)
   - [logout_on_free](#logout_on_free)
@@ -86,12 +93,15 @@ api_key 1-your-api-key-here
 **Description**: iSCSI target IQN (iSCSI Qualified Name)
 **Type**: String (IQN format)
 **Example**: `iqn.2005-10.org.freenas.ctl:proxmox`
+**Required For**: iSCSI transport mode only
 
 Configure in TrueNAS: **Shares** → **Block Shares (iSCSI)** → **Targets**
 
 ```ini
 target_iqn iqn.2005-10.org.freenas.ctl:proxmox
 ```
+
+**Note**: When using `transport_mode nvme-tcp`, use `subsystem_nqn` instead of `target_iqn`.
 
 ### `dataset`
 **Description**: Parent ZFS dataset path for Proxmox volumes
@@ -106,13 +116,21 @@ dataset tank/proxmox
 ```
 
 ### `discovery_portal`
-**Description**: Primary iSCSI portal for target discovery
+**Description**: Primary portal for target/subsystem discovery
 **Type**: String (IP:PORT format)
-**Default Port**: 3260
-**Example**: `192.168.1.100:3260`
+**Default Port**:
+  - `3260` for iSCSI transport mode
+  - `4420` for NVMe/TCP transport mode
+**Example**:
+  - iSCSI: `192.168.1.100:3260`
+  - NVMe/TCP: `192.168.1.100:4420`
 
 ```ini
+# iSCSI mode
 discovery_portal 192.168.1.100:3260
+
+# NVMe/TCP mode
+discovery_portal 192.168.1.100:4420
 ```
 
 ## Content Type
@@ -267,6 +285,169 @@ Required for IPv6 iSCSI connections when using by-path.
 ipv6_by_path 0
 ```
 
+## Transport Mode Selection
+
+### `transport_mode`
+**Description**: Storage transport protocol
+**Type**: String
+**Valid Values**: `iscsi`, `nvme-tcp`
+**Default**: `iscsi`
+**Fixed**: Yes (cannot be changed after storage creation)
+
+Selects the protocol for communicating with TrueNAS storage:
+- `iscsi`: Traditional iSCSI block storage (default, widely compatible)
+- `nvme-tcp`: NVMe over TCP (lower latency, reduced CPU overhead, requires TrueNAS SCALE 25.10+)
+
+```ini
+# iSCSI mode (default)
+transport_mode iscsi
+
+# NVMe/TCP mode
+transport_mode nvme-tcp
+```
+
+**Important Notes:**
+- `transport_mode` cannot be changed after storage creation (prevents volume orphaning)
+- Different transport modes have different required parameters:
+  - **iSCSI mode**: Requires `target_iqn`, `discovery_portal` (port 3260)
+  - **NVMe/TCP mode**: Requires `subsystem_nqn`, `discovery_portal` (port 4420), `api_transport ws`
+- Volume naming formats differ between modes (incompatible for migration)
+- See [NVMe-Setup.md](NVMe-Setup.md) for complete NVMe/TCP setup guide
+
+**When to Use NVMe/TCP:**
+- Modern infrastructure (TrueNAS SCALE 25.10+, Proxmox 9.x+)
+- Performance-critical workloads (databases, high IOPS)
+- Lower latency requirements
+- CPU overhead reduction
+
+**When to Use iSCSI:**
+- Older infrastructure (compatibility)
+- Proven stability requirements
+- Existing iSCSI infrastructure
+
+## NVMe/TCP Configuration
+
+These parameters are only applicable when `transport_mode nvme-tcp` is set.
+
+### `subsystem_nqn`
+**Description**: NVMe subsystem NQN (NVMe Qualified Name)
+**Type**: String (NQN format)
+**Required**: Yes (when using NVMe/TCP transport)
+**Fixed**: Yes (cannot be changed after creation)
+**Format**: `nqn.YYYY-MM.domain:identifier`
+**Example**: `nqn.2005-10.org.freenas.ctl:proxmox-nvme`
+
+The NVMe subsystem identifier on TrueNAS. The plugin automatically creates the subsystem if it doesn't exist.
+
+```ini
+subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+```
+
+**Format Requirements:**
+- Must start with `nqn.`
+- Followed by date in `YYYY-MM` format (e.g., `2005-10`)
+- Reverse domain notation (e.g., `org.freenas.ctl`)
+- Colon-separated identifier (e.g., `:proxmox-nvme`)
+
+**Validation Examples:**
+```
+✓ Valid:   nqn.2005-10.org.freenas.ctl:proxmox-nvme
+✓ Valid:   nqn.2025-10.us.neuforth:proxmox-multipath
+✗ Invalid: iqn.2005-10.org.freenas.ctl:proxmox  (wrong protocol prefix)
+✗ Invalid: nqn.org.freenas.ctl:proxmox         (missing date)
+```
+
+### `hostnqn`
+**Description**: NVMe host NQN (initiator identifier)
+**Type**: String (NQN format)
+**Required**: No (auto-detected from `/etc/nvme/hostnqn`)
+**Format**: Must start with `nqn.`
+**Example**: `nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400`
+
+Override the default host NQN for custom host identification. By default, the plugin reads the host NQN from `/etc/nvme/hostnqn` on the Proxmox node.
+
+```ini
+hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid-here
+```
+
+**Use Cases:**
+- Custom host identification for security policies
+- Multi-host setups with specific NQN requirements
+- Testing different host identities
+
+**Default Behavior:**
+If not specified, the plugin reads from:
+```bash
+cat /etc/nvme/hostnqn
+# Example output: nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400
+```
+
+Generate a new hostnqn:
+```bash
+nvme gen-hostnqn > /etc/nvme/hostnqn
+```
+
+### `nvme_dhchap_secret`
+**Description**: DH-HMAC-CHAP host authentication secret (unidirectional)
+**Type**: String
+**Format**: `DHHC-1:01:base64encodeddata...`
+**Required**: No (authentication is optional)
+**Default**: None
+
+Host authentication secret for authenticating the Proxmox host to the TrueNAS controller. Provides security by preventing unauthorized hosts from accessing the subsystem.
+
+```ini
+nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+```
+
+**Secret Format:**
+- `DHHC-1`: DH-CHAP protocol version 1
+- `01`: Hash algorithm (01 = SHA-256, 02 = SHA-384, 03 = SHA-512)
+- Base64-encoded secret data
+
+**Generate Secret:**
+```bash
+nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
+# Output: DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+```
+
+**Key Length Options:**
+- `32` bytes (256-bit) - Recommended
+- `48` bytes (384-bit)
+- `64` bytes (512-bit)
+
+**Security Notes:**
+- The same secret must be configured on TrueNAS for the host NQN
+- Secrets are stored in `/etc/pve/storage.cfg` (cluster-wide sync)
+- See [NVMe-Setup.md - DH-CHAP Authentication](NVMe-Setup.md#dh-chap-authentication-setup) for complete setup
+
+### `nvme_dhchap_ctrl_secret`
+**Description**: DH-HMAC-CHAP controller authentication secret (bidirectional)
+**Type**: String
+**Format**: `DHHC-1:01:base64encodeddata...`
+**Required**: No (bidirectional authentication is optional)
+**Default**: None
+
+Controller authentication secret for authenticating the TrueNAS controller to the Proxmox host (mutual authentication). Prevents man-in-the-middle attacks.
+
+```ini
+nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+```
+
+**Use Cases:**
+- Mutual authentication (both host and controller verify each other)
+- High-security environments
+- Preventing man-in-the-middle attacks
+
+**Setup:**
+1. Generate a separate controller secret (different from host secret)
+2. Configure on Proxmox as `nvme_dhchap_ctrl_secret`
+3. Configure the same secret on TrueNAS as the controller secret
+
+**Security Model:**
+- **Unidirectional** (host secret only): Proxmox proves identity to TrueNAS
+- **Bidirectional** (host + controller secrets): Both sides prove identity (recommended)
+
 ## iSCSI Behavior
 
 ### `force_delete_on_inuse`
@@ -394,7 +575,7 @@ chap_password your-secure-chap-password
 
 ## Configuration Examples
 
-### Basic Single-Node Configuration
+### Basic Single-Node Configuration (iSCSI)
 ```ini
 truenasplugin: truenas-basic
     api_host 192.168.1.100
@@ -402,6 +583,20 @@ truenasplugin: truenas-basic
     target_iqn iqn.2005-10.org.freenas.ctl:proxmox
     dataset tank/proxmox
     discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+```
+
+### Basic NVMe/TCP Configuration
+```ini
+truenasplugin: truenas-nvme
+    api_host 192.168.1.100
+    api_key 1-your-api-key
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    dataset tank/proxmox
+    discovery_portal 192.168.1.100:4420
+    api_transport ws
     content images
     shared 1
 ```
@@ -454,6 +649,42 @@ truenasplugin: truenas-ha
     chap_password very-secure-password
     force_delete_on_inuse 1
     api_retry_max 5
+```
+
+### NVMe/TCP with DH-CHAP Authentication
+```ini
+truenasplugin: truenas-nvme-secure
+    api_host 192.168.10.100
+    api_key 1-your-api-key
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
+    dataset tank/proxmox
+    discovery_portal 192.168.10.100:4420
+    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+    api_transport ws
+    api_scheme wss
+    api_port 443
+    content images
+    shared 1
+    zvol_blocksize 64K
+```
+
+### NVMe/TCP Multipath Configuration
+```ini
+truenasplugin: truenas-nvme-multipath
+    api_host 192.168.10.100
+    api_key 1-your-api-key
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
+    dataset tank/proxmox
+    discovery_portal 192.168.10.100:4420
+    portals 192.168.10.101:4420,192.168.10.102:4420
+    api_transport ws
+    content images
+    shared 1
+    zvol_blocksize 128K
+    tn_sparse 1
 ```
 
 ### IPv6 Configuration

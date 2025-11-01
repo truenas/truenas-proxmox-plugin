@@ -4,15 +4,30 @@
 # Choose the configuration that best matches your environment
 
 # =============================================================================
-# BASIC CONFIGURATION
+# BASIC CONFIGURATION (iSCSI)
 # =============================================================================
-# Simple single-node setup with minimal configuration
+# Simple single-node setup with minimal configuration using iSCSI
 truenasplugin: truenas-basic
     api_host 192.168.1.100
     api_key 1-abcdef1234567890abcdef1234567890abcdef12
     target_iqn iqn.2005-10.org.freenas.ctl:proxmox-target
     dataset tank/proxmox
     discovery_portal 192.168.1.100:3260
+    content images
+    shared 1
+
+# =============================================================================
+# BASIC NVME/TCP CONFIGURATION
+# =============================================================================
+# Simple single-node setup using NVMe/TCP for lower latency
+truenasplugin: truenas-nvme
+    api_host 192.168.1.100
+    api_key 1-abcdef1234567890abcdef1234567890abcdef12
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    dataset tank/proxmox
+    discovery_portal 192.168.1.100:4420
+    api_transport ws
     content images
     shared 1
 
@@ -155,6 +170,44 @@ truenasplugin: truenas-rest
     tn_sparse 1
 
 # =============================================================================
+# NVME/TCP WITH DH-CHAP AUTHENTICATION
+# =============================================================================
+# Secure NVMe/TCP setup with mutual authentication
+truenasplugin: truenas-nvme-secure
+    api_host 192.168.10.100
+    api_key 1-nvmesecure123456789abcdef123456789abcdef
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
+    dataset tank/proxmox
+    discovery_portal 192.168.10.100:4420
+    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+    api_transport ws
+    api_scheme wss
+    api_port 443
+    content images
+    shared 1
+    zvol_blocksize 64K
+
+# =============================================================================
+# NVME/TCP MULTIPATH CONFIGURATION
+# =============================================================================
+# High-availability NVMe/TCP with multiple paths
+truenasplugin: truenas-nvme-multipath
+    api_host 192.168.10.100
+    api_key 1-nvmemulti123456789abcdef123456789abcdef12
+    transport_mode nvme-tcp
+    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
+    dataset tank/proxmox
+    discovery_portal 192.168.10.100:4420
+    portals 192.168.10.101:4420,192.168.10.102:4420
+    api_transport ws
+    content images
+    shared 1
+    zvol_blocksize 128K
+    tn_sparse 1
+
+# =============================================================================
 # SMALL OFFICE CONFIGURATION
 # =============================================================================
 # Single TrueNAS server, small cluster (2-3 nodes)
@@ -184,10 +237,27 @@ truenasplugin: truenas-soho
 # - Use user-linked keys with appropriate permissions
 # - Keep keys secure and rotate regularly
 #
-# Target IQN:
-# - Configure in TrueNAS: Shares > Block Shares (iSCSI) > Targets
+# Transport Mode Selection:
+# - iSCSI (default): Traditional block storage, widely compatible
+# - NVMe/TCP: Lower latency, reduced CPU overhead (requires TrueNAS 25.10+)
+# - CANNOT be changed after storage creation
+# - Different required parameters for each mode
+#
+# iSCSI Configuration:
+# - Target IQN: Configure in TrueNAS: Shares > Block Shares (iSCSI) > Targets
 # - Use descriptive names for easier management
 # - Ensure targets are associated with proper portals
+# - Default port: 3260
+# - Optional CHAP authentication for security
+#
+# NVMe/TCP Configuration:
+# - Subsystem NQN: Format nqn.YYYY-MM.domain:identifier
+# - Plugin auto-creates subsystem if it doesn't exist
+# - Default port: 4420
+# - Requires api_transport = ws (WebSocket)
+# - Install nvme-cli on Proxmox nodes: apt-get install nvme-cli
+# - Generate host NQN: nvme gen-hostnqn > /etc/nvme/hostnqn
+# - Optional DH-CHAP authentication (generate with: nvme gen-dhchap-key)
 #
 # Datasets:
 # - Create parent datasets in TrueNAS before use
@@ -195,27 +265,39 @@ truenasplugin: truenas-soho
 # - Consider quotas and compression settings
 #
 # Portals:
-# - Configure in TrueNAS: Shares > Block Shares (iSCSI) > Portals
+# - iSCSI: Configure in TrueNAS: Shares > Block Shares (iSCSI) > Portals
+# - NVMe/TCP: Configure in TrueNAS NVMe-oF service (port 4420)
 # - Use multiple portals for redundancy
 # - Ensure proper network connectivity
+# - NVMe/TCP native multipath: specify additional portals
 #
 # Security:
-# - Use CHAP authentication in production
+# - iSCSI: Use CHAP authentication in production
+# - NVMe/TCP: Use DH-CHAP secrets for authentication
 # - Disable api_insecure in production
 # - Use dedicated VLANs for storage traffic
 #
 # Performance:
 # - Use 128K block size for VM workloads
+# - Use 64K for database workloads (NVMe/TCP recommended)
 # - Enable sparse volumes for thin provisioning
 # - Configure multipath for redundancy and performance
 # - Use local vmstate storage for better performance
+# - NVMe/TCP provides lower latency than iSCSI
 #
 # Cluster:
 # - Set shared=1 for cluster configurations
 # - Ensure all nodes have identical configurations
 # - Test failover scenarios regularly
+# - NVMe/TCP and iSCSI cannot be mixed on same storage ID
 #
 # Monitoring:
 # - Monitor storage performance regularly
 # - Set up alerts for storage issues
 # - Keep TrueNAS and Proxmox updated
+# - For NVMe/TCP: Monitor with nvme list-subsys and nvme list
+#
+# Documentation:
+# - See wiki/NVMe-Setup.md for complete NVMe/TCP setup guide
+# - See wiki/Configuration.md for detailed parameter reference
+# - See wiki/Troubleshooting.md for common issues and solutions

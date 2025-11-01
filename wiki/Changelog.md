@@ -1,5 +1,80 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.0 (October 31, 2025)
+
+### 🚀 **Major Feature: NVMe/TCP Transport Support**
+
+Added native NVMe over TCP (NVMe/TCP) as an alternative transport mode to traditional iSCSI, providing significantly lower latency and reduced CPU overhead for modern infrastructures.
+
+#### **Key Features**
+- **Dual-transport architecture** - Choose between iSCSI (default, widely compatible) or NVMe/TCP (modern, high-performance)
+- **Full lifecycle operations** - Complete support for volume create, delete, resize, list, clone, and snapshot operations
+- **Native multipath** - NVMe/TCP native multipathing with multiple portal support
+- **DH-HMAC-CHAP authentication** - Optional unidirectional or bidirectional authentication for secure connections
+- **UUID-based device mapping** - Reliable device identification using `/dev/disk/by-id/nvme-uuid.*` paths
+- **Automatic subsystem management** - Plugin creates and manages NVMe subsystems automatically via TrueNAS API
+
+#### **Configuration**
+New `transport_mode` parameter selects the storage protocol:
+- `transport_mode iscsi` - Traditional iSCSI (default, backward compatible)
+- `transport_mode nvme-tcp` - NVMe over TCP (requires TrueNAS SCALE 25.10+)
+
+**NVMe/TCP-specific parameters:**
+- `subsystem_nqn` - NVMe subsystem NQN (required, format: `nqn.YYYY-MM.domain:identifier`)
+- `hostnqn` - NVMe host NQN (optional, auto-detected from `/etc/nvme/hostnqn`)
+- `nvme_dhchap_secret` - Host authentication secret (optional DH-CHAP auth)
+- `nvme_dhchap_ctrl_secret` - Controller authentication secret (optional bidirectional auth)
+
+**Important notes:**
+- `transport_mode` is **fixed** and cannot be changed after storage creation
+- NVMe/TCP requires `api_transport ws` (WebSocket API transport)
+- Different device naming: iSCSI uses `vol-<name>-lun<N>`, NVMe uses `vol-<name>-ns<UUID>`
+- Default ports: iSCSI uses 3260, NVMe/TCP uses 4420
+
+#### **Requirements**
+- **TrueNAS**: SCALE 25.10.0 or later with NVMe-oF Target service enabled
+- **Proxmox**: VE 9.x or later with `nvme-cli` package installed (`apt-get install nvme-cli`)
+- **API Transport**: WebSocket required (`api_transport ws`) - REST API does not support NVMe operations
+
+#### **Performance Characteristics**
+Based on NVMe/TCP protocol advantages:
+- **Lower latency**: 50-150μs vs iSCSI 200-500μs (typical)
+- **Reduced CPU overhead**: No SCSI emulation layer
+- **Better queue depth**: Native NVMe queuing (64K+ commands) vs iSCSI single queue
+- **Native multipath**: Built-in multipathing without dm-multipath complexity
+
+#### **📚 Documentation**
+Comprehensive documentation added:
+- **wiki/NVMe-Setup.md** - Complete setup guide with step-by-step TrueNAS and Proxmox configuration
+- **wiki/Configuration.md** - Updated with NVMe/TCP parameter reference and examples
+- **wiki/Troubleshooting.md** - Added NVMe-specific troubleshooting sections
+- **storage.cfg.example** - Added NVMe/TCP configuration examples
+
+#### **🔧 Technical Implementation**
+- Lines 286-357: Configuration schema with transport mode and NVMe parameters
+- Lines 540-598: Configuration validation with transport-specific checks
+- Lines 2123-2424: NVMe helper functions (connection, device mapping, subsystem/namespace management)
+- Lines 2782-2793: NVMe-specific volume allocation
+- Lines 3084-3100: NVMe-specific volume deletion
+- Lines 3298-3380: NVMe-specific volume listing
+
+#### **Migration from iSCSI**
+In-place migration is **not possible** due to:
+- Volume naming format incompatibility (LUN numbers vs UUIDs)
+- Device path differences (`/dev/disk/by-path/` vs `/dev/disk/by-id/nvme-uuid.*`)
+- Transport mode marked as fixed in schema
+
+**Migration path**: Create new NVMe storage with different storage ID, use `qm move-disk` to migrate VM disks individually.
+
+#### **Validation and Testing**
+- Verified on TrueNAS SCALE 25.10.0 with Proxmox VE 9.x
+- Tested nvme-cli version 2.13 (git 2.13) with libnvme 1.13
+- Validated DH-CHAP authentication (secret generation and configuration)
+- Confirmed UUID-based device paths and multipath operation
+- Verified all API endpoints (subsystem, namespace, port, host configuration)
+
+---
+
 ## Version 1.0.8 (October 31, 2025)
 
 ### 🐛 **Bug Fix**
