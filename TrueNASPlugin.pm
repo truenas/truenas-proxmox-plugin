@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.9';
+our $VERSION = '1.1.10';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -4160,15 +4160,38 @@ sub activate_volume {
 
     my $mode = $scfg->{transport_mode} // 'iscsi';
 
+    # Parse volname to extract metadata (LUN for iSCSI, UUID for NVMe)
+    my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
+
     if ($mode eq 'iscsi') {
         _iscsi_login_all($scfg);
         if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
-        run_command(['udevadm','settle'], outfunc => sub {});
-        usleep(DEVICE_RESCAN_DELAY_US);
+
+        # Wait for the specific LUN device to appear (up to 5s)
+        my $lun = $metadata;
+        _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for LUN $lun device");
+        eval {
+            my $dev = _device_for_lun($scfg, $lun);
+            _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $@");
+            die $@;
+        }
     } elsif ($mode eq 'nvme-tcp') {
         _nvme_connect($scfg);
-        run_command(['udevadm','settle'], outfunc => sub {});
-        usleep(DEVICE_RESCAN_DELAY_US);
+
+        # Wait for the specific namespace device to appear (up to 5s)
+        my $device_uuid = $metadata;
+        _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
+        eval {
+            my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+            _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
+        };
+        if ($@) {
+            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $@");
+            die $@;
+        }
     }
 
     return 1;

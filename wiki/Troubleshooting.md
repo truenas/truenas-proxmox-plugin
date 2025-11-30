@@ -1733,6 +1733,24 @@ pvesm status
 ping YOUR_TRUENAS_IP
 ```
 
+#### 4. Check Block Device Discovery (if migration still fails)
+```bash
+# On destination node, verify devices appear after volume activation
+# For iSCSI:
+ls -la /dev/disk/by-path/ | grep iscsi
+
+# For NVMe-oF-TCP:
+nvme list
+ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Enable debug logging to see device wait process
+# In /etc/pve/storage.cfg:
+debug 2
+
+# Then check logs during migration
+journalctl -f | grep '\[TrueNAS\].*activate_volume'
+```
+
 ## Log Files and Debugging
 
 ### Proxmox Logs

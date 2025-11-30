@@ -1,5 +1,44 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.10 (November 30, 2025)
+
+### 🐛 **Critical Bug Fix: VM Migration Device Wait**
+
+#### **Fixed VM Migration for Both iSCSI and NVMe-oF-TCP**
+- **Modified `activate_volume` function to properly wait for block devices during migration** (GitHub Issue #44)
+  - **Problem**: VM migrations failed because `activate_volume` only waited 250 microseconds for block devices to appear
+  - **Impact**: All VM migrations to both iSCSI and NVMe-oF-TCP storage failed with "Could not locate device" errors
+  - **Root cause**: Volume metadata was transferred to destination node, but QEMU tried to start before block device path existed
+  - **Solution implemented** (lines 4155-4198):
+    - Added `parse_volname` call to extract LUN (iSCSI) or device UUID (NVMe) metadata from volname
+    - For iSCSI: Now calls `_device_for_lun()` which waits up to 5 seconds for `/dev/disk/by-path/` device to appear
+    - For NVMe-oF-TCP: Now calls `_nvme_device_for_uuid()` which waits up to 5 seconds for namespace device to appear
+    - Added proper error handling with detailed troubleshooting messages if device wait times out
+    - Added debug logging at level 2 for device wait operations
+
+### 🔧 **Technical Details**
+- Reuses existing proven device wait helpers that work correctly during normal volume creation
+- No new functions added - minimal change approach
+- Progressive intervention during wait (udev settle, session rescan, controller rescan)
+- Both online and offline migration scenarios validated
+- Works with multipath configurations
+
+### 📊 **Impact**
+- **Migration reliability**: Enables reliable VM migration for both iSCSI and NVMe-oF-TCP storage
+- **No breaking changes**: Backward compatible with existing configurations
+- **Proper error reporting**: If device wait times out, provides detailed troubleshooting guidance
+- **Test coverage**: Successfully tested on 3-node cluster with bidirectional migrations
+
+### ✅ **Validation**
+- Tested iSCSI offline migration (bidirectional)
+- Tested NVMe-oF-TCP offline migration (bidirectional)
+- Tested cross-transport migrations (iSCSI ↔ NVMe-oF-TCP)
+- Tested 3-node migration circuit
+- Verified device wait logic (up to 5 seconds, proper error propagation)
+- Confirmed no regressions to normal volume creation workflow
+
+---
+
 ## Version 1.1.9 (November 22, 2025)
 
 ### 🧹 **SCSI Device Cleanup After iSCSI Disk Deletion**

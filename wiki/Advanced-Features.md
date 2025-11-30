@@ -879,7 +879,7 @@ truenasplugin: cluster-storage
 ```
 
 **Critical Settings**:
-- `shared 1` - Required for cluster
+- `shared 1` - Required for cluster and VM migration
 - Multiple portals - For redundancy
 - `use_multipath 1` - For failover
 
