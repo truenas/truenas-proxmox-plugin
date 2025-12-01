@@ -4257,7 +4257,17 @@ sub _clone_image_iscsi {
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
 
     # 1) Create ZFS clone from snapshot
-    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+    my $clone_result = _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # Wait for clone job to complete if it returned a job ID
+    if (defined $clone_result && !ref($clone_result) && $clone_result =~ /^\d+$/) {
+        _log($scfg, 1, 'info', "[TrueNAS] _clone_image_iscsi: waiting for clone job $clone_result to complete");
+        my $job_result = _wait_for_job_completion($scfg, $clone_result, 30);
+        unless ($job_result->{success}) {
+            die "Failed to clone zvol $source_snapshot to $target_full: " . ($job_result->{error} // 'Unknown error') . "\n";
+        }
+        _log($scfg, 1, 'info', "[TrueNAS] _clone_image_iscsi: clone completed successfully");
+    }
 
     # 2) Create iSCSI extent for the cloned zvol
     my $zvol_path = 'zvol/' . $target_full;
