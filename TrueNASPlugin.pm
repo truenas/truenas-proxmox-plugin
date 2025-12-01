@@ -1524,12 +1524,19 @@ sub volume_resize {
     # Perform the TrueNAS zvol grow
     my $id = URI::Escape::uri_escape($full);
     my $payload = { volsize => int($req_bytes) };
-    _api_call(
+    my $result = _api_call(
         $scfg,
         'pool.dataset.update',
         [ $full, $payload ],
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) },
     );
+
+    # Wait for resize job completion before rescanning (prevent race condition)
+    my $job_result = _handle_api_result_with_job_support($scfg, $result, "volume resize for $volname", 60);
+    if (!$job_result->{success}) {
+        _log($scfg, 0, 'err', "[TrueNAS] volume_resize: failed for $volname: " . $job_result->{error});
+        die $job_result->{error};
+    }
 
     # Initiator-side rescan so Linux sees the new size (transport-specific)
     my $mode = $scfg->{transport_mode} // 'iscsi';
