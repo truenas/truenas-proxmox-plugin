@@ -1,5 +1,46 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.10 (November 30, 2025)
+
+### 🐛 **Critical Bug Fix: Volume Resize Race Condition**
+
+#### **Fixed race condition in volume resize causing VM crashes**
+- **Fixed `volume_resize()` function to wait for TrueNAS job completion** - Plugin now waits for resize operations to complete before rescanning iSCSI/NVMe sessions
+  - **GitHub Issue**: [#45](https://github.com/WarlockSyno/TrueNAS-Proxmox-VE-Storage-Plugin/issues/45)
+  - **Problem**: Plugin rescanned iSCSI/NVMe sessions immediately after calling TrueNAS resize API, before the async job completed
+  - **Impact**: Caused "access beyond end of device" kernel errors, I/O errors, and VM crashes during disk resize operations in multipath configurations
+  - **Root cause**: SCSI layer queried device size while TrueNAS was still processing the resize job, resulting in size mismatches
+  - **Solution implemented**:
+    - Added job completion waiting using existing `_handle_api_result_with_job_support()` helper (lines 1534-1539)
+    - 60-second timeout for resize operations (matching snapshot/delete patterns)
+    - Proper error handling with logging on job failures
+    - Only rescans iSCSI/NVMe sessions after confirmed job completion
+    - Applies to both iSCSI and NVMe/TCP transport modes
+
+### 🔧 **Technical Details**
+- Modified `volume_resize()` function in TrueNASPlugin.pm
+  - Capture API call result instead of ignoring return value (line 1527)
+  - Wait for async job completion before device rescan (lines 1534-1539)
+  - Die with clear error message if resize job fails
+  - Pattern follows established snapshot/delete implementations
+  - 5 lines added, 1 line modified - minimal change approach
+
+### 📊 **Impact**
+- **Eliminated resize crashes**: No more "access beyond end of device" errors during resize operations
+- **Multipath compatibility**: Resize operations now safe in multipath configurations
+- **Both transport modes**: Fix applies to both iSCSI and NVMe/TCP
+- **No API changes**: Existing configurations continue to work without modification
+- **Production ready**: Tested on TrueNAS SCALE 25.10.0 with both transport modes
+
+### ✅ **Validation**
+- Tested iSCSI mode: Successfully resized 10GB → 20GB without errors
+- Tested NVMe/TCP mode: Successfully resized 10GB → 20GB without errors
+- Verified no kernel errors in `dmesg` during or after resize
+- Confirmed no VM crashes or I/O errors with active workloads during resize
+- Multipath systems handle resize correctly without path failures
+
+---
+
 ## Version 1.1.9 (November 22, 2025)
 
 ### 🧹 **SCSI Device Cleanup After iSCSI Disk Deletion**
