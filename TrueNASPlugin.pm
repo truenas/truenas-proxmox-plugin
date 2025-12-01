@@ -2471,13 +2471,14 @@ sub _nvme_find_device_by_subsystem {
         my @devices;
         opendir(my $bdh, "/sys/block") or next;
         while (my $entry = readdir($bdh)) {
-            my ($ctrl_id, $nsid, $type);
+            my ($ctrl_id, $type);
 
             # Match both nvme3n1 and nvme3c3n1 patterns
-            if ($entry =~ /^nvme(\d+)n(\d+)$/) {
-                ($ctrl_id, $nsid, $type) = ($1, $2, 'standard');
-            } elsif ($entry =~ /^nvme(\d+)c(\d+)n(\d+)$/) {
-                ($ctrl_id, $nsid, $type) = ($1, $3, 'controller');
+            # Note: We no longer parse NSID from device name as it's unreliable
+            if ($entry =~ /^nvme(\d+)n\d+$/) {
+                ($ctrl_id, $type) = ($1, 'standard');
+            } elsif ($entry =~ /^nvme(\d+)c\d+n\d+$/) {
+                ($ctrl_id, $type) = ($1, 'controller');
             } else {
                 next;
             }
@@ -2504,55 +2505,87 @@ sub _nvme_find_device_by_subsystem {
             };
 
             if ($dev_nqn && $dev_nqn eq $nqn) {
-                push @devices, {path => "/dev/$entry", nsid => $nsid, type => $type, name => $entry};
+                # Read NSID and NGUID from sysfs (reliable sources)
+                my $sysfs_nsid = eval {
+                    open my $fh, '<', "/sys/block/$entry/nsid" or return undef;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    return $val;
+                };
+                my $sysfs_nguid = eval {
+                    open my $fh, '<', "/sys/block/$entry/nguid" or return undef;
+                    my $val = <$fh>;
+                    close $fh;
+                    chomp($val);
+                    return $val;
+                };
+
+                push @devices, {
+                    path => "/dev/$entry",
+                    nsid => $sysfs_nsid,
+                    nguid => $sysfs_nguid,
+                    type => $type,
+                    name => $entry
+                };
             }
         }
         closedir($bdh);
 
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found " . scalar(@devices) . " device(s) for subsystem $nqn");
 
+        # TIER 1: Try NGUID matching (most reliable, unambiguous)
         # Query TrueNAS once for namespace info
         my $ns_info = eval { _nvme_get_namespace_info($scfg, $device_uuid) };
+        my $api_error = $@;
 
-        # Try to match by NSID first if we have namespace info
-        if ($ns_info && defined $ns_info->{nsid}) {
+        if ($ns_info && defined $ns_info->{device_nguid}) {
+            my $target_nguid = $ns_info->{device_nguid};
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NGUID match for $target_nguid");
+
             for my $dev (@devices) {
-                if ($dev->{nsid} == $ns_info->{nsid}) {
+                if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
                     closedir($dh);
-                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found device $dev->{path} for UUID $device_uuid (NSID: $dev->{nsid}, type: $dev->{type})");
+                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NGUID (NSID: $dev->{nsid}, type: $dev->{type})");
                     return $dev->{path};
                 }
             }
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NGUID matching failed - no device matched NGUID $target_nguid");
         }
 
-        # Fallback: find newest device by mtime when NSID matching unavailable
-        # Used when TrueNAS API query fails or NSID doesn't match expected value
+        # TIER 2: Fall back to NSID matching if API provided it
+        # This handles older TrueNAS versions that might not have device_nguid field
+        if ($ns_info && defined $ns_info->{nsid}) {
+            my $target_nsid = $ns_info->{nsid};
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NSID match for NSID $target_nsid");
 
-        # If only one device, safe to return it
+            for my $dev (@devices) {
+                if (defined $dev->{nsid} && $dev->{nsid} eq $target_nsid) {
+                    closedir($dh);
+                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NSID (NSID: $dev->{nsid}, type: $dev->{type})");
+                    return $dev->{path};
+                }
+            }
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NSID matching failed - no device matched NSID $target_nsid");
+        }
+
+        # Log API failure details if both matching strategies failed
+        if ($api_error) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: TrueNAS API query failed: $api_error");
+        }
+
+        # TIER 3: Safe fallback when only one device exists
         if (@devices == 1) {
             closedir($dh);
-            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found single device $devices[0]->{path} for UUID $device_uuid (type: $devices[0]->{type})");
+            _log($scfg, 1, 'info', "[TrueNAS] nvme_find_device: using single device $devices[0]->{path} (NSID: $devices[0]->{nsid}, type: $devices[0]->{type})");
             return $devices[0]->{path};
         }
 
-        # Multiple devices found but NSID matching failed - this is unexpected
-        # Use newest device but log warning about potential ambiguity
-        my $newest_device;
-        my $newest_time = 0;
-        for my $dev (@devices) {
-            my $mtime = (stat("/sys/block/$dev->{name}"))[9] || 0;
-            if ($mtime > $newest_time) {
-                $newest_time = $mtime;
-                $newest_device = $dev;
-            }
-        }
-
-        if ($newest_device) {
-            closedir($dh);
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: multiple devices found but NSID matching unavailable, using newest device");
-            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found device $newest_device->{path} for UUID $device_uuid (type: $newest_device->{type})");
-            return $newest_device->{path};
-        }
+        # No reliable matching available - cannot safely select a device
+        closedir($dh);
+        my $dev_list = join(', ', map { "$_->{name} (NSID: $_->{nsid})" } @devices);
+        _log($scfg, 0, 'error', "[TrueNAS] nvme_find_device: multiple devices found but no reliable matching available. Devices: $dev_list");
+        return undef;
     }
     closedir($dh);
 
