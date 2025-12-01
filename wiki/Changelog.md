@@ -1,5 +1,44 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.11 (December 1, 2025)
+
+### 🐛 **Critical Bug Fix: Multi-Disk Clone Size Mismatch**
+
+#### **Fixed race condition in clone operations causing size mismatches**
+- **Fixed `_clone_image_nvme()` and `_clone_image_iscsi()` to wait for ZFS clone job completion**
+  - **Problem**: Plugin created namespaces/extents immediately after calling clone API, before async job completed
+  - **Impact**: Multi-disk VM clones failed with "output file is smaller than input file" on second and subsequent disks
+  - **Root cause**: Namespace/extent creation proceeded while ZFS clone operation was still in progress
+  - **Solution implemented**:
+    - Added job completion waiting using existing `_wait_for_job_completion()` helper
+    - 30-second timeout for clone operations
+    - Verifies cloned zvol exists and has correct size before proceeding
+    - Applies to both iSCSI and NVMe/TCP transport modes
+    - Modified `_clone_image_nvme` (lines 4408-4424) and `_clone_image_iscsi` (lines 4260-4270)
+
+### 🔧 **Technical Details**
+- Captures return value from `_tn_dataset_clone()` instead of ignoring it
+- Detects if return value is a job ID (numeric pattern matching)
+- Waits for job completion with proper error handling and logging
+- Pattern matches existing `alloc_image()` job completion handling
+- Added zvol verification step to ensure clone is ready before exposure
+- Minimal change approach - reuses existing proven helpers
+
+### 📊 **Impact**
+- **Eliminated multi-disk clone failures**: All disks now clone successfully regardless of count
+- **Both transport modes**: Fix applies to both iSCSI and NVMe/TCP
+- **Consistent behavior**: Both transport modes now handle async operations identically
+- **No API changes**: Existing configurations continue to work without modification
+
+### ✅ **Validation**
+- Tested NVMe/TCP multi-disk clone (2 disks): Both disks cloned to 100% successfully
+- Tested iSCSI multi-disk clone (2 disks): Both disks cloned to 100% successfully
+- Dev test script #25 (Multi-Disk Advanced Operations: Clone): PASSED
+- Verified no "output file is smaller than input file" errors
+- Confirmed cloned VMs boot correctly with all disks accessible
+
+---
+
 ## Version 1.1.10 (November 30, 2025)
 
 ### 🐛 **Critical Bug Fix: VM Migration Device Wait**
