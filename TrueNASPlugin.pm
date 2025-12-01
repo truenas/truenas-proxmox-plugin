@@ -4403,7 +4403,25 @@ sub _clone_image_nvme {
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
 
     # 1) Create ZFS clone from snapshot
-    _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+    my $clone_result = _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+
+    # Wait for clone job to complete if it returned a job ID
+    if (defined $clone_result && !ref($clone_result) && $clone_result =~ /^\d+$/) {
+        _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: waiting for clone job $clone_result to complete");
+        my $job_result = _wait_for_job_completion($scfg, $clone_result, 30);
+        unless ($job_result->{success}) {
+            die "Failed to clone zvol $source_snapshot to $target_full: " . ($job_result->{error} // 'Unknown error') . "\n";
+        }
+        _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: clone completed successfully");
+    }
+
+    # Verify cloned zvol exists and get its properties
+    my $cloned_ds = eval { _tn_dataset_get($scfg, $target_full) };
+    if (!$cloned_ds) {
+        die "Failed to verify cloned zvol $target_full: $@\n";
+    }
+    my $cloned_size = _normalize_value($cloned_ds->{volsize});
+    _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: verified cloned zvol size = $cloned_size bytes");
 
     # 2) Create NVMe namespace for the cloned zvol
     my $nqn = $scfg->{subsystem_nqn};
@@ -4419,20 +4437,14 @@ sub _clone_image_nvme {
     }
     my $subsys_id = $subsystems->[0]{id};
 
-    # Get zvol details for blocksize
-    my $ds = eval { _tn_dataset_get($scfg, $target_full) } // {};
-    my $volblocksize = _normalize_value($ds->{volblocksize}) || (128 * 1024);  # default 128K
-
-    # Normalize blocksize to uppercase format
-    my $blocksize_str = _normalize_blocksize($volblocksize);
-
-    # Create namespace
+    # Create namespace (size is inherited from the zvol at device_path)
     my $ns_payload = {
         subsys_id => $subsys_id,
         device_path => "zvol/$target_full",
         device_type => 'ZVOL',
-        block_size => $blocksize_str,
     };
+
+    _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
     my $ns = eval {
         _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
