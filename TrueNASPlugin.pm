@@ -2509,6 +2509,8 @@ sub _nvme_find_device_by_subsystem {
         }
         closedir($bdh);
 
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found " . scalar(@devices) . " device(s) for subsystem $nqn");
+
         # Query TrueNAS once for namespace info
         my $ns_info = eval { _nvme_get_namespace_info($scfg, $device_uuid) };
 
@@ -2523,8 +2525,18 @@ sub _nvme_find_device_by_subsystem {
             }
         }
 
-        # Fallback: find newest device (most recently created)
-        # This works because we just created the namespace
+        # Fallback: find newest device by mtime when NSID matching unavailable
+        # Used when TrueNAS API query fails or NSID doesn't match expected value
+
+        # If only one device, safe to return it
+        if (@devices == 1) {
+            closedir($dh);
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found single device $devices[0]->{path} for UUID $device_uuid (type: $devices[0]->{type})");
+            return $devices[0]->{path};
+        }
+
+        # Multiple devices found but NSID matching failed - this is unexpected
+        # Use newest device but log warning about potential ambiguity
         my $newest_device;
         my $newest_time = 0;
         for my $dev (@devices) {
@@ -2535,9 +2547,10 @@ sub _nvme_find_device_by_subsystem {
             }
         }
 
-        if ($newest_device && $newest_time > (time() - 10)) {
+        if ($newest_device) {
             closedir($dh);
-            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found newest device $newest_device->{path} for UUID $device_uuid (created within 10s, type: $newest_device->{type})");
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: multiple devices found but NSID matching unavailable, using newest device");
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found device $newest_device->{path} for UUID $device_uuid (type: $newest_device->{type})");
             return $newest_device->{path};
         }
     }
