@@ -1,5 +1,45 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.12 (December 2, 2025)
+
+### 🔧 **NVMe/TCP Device Matching Improvements**
+
+#### **Improved NVMe namespace device discovery reliability**
+- **Implemented three-tier device matching strategy in `_nvme_find_device_by_subsystem()`**
+  - **Tier 1: NGUID matching** (primary) - Matches devices by NVMe Namespace GUID from TrueNAS API against sysfs
+  - **Tier 2: NSID matching** (fallback) - Falls back to Namespace ID matching if API fails or NGUID unavailable
+  - **Tier 3: Single device** (safe fallback) - Returns single device when only one namespace exists on subsystem
+  - **Eliminated unreliable "newest device" timestamp fallback** - Removed race-condition-prone mtime-based selection
+  - Modified `_nvme_find_device_by_subsystem` (lines 2450-2606)
+
+#### **Critical Bug Fix: Device Name NSID Parsing**
+- **Fixed incorrect NSID extraction from device names**
+  - **Problem**: Plugin parsed NSID from device name pattern (e.g., `nvme3n5` → NSID 5), but device name suffix doesn't always match NSID
+  - **Root cause**: Linux kernel assigns device names independently of namespace IDs
+  - **Impact**: Could select wrong device when multiple namespaces exist on same subsystem
+  - **Solution**: Now reads NSID directly from sysfs (`/sys/block/nvmeXnY/nsid`) instead of parsing device name
+  - **Example**: `nvme3n5` may have NSID=3 (not 5), `nvme3n10` may have NSID=8 (not 10)
+
+### 🔧 **Technical Details**
+- **NGUID validation**: Added format validation for API-returned NGUID (UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+- **Enhanced logging**: Added debug logging for each matching tier with device details and failure reasons
+- **Backward compatibility**: Gracefully falls back to NSID matching for older TrueNAS versions without `device_nguid` field
+- **Multipath support**: NGUID and NSID are identical across all controllers, ensuring correct device selection
+
+### 📊 **Impact**
+- **Eliminates race conditions**: NGUID matching is unambiguous and doesn't rely on timing or device creation order
+- **Fixes device selection bug**: Corrects NSID matching that could fail due to name parsing error
+- **Better diagnostics**: Enhanced logging helps troubleshoot device discovery issues
+- **Production-ready**: Tested with multiple simultaneous volumes on same subsystem
+
+### ✅ **Validation**
+- Tested single volume activation - NGUID matched correctly
+- Tested 3 simultaneous volumes on same subsystem - all matched without confusion
+- Verified NGUID from TrueNAS API matches sysfs NGUID exactly
+- Confirmed no device selection errors with multiple namespaces
+
+---
+
 ## Version 1.1.11 (December 1, 2025)
 
 ### 🐛 **Critical Bug Fix: Multi-Disk Clone Size Mismatch**
@@ -410,8 +450,9 @@ journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
     - Matches both standard (`nvme3n1`) and controller-specific (`nvme3c3n1`) device naming patterns
     - Verifies each device belongs to our subsystem by checking subsystem NQN in sysfs
     - Tries to match by NSID from TrueNAS API first
-    - Falls back to "newest device" detection (created within last 10 seconds)
+    - Falls back to "newest device" detection (created within last 10 seconds) - **Note**: This fallback was improved in v1.1.12 with NGUID matching and eliminated timestamp-based selection
     - Returns actual device path like `/dev/nvme3n1` or `/dev/nvme3c3n1`
+  - **Implementation**: See `_nvme_find_device_by_subsystem()` (TrueNASPlugin.pm lines 2450-2606 in v1.1.12+)
 
 #### **Multipath Portal Login**
 - **Fixed multipath failing to connect to all portals** - Storage now establishes sessions to ALL configured portals
@@ -441,7 +482,7 @@ journalctl --since '10 minutes ago' | grep '\[TrueNAS\]'
 
 ### 🔧 **Technical Details**
 - **New functions added**:
-  - `_nvme_find_device_by_subsystem()` (lines 2368-2467) - Scans `/sys/block` for NVMe devices matching subsystem NQN, handles both standard and controller-specific naming
+  - `_nvme_find_device_by_subsystem()` (lines 2450-2606 in v1.1.12+) - Scans `/sys/block` for NVMe devices matching subsystem NQN, handles both standard and controller-specific naming, uses three-tier matching (NGUID → NSID → single device)
   - `_nvme_get_namespace_info()` (lines 2469-2482) - Queries TrueNAS WebSocket API for namespace details by device_uuid
   - `_all_portals_connected()` (lines 2018-2047) - Validates that all configured portals have active iSCSI sessions
 - **Modified `_nvme_device_for_uuid()`** (lines 2484-2565) - Now calls `_nvme_find_device_by_subsystem()` for device discovery instead of checking `/dev/disk/by-id/nvme-uuid.*`

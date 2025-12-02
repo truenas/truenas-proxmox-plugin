@@ -1094,6 +1094,13 @@ ERROR: Could not locate NVMe device for UUID after 5 seconds
 Expected device: /dev/disk/by-id/nvme-uuid.550e8400-e29b-41d4-a716-446655440000
 ```
 
+**Background**: The plugin uses a three-tier device matching strategy:
+1. **NGUID matching** (primary) - Matches NVMe Namespace GUID from TrueNAS API against sysfs
+2. **NSID matching** (fallback) - Matches Namespace ID from sysfs if NGUID unavailable
+3. **Single device** (safe fallback) - Returns device when only one namespace exists
+
+This error indicates all three matching strategies failed to locate the device.
+
 **Diagnosis**:
 ```bash
 # Check if subsystem is connected
@@ -1104,6 +1111,12 @@ nvme list
 
 # Check for UUID symlinks
 ls -la /dev/disk/by-id/nvme-uuid.*
+
+# Check NGUID in sysfs (for debugging)
+cat /sys/block/nvme*/nguid
+
+# Check NSID in sysfs
+cat /sys/block/nvme*/nsid
 ```
 
 **Solutions**:
@@ -1155,6 +1168,24 @@ dmesg | grep -i nvme | tail -50
 
 # Look for device discovery messages
 dmesg | grep -i "nvme.*namespace"
+```
+
+#### 5. Verify NGUID/NSID Matching (Debug)
+```bash
+# Enable debug logging to see matching details
+# In /etc/pve/storage.cfg:
+debug 2
+
+# Then check logs for device matching
+journalctl -f | grep '\[TrueNAS\].*nvme_find_device'
+
+# You should see:
+# - "attempting NGUID match for <guid>"
+# - "matched device /dev/nvmeXnY by NGUID" (success)
+# OR
+# - "NGUID matching failed - no device matched" (fallback to NSID)
+# - "attempting NSID match for NSID X"
+# - "matched device /dev/nvmeXnY by NSID" (success)
 ```
 
 ### Namespace Creation Fails

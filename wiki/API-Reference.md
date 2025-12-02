@@ -384,6 +384,110 @@ WebSocket: iscsi.targetextent.delete
 REST: DELETE /api/v2.0/iscsi/targetextent/id/5
 ```
 
+### NVMe-oF Operations
+
+**Note**: NVMe-oF operations are only available via WebSocket transport. REST API does not support `nvmet.*` endpoints.
+
+#### List NVMe Subsystems
+```
+WebSocket: nvmet.subsys.query
+REST: Not supported
+```
+
+**Response**:
+```json
+[
+  {
+    "id": 1,
+    "name": "proxmox-nvme",
+    "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme",
+    "allow_any_host": true
+  }
+]
+```
+
+#### List NVMe Namespaces
+```
+WebSocket: nvmet.namespace.query
+REST: Not supported
+```
+
+**Parameters** (filter by device UUID):
+```json
+[
+  [["device_uuid", "=", "eab32e9b-2668-4a74-b82b-0a6e7f9b3d77"]]
+]
+```
+
+**Response**:
+```json
+[
+  {
+    "id": 1,
+    "nsid": 2,
+    "device_uuid": "eab32e9b-2668-4a74-b82b-0a6e7f9b3d77",
+    "device_nguid": "b68c0fbe-93ea-46a9-9e2f-e9c5a5f50e4b",
+    "device_path": "zvol/flash/nvme-test/vm-100-disk-0",
+    "subsys_id": 1,
+    "device_type": "ZVOL",
+    "enabled": true
+  }
+]
+```
+
+**Key Fields for Device Matching**:
+- `device_uuid`: TrueNAS middleware UUID (used in volume naming: `vol-<zname>-ns<device_uuid>`)
+- `device_nguid`: NVMe Namespace GUID - matches `/sys/block/nvmeXnY/nguid` (primary matching method)
+- `nsid`: NVMe Namespace ID - matches `/sys/block/nvmeXnY/nsid` (fallback matching method)
+
+**Device Matching Strategy**:
+
+The plugin uses a three-tier matching strategy in `_nvme_find_device_by_subsystem()`:
+
+1. **Tier 1: NGUID Matching (Primary)**
+   - Queries `nvmet.namespace.query` by `device_uuid` to get namespace info
+   - Extracts `device_nguid` from API response
+   - Compares against `/sys/block/nvmeXnY/nguid` for each device on subsystem
+   - Most reliable - NGUID is globally unique and consistent across multipath controllers
+
+2. **Tier 2: NSID Matching (Fallback)**
+   - If API call fails or `device_nguid` field not available (older TrueNAS versions)
+   - Extracts `nsid` from API response
+   - Reads NSID from `/sys/block/nvmeXnY/nsid` sysfs file (NOT from device name)
+   - Important: Device names like `nvme3n5` do NOT reliably indicate NSID
+
+3. **Tier 3: Single Device (Safe Fallback)**
+   - If only one namespace exists on subsystem, returns it safely
+   - Avoids ambiguity when metadata matching unavailable
+
+**Note**: The unreliable "newest device" timestamp fallback was eliminated in v1.1.12 to prevent race conditions.
+
+#### Create NVMe Namespace
+```
+WebSocket: nvmet.namespace.create
+REST: Not supported
+```
+
+**Parameters**:
+```json
+{
+  "device_type": "ZVOL",
+  "device_path": "zvol/tank/proxmox/vm-100-disk-0",
+  "subsys_id": 1,
+  "enabled": true
+}
+```
+
+**Response**: Created namespace object with `device_uuid`, `device_nguid`, and `nsid`
+
+#### Delete NVMe Namespace
+```
+WebSocket: nvmet.namespace.delete
+REST: Not supported
+```
+
+**Parameters**: `{"id": <namespace_id>}`
+
 ### Service Operations
 
 #### Query Service Status

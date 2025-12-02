@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.11';
+our $VERSION = '1.1.12';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -2471,14 +2471,14 @@ sub _nvme_find_device_by_subsystem {
         my @devices;
         opendir(my $bdh, "/sys/block") or next;
         while (my $entry = readdir($bdh)) {
-            my ($ctrl_id, $type);
+            my $type;
 
             # Match both nvme3n1 and nvme3c3n1 patterns
             # Note: We no longer parse NSID from device name as it's unreliable
-            if ($entry =~ /^nvme(\d+)n\d+$/) {
-                ($ctrl_id, $type) = ($1, 'standard');
-            } elsif ($entry =~ /^nvme(\d+)c\d+n\d+$/) {
-                ($ctrl_id, $type) = ($1, 'controller');
+            if ($entry =~ /^nvme\d+n\d+$/) {
+                $type = 'standard';
+            } elsif ($entry =~ /^nvme\d+c\d+n\d+$/) {
+                $type = 'controller';
             } else {
                 next;
             }
@@ -2541,16 +2541,29 @@ sub _nvme_find_device_by_subsystem {
 
         if ($ns_info && defined $ns_info->{device_nguid}) {
             my $target_nguid = $ns_info->{device_nguid};
-            _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NGUID match for $target_nguid");
 
-            for my $dev (@devices) {
-                if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
-                    closedir($dh);
-                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NGUID (NSID: $dev->{nsid}, type: $dev->{type})");
-                    return $dev->{path};
+            # Validate NGUID format (UUID with dashes)
+            if ($target_nguid !~ /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: invalid NGUID format from API: $target_nguid");
+            } else {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NGUID match for $target_nguid");
+
+                for my $dev (@devices) {
+                    if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
+                        closedir($dh);
+                        _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NGUID (NSID: $dev->{nsid}, type: $dev->{type})");
+                        return $dev->{path};
+                    }
                 }
+
+                # NGUID matching failed - log available devices for debugging
+                my $device_nguids = join(', ', map {
+                    my $ng = $_->{nguid} // 'undef';
+                    "$_->{name}:$ng"
+                } @devices);
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: devices with NGUIDs: $device_nguids");
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NGUID matching failed - no device matched NGUID $target_nguid");
             }
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NGUID matching failed - no device matched NGUID $target_nguid");
         }
 
         # TIER 2: Fall back to NSID matching if API provided it

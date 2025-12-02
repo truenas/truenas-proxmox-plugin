@@ -623,6 +623,28 @@ Regenerate secrets if needed and update both sides.
 
 **Error: "Could not locate NVMe device for UUID"**
 
+**How Device Matching Works**:
+
+The plugin uses a three-tier strategy to locate NVMe namespace devices:
+
+1. **Tier 1: NGUID Matching (Primary)**
+   - Queries TrueNAS API for `device_nguid` field in namespace object
+   - Matches against `/sys/block/nvmeXnY/nguid` sysfs attribute
+   - Most reliable - NGUID is globally unique and consistent across controllers
+
+2. **Tier 2: NSID Matching (Fallback)**
+   - Uses namespace ID from TrueNAS API
+   - Reads NSID from `/sys/block/nvmeXnY/nsid` sysfs file (NOT from device name)
+   - Fallback for older TrueNAS versions or if API fails
+
+3. **Tier 3: Single Device (Safe Fallback)**
+   - If only one namespace exists on subsystem, returns it safely
+   - Avoids ambiguity when no matching metadata available
+
+**Note**: Device names like `nvme3n5` do NOT reliably indicate NSID. The plugin reads NSID from sysfs instead.
+
+**Diagnosis**:
+
 Check if subsystem is connected:
 ```bash
 nvme list-subsys | grep -i <subsystem_nqn>
@@ -631,6 +653,17 @@ nvme list-subsys | grep -i <subsystem_nqn>
 Check if namespace exists:
 ```bash
 nvme list | grep TrueNAS
+```
+
+Verify NGUID matching (requires debug logging):
+```bash
+# Enable debug logging in /etc/pve/storage.cfg:
+debug 2
+
+# Watch device matching process
+journalctl -f | grep '\[TrueNAS\].*nvme_find_device'
+
+# You should see NGUID matching attempts and results
 ```
 
 Trigger udev rescan:
