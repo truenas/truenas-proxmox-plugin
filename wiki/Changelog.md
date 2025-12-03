@@ -1,5 +1,75 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.1.13 (December 2, 2025)
+
+### 🐛 **Critical Bug Fix: Dataset Deletion Race Condition (Issue #45)**
+
+#### **Fixed race condition causing "PoolDataset does not exist" errors and VM crashes**
+- **Problem**: VM deletion operations failed with `[ENOENT] PoolDataset does not exist` errors, followed by kernel `access beyond end of device` errors that crashed all VMs on the node
+- **Root cause**: Plugin attempted to delete datasets while kernel still had active device references, causing TrueNAS to report dataset as "busy" but return misleading "does not exist" error
+- **Impact**: VM deletions would fail and corrupt SCSI subsystem state, causing IO errors on all active VMs
+- **Solution implemented**:
+  - **Inverted deletion sequence**: Devices are now fully disconnected BEFORE dataset deletion
+  - **Device cleanup verification**: Added `_verify_devices_disconnected()` helper to ensure devices are gone before proceeding (TrueNASPlugin.pm:1190-1217)
+  - **Dataset deletion with retry**: Added `_delete_dataset_with_retry()` helper with exponential backoff for transient "busy" errors (TrueNASPlugin.pm:1239-1287)
+  - **Error differentiation**: Added `_parse_dataset_error()` to distinguish "not found" (idempotent) from "busy" (retryable) errors (TrueNASPlugin.pm:1219-1237)
+  - **Faster job polling**: Enhanced `_wait_for_job_completion()` with 100ms polling for first 5 seconds, then 1s (TrueNASPlugin.pm:1109-1170)
+  - **Increased timeout**: Dataset deletion timeout increased from 20s to 30s for better reliability under load
+
+#### **iSCSI Deletion Flow (Lines 3529-3593)**
+**Before (BROKEN)**:
+```
+Capture devices → Delete extent/mapping → Delete dataset (RACE!) → Cleanup devices → Rescan
+```
+
+**After (FIXED)**:
+```
+Capture devices → Delete extent/mapping → Logout & cleanup devices → Verify cleanup → Delete dataset with retry → Rescan
+```
+
+#### **NVMe Deletion Flow (Lines 3713-3747)**
+**Before (BROKEN)**:
+```
+Delete namespace → Disconnect (if needed) → Delete dataset (RACE!) → udevadm settle
+```
+
+**After (FIXED)**:
+```
+Delete namespace → Disconnect & verify → udevadm settle → Delete dataset with retry → udevadm settle
+```
+
+### 🔧 **Technical Details**
+- Modified `_free_image_iscsi()` (TrueNASPlugin.pm:3373-3637)
+  - Moved SCSI device cleanup to BEFORE dataset deletion (phase 4)
+  - Added device disconnect verification with 5-second timeout
+  - Replaced manual dataset deletion with retry helper
+  - Removed old "retry after logout" code (no longer needed)
+- Modified `_free_image_nvme()` (TrueNASPlugin.pm:3713-3750)
+  - Added explicit disconnect verification before dataset deletion
+  - Replaced manual dataset deletion with retry helper
+- New constants (TrueNASPlugin.pm:58-62):
+  - `DEVICE_CLEANUP_VERIFY_TIMEOUT_S = 5` - Device cleanup verification timeout
+  - `DATASET_DELETE_RETRY_COUNT = 3` - Max retries for dataset deletion
+  - `DATASET_DELETE_TIMEOUT_S = 30` - Increased from 20s
+
+### 📊 **Impact**
+- **Eliminates VM crashes**: No more "access beyond end of device" kernel errors during VM deletion
+- **Fixes misleading errors**: Correctly handles TrueNAS "busy" vs "not found" errors
+- **Better reliability**: Retry logic handles transient failures gracefully
+- **Multipath compatibility**: Works correctly in cluster environments with multiple active sessions
+- **Both transports**: Fix applies to both iSCSI and NVMe/TCP modes
+- **Slight latency increase**: Dataset deletion takes 2-5 seconds longer but eliminates race condition
+
+### ✅ **Validation**
+- Tested single disk deletion (iSCSI) - completed successfully without errors
+- Tested single disk deletion (NVMe) - completed successfully without errors
+- Tested sequential 3-disk deletion (iSCSI) - all deleted without kernel errors
+- Verified no "access beyond end of device" errors in kernel log
+- Verified no "io-error" states on active VMs during deletions
+- Tested on TrueNAS SCALE 25.10.0 with Proxmox VE 9.x cluster
+
+---
+
 ## Version 1.1.12 (December 2, 2025)
 
 ### 🔧 **NVMe/TCP Device Matching Improvements**

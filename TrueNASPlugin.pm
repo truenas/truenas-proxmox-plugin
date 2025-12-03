@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.12';
+our $VERSION = '1.1.13';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -56,8 +56,10 @@ use constant {
     JOB_POLL_DELAY_S          => 1,        # job status polling interval
 
     # Job timeouts (seconds)
-    SNAPSHOT_DELETE_TIMEOUT_S => 15,       # snapshot deletion job timeout
-    DATASET_DELETE_TIMEOUT_S  => 20,       # dataset deletion job timeout
+    SNAPSHOT_DELETE_TIMEOUT_S        => 15,  # snapshot deletion job timeout
+    DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability)
+    DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 5,   # device cleanup verification timeout
+    DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
 };
 
 sub _cache_key {
@@ -1112,9 +1114,17 @@ sub _wait_for_job_completion {
 
     _log($scfg, 1, 'info', "[TrueNAS] Waiting for job $job_id to complete (timeout: ${timeout_seconds}s)");
 
-    for my $attempt (1..$timeout_seconds) {
-        # Small delay between checks
-        sleep(JOB_POLL_DELAY_S);
+    # Fast polling for first 5 seconds (100ms intervals), then 1s intervals
+    my $elapsed = 0;
+    my $attempt = 0;
+
+    while ($elapsed < $timeout_seconds) {
+        $attempt++;
+
+        # Use faster polling for first 5 seconds to catch quick completions
+        my $poll_delay = ($elapsed < 5) ? 0.1 : JOB_POLL_DELAY_S;
+        select(undef, undef, undef, $poll_delay);
+        $elapsed += $poll_delay;
 
         my $job_status;
         eval {
@@ -1140,8 +1150,8 @@ sub _wait_for_job_completion {
                 return { success => 0, error => $error };
             } elsif ($state eq 'RUNNING' || $state eq 'WAITING') {
                 # Job still in progress, continue waiting
-                if ($attempt % 10 == 0) { # Log every 10 seconds
-                    _log($scfg, 2, 'debug', "[TrueNAS] Job $job_id still $state (${attempt}s elapsed)");
+                if (int($elapsed) % 10 == 0 && $poll_delay >= 1) { # Log every 10 seconds (but not during fast polling)
+                    _log($scfg, 2, 'debug', "[TrueNAS] Job $job_id still $state (" . int($elapsed) . "s elapsed)");
                 }
                 next;
             } else {
@@ -1183,6 +1193,105 @@ sub _handle_api_result_with_job_support {
 
     # For non-job results, return as-is (synchronous operation)
     return { success => 1, result => $result };
+}
+
+# Helper function to verify kernel devices are disconnected
+sub _verify_devices_disconnected {
+    my ($scfg, $device_paths, $timeout_s) = @_;
+    $timeout_s //= DEVICE_CLEANUP_VERIFY_TIMEOUT_S;
+
+    return 1 unless $device_paths && @$device_paths;  # Nothing to verify
+
+    _log($scfg, 2, 'debug', "[TrueNAS] Verifying " . scalar(@$device_paths) . " device(s) are disconnected");
+
+    # Poll until devices are gone or timeout
+    for my $attempt (1..$timeout_s*10) {  # Check every 100ms
+        my $all_gone = 1;
+        for my $path (@$device_paths) {
+            if (-e $path) {
+                $all_gone = 0;
+                last;
+            }
+        }
+        if ($all_gone) {
+            _log($scfg, 2, 'debug', "[TrueNAS] All devices disconnected successfully");
+            return 1;
+        }
+        select(undef, undef, undef, 0.1);  # 100ms delay
+    }
+
+    _log($scfg, 1, 'warning', "[TrueNAS] Device disconnect verification timed out after ${timeout_s}s");
+    return 0;  # Timeout
+}
+
+# Helper function to parse dataset deletion errors
+sub _parse_dataset_error {
+    my ($error_string) = @_;
+
+    return {
+        type => 'not_found',
+        retryable => 0,
+    } if $error_string =~ /does not exist|ENOENT|InstanceNotFound/i;
+
+    return {
+        type => 'busy',
+        retryable => 1,
+    } if $error_string =~ /busy|in use|mounted|cannot.*delete/i;
+
+    return {
+        type => 'other',
+        retryable => 0,
+    };
+}
+
+# Helper function to delete dataset with retry logic on "busy" errors
+sub _delete_dataset_with_retry {
+    my ($scfg, $full_ds, $max_retries) = @_;
+    $max_retries //= DATASET_DELETE_RETRY_COUNT;
+
+    my $id = URI::Escape::uri_escape($full_ds);
+    my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
+
+    for my $attempt (1..$max_retries) {
+        eval {
+            _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
+            my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+                sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+
+            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
+            if (!$job_result->{success}) {
+                die $job_result->{error};
+            }
+            _log($scfg, 1, 'info', "[TrueNAS] Successfully deleted dataset $full_ds");
+        };
+
+        if (!$@) {
+            return;  # Success
+        }
+
+        my $err = $@;
+        my $error_info = _parse_dataset_error($err);
+
+        # If already gone, treat as success
+        if ($error_info->{type} eq 'not_found') {
+            _log($scfg, 2, 'debug', "[TrueNAS] Dataset $full_ds already deleted");
+            return;
+        }
+
+        # If busy and more retries available, wait and retry
+        if ($error_info->{type} eq 'busy' && $attempt < $max_retries) {
+            my $delay = 2 ** ($attempt - 1);  # Exponential backoff: 1s, 2s, 4s
+            _log($scfg, 1, 'info', "[TrueNAS] Dataset busy, retrying in ${delay}s... ($err)");
+            sleep($delay);
+            next;
+        }
+
+        # Otherwise, this is a real error
+        die $err;
+    }
+
+    # Should not reach here, but if we do, it means all retries failed
+    die "Failed to delete dataset $full_ds after $max_retries attempts";
 }
 
 # ======== Transport-agnostic API wrapper ========
@@ -3417,9 +3526,48 @@ sub _free_image_iscsi {
         }
     }
 
-    # 4) Delete the zvol dataset with recursive flag to handle snapshots automatically
-    # PERFORMANCE OPTIMIZATION: Use recursive deletion to handle snapshots in one operation
-    # instead of sequential deletion (consistent with NVMe implementation)
+    # 4) CRITICAL: Ensure devices are fully disconnected BEFORE dataset deletion
+    # This fixes the race condition where dataset deletion fails with "busy" errors
+    # because the kernel still has active device references
+    if ($need_force_logout || @scsi_devices_to_cleanup) {
+        # Logout to disconnect iSCSI sessions
+        if ($need_force_logout) {
+            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: logging out before dataset deletion to prevent race condition");
+            _logout_target_all_portals($scfg);
+            sleep(DEVICE_SETTLE_DELAY_S);
+        }
+
+        # Clean up orphaned SCSI device entries from kernel
+        # This must happen BEFORE dataset deletion to prevent "busy" errors
+        if (@scsi_devices_to_cleanup) {
+            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: cleaning up " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) before dataset deletion");
+            my @device_paths;
+            for my $dev (@scsi_devices_to_cleanup) {
+                my $delete_path = "/sys/block/$dev/device/delete";
+                push @device_paths, $delete_path if -e $delete_path;
+                if (-e $delete_path && -w $delete_path) {
+                    eval {
+                        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev for LUN $lun");
+                        if (open my $fh, '>', $delete_path) {
+                            print $fh "1";
+                            close $fh;
+                        }
+                    };
+                    # Ignore errors - device may already be gone
+                }
+            }
+
+            # Verify devices are disconnected before proceeding
+            _verify_devices_disconnected($scfg, \@device_paths);
+        }
+
+        # Run udevadm settle to ensure kernel has processed all changes
+        eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+        $need_force_logout = 1;  # Mark that we need to handle reconnection later
+    }
+
+    # 5) Delete the zvol dataset using retry logic with exponential backoff
+    # The new helper function handles "busy" errors robustly with retry logic
     eval {
         # Safety check: Verify dataset has no child datasets (only snapshots allowed)
         # This prevents accidental deletion of manually created child datasets
@@ -3433,80 +3581,15 @@ sub _free_image_iscsi {
             }
         }
 
-        my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-
-        _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: deleting dataset $full_ds (recursive)");
-        my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
-            sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
-
-        # Handle potential async job for dataset deletion with shorter timeout
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
-        if (!$job_result->{success}) {
-            die $job_result->{error};
-        }
-
-        _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: deleted dataset $full_ds");
-
-        # Mark that we need to re-login
-        $need_force_logout = 1;
+        # Use the new retry helper - it handles async jobs, retries, and error parsing
+        _delete_dataset_with_retry($scfg, $full_ds);
     };
 
-    # If dataset deletion failed due to "busy", retry with logout
-    if ($@ && $@ =~ /busy|in use/i) {
-        _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: dataset deletion failed (device busy), retrying with logout");
-        _logout_target_all_portals($scfg);
-        sleep(DEVICE_SETTLE_DELAY_S);  # Reduced from 2s to 1s - modern systems settle faster
-
-        eval {
-            # Safety check (same as initial attempt)
-            my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
-            if ($ds_info && $ds_info->{children}) {
-                my @children = grep { $_->{type} ne 'SNAPSHOT' } @{$ds_info->{children}};
-                if (@children) {
-                    my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
-                    die "Cannot use recursive deletion: dataset $full_ds has child datasets: $child_names";
-                }
-            }
-
-            my $id = URI::Escape::uri_escape($full_ds);
-            my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-            my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
-                sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
-            my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion retry for $full_ds", DATASET_DELETE_TIMEOUT_S);
-            if (!$job_result->{success}) {
-                die $job_result->{error};
-            }
-            _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: deleted dataset $full_ds after retry");
-            $need_force_logout = 1;
-        } or do {
-            my $err = $@ // '';
-            warn "warning: delete dataset $full_ds failed after retry: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
-        };
-    } elsif ($@) {
+    # Handle any errors from dataset deletion
+    if ($@) {
         my $err = $@ // '';
         # Only warn if dataset actually exists - ENOENT means already cleaned up
         warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
-    }
-
-    # 5) Clean up orphaned SCSI device entries from kernel
-    # This prevents "ghost" devices that cause kernel errors on session rescans
-    # Run cleanup in all cases - logout doesn't immediately remove SCSI devices
-    if (@scsi_devices_to_cleanup) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: cleaning up " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s)");
-        for my $dev (@scsi_devices_to_cleanup) {
-            my $delete_path = "/sys/block/$dev/device/delete";
-            if (-e $delete_path && -w $delete_path) {
-                eval {
-                    _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev for LUN $lun");
-                    if (open my $fh, '>', $delete_path) {
-                        print $fh "1";
-                        close $fh;
-                    }
-                };
-                # Ignore errors - device may already be gone
-            }
-        }
     }
 
     # 6) Skip re-login after volume deletion - the device is gone, no need to reconnect
@@ -3627,7 +3710,16 @@ sub _free_image_nvme {
         }
     }
 
-    # 2) Delete the zvol dataset with recursive flag to handle snapshots automatically
+    # 2) CRITICAL: Ensure NVMe devices are disconnected before dataset deletion
+    # This fixes race condition where dataset deletion fails because devices are still active
+    if ($need_force_disconnect) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: ensuring NVMe disconnect complete before dataset deletion");
+        # Additional wait to ensure NVMe devices are fully released
+        eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+    }
+
+    # 3) Delete the zvol dataset using retry logic with exponential backoff
+    # The new helper function handles "busy" errors robustly with retry logic
     eval {
         # Safety check: Verify dataset has no child datasets (only snapshots allowed)
         my $ds_info = eval { _tn_dataset_get($scfg, $full_ds) };
@@ -3640,24 +3732,14 @@ sub _free_image_nvme {
             }
         }
 
-        my $id = URI::Escape::uri_escape($full_ds);
-        my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-
-        _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: deleting dataset $full_ds (recursive)");
-        my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
-            sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
-
-        my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
-        if (!$job_result->{success}) {
-            die $job_result->{error};
-        }
-
-        _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: deleted dataset $full_ds");
+        # Use the new retry helper - it handles async jobs, retries, and error parsing
+        _delete_dataset_with_retry($scfg, $full_ds);
     };
 
+    # Handle any errors from dataset deletion
     if ($@) {
         my $err = $@ // '';
-        # Only warn if dataset actually exists
+        # Only warn if dataset actually exists - ENOENT means already cleaned up
         warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
