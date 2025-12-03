@@ -174,20 +174,129 @@ track_timing() {
 # Helper Functions
 # ============================================================================
 
+# ============================================================================
+# Enhanced Logging System
+# ============================================================================
+
+# Generate unique operation ID for tracing
+generate_operation_id() {
+    echo "op-$(date +%s%N | cut -c1-13)"
+}
+
+# Current operation ID (used for correlating log entries)
+CURRENT_OP_ID=""
+
+# Log to file only (verbose)
+# Args: $1 = message, $2 = level (INFO|DEBUG|ERROR|WARN), $3 = op_id (optional)
+log_verbose() {
+    local level="${2:-DEBUG}"
+    local op_id="${3:-$CURRENT_OP_ID}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S.%3N')
+
+    if [[ -n "$op_id" ]]; then
+        echo "[$timestamp] [$level] [$op_id] $1" >> "$LOG_FILE"
+    else
+        echo "[$timestamp] [$level] $1" >> "$LOG_FILE"
+    fi
+}
+
+# Log to console only (simple)
+# Args: $1 = message, $2 = color_code (optional)
+log_console() {
+    local color="${2:-$NC}"
+    echo -e "${color}$1${NC}"
+}
+
+# Log to both console and file
+# Args: $1 = message, $2 = level (INFO|SUCCESS|ERROR|WARN)
+log_both() {
+    local message="$1"
+    local level="${2:-INFO}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S.%3N')
+
+    # Determine color based on level
+    local color=$NC
+    local console_prefix=""
+    case "$level" in
+        INFO)
+            color=$BLUE
+            console_prefix="[INFO]"
+            ;;
+        SUCCESS)
+            color=$GREEN
+            console_prefix="[OK]"
+            ;;
+        ERROR)
+            color=$RED
+            console_prefix="[ERROR]"
+            ;;
+        WARN)
+            color=$YELLOW
+            console_prefix="[WARN]"
+            ;;
+    esac
+
+    # Console: simple format
+    echo -e "${color}${console_prefix}${NC} $message"
+
+    # File: verbose format with timestamp and op_id
+    if [[ -n "$CURRENT_OP_ID" ]]; then
+        echo "[$timestamp] [$level] [$CURRENT_OP_ID] $message" >> "$LOG_FILE"
+    else
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
+}
+
+# Execute command with verbose logging
+# Args: $1 = command description, $2 = command to execute, $3 = capture_output (true|false)
+# Returns: command exit code, sets LAST_CMD_OUTPUT if capture_output=true
+LAST_CMD_OUTPUT=""
+exec_with_logging() {
+    local description="$1"
+    local command="$2"
+    local capture="${3:-false}"
+    local op_id="${CURRENT_OP_ID:-$(generate_operation_id)}"
+
+    log_verbose "Executing: $description" "DEBUG" "$op_id"
+    log_verbose "Command: $command" "DEBUG" "$op_id"
+
+    local start_time=$(date +%s%N)
+    local exit_code=0
+
+    if [[ "$capture" == "true" ]]; then
+        LAST_CMD_OUTPUT=$(eval "$command" 2>&1) || exit_code=$?
+        log_verbose "Output: $LAST_CMD_OUTPUT" "DEBUG" "$op_id"
+    else
+        eval "$command" >> "$LOG_FILE" 2>&1 || exit_code=$?
+    fi
+
+    local end_time=$(date +%s%N)
+    local duration_ms=$(( (end_time - start_time) / 1000000 ))
+
+    if [[ $exit_code -eq 0 ]]; then
+        log_verbose "$description completed successfully (${duration_ms}ms)" "DEBUG" "$op_id"
+    else
+        log_verbose "$description failed with exit code $exit_code (${duration_ms}ms)" "ERROR" "$op_id"
+    fi
+
+    return $exit_code
+}
+
+# Legacy wrappers for backward compatibility
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"
+    log_both "$*" "INFO"
 }
 
 log_success() {
-    echo -e "${GREEN}[OK]${NC} $*" | tee -a "$LOG_FILE"
+    log_both "$*" "SUCCESS"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"
+    log_both "$*" "ERROR"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"
+    log_both "$*" "WARN"
 }
 
 # Get storage configuration from storage.cfg
@@ -219,34 +328,63 @@ wait_for_vm_deletion() {
     local vmid_start="$1"
     local vmid_end="$2"
     local max_retries="${3:-$DELETION_MAX_RETRIES}"
+    local op_id="${CURRENT_OP_ID:-$(generate_operation_id)}"
 
-    log_info "Waiting for deletions to complete..."
+    log_both "Waiting for VM deletions to complete (VMIDs $vmid_start-$vmid_end)..." "INFO"
+    log_verbose "Max retries: $max_retries, settle time: ${DELETION_VERIFY_SLEEP}s" "DEBUG" "$op_id"
     sleep $DELETION_VERIFY_SLEEP
 
     local retry_count=0
     while [[ $retry_count -lt $max_retries ]]; do
-        local remaining_vms
-        remaining_vms=$(timeout 30 pvesh get /cluster/resources --type vm --output-format json 2>/dev/null || echo "[]")
-        local found_any=0
+        log_verbose "Deletion verification attempt $((retry_count + 1))/$max_retries" "DEBUG" "$op_id"
 
+        # Query cluster resources with explicit error handling
+        local remaining_vms
+        local query_failed=0
+        if ! exec_with_logging "Query cluster resources for VM deletion verification" \
+                "timeout 30 pvesh get /cluster/resources --type vm --output-format json" \
+                "true"; then
+            query_failed=1
+            log_verbose "Cluster query failed, will retry" "WARN" "$op_id"
+            sleep $DELETION_WAIT
+            retry_count=$((retry_count + 1))
+            continue
+        fi
+
+        remaining_vms="$LAST_CMD_OUTPUT"
+
+        # Validate JSON output
+        if ! echo "$remaining_vms" | grep -q '^\['; then
+            log_verbose "Invalid JSON response from cluster query: $remaining_vms" "ERROR" "$op_id"
+            query_failed=1
+            sleep $DELETION_WAIT
+            retry_count=$((retry_count + 1))
+            continue
+        fi
+
+        # Check each VMID
+        local found_any=0
+        local found_vmids=""
         for vmid in $(seq "$vmid_start" "$vmid_end"); do
             if echo "$remaining_vms" | grep -q "\"vmid\":$vmid"; then
                 found_any=1
-                break
+                found_vmids="$found_vmids $vmid"
+                log_verbose "VM $vmid still exists" "DEBUG" "$op_id"
             fi
         done
 
         if [[ $found_any -eq 0 ]]; then
-            log_success "All VMs successfully deleted"
+            log_both "All VMs successfully deleted (verified after $((retry_count + 1)) attempts)" "SUCCESS"
             return 0
         fi
 
-        log_info "Some VMs still exist, waiting... (attempt $((retry_count + 1))/$max_retries)"
+        log_console "  Some VMs still exist (${found_vmids}), waiting... (attempt $((retry_count + 1))/$max_retries)"
+        log_verbose "Still waiting for VMs:$found_vmids" "INFO" "$op_id"
         sleep $DELETION_WAIT
         retry_count=$((retry_count + 1))
     done
 
-    log_warning "Some VMs may still exist after cleanup timeout"
+    log_both "Deletion verification timeout: Some VMs may still exist after $max_retries attempts" "ERROR"
     return 1
 }
 
@@ -1535,7 +1673,7 @@ test_efi_vm_creation() {
 }
 
 # ============================================================================
-# Phase 23: Multi-Disk Advanced Operations
+# Phase 11: Multi-Disk Advanced Operations
 # ============================================================================
 
 test_multidisk_advanced_operations() {
@@ -2001,7 +2139,7 @@ test_multidisk_advanced_operations() {
 }
 
 # ============================================================================
-# Phase 11: Live Migration
+# Phase 12: Live Migration
 # ============================================================================
 
 test_live_migration() {
@@ -2115,7 +2253,7 @@ test_live_migration() {
 }
 
 # ============================================================================
-# Phase 12: Offline Migration
+# Phase 13: Offline Migration
 # ============================================================================
 
 test_offline_migration() {
@@ -2213,7 +2351,7 @@ test_offline_migration() {
 }
 
 # ============================================================================
-# Phase 13: Online Backup
+# Phase 16: Online Backup
 # ============================================================================
 
 test_online_backup() {
@@ -2312,7 +2450,7 @@ test_online_backup() {
 }
 
 # ============================================================================
-# Phase 14: Offline Backup
+# Phase 17: Offline Backup
 # ============================================================================
 
 test_offline_backup() {
@@ -2396,7 +2534,7 @@ test_offline_backup() {
 }
 
 # ============================================================================
-# Phase 15: Cross-Node Clone (Online)
+# Phase 14: Cross-Node Clone (Online)
 # ============================================================================
 
 test_cross_node_clone_online() {
@@ -2501,7 +2639,7 @@ test_cross_node_clone_online() {
 }
 
 # ============================================================================
-# Phase 16: Cross-Node Clone (Offline)
+# Phase 15: Cross-Node Clone (Offline)
 # ============================================================================
 
 test_cross_node_clone_offline() {
@@ -2589,7 +2727,7 @@ test_cross_node_clone_offline() {
 }
 
 # ============================================================================
-# Phase 17: Rapid Creation/Deletion Stress Test
+# Phase 18: Rapid Creation/Deletion Stress Test
 # ============================================================================
 
 test_rapid_create_delete_stress() {
@@ -2644,16 +2782,57 @@ test_rapid_create_delete_stress() {
     done
 
     # Wait for all deletions to complete
-    wait_for_vm_deletion "$base_vmid" "$((base_vmid + 9))" 15
+    CURRENT_OP_ID=$(generate_operation_id)
+    if ! wait_for_vm_deletion "$base_vmid" "$((base_vmid + 9))" 15; then
+        log_error "VM deletion verification failed - VMs may still be running"
+        log_verbose "Test failed due to incomplete VM deletion" "ERROR" "$CURRENT_OP_ID"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Deletion verification failed")
+        return 1
+    fi
 
     # Verify no orphaned disks remain
     local orphaned_disks=0
+    local orphan_check_failed=0
+    log_verbose "Checking for orphaned disks" "INFO" "$CURRENT_OP_ID"
+
     for i in {0..9}; do
         local vmid=$((base_vmid + i))
-        local remaining
-        remaining=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | wc -l)
-        orphaned_disks=$((orphaned_disks + remaining))
+        log_verbose "Checking storage for VM $vmid" "DEBUG" "$CURRENT_OP_ID"
+
+        # Execute with explicit error handling
+        if exec_with_logging "List storage for VM $vmid orphan check" \
+                "pvesm list '$STORAGE_ID' --vmid $vmid" \
+                "true"; then
+            local remaining=$(echo "$LAST_CMD_OUTPUT" | tail -n +2 | wc -l)
+            orphaned_disks=$((orphaned_disks + remaining))
+
+            if [[ $remaining -gt 0 ]]; then
+                log_verbose "Found $remaining orphaned disk(s) for VM $vmid" "WARN" "$CURRENT_OP_ID"
+                log_verbose "Orphan details: $LAST_CMD_OUTPUT" "DEBUG" "$CURRENT_OP_ID"
+            fi
+        else
+            log_verbose "Failed to query storage for VM $vmid - orphan check inconclusive" "ERROR" "$CURRENT_OP_ID"
+            orphan_check_failed=1
+        fi
     done
+
+    if [[ $orphan_check_failed -eq 1 ]]; then
+        log_error "Orphan disk check failed due to storage query errors"
+        log_verbose "Cannot verify orphan status - storage queries failed" "ERROR" "$CURRENT_OP_ID"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Storage verification failed")
+        return 1
+    fi
+
+    # Verify storage is accessible
+    log_verbose "Final storage accessibility check" "INFO" "$CURRENT_OP_ID"
+    if ! exec_with_logging "Verify storage accessible" "pvesm status -storage '$STORAGE_ID'" "true"; then
+        log_error "Storage accessibility check failed - results may be unreliable"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Storage not accessible")
+        return 1
+    fi
 
     local duration=$(($(date +%s) - start_time))
 
@@ -2677,7 +2856,7 @@ test_rapid_create_delete_stress() {
 }
 
 # ============================================================================
-# Phase 18: Storage Quota/Space Exhaustion Test
+# Phase 19: Storage Quota/Space Exhaustion Test
 # ============================================================================
 
 test_storage_exhaustion() {
@@ -2793,7 +2972,7 @@ test_storage_exhaustion() {
 }
 
 # ============================================================================
-# Phase 19: Invalid/Malformed API Requests Test
+# Phase 20: Invalid/Malformed API Requests Test
 # ============================================================================
 
 test_invalid_api_requests() {
@@ -2935,7 +3114,7 @@ test_invalid_api_requests() {
 }
 
 # ============================================================================
-# Phase 20: Interrupted Operations Test
+# Phase 21: Interrupted Operations Test
 # ============================================================================
 
 test_interrupted_operations() {
@@ -3155,7 +3334,7 @@ test_interrupted_operations() {
 }
 
 # ============================================================================
-# Phase 21: Large Disk Operations Test
+# Phase 22: Large Disk Operations Test
 # ============================================================================
 
 test_large_disk_operations() {
@@ -3510,9 +3689,9 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 22: Multi-Disk Advanced Operations
+    # Phase 11: Multi-Disk Advanced Operations
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 22: Multi-Disk Advanced Operations Tests" | tee -a "$LOG_FILE"
+    echo "  PHASE 11: Multi-Disk Advanced Operations Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3529,9 +3708,9 @@ main() {
 
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
-        # Phase 11: Live Migration
+        # Phase 12: Live Migration
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 11: Live Migration Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 12: Live Migration Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3540,9 +3719,9 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
 
-        # Phase 12: Offline Migration
+        # Phase 13: Offline Migration
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 12: Offline Migration Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 13: Offline Migration Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3551,9 +3730,9 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
 
-        # Phase 15: Cross-Node Clone (Online)
+        # Phase 14: Cross-Node Clone (Online)
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 15: Cross-Node Clone (Online) Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 14: Cross-Node Clone (Online) Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3563,9 +3742,9 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
 
-        # Phase 16: Cross-Node Clone (Offline)
+        # Phase 15: Cross-Node Clone (Offline)
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 16: Cross-Node Clone (Offline) Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 15: Cross-Node Clone (Offline) Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3575,13 +3754,13 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
     else
-        log_info "Skipping cluster-based tests (Phases 11, 12, 15, 16) - not in a cluster or no target node available"
+        log_info "Skipping cluster-based tests (Phases 12-15) - not in a cluster or no target node available"
         echo | tee -a "$LOG_FILE"
     fi
 
-    # Phase 17: Rapid Creation/Deletion Stress Test
+    # Phase 18: Rapid Creation/Deletion Stress Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 17: Rapid Creation/Deletion Stress Test" | tee -a "$LOG_FILE"
+    echo "  PHASE 18: Rapid Creation/Deletion Stress Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3590,9 +3769,9 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 18: Storage Quota/Space Exhaustion Test
+    # Phase 19: Storage Quota/Space Exhaustion Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 18: Storage Quota/Space Exhaustion Test" | tee -a "$LOG_FILE"
+    echo "  PHASE 19: Storage Quota/Space Exhaustion Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3601,9 +3780,9 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 19: Invalid/Malformed API Requests Test
+    # Phase 20: Invalid/Malformed API Requests Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 19: Invalid/Malformed API Requests Test" | tee -a "$LOG_FILE"
+    echo "  PHASE 20: Invalid/Malformed API Requests Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3612,9 +3791,9 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 20: Interrupted Operations Test
+    # Phase 21: Interrupted Operations Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 20: Interrupted Operations Test" | tee -a "$LOG_FILE"
+    echo "  PHASE 21: Interrupted Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3623,9 +3802,9 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
 
-    # Phase 21: Large Disk Operations Test
+    # Phase 22: Large Disk Operations Test
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-    echo "  PHASE 21: Large Disk Operations Test" | tee -a "$LOG_FILE"
+    echo "  PHASE 22: Large Disk Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
@@ -3636,9 +3815,9 @@ main() {
 
     # Backup tests (only if backup storage specified)
     if [[ -n "$BACKUP_STORE" ]]; then
-        # Phase 13: Online Backup
+        # Phase 16: Online Backup
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 13: Online Backup Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 16: Online Backup Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3647,9 +3826,9 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
 
-        # Phase 14: Offline Backup
+        # Phase 17: Offline Backup
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
-        echo "  PHASE 14: Offline Backup Test" | tee -a "$LOG_FILE"
+        echo "  PHASE 17: Offline Backup Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo | tee -a "$LOG_FILE"
 
@@ -3658,7 +3837,7 @@ main() {
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
     else
-        log_info "Skipping backup tests (Phases 13, 14) - no backup storage specified (use --backup-store)"
+        log_info "Skipping backup tests (Phases 16, 17) - no backup storage specified (use --backup-store)"
         echo | tee -a "$LOG_FILE"
     fi
 
