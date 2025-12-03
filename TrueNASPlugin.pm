@@ -1117,6 +1117,7 @@ sub _wait_for_job_completion {
     # Fast polling for first 5 seconds (100ms intervals), then 1s intervals
     my $elapsed = 0;
     my $attempt = 0;
+    my $consecutive_failures = 0;
 
     while ($elapsed < $timeout_seconds) {
         $attempt++;
@@ -1133,9 +1134,19 @@ sub _wait_for_job_completion {
         };
 
         if ($@) {
-            _log($scfg, 1, 'warning', "[TrueNAS] Failed to check job status for job $job_id: $@");
+            $consecutive_failures++;
+            _log($scfg, 1, 'warning', "[TrueNAS] Failed to check job status for job $job_id (consecutive failures: $consecutive_failures): $@");
+
+            # Abort if API is consistently failing (likely unreachable)
+            if ($consecutive_failures >= 5) {
+                _log($scfg, 0, 'err', "[TrueNAS] Job $job_id check failing repeatedly ($consecutive_failures consecutive failures), aborting");
+                return { success => 0, error => "API unavailable: $@" };
+            }
             next; # Continue trying
         }
+
+        # Reset consecutive failures on successful API call
+        $consecutive_failures = 0;
 
         if ($job_status && ref($job_status) eq 'ARRAY' && @$job_status > 0) {
             my $job = $job_status->[0];
@@ -3704,6 +3715,11 @@ sub _free_image_nvme {
             } else {
                 # Reconnect after successful deletion
                 eval { _nvme_connect($scfg) };
+                if ($@) {
+                    _log($scfg, 1, 'warning', "[TrueNAS] _free_image_nvme: reconnection failed after namespace deletion: $@");
+                } else {
+                    _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: successfully reconnected after namespace deletion");
+                }
             }
         } else {
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: skipping disconnect - $active_ns_count other namespaces active");
@@ -3716,6 +3732,24 @@ sub _free_image_nvme {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: ensuring NVMe disconnect complete before dataset deletion");
         # Additional wait to ensure NVMe devices are fully released
         eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+
+        # Verify NVMe device cleanup (similar to iSCSI path)
+        # Find device path for this UUID to verify it's disconnected
+        my @nvme_device_paths;
+        if ($device_uuid) {
+            # Try to find the device path - it should not exist after disconnect
+            my $dev_path = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
+            if ($dev_path && ref($dev_path) eq 'HASH') {
+                push @nvme_device_paths, $dev_path->{path};
+            } elsif ($dev_path) {
+                push @nvme_device_paths, $dev_path;
+            }
+        }
+
+        if (@nvme_device_paths) {
+            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_nvme: verifying device cleanup for " . join(', ', @nvme_device_paths));
+            _verify_devices_disconnected($scfg, \@nvme_device_paths);
+        }
     }
 
     # 3) Delete the zvol dataset using retry logic with exponential backoff
