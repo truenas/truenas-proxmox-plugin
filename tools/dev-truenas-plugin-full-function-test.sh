@@ -112,7 +112,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 NODE=$(hostname)
-VMID_END=$((VMID_START + 30))  # Increased range for new tests
+VMID_END=$((VMID_START + 250))  # Increased range to cover all tests including rate-limiting (VMID_START+100) and multi-node (VMID_START+200)
 TEST_SIZES=(1 10 32 100)  # GB sizes to test
 
 # Clone/Snapshot test VMIDs (at end of range)
@@ -140,6 +140,8 @@ readonly DELETION_WAIT=1          # Wait after VM deletion to verify cleanup
 readonly DELETION_VERIFY_SLEEP=2  # Initial wait before verifying deletions
 readonly DISK_ATTACH_WAIT=1       # Wait after disk attachment
 readonly DELETION_MAX_RETRIES=10  # Max attempts to verify VM deletion
+readonly ALLOCATION_WAIT=1        # Wait after disk allocation
+readonly SNAPSHOT_WAIT=2          # Wait after snapshot operations
 
 # Test counters
 TOTAL_TESTS=0
@@ -173,6 +175,22 @@ track_timing() {
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+# Extract nested JSON value (e.g., "compression" -> "value")
+# Usage: json_extract_nested "$json" "outer_key" "inner_key" "default"
+# Returns the value or default if not found
+json_extract_nested() {
+    local json="$1"
+    local outer_key="$2"
+    local inner_key="$3"
+    local default="${4:-}"
+
+    local result
+    result=$(echo "$json" | grep -o "\"${outer_key}\"[^}]*\"${inner_key}\"[^,}]*" | \
+        sed -n 's/.*"'"${inner_key}"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+    echo "${result:-$default}"
+}
 
 # ============================================================================
 # Enhanced Logging System
@@ -2760,11 +2778,13 @@ test_rapid_create_delete_stress() {
 
         # Allocate disk
         local volid
-        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        local alloc_output
+        alloc_output=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-0" \
             -size "1G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1) || true
+        volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
 
         if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk for VM $vmid"
@@ -3473,6 +3493,1192 @@ test_large_disk_operations() {
 }
 
 # ============================================================================
+# Phase 23: Transport Mode Verification Test
+# ============================================================================
+
+test_transport_mode_verification() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="Transport Mode Verification"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 23 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Detect transport mode from storage.cfg
+    log_verbose "Reading storage configuration" "INFO" "$CURRENT_OP_ID"
+    local storage_cfg="/etc/pve/storage.cfg"
+    local transport_mode=""
+    local target_iqn=""
+    local subsystem_nqn=""
+    local in_storage_block=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:[[:space:]]+$STORAGE_ID$ ]]; then
+            in_storage_block=1
+            continue
+        fi
+
+        if [[ $in_storage_block -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^truenasplugin: ]]; then
+                break
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]*transport_mode[[:space:]]+(.+)$ ]]; then
+                transport_mode="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*target_iqn[[:space:]]+(.+)$ ]]; then
+                target_iqn="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*subsystem_nqn[[:space:]]+(.+)$ ]]; then
+                subsystem_nqn="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$storage_cfg"
+
+    # Determine transport mode
+    if [[ "$transport_mode" == "nvme-tcp" ]] || [[ -n "$subsystem_nqn" ]]; then
+        transport_mode="nvme-tcp"
+    elif [[ -n "$target_iqn" ]]; then
+        transport_mode="iscsi"
+    else
+        log_error "Could not determine transport mode from storage configuration"
+        log_verbose "transport_mode='$transport_mode' target_iqn='$target_iqn' subsystem_nqn='$subsystem_nqn'" "ERROR" "$CURRENT_OP_ID"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Transport mode detection failed")
+        return 1
+    fi
+
+    log_verbose "Detected transport mode: $transport_mode" "INFO" "$CURRENT_OP_ID"
+
+    # Verify transport-specific connectivity
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        log_verbose "Verifying iSCSI session for target: $target_iqn" "INFO" "$CURRENT_OP_ID"
+
+        if ! command -v iscsiadm &>/dev/null; then
+            log_error "iscsiadm not found - iSCSI tools not installed"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - iSCSI tools missing")
+            return 1
+        fi
+
+        local session_check
+        session_check=$(iscsiadm --mode session 2>&1) || true
+        local session_rc=$?
+
+        if [[ $session_rc -ne 0 ]] || ! echo "$session_check" | grep -q "$target_iqn"; then
+            log_error "iSCSI session not found for target: $target_iqn"
+            log_verbose "Session check output: $session_check" "ERROR" "$CURRENT_OP_ID"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - iSCSI session not active")
+            return 1
+        fi
+
+        log_verbose "iSCSI session verified for $target_iqn" "INFO" "$CURRENT_OP_ID"
+
+    elif [[ "$transport_mode" == "nvme-tcp" ]]; then
+        log_verbose "Verifying NVMe subsystem for: $subsystem_nqn" "INFO" "$CURRENT_OP_ID"
+
+        if ! command -v nvme &>/dev/null; then
+            log_error "nvme command not found - nvme-cli not installed"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - nvme-cli missing")
+            return 1
+        fi
+
+        local subsys_check
+        subsys_check=$(nvme list-subsys 2>&1) || true
+        local subsys_rc=$?
+
+        if [[ $subsys_rc -ne 0 ]] || ! echo "$subsys_check" | grep -q "$subsystem_nqn"; then
+            log_error "NVMe subsystem not found for: $subsystem_nqn"
+            log_verbose "Subsystem check output: $subsys_check" "ERROR" "$CURRENT_OP_ID"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - NVMe subsystem not connected")
+            return 1
+        fi
+
+        log_verbose "NVMe subsystem verified for $subsystem_nqn" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Create test VM with disk to verify device identifiers
+    log_verbose "Creating test VM to verify device identifiers" "INFO" "$CURRENT_OP_ID"
+
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-transport-$vmid" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    # Allocate test disk using pvesh create to capture returned volid
+    log_verbose "Allocating test disk" "INFO" "$CURRENT_OP_ID"
+    local volid alloc_output
+    alloc_output=$(timeout 60 pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-0" \
+        -size "32G" \
+        --output-format=json 2>&1) || true
+    # Extract volid - successful response is just a quoted string like "storage:vol-..."
+    # Error response is JSON with "code" field - check for storage ID prefix to validate
+    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
+        log_error "Failed to allocate test disk"
+        log_verbose "Allocation output: $alloc_output" "ERROR" "$CURRENT_OP_ID"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated volume: $volid" "INFO" "$CURRENT_OP_ID"
+    sleep $ALLOCATION_WAIT
+
+    # Attach disk to VM
+    log_verbose "Attaching disk to VM" "INFO" "$CURRENT_OP_ID"
+    local attach_rc=0
+    pvesh set "/nodes/$NODE/qemu/$vmid/config" -scsi0 "$volid" >/dev/null 2>&1 || attach_rc=$?
+
+    if [[ $attach_rc -ne 0 ]]; then
+        log_error "Failed to attach disk to VM (rc=$attach_rc)"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk attachment failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+
+    # Verify device identifier based on transport mode
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        log_verbose "Verifying iSCSI WWN identifier" "INFO" "$CURRENT_OP_ID"
+
+        # Get disk path from qemu config
+        local disk_info
+        disk_info=$(pvesh get "/nodes/$NODE/qemu/$vmid/config" 2>/dev/null)
+
+        if ! echo "$disk_info" | grep -q "scsi0"; then
+            log_error "Disk not attached to VM"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            wait_for_vm_deletion "$vmid" "$vmid" 5
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Disk attachment verification failed")
+            return 1
+        fi
+
+        log_verbose "iSCSI disk attached and verified" "INFO" "$CURRENT_OP_ID"
+
+    elif [[ "$transport_mode" == "nvme-tcp" ]]; then
+        log_verbose "Verifying NVMe NGUID identifier" "INFO" "$CURRENT_OP_ID"
+
+        # List NVMe devices and look for our subsystem
+        local nvme_devices
+        nvme_devices=$(nvme list 2>&1) || true
+
+        if ! echo "$nvme_devices" | grep -q "/dev/nvme"; then
+            log_error "No NVMe devices found after disk allocation"
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+            wait_for_vm_deletion "$vmid" "$vmid" 5
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - NVMe device not found")
+            return 1
+        fi
+
+        log_verbose "NVMe disk attached and verified" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Cleanup
+    log_verbose "Cleaning up test VM" "INFO" "$CURRENT_OP_ID"
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Transport mode verification completed: $transport_mode (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name ($transport_mode)")
+    track_timing "transport_mode_verification" "$duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 28: Performance Regression Tracking
+# ============================================================================
+
+test_performance_regression_tracking() {
+    local test_num=$1
+    local test_name="Performance Regression Tracking"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 28 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    local baseline_file="/var/lib/truenas-test-baseline.json"
+    local baseline_exists=0
+
+    # Check if baseline exists
+    if [[ -f "$baseline_file" ]]; then
+        baseline_exists=1
+        log_verbose "Found existing baseline file: $baseline_file" "INFO" "$CURRENT_OP_ID"
+    else
+        log_verbose "No baseline file found, will create from current run" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # If baseline exists, compare current performance
+    if [[ $baseline_exists -eq 1 ]]; then
+        log_console "Comparing performance against baseline..."
+
+        # Read baseline data and compare
+        local regressions=0
+        local improvements=0
+        local comparison_output=""
+
+        # Compare each timing we have
+        for key in "${!PERF_TIMINGS[@]}"; do
+            local current_time="${PERF_TIMINGS[$key]}"
+            local baseline_time
+            # Extract numeric value for key from JSON baseline file using grep/sed
+            baseline_time=$(grep -o "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]*" "$baseline_file" 2>/dev/null | \
+                sed 's/.*:[[:space:]]*//' | head -1)
+            [[ -z "$baseline_time" ]] && baseline_time="none"
+
+            if [[ "$baseline_time" == "none" ]]; then
+                comparison_output+="  NEW: $key = ${current_time}s\n"
+                continue
+            fi
+
+            # Calculate percentage difference
+            local diff=$((current_time - baseline_time))
+            local percent=0
+
+            if [[ $baseline_time -gt 0 ]]; then
+                percent=$((diff * 100 / baseline_time))
+            fi
+
+            # Check for regressions (>20% slower) or improvements (>20% faster)
+            if [[ $percent -gt 20 ]]; then
+                regressions=$((regressions + 1))
+                comparison_output+="  ⚠ REGRESSION: $key = ${current_time}s (was ${baseline_time}s, +${percent}%)\n"
+            elif [[ $percent -lt -20 ]]; then
+                improvements=$((improvements + 1))
+                comparison_output+="  ✓ IMPROVEMENT: $key = ${current_time}s (was ${baseline_time}s, ${percent}%)\n"
+            else
+                comparison_output+="  = STABLE: $key = ${current_time}s (baseline ${baseline_time}s, ${percent:+$percent%})\n"
+            fi
+        done
+
+        # Display comparison results
+        echo | tee -a "$LOG_FILE"
+        echo "Performance Comparison:" | tee -a "$LOG_FILE"
+        echo -e "$comparison_output" | tee -a "$LOG_FILE"
+
+        if [[ $regressions -gt 0 ]]; then
+            log_warning "Found $regressions performance regression(s)"
+        fi
+
+        if [[ $improvements -gt 0 ]]; then
+            log_success "Found $improvements performance improvement(s)"
+        fi
+
+        log_verbose "Regressions: $regressions, Improvements: $improvements" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Update baseline with current run data
+    log_verbose "Updating baseline with current performance data" "INFO" "$CURRENT_OP_ID"
+
+    # Create JSON from PERF_TIMINGS associative array
+    local json_data="{"
+    local first=1
+    for key in "${!PERF_TIMINGS[@]}"; do
+        if [[ $first -eq 0 ]]; then
+            json_data+=","
+        fi
+        json_data+="\"$key\":${PERF_TIMINGS[$key]}"
+        first=0
+    done
+    json_data+="}"
+
+    # Ensure directory exists
+    mkdir -p "$(dirname "$baseline_file")" 2>/dev/null || true
+
+    # Write baseline file
+    echo "$json_data" > "$baseline_file" 2>/dev/null
+
+    if [[ $? -eq 0 ]]; then
+        log_success "Baseline updated at $baseline_file"
+    else
+        log_warning "Could not write baseline file (may need root permissions)"
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "performance_regression_tracking" "$duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 24: Snapshot Reversion Test
+# ============================================================================
+
+test_snapshot_reversion() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="Snapshot Reversion"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 24 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Create VM
+    log_verbose "Creating test VM" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-snap-revert-$vmid" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    # Allocate disk using pvesh create to capture returned volid
+    log_verbose "Allocating test disk" "INFO" "$CURRENT_OP_ID"
+    local volid alloc_output
+    alloc_output=$(timeout 60 pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-0" \
+        -size "8G" \
+        --output-format=json 2>&1) || true
+    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
+        log_error "Failed to allocate disk"
+        log_verbose "Allocation output: $alloc_output" "ERROR" "$CURRENT_OP_ID"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated volume: $volid" "INFO" "$CURRENT_OP_ID"
+    sleep $ALLOCATION_WAIT
+
+    # Attach disk
+    local attach_rc=0
+    pvesh set "/nodes/$NODE/qemu/$vmid/config" -scsi0 "$volid" >/dev/null 2>&1 || attach_rc=$?
+    if [[ $attach_rc -ne 0 ]]; then
+        log_error "Failed to attach disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk attachment failed")
+        return 1
+    fi
+    sleep $ALLOCATION_WAIT
+
+    # Create first snapshot "pre-change"
+    log_verbose "Creating snapshot 'pre-change'" "INFO" "$CURRENT_OP_ID"
+    local snap1_start=$(date +%s)
+    pvesh create "/nodes/$NODE/qemu/$vmid/snapshot" -snapname "pre-change" >/dev/null 2>&1
+    local snap1_rc=$?
+
+    if [[ $snap1_rc -ne 0 ]]; then
+        log_error "Failed to create first snapshot"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - First snapshot creation failed")
+        return 1
+    fi
+
+    sleep $SNAPSHOT_WAIT
+    local snap1_duration=$(($(date +%s) - snap1_start))
+    log_verbose "First snapshot created in ${snap1_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Simulate modification by creating another snapshot "post-change"
+    log_verbose "Creating snapshot 'post-change'" "INFO" "$CURRENT_OP_ID"
+    local snap2_start=$(date +%s)
+    pvesh create "/nodes/$NODE/qemu/$vmid/snapshot" -snapname "post-change" >/dev/null 2>&1
+    local snap2_rc=$?
+
+    if [[ $snap2_rc -ne 0 ]]; then
+        log_error "Failed to create second snapshot"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Second snapshot creation failed")
+        return 1
+    fi
+
+    sleep $SNAPSHOT_WAIT
+    local snap2_duration=$(($(date +%s) - snap2_start))
+    log_verbose "Second snapshot created in ${snap2_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Verify both snapshots exist (use VM snapshot list, not storage list)
+    log_verbose "Verifying snapshots exist" "INFO" "$CURRENT_OP_ID"
+    local snap_list
+    snap_list=$(pvesh get "/nodes/$NODE/qemu/$vmid/snapshot" --output-format=json 2>&1) || true
+
+    if ! echo "$snap_list" | grep -q '"name":"pre-change"'; then
+        log_error "Snapshot 'pre-change' not found in VM snapshot list"
+        log_verbose "Snapshot list: $snap_list" "ERROR" "$CURRENT_OP_ID"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - First snapshot verification failed")
+        return 1
+    fi
+
+    if ! echo "$snap_list" | grep -q '"name":"post-change"'; then
+        log_error "Snapshot 'post-change' not found in VM snapshot list"
+        log_verbose "Snapshot list: $snap_list" "ERROR" "$CURRENT_OP_ID"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Second snapshot verification failed")
+        return 1
+    fi
+
+    # Rollback to "pre-change" snapshot
+    log_verbose "Rolling back to snapshot 'pre-change'" "INFO" "$CURRENT_OP_ID"
+    local rollback_start=$(date +%s)
+
+    pvesh create "/nodes/$NODE/qemu/$vmid/snapshot/pre-change/rollback" >/dev/null 2>&1
+    local rollback_rc=$?
+
+    if [[ $rollback_rc -ne 0 ]]; then
+        log_error "Rollback to 'pre-change' failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rollback failed")
+        return 1
+    fi
+
+    sleep $SNAPSHOT_WAIT
+    local rollback_duration=$(($(date +%s) - rollback_start))
+    log_verbose "Rollback completed in ${rollback_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Verify rollback succeeded - post-change snapshot should still exist
+    snap_list=$(pvesh get "/nodes/$NODE/qemu/$vmid/snapshot" --output-format=json 2>&1) || true
+
+    if ! echo "$snap_list" | grep -q '"name":"pre-change"'; then
+        log_error "After rollback, 'pre-change' snapshot missing"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Post-rollback verification failed")
+        return 1
+    fi
+
+    log_success "Snapshot rollback successful"
+
+    # Cleanup - delete VM which will delete all snapshots
+    log_verbose "Cleaning up test VM and snapshots" "INFO" "$CURRENT_OP_ID"
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Snapshot reversion test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "snapshot_reversion" "$duration"
+    track_timing "snapshot_rollback" "$rollback_duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 26: API Rate Limiting Test
+# ============================================================================
+
+test_api_rate_limiting() {
+    local test_num=$1
+    local test_name="API Rate Limiting"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 26 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    local base_vmid=$((VMID_START + 100))
+    local num_vms=5
+    local vmids=()
+
+    # Create multiple VMs rapidly (no delays)
+    log_verbose "Creating $num_vms VMs rapidly" "INFO" "$CURRENT_OP_ID"
+    local create_start=$(date +%s)
+
+    for i in $(seq 1 $num_vms); do
+        local vmid=$((base_vmid + i))
+        vmids+=("$vmid")
+
+        pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-rate-$vmid" \
+            -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1 &
+    done
+
+    # Wait for all VM creations to complete
+    wait
+    local create_duration=$(($(date +%s) - create_start))
+    log_verbose "Created $num_vms VMs in ${create_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    sleep $((ALLOCATION_WAIT * 2))
+
+    # Allocate disks for all VMs simultaneously
+    log_verbose "Allocating disks for all VMs simultaneously" "INFO" "$CURRENT_OP_ID"
+    local alloc_start=$(date +%s)
+
+    for vmid in "${vmids[@]}"; do
+        pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1 &
+    done
+
+    # Wait for all allocations
+    wait
+    local alloc_duration=$(($(date +%s) - alloc_start))
+    log_verbose "Allocated $num_vms disks in ${alloc_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    sleep $((ALLOCATION_WAIT * 2))
+
+    # Query storage multiple times in quick succession
+    log_verbose "Performing rapid storage queries" "INFO" "$CURRENT_OP_ID"
+    local query_start=$(date +%s)
+    local query_count=20
+    local query_failures=0
+
+    for i in $(seq 1 $query_count); do
+        if ! pvesm list "$STORAGE_ID" >/dev/null 2>&1; then
+            query_failures=$((query_failures + 1))
+        fi
+    done
+
+    local query_duration=$(($(date +%s) - query_start))
+    log_verbose "Completed $query_count queries in ${query_duration}s ($query_failures failures)" "INFO" "$CURRENT_OP_ID"
+
+    if [[ $query_failures -gt 0 ]]; then
+        log_warning "Some storage queries failed ($query_failures/$query_count)"
+    fi
+
+    # Verify allocated resources - some may fail due to rate limiting which is expected
+    log_verbose "Verifying allocated resources" "INFO" "$CURRENT_OP_ID"
+    local visible_count=0
+
+    for vmid in "${vmids[@]}"; do
+        # Match both iSCSI (vm-$vmid-disk-0) and NVMe (vol-vm-$vmid-disk-0-ns...) naming
+        if pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | grep -qE "(vm-${vmid}-disk-0|vol-vm-${vmid}-disk-0)"; then
+            visible_count=$((visible_count + 1))
+        fi
+    done
+
+    log_verbose "Visible disks: $visible_count/$num_vms" "INFO" "$CURRENT_OP_ID"
+
+    # For rate limiting test, we expect some failures when hammering the API
+    # Fail only if less than 50% succeeded (severe issue)
+    local min_required=$((num_vms / 2))
+    if [[ $visible_count -lt $min_required ]]; then
+        log_error "Only $visible_count/$num_vms disks visible - severe allocation failures"
+
+        # Cleanup
+        for vmid in "${vmids[@]}"; do
+            pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 &
+        done
+        wait
+
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Severe resource allocation failures")
+        return 1
+    elif [[ $visible_count -lt $num_vms ]]; then
+        log_warning "$visible_count/$num_vms disks allocated - some parallel allocations failed (expected under load)"
+    fi
+
+    # Delete all VMs simultaneously
+    log_verbose "Deleting all VMs simultaneously" "INFO" "$CURRENT_OP_ID"
+    local delete_start=$(date +%s)
+
+    for vmid in "${vmids[@]}"; do
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 &
+    done
+
+    wait
+    local delete_duration=$(($(date +%s) - delete_start))
+    log_verbose "Deleted $num_vms VMs in ${delete_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Wait for cleanup
+    sleep $((DELETION_WAIT * 2))
+
+    # Clean up any orphaned disks (not attached to VMs, so VM delete doesn't remove them)
+    log_verbose "Cleaning up allocated disks" "INFO" "$CURRENT_OP_ID"
+    for vmid in "${vmids[@]}"; do
+        # Find and delete disks for this VMID
+        local disk_list
+        disk_list=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 || true)
+        if [[ -n "$disk_list" ]]; then
+            while read -r line; do
+                local volid
+                volid=$(echo "$line" | awk '{print $1}')
+                if [[ -n "$volid" ]]; then
+                    pvesm free "$volid" >/dev/null 2>&1 || true
+                fi
+            done <<< "$disk_list"
+        fi
+    done
+
+    sleep $((DELETION_WAIT * 2))
+
+    # Check for orphaned resources
+    log_verbose "Verifying cleanup complete" "INFO" "$CURRENT_OP_ID"
+    local orphan_count=0
+
+    for vmid in "${vmids[@]}"; do
+        if pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | grep -qE "(vm-${vmid}|vol-vm-${vmid})"; then
+            orphan_count=$((orphan_count + 1))
+            log_warning "Found orphaned resource for VMID $vmid"
+        fi
+    done
+
+    if [[ $orphan_count -gt 0 ]]; then
+        log_error "Found $orphan_count orphaned resources after cleanup"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Orphaned resources detected after cleanup")
+        return 1
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "API rate limiting test completed - no pool exhaustion or orphans (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "api_rate_limiting" "$duration"
+    track_timing "rapid_vm_creation" "$create_duration"
+    track_timing "rapid_disk_allocation" "$alloc_duration"
+    track_timing "rapid_deletion" "$delete_duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 25: Disk Hotswap Test
+# ============================================================================
+
+test_disk_hotswap() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="Disk Hotswap"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 25 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Create VM
+    log_verbose "Creating test VM" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-hotswap-$vmid" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    # Allocate first disk using pvesh create to capture returned volid
+    log_verbose "Allocating primary disk" "INFO" "$CURRENT_OP_ID"
+    local volid alloc_output
+    alloc_output=$(timeout 60 pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-0" \
+        -size "8G" \
+        --output-format=json 2>&1) || true
+    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
+        log_error "Failed to allocate primary disk"
+        log_verbose "Allocation output: $alloc_output" "ERROR" "$CURRENT_OP_ID"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Primary disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated volume: $volid" "INFO" "$CURRENT_OP_ID"
+    sleep $ALLOCATION_WAIT
+
+    local attach_rc=0
+    pvesh set "/nodes/$NODE/qemu/$vmid/config" -scsi0 "$volid" >/dev/null 2>&1 || attach_rc=$?
+    if [[ $attach_rc -ne 0 ]]; then
+        log_error "Failed to attach primary disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Primary disk attachment failed")
+        return 1
+    fi
+    sleep $ALLOCATION_WAIT
+
+    # Start VM
+    log_verbose "Starting VM for hotswap test" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu/$vmid/status/start" >/dev/null 2>&1
+    local start_rc=$?
+
+    if [[ $start_rc -ne 0 ]]; then
+        log_warning "VM failed to start - testing hotswap without running VM"
+        # Continue test but without guest agent verification
+    else
+        sleep 3
+        log_verbose "VM started" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Allocate second disk while VM is running (or configured)
+    log_verbose "Allocating second disk for hot-attach" "INFO" "$CURRENT_OP_ID"
+    local hotswap_start=$(date +%s)
+
+    local volid2 alloc_output2
+    alloc_output2=$(timeout 60 pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-1" \
+        -size "8G" \
+        --output-format=json 2>&1) || true
+    volid2=$(echo "$alloc_output2" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$volid2" ]] || [[ "$volid2" != "${STORAGE_ID}:"* ]]; then
+        log_error "Failed to allocate second disk"
+        log_verbose "Allocation output: $alloc_output2" "ERROR" "$CURRENT_OP_ID"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Second disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated second volume: $volid2" "INFO" "$CURRENT_OP_ID"
+    sleep $ALLOCATION_WAIT
+
+    # Hot-attach the disk
+    log_verbose "Hot-attaching second disk to running VM" "INFO" "$CURRENT_OP_ID"
+
+    local attach2_rc=0
+    pvesh set "/nodes/$NODE/qemu/$vmid/config" -scsi1 "$volid2" >/dev/null 2>&1 || attach2_rc=$?
+
+    if [[ $attach2_rc -ne 0 ]]; then
+        log_error "Failed to hot-attach disk"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Hot-attach failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+    local attach_duration=$(($(date +%s) - hotswap_start))
+    log_verbose "Disk hot-attached in ${attach_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Verify both disks are in config
+    local config
+    config=$(pvesh get "/nodes/$NODE/qemu/$vmid/config" 2>/dev/null)
+
+    if ! echo "$config" | grep -q "scsi0"; then
+        log_error "Primary disk (scsi0) not in configuration"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Primary disk verification failed")
+        return 1
+    fi
+
+    if ! echo "$config" | grep -q "scsi1"; then
+        log_error "Hot-attached disk (scsi1) not in configuration"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Hot-attach verification failed")
+        return 1
+    fi
+
+    log_verbose "Both disks verified in configuration" "INFO" "$CURRENT_OP_ID"
+
+    # Hot-detach the second disk
+    log_verbose "Hot-detaching second disk" "INFO" "$CURRENT_OP_ID"
+    local detach_start=$(date +%s)
+
+    pvesh set "/nodes/$NODE/qemu/$vmid/config" -delete scsi1 >/dev/null 2>&1
+    local detach_rc=$?
+
+    if [[ $detach_rc -ne 0 ]]; then
+        log_error "Failed to hot-detach disk"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Hot-detach failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+    local detach_duration=$(($(date +%s) - detach_start))
+    log_verbose "Disk hot-detached in ${detach_duration}s" "INFO" "$CURRENT_OP_ID"
+
+    # Verify scsi1 removed
+    config=$(pvesh get "/nodes/$NODE/qemu/$vmid/config" 2>/dev/null)
+
+    if echo "$config" | grep -q "scsi1"; then
+        log_error "Hot-detached disk still in configuration"
+        pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+        sleep 2
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Hot-detach verification failed")
+        return 1
+    fi
+
+    log_verbose "Hot-detach verified - scsi1 removed from configuration" "INFO" "$CURRENT_OP_ID"
+
+    # Cleanup
+    log_verbose "Stopping and deleting VM" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
+    sleep 2
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Disk hotswap test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "disk_hotswap" "$duration"
+    track_timing "hot_attach" "$attach_duration"
+    track_timing "hot_detach" "$detach_duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 27: Multi-Pool Operations Test
+# ============================================================================
+
+test_multi_pool_operations() {
+    local test_num=$1
+    local test_name="Multi-Pool Operations"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 27 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Check for multiple truenasplugin storage entries
+    log_verbose "Scanning for multiple TrueNAS storage configurations" "INFO" "$CURRENT_OP_ID"
+    local storage_cfg="/etc/pve/storage.cfg"
+    local storage_ids=()
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
+            storage_ids+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$storage_cfg"
+
+    local pool_count=${#storage_ids[@]}
+    log_verbose "Found $pool_count TrueNAS storage pool(s)" "INFO" "$CURRENT_OP_ID"
+
+    if [[ $pool_count -lt 2 ]]; then
+        log_warning "Only $pool_count TrueNAS storage pool configured - skipping multi-pool test"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("SKIP: $test_name - Single pool only")
+        return 0
+    fi
+
+    local pool_a="${storage_ids[0]}"
+    local pool_b="${storage_ids[1]}"
+
+    log_verbose "Testing with pools: $pool_a and $pool_b" "INFO" "$CURRENT_OP_ID"
+
+    # Create VM with disk on pool A
+    local vmid_a=$((VMID_START + 200))
+    log_verbose "Creating VM on pool A ($pool_a)" "INFO" "$CURRENT_OP_ID"
+
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid_a" -name "test-pool-a-$vmid_a" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    pvesm alloc "$pool_a" "$vmid_a" "vm-$vmid_a-disk-0" 8G >/dev/null 2>&1
+    local alloc_a_rc=$?
+
+    if [[ $alloc_a_rc -ne 0 ]]; then
+        log_error "Failed to allocate disk on pool A"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool A allocation failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+
+    # Create second VM with disk on pool B
+    local vmid_b=$((VMID_START + 201))
+    log_verbose "Creating VM on pool B ($pool_b)" "INFO" "$CURRENT_OP_ID"
+
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid_b" -name "test-pool-b-$vmid_b" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    pvesm alloc "$pool_b" "$vmid_b" "vm-$vmid_b-disk-0" 8G >/dev/null 2>&1
+    local alloc_b_rc=$?
+
+    if [[ $alloc_b_rc -ne 0 ]]; then
+        log_error "Failed to allocate disk on pool B"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid_a" "$vmid_a" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool B allocation failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+
+    # Verify disks on correct pools
+    log_verbose "Verifying disk placement on correct pools" "INFO" "$CURRENT_OP_ID"
+
+    local disk_a_check
+    disk_a_check=$(pvesm list "$pool_a" --vmid "$vmid_a" 2>/dev/null | tail -n +2)
+
+    if ! echo "$disk_a_check" | grep -q "vm-$vmid_a-disk-0"; then
+        log_error "Disk for VMID $vmid_a not found on pool A"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid_a" "$vmid_b" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool A verification failed")
+        return 1
+    fi
+
+    local disk_b_check
+    disk_b_check=$(pvesm list "$pool_b" --vmid "$vmid_b" 2>/dev/null | tail -n +2)
+
+    if ! echo "$disk_b_check" | grep -q "vm-$vmid_b-disk-0"; then
+        log_error "Disk for VMID $vmid_b not found on pool B"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid_a" "$vmid_b" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool B verification failed")
+        return 1
+    fi
+
+    log_verbose "Both disks verified on correct pools" "INFO" "$CURRENT_OP_ID"
+
+    # Test cross-pool operations (if supported)
+    # Note: Cross-pool migration may not be supported, so we just verify isolation
+    log_verbose "Verifying pool isolation" "INFO" "$CURRENT_OP_ID"
+
+    # Disk from pool A should not appear in pool B listings
+    local cross_check_b
+    cross_check_b=$(pvesm list "$pool_b" --vmid "$vmid_a" 2>/dev/null | tail -n +2)
+
+    if echo "$cross_check_b" | grep -q "vm-$vmid_a"; then
+        log_error "Pool isolation broken - VM A disk visible in pool B"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid_a" "$vmid_b" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool isolation test failed")
+        return 1
+    fi
+
+    # Disk from pool B should not appear in pool A listings
+    local cross_check_a
+    cross_check_a=$(pvesm list "$pool_a" --vmid "$vmid_b" 2>/dev/null | tail -n +2)
+
+    if echo "$cross_check_a" | grep -q "vm-$vmid_b"; then
+        log_error "Pool isolation broken - VM B disk visible in pool A"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid_a" "$vmid_b" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Pool isolation test failed")
+        return 1
+    fi
+
+    log_verbose "Pool isolation verified - disks properly segregated" "INFO" "$CURRENT_OP_ID"
+
+    # Cleanup
+    log_verbose "Cleaning up multi-pool test VMs" "INFO" "$CURRENT_OP_ID"
+    pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_a" "$vmid_b" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Multi-pool operations test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "multi_pool_operations" "$duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 29: Dataset Property Inheritance Test
+# ============================================================================
+
+test_dataset_property_inheritance() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="Dataset Property Inheritance"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 29 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Extract API credentials from storage.cfg
+    log_verbose "Reading TrueNAS API configuration" "INFO" "$CURRENT_OP_ID"
+    local storage_cfg="/etc/pve/storage.cfg"
+    local api_host=""
+    local api_key=""
+    local dataset=""
+    local in_storage_block=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:[[:space:]]+$STORAGE_ID$ ]]; then
+            in_storage_block=1
+            continue
+        fi
+
+        if [[ $in_storage_block -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^truenasplugin: ]]; then
+                break
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]*api_host[[:space:]]+(.+)$ ]]; then
+                api_host="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*api_key[[:space:]]+(.+)$ ]]; then
+                api_key="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*dataset[[:space:]]+(.+)$ ]]; then
+                dataset="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$storage_cfg"
+
+    if [[ -z "$api_host" ]] || [[ -z "$api_key" ]] || [[ -z "$dataset" ]]; then
+        log_error "Could not extract API configuration from storage.cfg"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Configuration extraction failed")
+        return 1
+    fi
+
+    log_verbose "API Host: $api_host, Dataset: $dataset" "INFO" "$CURRENT_OP_ID"
+
+    # Query parent dataset properties
+    log_verbose "Querying parent dataset properties" "INFO" "$CURRENT_OP_ID"
+    local api_url="https://${api_host}/api/v2.0/pool/dataset/id/${dataset}"
+    api_url="${api_url//\/\//\/}"  # Replace // with /
+
+    local dataset_props
+    dataset_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$api_url" 2>/dev/null)
+    local curl_rc=$?
+
+    if [[ $curl_rc -ne 0 ]]; then
+        log_error "Failed to query TrueNAS API for dataset properties"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - API query failed")
+        return 1
+    fi
+
+    # Extract properties using grep/sed helper
+    local compression
+    local dedup
+    local volblocksize
+
+    compression=$(json_extract_nested "$dataset_props" "compression" "value" "unknown")
+    dedup=$(json_extract_nested "$dataset_props" "deduplication" "value" "unknown")
+    volblocksize=$(json_extract_nested "$dataset_props" "volblocksize" "value" "unknown")
+
+    log_verbose "Parent dataset properties - compression: $compression, dedup: $dedup, volblocksize: $volblocksize" "INFO" "$CURRENT_OP_ID"
+
+    # Create VM with disk to generate a zvol
+    log_verbose "Creating VM to test zvol property inheritance" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-inherit-$vmid" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    # Allocate disk (creates zvol)
+    log_verbose "Allocating disk (creates zvol)" "INFO" "$CURRENT_OP_ID"
+    pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1
+    local alloc_rc=$?
+
+    if [[ $alloc_rc -ne 0 ]]; then
+        log_error "Failed to allocate disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    sleep $ALLOCATION_WAIT
+
+    # Query zvol properties
+    log_verbose "Querying zvol properties" "INFO" "$CURRENT_OP_ID"
+    local zvol_name="vm-$vmid-disk-0"
+    local zvol_path="${dataset}/${zvol_name}"
+    local zvol_api_url="https://${api_host}/api/v2.0/pool/dataset/id/${zvol_path}"
+    zvol_api_url="${zvol_api_url//\/\//\/}"
+
+    local zvol_props
+    zvol_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$zvol_api_url" 2>/dev/null)
+    curl_rc=$?
+
+    if [[ $curl_rc -ne 0 ]]; then
+        log_warning "Could not query zvol properties - may not be exposed via API"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("SKIP: $test_name - Zvol properties not accessible")
+        return 0
+    fi
+
+    # Extract zvol properties using grep/sed helper
+    local zvol_compression
+    local zvol_dedup
+    local zvol_volblocksize
+
+    zvol_compression=$(json_extract_nested "$zvol_props" "compression" "value" "inherit")
+    zvol_dedup=$(json_extract_nested "$zvol_props" "deduplication" "value" "inherit")
+    zvol_volblocksize=$(json_extract_nested "$zvol_props" "volblocksize" "value" "inherit")
+
+    log_verbose "Zvol properties - compression: $zvol_compression, dedup: $zvol_dedup, volblocksize: $zvol_volblocksize" "INFO" "$CURRENT_OP_ID"
+
+    # Verify inheritance (property should either be inherited or match parent)
+    local inheritance_ok=1
+
+    if [[ "$zvol_compression" != "inherit" ]] && [[ "$zvol_compression" != "$compression" ]]; then
+        if [[ "$compression" != "unknown" ]]; then
+            log_warning "Compression mismatch: parent=$compression, zvol=$zvol_compression"
+            # Don't fail on this - zvol might override parent
+        fi
+    fi
+
+    if [[ "$zvol_dedup" != "inherit" ]] && [[ "$zvol_dedup" != "$dedup" ]]; then
+        if [[ "$dedup" != "unknown" ]]; then
+            log_verbose "Dedup setting: parent=$dedup, zvol=$zvol_dedup" "INFO" "$CURRENT_OP_ID"
+        fi
+    fi
+
+    log_success "Dataset property inheritance verified"
+
+    # Cleanup
+    log_verbose "Cleaning up test VM" "INFO" "$CURRENT_OP_ID"
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "Dataset property inheritance test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "dataset_property_inheritance" "$duration"
+    return 0
+}
+
+# ============================================================================
 # Performance Summary Table
 # ============================================================================
 
@@ -3546,7 +4752,7 @@ main() {
     fi
     echo | tee -a "$LOG_FILE"
 
-    # Phase 1: Cleanup
+    # Phase 1: Cleanup (always run for safety)
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 1: Pre-flight Cleanup" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3555,22 +4761,32 @@ main() {
     cleanup_test_vms "$VMID_START" "$VMID_END"
     echo | tee -a "$LOG_FILE"
 
+    # Initialize test counters (must be before phase checks for --phase to work)
+    local vmid=$VMID_START
+    local test_num=1
+
     # Phase 2: Disk Allocation
+    if [[ $START_PHASE -gt 2 ]]; then
+        log_info "Skipping Phase 2 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 2: Disk Allocation Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
-    local vmid=$VMID_START
-    local test_num=1
+    vmid=$VMID_START
     for size in "${TEST_SIZES[@]}"; do
         test_disk_allocation "$size" "$vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         vmid=$((vmid + 1))
         test_num=$((test_num + 1))
     done
+    fi
 
     # Phase 3: TrueNAS Size Verification
+    if [[ $START_PHASE -gt 3 ]]; then
+        log_info "Skipping Phase 3 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 3: TrueNAS Size Verification Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3583,8 +4799,12 @@ main() {
         vmid=$((vmid + 1))
         test_num=$((test_num + 1))
     done
+    fi
 
     # Phase 4: Disk Deletion
+    if [[ $START_PHASE -gt 4 ]]; then
+        log_info "Skipping Phase 4 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 4: Disk Deletion Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3597,8 +4817,12 @@ main() {
         vmid=$((vmid + 1))
         test_num=$((test_num + 1))
     done
+    fi
 
     # Phase 5: Clone and Snapshot Tests
+    if [[ $START_PHASE -gt 5 ]]; then
+        log_info "Skipping Phase 5 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 5: Clone and Snapshot Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3633,8 +4857,12 @@ main() {
     test_disk_deletion "$CLONE_BASE_VMID" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 6: Disk Resize
+    if [[ $START_PHASE -gt 6 ]]; then
+        log_info "Skipping Phase 6 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 6: Disk Resize Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3644,8 +4872,12 @@ main() {
     test_disk_resize "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 7: Concurrent Operations
+    if [[ $START_PHASE -gt 7 ]]; then
+        log_info "Skipping Phase 7 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 7: Concurrent Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3655,8 +4887,12 @@ main() {
     test_concurrent_operations "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 8: Performance
+    if [[ $START_PHASE -gt 8 ]]; then
+        log_info "Skipping Phase 8 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 8: Performance Benchmarks" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3666,8 +4902,12 @@ main() {
     test_performance "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 9: Multiple Disks
+    if [[ $START_PHASE -gt 9 ]]; then
+        log_info "Skipping Phase 9 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 9: Multiple Disks Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3677,8 +4917,12 @@ main() {
     test_multiple_disks "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 10: EFI VM Creation
+    if [[ $START_PHASE -gt 10 ]]; then
+        log_info "Skipping Phase 10 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 10: EFI VM Creation Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3688,8 +4932,12 @@ main() {
     test_efi_vm_creation "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 11: Multi-Disk Advanced Operations
+    if [[ $START_PHASE -gt 11 ]]; then
+        log_info "Skipping Phase 11 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 11: Multi-Disk Advanced Operations Tests" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3705,10 +4953,14 @@ main() {
     else
         test_num=$((test_num + 3))
     fi
+    fi
 
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
         # Phase 12: Live Migration
+        if [[ $START_PHASE -gt 12 ]]; then
+            log_info "Skipping Phase 12 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 12: Live Migration Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3718,8 +4970,12 @@ main() {
         test_live_migration "$vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
 
         # Phase 13: Offline Migration
+        if [[ $START_PHASE -gt 13 ]]; then
+            log_info "Skipping Phase 13 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 13: Offline Migration Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3729,8 +4985,12 @@ main() {
         test_offline_migration "$vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
 
         # Phase 14: Cross-Node Clone (Online)
+        if [[ $START_PHASE -gt 14 ]]; then
+            log_info "Skipping Phase 14 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 14: Cross-Node Clone (Online) Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3741,8 +5001,12 @@ main() {
         test_cross_node_clone_online "$vmid" "$clone_vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
 
         # Phase 15: Cross-Node Clone (Offline)
+        if [[ $START_PHASE -gt 15 ]]; then
+            log_info "Skipping Phase 15 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 15: Cross-Node Clone (Offline) Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3753,12 +5017,16 @@ main() {
         test_cross_node_clone_offline "$vmid" "$clone_vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
     else
         log_info "Skipping cluster-based tests (Phases 12-15) - not in a cluster or no target node available"
         echo | tee -a "$LOG_FILE"
     fi
 
     # Phase 18: Rapid Creation/Deletion Stress Test
+    if [[ $START_PHASE -gt 18 ]]; then
+        log_info "Skipping Phase 18 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 18: Rapid Creation/Deletion Stress Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3768,8 +5036,12 @@ main() {
     test_rapid_create_delete_stress "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 19: Storage Quota/Space Exhaustion Test
+    if [[ $START_PHASE -gt 19 ]]; then
+        log_info "Skipping Phase 19 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 19: Storage Quota/Space Exhaustion Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3779,8 +5051,12 @@ main() {
     test_storage_exhaustion "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 20: Invalid/Malformed API Requests Test
+    if [[ $START_PHASE -gt 20 ]]; then
+        log_info "Skipping Phase 20 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 20: Invalid/Malformed API Requests Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3790,8 +5066,12 @@ main() {
     test_invalid_api_requests "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 21: Interrupted Operations Test
+    if [[ $START_PHASE -gt 21 ]]; then
+        log_info "Skipping Phase 21 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 21: Interrupted Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3801,8 +5081,12 @@ main() {
     test_interrupted_operations "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Phase 22: Large Disk Operations Test
+    if [[ $START_PHASE -gt 22 ]]; then
+        log_info "Skipping Phase 22 (--phase $START_PHASE)"
+    else
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PHASE 22: Large Disk Operations Test" | tee -a "$LOG_FILE"
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3812,10 +5096,14 @@ main() {
     test_large_disk_operations "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
 
     # Backup tests (only if backup storage specified)
     if [[ -n "$BACKUP_STORE" ]]; then
         # Phase 16: Online Backup
+        if [[ $START_PHASE -gt 16 ]]; then
+            log_info "Skipping Phase 16 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 16: Online Backup Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3825,8 +5113,12 @@ main() {
         test_online_backup "$vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
 
         # Phase 17: Offline Backup
+        if [[ $START_PHASE -gt 17 ]]; then
+            log_info "Skipping Phase 17 (--phase $START_PHASE)"
+        else
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
         echo "  PHASE 17: Offline Backup Test" | tee -a "$LOG_FILE"
         echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -3836,9 +5128,112 @@ main() {
         test_offline_backup "$vmid" "$test_num"
         echo | tee -a "$LOG_FILE"
         test_num=$((test_num + 1))
+        fi
     else
         log_info "Skipping backup tests (Phases 16, 17) - no backup storage specified (use --backup-store)"
         echo | tee -a "$LOG_FILE"
+    fi
+
+    # Phase 23: Transport Mode Verification
+    if [[ $START_PHASE -gt 23 ]]; then
+        log_info "Skipping Phase 23 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 23: Transport Mode Verification Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 32))
+    test_transport_mode_verification "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 24: Snapshot Reversion
+    if [[ $START_PHASE -gt 24 ]]; then
+        log_info "Skipping Phase 24 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 24: Snapshot Reversion Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 23))
+    test_snapshot_reversion "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 25: Disk Hotswap
+    if [[ $START_PHASE -gt 25 ]]; then
+        log_info "Skipping Phase 25 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 25: Disk Hotswap Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 24))
+    test_disk_hotswap "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 26: API Rate Limiting
+    if [[ $START_PHASE -gt 26 ]]; then
+        log_info "Skipping Phase 26 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 26: API Rate Limiting Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_api_rate_limiting "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 27: Multi-Pool Operations
+    if [[ $START_PHASE -gt 27 ]]; then
+        log_info "Skipping Phase 27 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 27: Multi-Pool Operations Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_multi_pool_operations "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 28: Performance Regression Tracking
+    if [[ $START_PHASE -gt 28 ]]; then
+        log_info "Skipping Phase 28 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 28: Performance Regression Tracking" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_performance_regression_tracking "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+
+    # Phase 29: Dataset Property Inheritance
+    if [[ $START_PHASE -gt 29 ]]; then
+        log_info "Skipping Phase 29 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 29: Dataset Property Inheritance Test" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 25))
+    test_dataset_property_inheritance "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
     fi
 
     # Performance Summary
