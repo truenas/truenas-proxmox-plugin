@@ -423,6 +423,11 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        storage_lock_timeout => {
+            description => "Cluster lock timeout in seconds for storage operations. " .
+                          "Increase for parallel bulk provisioning. Default: 120.",
+            type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
+        },
     };
 }
 sub options {
@@ -488,6 +493,9 @@ sub options {
         # Retry configuration
         api_retry_max => { optional => 1 },
         api_retry_delay => { optional => 1 },
+
+        # Concurrency
+        storage_lock_timeout => { optional => 1 },
     };
 }
 
@@ -906,6 +914,30 @@ sub _ws_cleanup_connections() {
     %_ws_connections = ();
 }
 
+# ======== Ephemeral WebSocket Connection for Write Operations ========
+# Creates a fresh, isolated connection for write operations to avoid
+# race conditions when multiple processes share persistent connections.
+# Each write operation gets its own connection that is closed after use.
+
+sub _ws_open_ephemeral($scfg) {
+    # Create a new WebSocket connection that will NOT be cached
+    # This is identical to _ws_open() but the caller is responsible
+    # for closing it after use via _ws_close_ephemeral()
+    return _ws_open($scfg);
+}
+
+sub _ws_close_ephemeral($conn) {
+    # Close an ephemeral connection after use
+    return unless $conn && $conn->{sock};
+    eval {
+        # Send WebSocket close frame (opcode 0x08)
+        my $close_frame = pack('CC', 0x88, 0x80) . join('', map { chr(int(rand(256))) } 1..4);
+        $conn->{sock}->syswrite($close_frame);
+        $conn->{sock}->close();
+    };
+    # Ignore errors during close - connection may already be dead
+}
+
 # ======== Bulk Operations Helper ========
 sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
     # Use core.bulk to batch multiple calls of the same method
@@ -917,7 +949,8 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
         die "Bulk operations are disabled in storage configuration";
     }
 
-    return _api_call($scfg, 'core.bulk', [$method_name, $params_array, $description],
+    # Bulk operations are always write operations, use ephemeral connection
+    return _api_call_write($scfg, 'core.bulk', [$method_name, $params_array, $description],
         sub { die "Bulk operations require WebSocket transport"; });
 }
 
@@ -1306,35 +1339,68 @@ sub _delete_dataset_with_retry {
 }
 
 # ======== Transport-agnostic API wrapper ========
-sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback) {
+# $opts is an optional hashref with:
+#   - use_ephemeral: if true, use an ephemeral connection (for write operations)
+sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback, $opts = undef) {
     my $transport = lc($scfg->{api_transport} // 'ws');
+    my $use_ephemeral = $opts && $opts->{use_ephemeral};
 
     # Level 2: Verbose - log all API calls with parameters
+    my $conn_type = $use_ephemeral ? 'ephemeral' : 'persistent';
     if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport, params=" . encode_json($ws_params));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport, conn=$conn_type, params=" . encode_json($ws_params));
     } else {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport");
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport, conn=$conn_type");
     }
 
     if ($transport eq 'ws') {
-        # Wrap WebSocket call with retry logic
-        return _retry_with_backoff($scfg, "WS $ws_method", sub {
-            my $conn = _ws_get_persistent($scfg);
-            my $res = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+        if ($use_ephemeral) {
+            # Use ephemeral connection for write operations to avoid race conditions
+            # Each write gets its own isolated connection
+            return _retry_with_backoff($scfg, "WS $ws_method", sub {
+                my $conn = _ws_open_ephemeral($scfg);
+                my $res;
+                eval {
+                    $res = _ws_rpc($conn, {
+                        jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+                    });
+                };
+                my $err = $@;
+                # Always close ephemeral connection, even on error
+                _ws_close_ephemeral($conn);
+                die $err if $err;
+
+                # Level 2: Verbose - log API response
+                _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+
+                return $res;
             });
+        } else {
+            # Use persistent connection for read operations (original behavior)
+            return _retry_with_backoff($scfg, "WS $ws_method", sub {
+                my $conn = _ws_get_persistent($scfg);
+                my $res = _ws_rpc($conn, {
+                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+                });
 
-            # Level 2: Verbose - log API response
-            _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+                # Level 2: Verbose - log API response
+                _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
 
-            return $res;
-        });
+                return $res;
+            });
+        }
     } elsif ($transport eq 'rest') {
         return $rest_fallback->() if $rest_fallback;
         die "REST fallback not provided for $ws_method";
     } else {
         die "Invalid api_transport '$transport' (use 'ws' or 'rest')";
     }
+}
+
+# Convenience wrapper for write operations that need ephemeral connections
+# Use this for create, update, delete operations to avoid WebSocket race conditions
+sub _api_call_write($scfg, $ws_method, $ws_params, $rest_fallback) {
+    return _api_call($scfg, $ws_method, $ws_params, $rest_fallback, { use_ephemeral => 1 });
 }
 
 # ======== TrueNAS API ops (WS with REST fallback) ========
@@ -1417,7 +1483,7 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     if ($blocksize) {
         $payload->{volblocksize} = _normalize_blocksize($blocksize);
     }
-    return _api_call($scfg, 'pool.dataset.create', [ $payload ],
+    return _api_call_write($scfg, 'pool.dataset.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
     );
 }
@@ -1425,7 +1491,7 @@ sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full); # encode '/' as %2F for REST
 
     _log($scfg, 1, 'info', "[TrueNAS] _tn_dataset_delete: deleting $full (recursive=true)");
-    my $result = _api_call($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
+    my $result = _api_call_write($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
         sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
     );
 
@@ -1448,7 +1514,7 @@ sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     # REST path uses %2F for '/', same as get/delete helpers
     my $id = URI::Escape::uri_escape($full);
     my $payload = { volsize => int($new_bytes) }; # grow-only
-    return _api_call($scfg, 'pool.dataset.update', [ $full, $payload ],
+    return _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ],
         sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) }
     );
 }
@@ -1460,7 +1526,7 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call($scfg, 'zfs.snapshot.clone', [ $payload ],
+    return _api_call_write($scfg, 'zfs.snapshot.clone', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot/clone', $payload) }
     );
 }
@@ -1475,12 +1541,19 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
 
     # TrueNAS 25.04+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
     my $attempt_rollback = sub {
-        my $conn = _ws_open($ws_scfg);
-        return _ws_rpc($conn, {
-            jsonrpc => "2.0", id => 1,
-            method  => "zfs.snapshot.rollback",
-            params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
-        });
+        my $conn = _ws_open_ephemeral($ws_scfg);
+        my $result;
+        eval {
+            $result = _ws_rpc($conn, {
+                jsonrpc => "2.0", id => 1,
+                method  => "zfs.snapshot.rollback",
+                params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+            });
+        };
+        my $err = $@;
+        _ws_close_ephemeral($conn);
+        die $err if $err;
+        return $result;
     };
 
     eval { $attempt_rollback->(); };
@@ -1492,12 +1565,18 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
             if ($force_bool && !$recursive_bool) {
                 # Retry with recursive=1 to delete newer snapshots
                 eval {
-                    my $conn = _ws_open($ws_scfg);
-                    _ws_rpc($conn, {
-                        jsonrpc => "2.0", id => 2,
-                        method  => "zfs.snapshot.rollback",
-                        params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
-                    });
+                    my $conn = _ws_open_ephemeral($ws_scfg);
+                    my $result;
+                    eval {
+                        $result = _ws_rpc($conn, {
+                            jsonrpc => "2.0", id => 2,
+                            method  => "zfs.snapshot.rollback",
+                            params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
+                        });
+                    };
+                    my $inner_err = $@;
+                    _ws_close_ephemeral($conn);
+                    die $inner_err if $inner_err;
                 };
                 return 1 if !$@;
             }
@@ -1738,7 +1817,7 @@ sub volume_snapshot {
     # TrueNAS REST: POST /zfs/snapshot { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
     # Snapshot will be <pool/ds/...>@<snapname>
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-    my $result = _api_call(
+    my $result = _api_call_write(
         $scfg, 'zfs.snapshot.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
@@ -1772,7 +1851,7 @@ sub volume_snapshot_delete {
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
 
     # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap> with job completion waiting
-    my $result = _api_call(
+    my $result = _api_call_write(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
         sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
     );
@@ -1883,7 +1962,7 @@ sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    my $result = _api_call($scfg, 'iscsi.extent.create', [ $payload ],
+    my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
     );
     # Invalidate cache since extents list has changed
@@ -1891,7 +1970,7 @@ sub _tn_extent_create($scfg, $zname, $full) {
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    my $result = _api_call($scfg, 'iscsi.extent.delete', [ $extent_id ],
+    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
     );
     # Invalidate cache since extents list has changed
@@ -1913,7 +1992,7 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
 
     # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
-    my $result = _api_call($scfg, 'iscsi.targetextent.create', [ $payload ],
+    my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ],
         sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
     );
     # Invalidate cache since targetextents list has changed
@@ -1921,7 +2000,7 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    my $result = _api_call($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
+    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
         sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
     );
     # Invalidate cache since targetextents list has changed
@@ -4672,5 +4751,35 @@ sub copy_image {
 }
 
 sub create_base { die "base images not supported"; }
+
+# ======== Extended Cluster Lock Timeout ========
+# Override cluster_lock_storage to use a longer timeout for TrueNAS operations.
+#
+# The default Proxmox CFS lock timeout is 10 seconds, which is too short for
+# concurrent storage operations on TrueNAS. Each disk allocation takes ~12-15
+# seconds (zvol creation + iSCSI extent + device discovery), so parallel
+# allocations (e.g., bulk VM provisioning) can queue up and timeout.
+#
+# This override increases the timeout to 120 seconds (configurable via
+# storage_lock_timeout option), allowing more concurrent operations to succeed.
+# The lock is still cluster-wide, so operations are serialized - this just
+# prevents timeouts during the queue wait.
+
+use constant DEFAULT_LOCK_TIMEOUT => 120;  # 2 minutes default, vs Proxmox's 10 seconds
+
+sub cluster_lock_storage {
+    my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
+
+    # Use configured timeout or our default (much longer than Proxmox's 10s)
+    my $cfg = PVE::Storage::config();
+    my $scfg = PVE::Storage::storage_config($cfg, $storeid, 1);
+    my $lock_timeout = $scfg->{storage_lock_timeout} // DEFAULT_LOCK_TIMEOUT;
+
+    # Override the timeout if not explicitly provided or if it's the Proxmox default
+    $timeout = $lock_timeout if !defined($timeout) || $timeout < $lock_timeout;
+
+    # Call parent implementation with extended timeout
+    return $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $func, @param);
+}
 
 1;
