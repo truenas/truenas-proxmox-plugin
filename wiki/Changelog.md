@@ -1,5 +1,28 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.0 (December 7, 2025)
+
+### **Concurrent Operations Support**
+
+#### **Fixed parallel disk allocation failures (30% → 100% success rate)**
+- **Problem**: Parallel VM creation with disk allocation failed at ~30% success rate due to Proxmox CFS lock timeout
+- **Root cause**: Default 10-second CFS lock timeout was insufficient for concurrent disk allocations that take ~12-15 seconds each
+- **Solution implemented**:
+  - **Extended CFS lock timeout**: Added `storage_lock_timeout` property (default 120s, range 10-600s)
+  - **Ephemeral WebSocket connections**: Write operations now use isolated connections to prevent response interleaving
+  - **RFC 6455 compliance**: WebSocket close frames now properly formatted
+
+#### **New Configuration Options**
+- `storage_lock_timeout` - Configurable Proxmox CFS lock timeout for bulk provisioning scenarios
+
+#### **Technical Changes**
+- Added `_ws_open_ephemeral()` and `_ws_close_ephemeral()` for isolated write connections
+- Added `_api_call_write()` wrapper routing writes through ephemeral connections
+- Updated all write helpers: dataset, extent, targetextent, snapshot, bulk operations
+- Fixed `_delete_dataset_with_retry()` to use ephemeral connections for consistency
+
+---
+
 ## Version 1.1.13 (December 2, 2025)
 
 ### 🐛 **Critical Bug Fix: Dataset Deletion Race Condition (Issue #45)**

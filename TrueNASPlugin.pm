@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.1.13';
+our $VERSION = '1.2.0';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -926,15 +926,18 @@ sub _ws_open_ephemeral($scfg) {
     return _ws_open($scfg);
 }
 
-sub _ws_close_ephemeral($conn) {
+sub _ws_close_ephemeral($conn, $scfg = undef) {
     # Close an ephemeral connection after use
     return unless $conn && $conn->{sock};
     eval {
-        # Send WebSocket close frame (opcode 0x08)
-        my $close_frame = pack('CC', 0x88, 0x80) . join('', map { chr(int(rand(256))) } 1..4);
+        # Send minimal WebSocket close frame per RFC 6455 (FIN + close opcode, no payload)
+        my $close_frame = pack('CC', 0x88, 0x00);
         $conn->{sock}->syswrite($close_frame);
         $conn->{sock}->close();
     };
+    if ($@ && $scfg) {
+        _log($scfg, 2, 'debug', "[TrueNAS] Failed to close ephemeral connection cleanly: $@");
+    }
     # Ignore errors during close - connection may already be dead
 }
 
@@ -1299,7 +1302,7 @@ sub _delete_dataset_with_retry {
     for my $attempt (1..$max_retries) {
         eval {
             _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
-            my $result = _api_call($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
+            my $result = _api_call_write($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
                 sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
 
             my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);

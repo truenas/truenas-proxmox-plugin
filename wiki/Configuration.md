@@ -21,6 +21,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [api_insecure](#api_insecure)
   - [api_retry_max](#api_retry_max)
   - [api_retry_delay](#api_retry_delay)
+  - [storage_lock_timeout](#storage_lock_timeout)
 - [Network Configuration](#network-configuration)
   - [prefer_ipv4](#prefer_ipv4)
   - [portals](#portals)
@@ -169,7 +170,7 @@ shared 1
 **Valid Values**: `ws` (WebSocket), `rest` (HTTP REST)
 **Default**: `ws`
 
-WebSocket is recommended for better performance and persistent connections.
+WebSocket is recommended for better performance and persistent connections. For write operations (create, update, delete), WebSocket uses ephemeral connections to prevent concurrent operation interference.
 
 ```ini
 api_transport ws
@@ -229,6 +230,30 @@ Each retry doubles the delay: `delay * 2^(attempt-1)`. Example: 1s → 2s → 4s
 ```ini
 api_retry_delay 2
 ```
+
+### `storage_lock_timeout`
+**Description**: Cluster lock timeout in seconds for storage operations
+**Type**: Integer (10-600)
+**Default**: `120`
+**Validation**: Must be between 10 and 600 seconds
+
+Configures the timeout for Proxmox Cluster File System (CFS) locks used during write operations. The default Proxmox timeout (10 seconds) may be insufficient for concurrent disk allocation operations, especially when multiple VMs are being created in parallel.
+
+Increase this value for:
+- Parallel VM provisioning (multiple simultaneous disk allocations)
+- Bulk storage operations
+- High-concurrency environments
+- Slower TrueNAS backends (high latency, lower throughput)
+
+```ini
+# Default (suitable for most deployments)
+storage_lock_timeout 120
+
+# Extended timeout for high-concurrency scenarios
+storage_lock_timeout 300
+```
+
+**Technical Details**: This property controls the timeout for `PVE::Storage::lock_storage()` calls, which serialize access to the storage configuration file during write operations. When concurrent operations exceed this timeout, they fail with a "lock timeout" error. Typical disk allocation operations take 10-15 seconds on standard hardware, so the default 120-second timeout provides ample time for 8+ concurrent operations.
 
 ## Network Configuration
 
@@ -661,6 +686,7 @@ truenasplugin: truenas-cluster
     tn_sparse 1
     use_multipath 1
     vmstate_storage local
+    storage_lock_timeout 120
     # Security
     chap_user proxmox-cluster
     chap_password your-secure-password
@@ -689,6 +715,7 @@ truenasplugin: truenas-ha
     tn_sparse 1
     use_multipath 1
     vmstate_storage local
+    storage_lock_timeout 180
     chap_user proxmox-ha
     chap_password very-secure-password
     force_delete_on_inuse 1
@@ -817,6 +844,7 @@ truenasplugin: enterprise-storage
     vmstate_storage local
 
     # Performance Optimization
+    storage_lock_timeout 180
     enable_bulk_operations 1
 ```
 

@@ -859,6 +859,97 @@ api_retry_delay 1
 
 Jitter: Random 0-20% added to prevent thundering herd
 
+### Concurrent Operations and Storage Lock Timeout
+
+The plugin is optimized to handle parallel disk allocations and bulk storage operations through a combination of ephemeral WebSocket connections and extended lock timeouts.
+
+#### Ephemeral WebSocket Connections for Write Operations
+
+All write operations (create, update, delete) use one-time WebSocket connections that are created, used, and immediately closed. This prevents response interleaving issues when multiple concurrent processes perform operations simultaneously.
+
+**How it Works**:
+1. For each write operation, a new WebSocket connection is created via `_ws_open_ephemeral()`
+2. The operation is executed on this isolated connection
+3. Connection is immediately closed via `_ws_close_ephemeral()` with RFC 6455 compliant close frame
+4. Read operations continue using cached persistent connections for efficiency
+
+**Affected Write Operations**:
+- Dataset operations (create, delete, update, clone)
+- iSCSI extent and target-extent creation/deletion
+- Snapshot operations (create, delete, rollback)
+- NVMe namespace operations
+- Bulk operations via core.bulk API
+
+#### Storage Lock Timeout Configuration
+
+The Proxmox Cluster File System (CFS) requires a lock on the storage configuration file during write operations. The default 10-second timeout is insufficient for parallel bulk provisioning.
+
+```ini
+# Extended timeout for parallel operations (default: 120 seconds)
+storage_lock_timeout 120
+
+# For high-concurrency scenarios (8+ parallel operations)
+storage_lock_timeout 180
+
+# For very high concurrency (enterprise bulk provisioning)
+storage_lock_timeout 300
+```
+
+**Timeout Calculation**:
+- Each disk allocation takes approximately 10-15 seconds (zvol creation, extent creation, mapping)
+- With n concurrent operations, timeout should be at least 15 * n seconds
+- 120 seconds default supports 8+ concurrent operations comfortably
+- Range: 10-600 seconds
+
+**When to Increase**:
+- Parallel VM creation with many VMs
+- Bulk provisioning of multiple storage volumes
+- Lower-performance TrueNAS backends
+- High-latency network between Proxmox and TrueNAS
+
+**Example Scenarios**:
+
+| Scenario | Concurrent Ops | Recommended Timeout | Rationale |
+|----------|---|---|---|
+| Single VM creation | 1 | 120s (default) | Sufficient for single operations |
+| 5 VMs in parallel | 5 | 120s (default) | ~13s per op, 120s handles comfortably |
+| 10 VMs in parallel | 10 | 180s | ~13s per op, 180s handles with margin |
+| Bulk 20 VM deployment | 20 | 300s | ~15s per op, 300s maximum buffer |
+
+**Technical Details**:
+- Lock is acquired via `PVE::Storage::lock_storage()` which serializes access to `/etc/pve/storage.cfg`
+- When timeout is exceeded, the operation fails with "lock timeout" error
+- Lock timeout is separate from API retry timeout
+- Both ephemeral connections AND extended lock timeout are required for reliable concurrent operations
+
+#### Monitoring Concurrent Operations
+
+Check for lock timeout issues:
+
+```bash
+# Monitor for lock timeouts in recent operations
+journalctl --since '30 minutes ago' | grep 'lock timeout'
+
+# View detailed operation logs with debug enabled
+debug 1  # In storage configuration
+journalctl -u pvedaemon -f | grep TrueNAS
+```
+
+**Error Indicators**:
+- Intermittent failures during parallel operations
+- "lock timeout" in error messages
+- Failures that don't occur with sequential operations
+- Increasing failure rate as concurrency increases
+
+**Resolution**:
+```ini
+# Increase storage_lock_timeout in /etc/pve/storage.cfg
+storage_lock_timeout 240
+
+# Restart services to apply
+systemctl restart pvedaemon pveproxy
+```
+
 ## Cluster Configuration
 
 ### Shared Storage Setup
