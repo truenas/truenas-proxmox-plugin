@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.0';
+our $VERSION = '1.2.1';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -858,7 +858,13 @@ sub _ws_rpc {
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
     my $resp = _ws_recv_text($conn->{sock});
-    my $decoded = decode_json($resp);
+    my $decoded = eval { decode_json($resp) };
+    if ($@ || !$decoded) {
+        my $len = length($resp // '');
+        my $preview = substr($resp // '', 0, 200);
+        _log(undef, 0, 'err', "[TrueNAS] JSON decode failed (len=$len): $@ Preview: $preview");
+        die "JSON-RPC decode failed: $@";
+    }
     die "JSON-RPC error: ".encode_json($decoded->{error}) if exists $decoded->{error};
     return $decoded->{result};
 }
@@ -1944,7 +1950,7 @@ sub volume_snapshot_info {
         if (my $props = $s->{properties}) {
             if (ref($props->{creation}) eq 'HASH') {
                 $ts = int($props->{creation}{rawvalue} // 0);
-            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+            } elsif (defined $props->{creation} && !ref($props->{creation}) && $props->{creation} =~ /(\d{10})/) {
                 $ts = int($1);
             }
         }
@@ -2677,9 +2683,12 @@ sub _nvme_find_device_by_subsystem {
 
             # Match both nvme3n1 and nvme3c3n1 patterns
             # Note: We no longer parse NSID from device name as it's unreliable
-            if ($entry =~ /^nvme\d+n\d+$/) {
+            # Use capture groups to untaint $entry from readdir() for use in system calls
+            if ($entry =~ /^(nvme\d+n\d+)$/) {
+                $entry = $1;  # Untaint via capture
                 $type = 'standard';
-            } elsif ($entry =~ /^nvme\d+c\d+n\d+$/) {
+            } elsif ($entry =~ /^(nvme\d+c\d+n\d+)$/) {
+                $entry = $1;  # Untaint via capture
                 $type = 'controller';
             } else {
                 next;
@@ -4007,7 +4016,7 @@ sub _list_images_iscsi {
         if (my $props = $ds->{properties}) {
             if (ref($props->{creation}) eq 'HASH') {
                 $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
-            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+            } elsif (defined $props->{creation} && !ref($props->{creation}) && $props->{creation} =~ /(\d{10})/) {
                 $ctime = int($1);
             }
         }
@@ -4145,7 +4154,7 @@ sub _list_images_nvme {
         if (my $props = $ds->{properties}) {
             if (ref($props->{creation}) eq 'HASH') {
                 $ctime = int($props->{creation}{rawvalue} // $props->{creation}{value} // 0);
-            } elsif (defined $props->{creation} && $props->{creation} =~ /(\d{10})/) {
+            } elsif (defined $props->{creation} && !ref($props->{creation}) && $props->{creation} =~ /(\d{10})/) {
                 $ctime = int($1);
             }
         }

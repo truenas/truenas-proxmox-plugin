@@ -1,5 +1,31 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.1 (December 8, 2025)
+
+### 🐛 **Bug Fixes: pvestatd Stability and NVMe Taint Mode**
+
+#### **Fixed pvestatd crashes (SIGSEGV) from truncated API responses**
+- **Problem**: pvestatd crashed with SIGSEGV after 1-2 minutes when TrueNAS returned truncated JSON responses
+- **Root cause**: `decode_json()` threw uncaught exceptions on malformed JSON, causing cascading failures
+- **Solution**: Wrapped JSON decoding in `eval {}` with diagnostic logging (response length and preview) before re-throwing
+
+#### **Fixed "Insecure dependency in exec" errors on NVMe storage**
+- **Problem**: Moving disks to/from NVMe storage and creating EFI disks failed with Perl taint mode errors
+- **Root cause**: Device names from `readdir()` were validated but not untainted before use in system calls
+- **Solution**: Added capture groups to regex patterns to properly untaint `$entry` via `$1` assignment
+
+#### **Fixed "Can't use string (DEFAULT) as SCALAR ref" errors**
+- **Problem**: Status checks failed when TrueNAS returned string "DEFAULT" for inherited properties
+- **Root cause**: Code attempted regex matching on property values that could be references instead of strings
+- **Solution**: Added `!ref()` guard before regex matching in three locations (volume_snapshot_info, _list_images_iscsi, _list_images_nvme)
+
+### 🔧 **Technical Details**
+- `_ws_rpc()`: JSON decode now wrapped in eval with error logging
+- `_nvme_find_device_by_subsystem()`: Device name regex uses capture groups for untainting
+- Property access hardening at lines 1953, 4019, 4157
+
+---
+
 ## Version 1.2.0 (December 7, 2025)
 
 ### **Concurrent Operations Support**

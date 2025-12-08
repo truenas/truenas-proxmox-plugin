@@ -1678,6 +1678,26 @@ test_efi_vm_creation() {
 
     log_success "EFI VM configured correctly"
 
+    # Test VM boot (exercises activate_volume code path - catches taint mode bugs)
+    log_info "Testing VM boot (activate_volume)"
+    if ! timeout 30 qm start "$vmid" 2>&1; then
+        log_error "Failed to start EFI VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM start failed")
+        return 1
+    fi
+
+    # Wait briefly for VM to initialize
+    sleep 3
+
+    # Stop VM
+    log_info "Stopping VM"
+    qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+    sleep 2
+
+    log_success "EFI VM boot test passed"
+
     # Cleanup
     pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1
     wait_for_vm_deletion "$vmid" "$vmid" 5
