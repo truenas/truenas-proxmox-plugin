@@ -678,7 +678,15 @@ sub _rest_call($scfg, $method, $path, $payload=undef) {
         die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
             if !$res->is_success;
         my $content = $res->decoded_content // '';
-        return length($content) ? decode_json($content) : undef;
+        return undef unless length($content);
+        my $decoded = eval { decode_json($content) };
+        if ($@ || !$decoded) {
+            my $len = length($content);
+            my $preview = substr($content, 0, 200);
+            _log(undef, 0, 'err', "[TrueNAS] REST JSON decode failed (len=$len): $@ Preview: $preview");
+            die "REST response decode failed: $@";
+        }
+        return $decoded;
     });
 }
 
@@ -1765,7 +1773,8 @@ sub volume_resize {
             my $subsys_link = readlink("/sys/class/nvme-subsystem/nvme-subsys*");
             opendir(my $dh, "/sys/class/nvme-subsystem") or die "Cannot open nvme-subsystem: $!";
             while (my $subsys = readdir($dh)) {
-                next unless $subsys =~ /^nvme-subsys\d+$/;
+                next unless $subsys =~ /^(nvme-subsys\d+)$/;
+                $subsys = $1;  # Untaint via capture
                 my $subsys_nqn = eval {
                     open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
                     my $val = <$fh>;
@@ -1778,8 +1787,9 @@ sub volume_resize {
                 # Found our subsystem, rescan all its controllers
                 opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
                 while (my $entry = readdir($sdh)) {
-                    next unless $entry =~ /^nvme(\d+)$/;
-                    my $ctrl_dev = "/dev/nvme$1";
+                    next unless $entry =~ /^(nvme(\d+))$/;
+                    $entry = $1;  # Untaint via capture
+                    my $ctrl_dev = "/dev/nvme$2";
                     if (-e $ctrl_dev) {
                         eval { _try_run(['nvme', 'ns-rescan', $ctrl_dev], "nvme rescan $ctrl_dev"); };
                         $rescanned++ unless $@;
@@ -1795,7 +1805,8 @@ sub volume_resize {
             eval {
                 opendir(my $dh, "/dev") or die "Cannot open /dev: $!";
                 while (my $dev = readdir($dh)) {
-                    next unless $dev =~ /^nvme\d+$/;
+                    next unless $dev =~ /^(nvme\d+)$/;
+                    $dev = $1;  # Untaint via capture
                     eval { _try_run(['nvme', 'ns-rescan', "/dev/$dev"], "nvme rescan /dev/$dev"); };
                 }
                 closedir($dh);
@@ -2663,7 +2674,8 @@ sub _nvme_find_device_by_subsystem {
     # Find subsystem matching our NQN
     opendir(my $dh, "/sys/class/nvme-subsystem") or return undef;
     while (my $subsys = readdir($dh)) {
-        next unless $subsys =~ /^nvme-subsys\d+$/;
+        next unless $subsys =~ /^(nvme-subsys\d+)$/;
+        $subsys = $1;  # Untaint via capture
 
         my $subsys_nqn = eval {
             open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
@@ -2858,7 +2870,8 @@ sub _nvme_device_for_uuid {
             eval {
                 opendir(my $dh, "/sys/class/nvme-subsystem") or die;
                 while (my $subsys = readdir($dh)) {
-                    next unless $subsys =~ /^nvme-subsys\d+$/;
+                    next unless $subsys =~ /^(nvme-subsys\d+)$/;
+                    $subsys = $1;  # Untaint via capture
                     my $subsys_nqn = eval {
                         open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
                         my $val = <$fh>;
@@ -2871,8 +2884,9 @@ sub _nvme_device_for_uuid {
                     # Rescan controllers in this subsystem
                     opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
                     while (my $entry = readdir($sdh)) {
-                        next unless $entry =~ /^nvme(\d+)$/;
-                        my $ctrl_dev = "/dev/nvme$1";
+                        next unless $entry =~ /^(nvme(\d+))$/;
+                        $entry = $1;  # Untaint via capture
+                        my $ctrl_dev = "/dev/nvme$2";
                         eval { run_command(['nvme', 'ns-rescan', $ctrl_dev], outfunc => sub {}, errfunc => sub {}) };
                     }
                     closedir($sdh);

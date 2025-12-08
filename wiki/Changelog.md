@@ -21,8 +21,11 @@
 
 ### 🔧 **Technical Details**
 - `_ws_rpc()`: JSON decode now wrapped in eval with error logging
+- `_rest_api_call()`: Same JSON decode error handling added for REST transport
 - `_nvme_find_device_by_subsystem()`: Device name regex uses capture groups for untainting
+- Extended untainting to all NVMe readdir operations (`_nvme_rescan_controllers`, `_nvme_device_for_uuid`)
 - Property access hardening at lines 1953, 4019, 4157
+- Test script now boots EFI VMs to exercise `activate_volume()` code path
 
 ---
 
