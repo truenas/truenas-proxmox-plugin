@@ -902,7 +902,11 @@ sub _ws_get_persistent($scfg) {
             });
         };
         if ($@) {
-            # Connection is dead, remove it
+            # Connection is dead, close socket properly before removing from cache
+            # This prevents "free unreferenced scalar" errors from IO::Socket::SSL
+            if ($conn && $conn->{sock}) {
+                eval { $conn->{sock}->close(); };
+            }
             delete $_ws_connections{$key};
             $conn = undef;
         }
@@ -2314,6 +2318,30 @@ sub _target_sessions_active($scfg) {
     return 0;
 }
 
+# Check if a specific portal has an active session for this target
+sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
+    my $iqn = $scfg->{target_iqn};
+    my $norm_portal = _normalize_portal($portal);
+
+    # Get active sessions if not provided
+    my @session_lines;
+    if ($session_lines_ref && ref($session_lines_ref) eq 'ARRAY') {
+        @session_lines = @$session_lines_ref;
+    } else {
+        @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
+        return 0 if $@;
+    }
+
+    # Check if this portal has an active session
+    for my $line (@session_lines) {
+        # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
+        if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E/) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 # Check if all configured portals have active sessions for this target
 sub _all_portals_connected($scfg) {
     my $iqn = $scfg->{target_iqn};
@@ -2325,21 +2353,13 @@ sub _all_portals_connected($scfg) {
 
     return 0 if !@portals; # No portals configured
 
-    # Get active sessions
+    # Get active sessions once for efficiency
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
     return 0 if $@; # If command fails (no sessions exist), return false
 
     # Check each portal has an active session
     for my $portal (@portals) {
-        my $found = 0;
-        for my $line (@session_lines) {
-            # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
-            if ($line =~ /\Q$portal\E.*\Q$iqn\E/) {
-                $found = 1;
-                last;
-            }
-        }
-        return 0 if !$found; # This portal is not connected
+        return 0 if !_portal_connected($scfg, $portal, \@session_lines);
     }
 
     return 1; # All portals are connected
@@ -2366,6 +2386,9 @@ sub _iscsi_login_all($scfg) {
     my $iqn = $scfg->{target_iqn};
     my @nodes = _run_lines(['iscsiadm','-m','node','-T',$iqn]);
 
+    # Get current session list once for efficiency
+    my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
+
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         next unless $n =~ /^(\S+)\s+$iqn$/;
@@ -2379,11 +2402,15 @@ sub _iscsi_login_all($scfg) {
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
             ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
         }
+        # Skip login if this portal is already connected
+        next if _portal_connected($scfg, $portal, \@session_lines);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
     # attempt direct login for any extra portals not already in -m node
     for my $p (@extra) {
+        # Skip login if this portal is already connected
+        next if _portal_connected($scfg, $p, \@session_lines);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
                  "iscsiadm login failed ($p)");
     }
