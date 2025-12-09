@@ -3210,21 +3210,66 @@ sub alloc_image {
     # Note: $bytes already calculated above in space check (size in KiB * 1024)
     my $blocksize = $scfg->{zvol_blocksize};
 
-    my $create_payload = {
-        name    => $full_ds,
-        type    => 'VOLUME',
-        volsize => $bytes,
-        sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-    };
-    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-    $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
+    # Handle race condition: if dataset already exists (e.g., from concurrent delete still in progress),
+    # retry with an incremented disk number. This can happen during rapid create/delete cycles where
+    # the async ZFS delete hasn't completed before a new allocation with the same name is attempted.
+    my $max_create_retries = 5;
+    my $create_attempt = 0;
+    my $create_result;
+    my $create_error;
 
-    my $create_result = _api_call(
-        $scfg,
-        'pool.dataset.create',
-        [ $create_payload ],
-        sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
-    );
+    while ($create_attempt < $max_create_retries) {
+        $create_attempt++;
+        $create_error = undef;
+
+        my $create_payload = {
+            name    => $full_ds,
+            type    => 'VOLUME',
+            volsize => $bytes,
+            sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        };
+        # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
+        $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
+
+        eval {
+            $create_result = _api_call(
+                $scfg,
+                'pool.dataset.create',
+                [ $create_payload ],
+                sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
+            );
+        };
+
+        if ($@) {
+            $create_error = $@;
+            # Check if error is "dataset already exists" - indicates race condition with async delete
+            if ($create_error =~ /dataset already exists/i) {
+                _log($scfg, 1, 'warn', "[TrueNAS] alloc_image: zvol $full_ds already exists (attempt $create_attempt/$max_create_retries), trying alternate name");
+
+                # Parse current name and increment disk number
+                if ($zname =~ /^(vm-\d+-disk-)(\d+)(.*)$/) {
+                    my ($prefix, $num, $suffix) = ($1, $2, $3);
+                    $zname = $prefix . ($num + 1) . $suffix;
+                    $full_ds = $scfg->{dataset} . '/' . $zname;
+                    _log($scfg, 1, 'info', "[TrueNAS] alloc_image: retrying with name $zname");
+                    next;  # Retry with new name
+                } else {
+                    # Name doesn't match expected pattern, can't auto-increment
+                    die "Dataset $full_ds already exists and name pattern cannot be auto-incremented: $create_error\n";
+                }
+            }
+            # Some other error - re-throw
+            die $create_error;
+        }
+
+        # Success - break out of retry loop
+        last;
+    }
+
+    # If we exhausted retries, die with the last error
+    if ($create_attempt >= $max_create_retries && $create_error) {
+        die "Failed to create zvol after $max_create_retries attempts (last error: $create_error)\n";
+    }
 
     # If pool.dataset.create returns a job ID, wait for it to complete
     # This ensures the zvol is fully created before we try to use it
