@@ -16,7 +16,7 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.1.1"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
@@ -3438,8 +3438,10 @@ menu_cleanup_orphans() {
 
         # Check if zvol is under our dataset and exists
         if [[ "$extent_disk" == "$dataset/"* ]]; then
-            # Use grep -c instead of grep -q to avoid pipefail issues
-            if [[ $(echo "$zvols" | grep -c "\"id\": *\"${extent_disk}\"" || echo "0") -eq 0 ]]; then
+            # Use grep -c and capture first line only to avoid newline issues
+            local zvol_match_count
+            zvol_match_count=$(echo "$zvols" | grep -c "\"id\": *\"${extent_disk}\"" 2>/dev/null | head -1) || zvol_match_count=0
+            if [[ "${zvol_match_count:-0}" -eq 0 ]]; then
                 extent_orphans+=("$extent_id")
                 orphan_count=$((orphan_count + 1))
             fi
@@ -3457,8 +3459,10 @@ menu_cleanup_orphans() {
 
         [[ -z "$extent_ref" ]] && continue
 
-        # Use grep -c instead of grep -q to avoid pipefail issues
-        if [[ $(echo "$extents" | grep -c "\"id\": *${extent_ref}" || echo "0") -eq 0 ]]; then
+        # Use grep -c and capture first line only to avoid newline issues
+        local extent_match_count
+        extent_match_count=$(echo "$extents" | grep -c "\"id\": *${extent_ref}" 2>/dev/null | head -1) || extent_match_count=0
+        if [[ "${extent_match_count:-0}" -eq 0 ]]; then
             te_orphans+=("$te_id")
             orphan_count=$((orphan_count + 1))
         # Also check if this target-extent references an orphan extent (zvol missing)
@@ -3475,8 +3479,10 @@ menu_cleanup_orphans() {
 
     for zvol_id in $zvol_ids; do
         local zvol_disk="zvol/${zvol_id}"
-        # Use grep -c instead of grep -q to avoid pipefail issues
-        if [[ $(echo "$extents" | grep -c "\"disk\": *\"${zvol_disk}\"" || echo "0") -eq 0 ]]; then
+        # Use grep -c and capture first line only to avoid newline issues
+        local match_count
+        match_count=$(echo "$extents" | grep -c "\"disk\": *\"${zvol_disk}\"" 2>/dev/null | head -1) || match_count=0
+        if [[ "${match_count:-0}" -eq 0 ]]; then
             zvol_orphans+=("$zvol_id")
             orphan_count=$((orphan_count + 1))
         fi
