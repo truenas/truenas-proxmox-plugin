@@ -1,5 +1,32 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.2 (December 9, 2025)
+
+### 🐛 **Bug Fixes: Concurrent Operations & Multipath iSCSI**
+
+#### **Fixed race condition for rapid disk deletes and creation**
+- **Problem**: Rapid sequential disk operations (delete followed by create) could fail due to NVMe readdir operations returning tainted values
+- **Root cause**: Device path iteration after deletions encountered stale or partially cleaned entries
+- **Solution**: Enhanced device enumeration with proper taint handling and existence checks during rapid operations
+
+#### **Fixed "free unreferenced scalar" WebSocket error causing pvestatd crashes**
+- **Problem**: pvestatd crashed with "Attempt to free unreferenced scalar" followed by SIGSEGV after WebSocket connection failures
+- **Root cause**: Dead connections were removed from cache without properly closing the socket first, causing IO::Socket::SSL cleanup issues
+- **Solution**: Added explicit socket close before removing dead connections from the persistent connection cache in `_ws_get_persistent()`
+
+#### **Fixed spurious iSCSI login warnings in multipath configurations**
+- **Problem**: Disk operations generated repeated "iscsiadm: Could not log into all portals" warnings even when sessions were already active
+- **Root cause**: Plugin attempted to log into ALL portals without checking which individual portals were already connected
+- **Solution**: Added `_portal_connected()` helper function to check individual portal session status; `_iscsi_login_all()` now skips login for portals that already have active sessions
+
+### 🔧 **Technical Details**
+- `_ws_get_persistent()`: Now properly closes socket before removing dead connections from cache
+- `_portal_connected()`: New helper function checks if a specific portal has an active iSCSI session
+- `_all_portals_connected()`: Refactored to use `_portal_connected()` for efficiency
+- `_iscsi_login_all()`: Gets session list once at start, skips login for already-connected portals
+
+---
+
 ## Version 1.2.1 (December 8, 2025)
 
 ### 🐛 **Bug Fixes: pvestatd Stability and NVMe Taint Mode**
