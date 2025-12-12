@@ -1,5 +1,21 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.3 (December 12, 2025)
+
+### 🐛 **Bug Fix: Fork-Related pvestatd Crashes**
+
+#### **Fixed "Attempt to free unreferenced scalar" crashes caused by forked processes**
+- **Problem**: pvestatd crashed with "Attempt to free unreferenced scalar" errors followed by SIGSEGV after variable periods of operation
+- **Root cause**: When pvestatd forks child processes for monitoring tasks, both parent and child inherit references to the same WebSocket socket objects in `%_ws_connections`. Perl's reference counting treats these as independent references, causing double-free corruption when either process's garbage collector runs
+- **Solution**: Added PID tracking (`$_ws_creator_pid`) to detect when a forked child process inherits parent connections. Child processes now silently discard inherited connection references (without closing sockets - parent owns them) and create fresh connections
+
+### 🔧 **Technical Details**
+- Added `$_ws_creator_pid` variable initialized to `$$` at module load
+- `_ws_get_persistent()`: Added fork detection at function entry - if `$$ != $_ws_creator_pid`, clears `%_ws_connections` without closing sockets and updates creator PID
+- Debug logging (level 2) when fork detection invalidates inherited connections
+
+---
+
 ## Version 1.2.2 (December 9, 2025)
 
 ### 🐛 **Bug Fixes: Concurrent Operations & Multipath iSCSI**
