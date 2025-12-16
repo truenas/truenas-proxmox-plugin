@@ -331,6 +331,29 @@ get_storage_config() {
     echo "$api_host|$api_key|$dataset"
 }
 
+# Check for APIVER mismatch between system and plugin
+# Returns: STATUS|system_apiver|plugin_apiver
+check_apiver_mismatch() {
+    local system_apiver
+    local plugin_apiver
+
+    # Get system APIVER
+    system_apiver=$(perl -e 'require PVE::Storage; print PVE::Storage::APIVER()' 2>/dev/null || echo "unknown")
+
+    # Get plugin's tested APIVER from the plugin file
+    plugin_apiver=$(grep -oP 'my \$tested_apiver = \K\d+' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm 2>/dev/null || echo "unknown")
+
+    if [[ "$system_apiver" != "unknown" && "$plugin_apiver" != "unknown" ]]; then
+        if [[ "$system_apiver" -gt "$plugin_apiver" ]]; then
+            echo "MISMATCH|$system_apiver|$plugin_apiver"
+        else
+            echo "OK|$system_apiver|$plugin_apiver"
+        fi
+    else
+        echo "UNKNOWN|$system_apiver|$plugin_apiver"
+    fi
+}
+
 # Parse VM node from cluster JSON
 # Args: $1 = cluster JSON, $2 = VMID
 # Returns: node name or empty string
@@ -4769,6 +4792,21 @@ main() {
         log_info "  Backup Store:  $BACKUP_STORE"
     else
         log_info "  Backup Store:  NOT SET (backup tests will be skipped)"
+    fi
+
+    # Check for APIVER mismatch
+    apiver_result=$(check_apiver_mismatch)
+    apiver_status=$(echo "$apiver_result" | cut -d'|' -f1)
+    system_apiver=$(echo "$apiver_result" | cut -d'|' -f2)
+    plugin_apiver=$(echo "$apiver_result" | cut -d'|' -f3)
+
+    if [[ "$apiver_status" == "MISMATCH" ]]; then
+        log_warning "  APIVER:        MISMATCH - System=$system_apiver, Plugin=$plugin_apiver"
+        log_warning "                 Plugin needs update to support PVE storage API $system_apiver"
+    elif [[ "$apiver_status" == "OK" ]]; then
+        log_info "  APIVER:        OK (System=$system_apiver, Plugin=$plugin_apiver)"
+    else
+        log_warning "  APIVER:        Unable to determine (System=$system_apiver, Plugin=$plugin_apiver)"
     fi
     echo | tee -a "$LOG_FILE"
 
