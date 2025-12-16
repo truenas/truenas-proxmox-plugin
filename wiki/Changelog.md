@@ -1,5 +1,22 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.4 (December 16, 2025)
+
+### 🐛 **Bug Fix: Complete Fix for Fork-Related pvestatd Crashes**
+
+#### **Fixed remaining "Attempt to free unreferenced scalar" crashes**
+- **Problem**: v1.2.3 fix still caused crashes because `%_ws_connections = ()` triggered Perl's DESTROY on inherited IO::Socket::SSL objects
+- **Root cause**: When clearing the connection hash, Perl decrements reference counts and calls DESTROY, which invokes `SSL_free()` on memory allocated in the parent process's address space - causing memory corruption
+- **Solution**: Added orphan list (`@_ws_orphaned`) to keep inherited connection references alive, preventing DESTROY from ever being called on inherited sockets
+
+### 🔧 **Technical Details**
+- Added `@_ws_orphaned` array to hold inherited connections
+- Fork detection now pushes connections to orphan list BEFORE clearing hash
+- This keeps refcount > 0, preventing DESTROY from being called
+- Orphaned connections stay in memory until child process exits (OS reclaims everything)
+
+---
+
 ## Version 1.2.3 (December 12, 2025)
 
 ### 🐛 **Bug Fix: Fork-Related pvestatd Crashes**

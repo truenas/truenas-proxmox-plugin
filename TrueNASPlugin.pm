@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.3';
+our $VERSION = '1.2.4';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -880,6 +880,7 @@ sub _ws_rpc {
 # ======== Persistent WebSocket Connection Management ========
 my %_ws_connections; # Global connection cache
 my $_ws_creator_pid = $$; # Track PID to detect fork
+my @_ws_orphaned; # Orphaned connections from parent - kept alive to prevent DESTROY
 
 sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
@@ -891,10 +892,14 @@ sub _ws_connection_key($scfg) {
 
 sub _ws_get_persistent($scfg) {
     # Fork detection: if we're in a child process, inherited connections are invalid
-    # Don't close them (parent owns them) - just discard references
+    # CRITICAL: We must NOT let Perl call DESTROY on inherited IO::Socket::SSL objects
+    # because SSL_free() on parent-allocated memory causes "free unreferenced scalar" errors
+    # Solution: Push to orphan list FIRST to keep refcount > 0, preventing DESTROY
     if ($$ != $_ws_creator_pid) {
-        _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), invalidating inherited persistent connections");
-        %_ws_connections = ();
+        _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), orphaning inherited connections");
+        # Keep inherited connections alive in orphan list - this prevents DESTROY
+        push @_ws_orphaned, values %_ws_connections;
+        %_ws_connections = (); # Safe now - originals still referenced in @_ws_orphaned
         $_ws_creator_pid = $$;
     }
 
