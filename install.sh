@@ -3956,6 +3956,18 @@ run_fio_benchmark() {
     # Try pvesm path first (authoritative source)
     test_device=$(pvesm path "$volume_name" 2>/dev/null)
 
+    # Resolve symlinks to get canonical device path
+    # IMPORTANT: FIO interprets colons (:) as filename separators, so by-path symlinks like
+    # /dev/disk/by-path/ip-10.15.14.172:3260-iscsi-iqn.2005-10.org.freenas.ctl:proxmox-lun-5
+    # would be parsed as 3 separate files. Resolving to /dev/sdX avoids this issue.
+    if [[ -n "$test_device" ]]; then
+        local resolved_device
+        resolved_device=$(readlink -f "$test_device" 2>/dev/null)
+        if [[ -n "$resolved_device" && -b "$resolved_device" ]]; then
+            test_device="$resolved_device"
+        fi
+    fi
+
     # If pvesm path didn't work, fall back to detection logic
     if [[ -z "$test_device" || ! -b "$test_device" ]]; then
         test_device=$(fio_detect_device_path "$storage_name" "$volume_name")
