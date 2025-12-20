@@ -881,7 +881,6 @@ sub _ws_rpc {
 # ======== Persistent WebSocket Connection Management ========
 my %_ws_connections; # Global connection cache
 my $_ws_creator_pid = $$; # Track PID to detect fork
-my @_ws_orphaned; # Orphaned connections from parent - kept alive to prevent DESTROY
 
 sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
@@ -901,25 +900,26 @@ sub _ws_get_persistent($scfg) {
     # 3. Clear all references
     # See: DBI InactiveDestroy, IO::Socket::SSL fork documentation
     if ($$ != $_ws_creator_pid) {
-        _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), disabling inherited connections");
+        eval { _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), disabling inherited connections"); };
         for my $conn (values %_ws_connections) {
             if ($conn && $conn->{sock}) {
-                # Remove SSL internals so DESTROY does nothing (InactiveDestroy pattern)
-                my $ssl = delete ${*$conn->{sock}}{_SSL_object};
-                if ($ssl) {
-                    # Also remove from IO::Socket::SSL's global tracking hash
-                    delete $IO::Socket::SSL::SSL_OBJECT{$ssl};
+                # For SSL sockets, remove SSL internals so DESTROY is a no-op (InactiveDestroy pattern)
+                if ($conn->{sock}->isa('IO::Socket::SSL')) {
+                    my $ssl = delete ${*$conn->{sock}}{_SSL_object};
+                    if ($ssl) {
+                        # Also remove from IO::Socket::SSL's global tracking hash
+                        delete $IO::Socket::SSL::SSL_OBJECT{$ssl};
+                    }
                 }
-                # Close raw FD without triggering SSL cleanup
+                # Close raw FD without triggering SSL cleanup (for both SSL and non-SSL sockets)
                 my $fd = fileno($conn->{sock});
                 if (defined $fd && $fd >= 0) {
-                    POSIX::close($fd);
+                    eval { POSIX::close($fd); };  # Ignore errors - we're cleaning up anyway
                 }
                 $conn->{sock} = undef;
             }
         }
         %_ws_connections = ();
-        @_ws_orphaned = ();  # Clear orphan list - no longer needed with this approach
         $_ws_creator_pid = $$;
     }
 
