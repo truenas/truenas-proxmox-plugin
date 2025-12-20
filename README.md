@@ -70,7 +70,7 @@ chmod +x install.sh
 
 **For Non-Interactive/Automated Installation:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash -s -- --non-interactive
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:
