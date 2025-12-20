@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.4';
+our $VERSION = '1.2.5';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -12,6 +12,7 @@ use Digest::SHA qw(sha1);
 use IO::Socket::INET;
 use IO::Socket::SSL;
 use Time::HiRes qw(usleep);
+use POSIX ();
 use Socket qw(inet_ntoa);
 use LWP::UserAgent;
 use HTTP::Request;
@@ -892,14 +893,33 @@ sub _ws_connection_key($scfg) {
 
 sub _ws_get_persistent($scfg) {
     # Fork detection: if we're in a child process, inherited connections are invalid
-    # CRITICAL: We must NOT let Perl call DESTROY on inherited IO::Socket::SSL objects
-    # because SSL_free() on parent-allocated memory causes "free unreferenced scalar" errors
-    # Solution: Push to orphan list FIRST to keep refcount > 0, preventing DESTROY
+    # CRITICAL: When child exits, Perl's global destruction calls DESTROY on all objects,
+    # including inherited IO::Socket::SSL sockets. DESTROY calls SSL_free() which corrupts
+    # the parent's SSL state (shared via fork). The InactiveDestroy pattern prevents this:
+    # 1. Remove _SSL_object from socket so DESTROY is a no-op
+    # 2. Close raw FD with POSIX::close() (bypasses SSL cleanup)
+    # 3. Clear all references
+    # See: DBI InactiveDestroy, IO::Socket::SSL fork documentation
     if ($$ != $_ws_creator_pid) {
-        _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), orphaning inherited connections");
-        # Keep inherited connections alive in orphan list - this prevents DESTROY
-        push @_ws_orphaned, values %_ws_connections;
-        %_ws_connections = (); # Safe now - originals still referenced in @_ws_orphaned
+        _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), disabling inherited connections");
+        for my $conn (values %_ws_connections) {
+            if ($conn && $conn->{sock}) {
+                # Remove SSL internals so DESTROY does nothing (InactiveDestroy pattern)
+                my $ssl = delete ${*$conn->{sock}}{_SSL_object};
+                if ($ssl) {
+                    # Also remove from IO::Socket::SSL's global tracking hash
+                    delete $IO::Socket::SSL::SSL_OBJECT{$ssl};
+                }
+                # Close raw FD without triggering SSL cleanup
+                my $fd = fileno($conn->{sock});
+                if (defined $fd && $fd >= 0) {
+                    POSIX::close($fd);
+                }
+                $conn->{sock} = undef;
+            }
+        }
+        %_ws_connections = ();
+        @_ws_orphaned = ();  # Clear orphan list - no longer needed with this approach
         $_ws_creator_pid = $$;
     }
 
