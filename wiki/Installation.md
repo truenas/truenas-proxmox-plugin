@@ -230,7 +230,7 @@ Transport mode (1-2) [1]: 1
 # === If iSCSI selected ===
 iSCSI target IQN: iqn.2005-10.org.freenas.ctl:proxmox
 Portal IP (optional, press Enter to use TrueNAS IP): 192.168.1.100
-Block size [16k]: 16k
+Block size [16K]: 16K
 Enable sparse volumes? (0/1) [1]: 1
 
 # Advanced Options:
@@ -248,7 +248,7 @@ Enable multipath I/O for redundancy/load balancing? (y/N): y
 # ✓ Auto-populates host NQN from /etc/nvme/hostnqn (or generates one)
 NVMe subsystem NQN (e.g., nqn.2005-10.org.freenas.ctl:proxmox): nqn.2005-10.org.freenas.ctl:proxmox-nvme
 Portal IP (default: 192.168.1.100:4420): 192.168.1.100:4420
-Block size [16k]: 16k
+Block size [16K]: 16K
 Enable sparse volumes? (0/1) [1]: 1
 
 # NVMe/TCP uses native kernel multipath:
@@ -610,6 +610,7 @@ If you prefer manual installation or need more control over the process, follow 
 ### Software Requirements
 - **Proxmox VE** - 8.x or later (9.x recommended for volume chains)
 - **TrueNAS SCALE** - 22.x or later (25.04+ recommended)
+  - **For TrueNAS 25.04+**: Must use WebSocket transport (`api_transport ws`) - REST API is deprecated and will be removed in 26.04
 - **Perl** - 5.36 or later (included with Proxmox VE)
 
 ### Network Requirements

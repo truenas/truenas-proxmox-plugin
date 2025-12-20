@@ -70,7 +70,7 @@ chmod +x install.sh
 
 **For Non-Interactive/Automated Installation:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
+curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:
@@ -281,6 +281,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 1.2.4
+**Version**: 1.2.5
 **Last Updated**: December 16, 2025
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 22.x+

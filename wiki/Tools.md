@@ -1783,6 +1783,8 @@ Orphaned resources occur when storage operations fail partway through:
 2. **Orphaned Target-Extent Mappings** - Mappings referencing deleted extents
 3. **Orphaned Zvols** - Zvols without corresponding iSCSI extents
 
+> **Note**: Orphan detection currently supports **iSCSI transport only**. It does not yet detect orphaned NVMe/TCP namespaces or subsystems. Zvols created for NVMe/TCP will not be scanned or cleaned up by this tool.
+
 **Common Causes**:
 - VM deletion failures
 - Network interruptions during volume creation

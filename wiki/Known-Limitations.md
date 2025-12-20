@@ -636,10 +636,10 @@ Parallel Read Performance: ~100-110 MB/s ✅
    - May be addressed in future TrueNAS SCALE releases
    - Check TrueNAS forums for updates
 
-**Future Solutions**:
-- NVMe over TCP (NVMe-oF) would eliminate this limitation
-- NVMe protocol has better parallelism than iSCSI
-- Support depends on future TrueNAS SCALE versions
+**Available Solution: NVMe/TCP**:
+- Use NVMe over TCP (NVMe-oF) to eliminate this limitation
+- NVMe protocol supports native parallelism and higher queue depths
+- Fully supported in this plugin version (requires TrueNAS SCALE 25.10+)
 
 **Note**: This is a TrueNAS SCALE platform limitation, not a plugin configuration issue. Multipath is configured correctly and both paths are being utilized - the bottleneck is at the iSCSI protocol layer.
 
