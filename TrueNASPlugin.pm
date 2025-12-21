@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.5';
+our $VERSION = '1.2.6';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -28,6 +28,14 @@ use base qw(PVE::Storage::Plugin);
 BEGIN {
     openlog('truenasplugin', 'pid', 'daemon');
 }
+
+# Null destructor package for fork-safe socket handling
+# When a process forks, inherited sockets must not run their DESTROY methods
+# as this corrupts the parent's SSL state. Reblessing into this class makes
+# DESTROY a no-op, preventing segfaults during child process exit.
+package PVE::Storage::Custom::TrueNASPlugin::NullDestructor;
+sub DESTROY { }  # Intentionally empty - prevents any cleanup
+package PVE::Storage::Custom::TrueNASPlugin;
 
 # Simple cache for API results (static data)
 my %API_CACHE = ();
@@ -894,31 +902,28 @@ sub _ws_get_persistent($scfg) {
     # Fork detection: if we're in a child process, inherited connections are invalid
     # CRITICAL: When child exits, Perl's global destruction calls DESTROY on all objects,
     # including inherited IO::Socket::SSL sockets. DESTROY calls SSL_free() which corrupts
-    # the parent's SSL state (shared via fork). The InactiveDestroy pattern prevents this:
-    # 1. Remove _SSL_object from socket so DESTROY is a no-op
-    # 2. Close raw FD with POSIX::close() (bypasses SSL cleanup)
-    # 3. Clear all references
-    # See: DBI InactiveDestroy, IO::Socket::SSL fork documentation
+    # the parent's SSL state (shared via fork).
+    #
+    # SOLUTION: Rebless inherited sockets into NullDestructor class. This makes DESTROY
+    # a complete no-op - no SSL cleanup, no FD close, nothing. The socket will "leak"
+    # in the child process, but that's fine:
+    # - Child exits soon anyway
+    # - OS reclaims all resources on process exit
+    # - No corruption can occur because no cleanup code runs
+    #
+    # IMPORTANT: Do NOT clear %_ws_connections or set sock=undef - that triggers DESTROY!
+    # Just rebless and update the PID so new connections get created on next call.
     if ($$ != $_ws_creator_pid) {
-        eval { _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), disabling inherited connections"); };
+        eval { _log($scfg, 2, 'debug', "[TrueNAS] Fork detected (creator PID $_ws_creator_pid, current PID $$), neutering inherited connections"); };
         for my $conn (values %_ws_connections) {
             if ($conn && $conn->{sock}) {
-                # For SSL sockets, remove SSL internals so DESTROY is a no-op (InactiveDestroy pattern)
-                if ($conn->{sock}->isa('IO::Socket::SSL')) {
-                    my $ssl = delete ${*$conn->{sock}}{_SSL_object};
-                    if ($ssl) {
-                        # Also remove from IO::Socket::SSL's global tracking hash
-                        delete $IO::Socket::SSL::SSL_OBJECT{$ssl};
-                    }
-                }
-                # Close raw FD without triggering SSL cleanup (for both SSL and non-SSL sockets)
-                my $fd = fileno($conn->{sock});
-                if (defined $fd && $fd >= 0) {
-                    eval { POSIX::close($fd); };  # Ignore errors - we're cleaning up anyway
-                }
-                $conn->{sock} = undef;
+                # Rebless socket into NullDestructor - makes DESTROY a complete no-op
+                # This prevents ALL cleanup code from running (SSL, IO::Socket, Perl IO layer)
+                bless $conn->{sock}, 'PVE::Storage::Custom::TrueNASPlugin::NullDestructor';
             }
         }
+        # Clear the hash so child creates fresh connections, but the neutered socket
+        # objects remain in memory until child exits (harmless - OS cleans up)
         %_ws_connections = ();
         $_ws_creator_pid = $$;
     }

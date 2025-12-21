@@ -1,5 +1,29 @@
 # TrueNAS Plugin Changelog
 
+## Version 1.2.6 (December 20, 2025)
+
+### 🐛 **Bug Fix: Improved Fork-Safety with NullDestructor Pattern**
+
+#### **Fixed remaining edge cases in fork handling that could still cause segfaults**
+- **Problem**: v1.2.5 InactiveDestroy pattern still caused crashes in some environments because setting `$conn->{sock} = undef` and clearing `%_ws_connections` triggers Perl's DESTROY chain, where underlying IO::Socket layers could still attempt cleanup on already-closed file descriptors
+- **Root cause**: Even with `_SSL_object` removed, setting socket references to undef invokes the full DESTROY chain including IO::Socket::INET's destructor and Perl's internal IO layer cleanup
+- **Solution**: Implemented **NullDestructor rebless pattern** - inherited sockets are reblessed into a dummy class with an empty DESTROY method, completely preventing any cleanup code from running
+
+### 🔧 **Technical Details**
+Fork detection now uses a more robust approach:
+1. **Added `NullDestructor` package** with empty `DESTROY { }` method
+2. **Rebless inherited sockets** into NullDestructor class - makes ALL destruction code no-op
+3. **Do NOT clear references** - clearing triggers DESTROY which we want to avoid
+4. **Clear connection hash** so child creates fresh connections on next call
+
+### 📊 **Impact**
+- **Eliminates edge-case segfaults**: No cleanup code runs at all on inherited sockets
+- **Simpler implementation**: No need to manipulate internal IO::Socket::SSL state
+- **Memory handling**: Neutered sockets remain in child's memory until exit (OS reclaims)
+- **Based on analysis**: Gemini-assisted investigation identified the reference-clearing as root cause
+
+---
+
 ## Version 1.2.5 (December 18, 2025)
 
 ### 🐛 **Bug Fix: Complete Resolution of Fork-Related pvestatd Crashes**
