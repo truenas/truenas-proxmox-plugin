@@ -673,6 +673,15 @@ Multiple simultaneous operations share connections:
 - Thread-safe connection management
 - Automatic cleanup of stale connections
 
+### Fork Safety
+
+Persistent WebSocket connections are protected against fork-related issues (common with pvestatd workers):
+
+- **PID Tracking**: Connections track the process that created them
+- **Fork Detection**: Child processes detect inherited connections via PID mismatch
+- **NullDestructor Pattern**: Inherited sockets are reblessed into a class with empty `DESTROY` method
+- **Result**: No double-free crashes when child processes exit - parent connections remain valid
+
 ## Query Optimization
 
 ### Filtered Queries

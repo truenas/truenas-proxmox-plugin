@@ -880,6 +880,17 @@ All write operations (create, update, delete) use one-time WebSocket connections
 - NVMe namespace operations
 - Bulk operations via core.bulk API
 
+**Fork Safety for Persistent Connections**:
+
+Read operations use persistent (cached) connections for efficiency. These are protected against fork-related crashes through the NullDestructor pattern:
+
+- Child processes (e.g., pvestatd workers) detect inherited connections via PID mismatch
+- Inherited sockets are reblessed into a `NullDestructor` class with empty `DESTROY` method
+- This prevents double-free memory corruption when child processes exit
+- Parent process connections remain valid and functional
+
+See [Changelog v1.2.6](../wiki/Changelog.md#version-126-december-20-2025) for technical details.
+
 #### Storage Lock Timeout Configuration
 
 The Proxmox Cluster File System (CFS) requires a lock on the storage configuration file during write operations. The default 10-second timeout is insufficient for parallel bulk provisioning.

@@ -13,8 +13,8 @@
 Fork detection now uses a more robust approach:
 1. **Added `NullDestructor` package** with empty `DESTROY { }` method
 2. **Rebless inherited sockets** into NullDestructor class - makes ALL destruction code no-op
-3. **Do NOT clear references** - clearing triggers DESTROY which we want to avoid
-4. **Clear connection hash** so child creates fresh connections on next call
+3. **Clear connection hash AFTER reblessing** - safe because DESTROY is now a no-op
+4. Child creates fresh connections on next call; neutered sockets remain until exit (harmless)
 
 ### 📊 **Impact**
 - **Eliminates edge-case segfaults**: No cleanup code runs at all on inherited sockets
