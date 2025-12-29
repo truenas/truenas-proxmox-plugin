@@ -187,7 +187,7 @@ json_extract_nested() {
 
     local result
     result=$(echo "$json" | grep -o "\"${outer_key}\"[^}]*\"${inner_key}\"[^,}]*" | \
-        sed -n 's/.*"'"${inner_key}"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        sed -n 's/.*"'"${inner_key}"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)
 
     echo "${result:-$default}"
 }
@@ -3782,7 +3782,7 @@ test_performance_regression_tracking() {
             local baseline_time
             # Extract numeric value for key from JSON baseline file using grep/sed
             baseline_time=$(grep -o "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]*" "$baseline_file" 2>/dev/null | \
-                sed 's/.*:[[:space:]]*//' | head -1)
+                sed 's/.*:[[:space:]]*//' | head -1 || true)
             [[ -z "$baseline_time" ]] && baseline_time="none"
 
             if [[ "$baseline_time" == "none" ]]; then
@@ -4615,9 +4615,9 @@ test_dataset_property_inheritance() {
     local api_url="https://${api_host}/api/v2.0/pool/dataset/id/${dataset}"
     api_url="${api_url//\/\//\/}"  # Replace // with /
 
+    local curl_rc=0
     local dataset_props
-    dataset_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$api_url" 2>/dev/null)
-    local curl_rc=$?
+    dataset_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$api_url" 2>/dev/null) || curl_rc=$?
 
     if [[ $curl_rc -ne 0 ]]; then
         log_error "Failed to query TrueNAS API for dataset properties"
@@ -4667,8 +4667,7 @@ test_dataset_property_inheritance() {
     zvol_api_url="${zvol_api_url//\/\//\/}"
 
     local zvol_props
-    zvol_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$zvol_api_url" 2>/dev/null)
-    curl_rc=$?
+    zvol_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$zvol_api_url" 2>/dev/null) || curl_rc=$?
 
     if [[ $curl_rc -ne 0 ]]; then
         log_warning "Could not query zvol properties - may not be exposed via API"

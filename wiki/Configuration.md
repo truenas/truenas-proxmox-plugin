@@ -172,6 +172,8 @@ shared 1
 
 WebSocket is recommended for better performance and persistent connections. For write operations (create, update, delete), WebSocket uses ephemeral connections to prevent concurrent operation interference.
 
+> **IMPORTANT**: TrueNAS SCALE 25.04 (Fangtooth) and later have deprecated the REST API for storage operations. You **MUST** use `api_transport ws` for TrueNAS SCALE 25.04+. The REST API will be completely removed in TrueNAS SCALE 26.04.
+
 ```ini
 api_transport ws
 ```

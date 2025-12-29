@@ -207,7 +207,7 @@ truenasplugin: truenas-nvme
 | `subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
 | `hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
 | `discovery_portal` | Yes | Primary portal IP:port | None |
-| `api_transport` | Yes | Must be `ws` for NVMe API calls | `rest` |
+| `api_transport` | Yes | Must be `ws` for NVMe API calls | `ws` |
 | `nvme_dhchap_secret` | No | Host authentication secret | None |
 | `nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
 
