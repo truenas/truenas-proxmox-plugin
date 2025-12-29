@@ -16,7 +16,7 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.1.1"
+readonly INSTALLER_VERSION="1.2.0"
 readonly GITHUB_REPO="WarlockSyno/truenasplugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
