@@ -2512,7 +2512,14 @@ menu_create_diagnostics_bundle() {
         return 0
     fi
 
+    # Clear screen and show banner for capture phase
+    clear_screen
+    print_banner
     echo
+
+    info "Diagnostics Bundle Capture"
+    echo
+
     run_diagnostics_bundle "$pvestatd_pid"
 }
 
@@ -2564,8 +2571,7 @@ run_diagnostics_bundle() {
     trap 'cleanup_diagnostics TERM' TERM
     trap 'cleanup_diagnostics EXIT' EXIT
 
-    # Start strace immediately
-    info "Starting strace capture (10 minutes)..."
+    # Start strace in background
     timeout ${strace_duration} strace -f -tt -o "$strace_file" \
         -e trace=clone,fork,vfork,socket,close,connect,read,write,exit_group \
         -p "$pvestatd_pid" 2>/dev/null &
@@ -2574,7 +2580,7 @@ run_diagnostics_bundle() {
     sleep 2  # Let strace attach
 
     # Collect diagnostics to log file
-    printf "%-30s " "Collecting diagnostics:"
+    printf "%-30s " "Gathering system info:"
     start_spinner
 
     # Use subshell to disable pipefail for diagnostic collection
@@ -2589,30 +2595,30 @@ run_diagnostics_bundle() {
 
         # Section 1: Plugin version + MD5 checksum
         echo "=== Plugin Information ==="
-        if [[ -f "$PLUGIN_PATH" ]]; then
-            echo "Plugin path: $PLUGIN_PATH"
-            plugin_version=$(grep -E "^our \\\$VERSION" "$PLUGIN_PATH" 2>/dev/null | head -1 || echo "unknown")
+        if [[ -f "$PLUGIN_FILE" ]]; then
+            echo "Plugin path: $PLUGIN_FILE"
+            plugin_version=$(grep -E "^our \\\$VERSION" "$PLUGIN_FILE" 2>/dev/null | head -1 || echo "unknown")
             echo "Version: $plugin_version"
-            echo "MD5: $(md5sum "$PLUGIN_PATH" 2>/dev/null | awk '{print $1}')"
-            echo "Size: $(ls -lh "$PLUGIN_PATH" 2>/dev/null | awk '{print $5}')"
+            echo "MD5: $(md5sum "$PLUGIN_FILE" 2>/dev/null | awk '{print $1}')"
+            echo "Size: $(ls -lh "$PLUGIN_FILE" 2>/dev/null | awk '{print $5}')"
         else
-            echo "Plugin not found at $PLUGIN_PATH"
+            echo "Plugin not found at $PLUGIN_FILE"
         fi
         echo
 
         # Section 2: Environment
         echo "=== Environment ==="
         echo "--- Perl Version ---"
-        perl -v 2>&1 | head -5
+        timeout 10 perl -v 2>&1 | head -5
         echo
         echo "--- IO::Socket::SSL ---"
-        perl -MIO::Socket::SSL -e 'print "IO::Socket::SSL version: $IO::Socket::SSL::VERSION\n"' 2>&1 || echo "Not installed"
+        timeout 10 perl -MIO::Socket::SSL -e 'print "IO::Socket::SSL version: $IO::Socket::SSL::VERSION\n"' 2>&1 || echo "Not installed"
         echo
         echo "--- OpenSSL ---"
-        openssl version 2>&1 || echo "Not available"
+        timeout 10 openssl version 2>&1 || echo "Not available"
         echo
         echo "--- Proxmox Version ---"
-        pveversion -v 2>&1 || echo "pveversion not available"
+        timeout 10 pveversion -v 2>&1 || echo "pveversion not available"
         echo
 
         # Section 3: Storage config (all TrueNAS storages, API keys redacted)
@@ -2626,38 +2632,38 @@ run_diagnostics_bundle() {
 
         # Section 4: pvestatd status at start
         echo "=== pvestatd Status (Start) ==="
-        systemctl status pvestatd --no-pager 2>&1 | head -20
+        timeout 10 systemctl status pvestatd --no-pager 2>&1 | head -20
         echo
         echo "PID file: $(cat /var/run/pvestatd.pid 2>/dev/null || echo 'not found')"
-        echo "Process check: $(ps -p "$pvestatd_pid" -o pid,ppid,stat,etime,cmd --no-headers 2>/dev/null || echo 'process not found')"
+        echo "Process check: $(timeout 5 ps -p "$pvestatd_pid" -o pid,ppid,stat,etime,cmd --no-headers 2>/dev/null || echo 'process not found')"
         echo
 
         # Section 5: Open file descriptors + socket connections
         echo "=== Open File Descriptors (pvestatd) ==="
-        ls -la /proc/"$pvestatd_pid"/fd 2>/dev/null | head -50 || echo "Cannot read fd info"
+        timeout 10 ls -la /proc/"$pvestatd_pid"/fd 2>/dev/null | head -50 || echo "Cannot read fd info"
         echo
         echo "--- Socket Connections ---"
-        ss -tunap 2>/dev/null | grep -E "pvestatd|:443|:8006" | head -30 || echo "No relevant sockets found"
+        timeout 10 ss -tunap 2>/dev/null | grep -E "pvestatd|:443|:8006" | head -30 || echo "No relevant sockets found"
         echo
 
         # Section 6: Process tree
         echo "=== Process Tree ==="
-        pstree -p "$pvestatd_pid" 2>/dev/null || echo "pstree not available"
+        timeout 10 pstree -p "$pvestatd_pid" 2>/dev/null || echo "pstree not available"
         echo
 
         # Section 7: Existing coredumps
         echo "=== Existing Coredumps ==="
-        coredumpctl list 2>/dev/null | grep -E "pvestatd|perl" | tail -10 || echo "No relevant coredumps found"
+        timeout 10 coredumpctl list --no-pager 2>/dev/null | grep -E "pvestatd|perl" | tail -10 || echo "No relevant coredumps found"
         echo
 
         # Section 8: Kernel crash logs (last 7 days)
         echo "=== Kernel Crash Logs (last 7 days) ==="
-        journalctl -k --since "7 days ago" 2>/dev/null | grep -iE "segfault|oops|bug|panic|killed" | tail -20 || echo "No kernel crash logs found"
+        timeout 10 journalctl -k --no-pager --since "7 days ago" 2>/dev/null | grep -iE "segfault|oops|bug|panic|killed" | tail -20 || echo "No kernel crash logs found"
         echo
 
         # Section 9: pvestatd error logs (last 7 days)
         echo "=== pvestatd Error Logs (last 7 days) ==="
-        journalctl -u pvestatd --since "7 days ago" 2>/dev/null | grep -iE "error|fail|die|crash|segfault|warn" | tail -50 || echo "No error logs found"
+        timeout 10 journalctl -u pvestatd --no-pager --since "7 days ago" 2>/dev/null | grep -iE "error|fail|die|crash|segfault|warn" | tail -50 || echo "No error logs found"
         echo
 
         # Section 10: System info
@@ -2666,23 +2672,25 @@ run_diagnostics_bundle() {
         echo "Kernel: $(uname -r)"
         echo "Uptime: $(uptime)"
         echo "Memory:"
-        free -h 2>/dev/null || echo "free not available"
+        timeout 10 free -h 2>/dev/null || echo "free not available"
         echo
         echo "CPU:"
-        lscpu 2>/dev/null | grep -E "Model name|CPU\(s\)|Thread|Core" | head -5 || echo "lscpu not available"
+        timeout 10 lscpu 2>/dev/null | grep -E "Model name|CPU\(s\)|Thread|Core" | head -5 || echo "lscpu not available"
         echo
 
     ) > "$logfile" 2>&1 || true
 
     stop_spinner
-    echo -e "\r$(printf "%-30s " "Collecting diagnostics:")${c2}✓${c0} Complete"
+    echo -e "\r$(printf "%-30s " "Gathering system info:")${c2}✓${c0} Complete"
 
-    # Wait for strace with progress
-    info "Monitoring pvestatd for $((strace_duration / 60)) minutes..."
-    echo
-
+    # Wait for strace with progress bar
     local elapsed=0
     local crashed=false
+    local bar_width=20
+
+    # Show initial progress bar
+    printf "%-30s " "Capturing strace (10 min):"
+
     while kill -0 $strace_pid 2>/dev/null && [[ $elapsed -lt $strace_duration ]]; do
         if [[ ! -d "/proc/$pvestatd_pid" ]]; then
             echo
@@ -2692,13 +2700,25 @@ run_diagnostics_bundle() {
             break
         fi
 
-        printf "\r  Capturing: %d/%d seconds (pvestatd running)    " $elapsed $strace_duration
+        # Calculate progress
+        local percent=$((elapsed * 100 / strace_duration))
+        local filled=$((elapsed * bar_width / strace_duration))
+        local empty=$((bar_width - filled))
+
+        # Build progress bar
+        local bar=""
+        for ((i=0; i<filled; i++)); do bar+="█"; done
+        for ((i=0; i<empty; i++)); do bar+="░"; done
+
+        # Display progress bar with percentage
+        printf "\r%-30s %s %3d%%" "Capturing strace (10 min):" "$bar" "$percent"
+
         sleep 10
         elapsed=$((elapsed + 10))
     done
 
-    echo
-    echo
+    # Show completion (spaces clear residual progress bar characters)
+    printf "\r%-30s ${c2}✓${c0} Complete                    \n" "Capturing strace (10 min):"
 
     # Collect post-capture state
     printf "%-30s " "Collecting final state:"
@@ -2716,7 +2736,7 @@ run_diagnostics_bundle() {
 
         # Section 11: Post-capture pvestatd status
         echo "=== pvestatd Status (End) ==="
-        systemctl status pvestatd --no-pager 2>&1 | head -20
+        timeout 10 systemctl status pvestatd --no-pager 2>&1 | head -20
         echo
         new_pid=$(cat /var/run/pvestatd.pid 2>/dev/null || echo 'not found')
         echo "PID file: $new_pid"
@@ -2729,16 +2749,16 @@ run_diagnostics_bundle() {
         if [[ "$crashed" == "true" ]]; then
             echo "=== Crash Detected During Capture ==="
             echo "--- Recent Coredumps ---"
-            coredumpctl list 2>/dev/null | tail -5 || echo "No coredumps"
+            timeout 10 coredumpctl list --no-pager 2>/dev/null | tail -5 || echo "No coredumps"
             echo
             echo "--- Recent Kernel Messages ---"
-            dmesg 2>/dev/null | tail -30 || journalctl -k -n 30 2>/dev/null || echo "Cannot read kernel logs"
+            timeout 10 dmesg 2>/dev/null | tail -30 || timeout 10 journalctl -k --no-pager -n 30 2>/dev/null || echo "Cannot read kernel logs"
             echo
         fi
 
         # Section 13: Recent pvestatd logs
         echo "=== Recent pvestatd Logs ==="
-        journalctl -u pvestatd --since "15 minutes ago" --no-pager 2>&1 | tail -100 || echo "No recent logs"
+        timeout 10 journalctl -u pvestatd --since "15 minutes ago" --no-pager 2>&1 | tail -100 || echo "No recent logs"
         echo
 
     ) >> "$logfile" 2>&1 || true

@@ -8,6 +8,7 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 **Integrated Features** (via `install.sh` Diagnostics Menu):
 - **[Integrated Plugin Test](#integrated-plugin-test)** - Quick function validation via installer
+- **[Diagnostics Bundle](#diagnostics-bundle)** - 10-minute strace capture with system diagnostics for troubleshooting
 - **[FIO Storage Benchmark](#fio-storage-benchmark)** - Comprehensive I/O performance testing (30 tests)
 - **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring
 - **[Orphan Cleanup](#orphan-cleanup)** - Find and remove orphaned iSCSI resources
@@ -737,6 +738,142 @@ Cluster detected - additional tests available:
 - [Production Test Suite](#production-test-suite) - For detailed standalone testing
 - [Health Check Tool](#health-check-tool) - For configuration validation
 - [Development Test Suite](#development-test-suite) - For plugin development testing
+
+---
+
+## Diagnostics Bundle
+
+### Overview
+
+The Diagnostics Bundle feature is built into the interactive installer (`install.sh`) and captures a comprehensive snapshot of your Proxmox node for troubleshooting WebSocket connection issues, fork-related crashes, and pvestatd problems. It combines a 10-minute strace capture of pvestatd with 13 sections of system and plugin diagnostics.
+
+**Access Method**: Run `bash install.sh`, select "Diagnostics" from the main menu, then choose "Create diagnostics bundle"
+
+**Output**: Single compressed tarball (`truenas-diag-TIMESTAMP.tar.gz`) containing:
+- `truenas-diag-TIMESTAMP.log` - Main diagnostic log with 13 sections
+- `truenas-strace-TIMESTAMP.log` - 10-minute strace capture of pvestatd
+
+### Bundle Contents
+
+**Diagnostic Log Sections**:
+1. Plugin version and MD5 checksum
+2. Environment info (Perl version, IO::Socket::SSL, OpenSSL, Proxmox versions)
+3. Storage configuration (all TrueNAS storages, API keys redacted)
+4. pvestatd status at capture start
+5. Open file descriptors and socket connections
+6. Process tree snapshot
+7. Existing coredumps (if any)
+8. Kernel crash logs (last 7 days)
+9. pvestatd error logs (last 7 days)
+10. System info (uptime, memory, kernel, CPU)
+11. Post-capture pvestatd status
+12. New crash logs (if crash occurred during capture)
+13. Recent pvestatd journal logs
+
+**Strace Capture**: Monitors the following syscalls over 10 minutes:
+- `clone`, `fork`, `vfork` - Process creation (fork-related issues)
+- `socket`, `close`, `connect` - Connection management
+- `read`, `write` - Data transfer
+- `exit_group` - Process termination
+
+### Use Cases
+
+**When to Use**:
+- Diagnosing WebSocket fork-related crashes or segfaults
+- Investigating pvestatd hangs or crashes
+- Capturing connection management patterns during failure
+- Collecting data for plugin maintainers to debug issues
+- Validating proper connection cleanup during fork events
+
+**When Not to Use**:
+- For simple configuration validation (use Health Check Tool instead)
+- For performance testing (use FIO Storage Benchmark instead)
+- When pvestatd is not running
+
+### Running the Bundle Capture
+
+**Prerequisites**:
+- Root access on Proxmox node
+- pvestatd service running (`systemctl status pvestatd`)
+- 10 minutes available (capture duration is fixed)
+
+**Steps**:
+1. Run `bash install.sh` on the Proxmox node
+2. Select "Diagnostics" from the main menu
+3. Select "Create diagnostics bundle"
+4. Review the warnings about what will be captured
+5. Type `CAPTURE` at the confirmation prompt (case-sensitive, prevents accidental 10-minute waits)
+6. Wait while the bundle captures data
+   - The progress display shows elapsed time and pvestatd status
+   - If pvestatd crashes during capture, it's detected and noted
+7. Bundle is automatically compressed and saved to `/tmp/`
+
+**Example Output**:
+```
+Diagnostics Bundle
+
+  This will capture the following for 10 minutes:
+    - System and plugin information
+    - All TrueNAS storage configurations (API keys redacted)
+    - strace of pvestatd (captures fork/socket activity)
+    - Crash logs and coredump info
+    - pvestatd journal logs
+
+  pvestatd found (PID: 12345)
+
+  This capture will take 10 minutes.
+
+  Type CAPTURE to start or any other input to cancel
+Confirmation: CAPTURE
+
+Starting strace capture (10 minutes)...
+Collecting diagnostics: ✓ Complete
+Monitoring pvestatd for 10 minutes...
+
+  Capturing: 120/600 seconds (pvestatd running)
+
+Collecting final state: ✓ Complete
+Compressing bundle: ✓ Complete
+
+Diagnostics bundle created successfully
+
+  Output file: /tmp/truenas-diag-20231215-143022.tar.gz
+  File size:   512K
+
+  Please send this file for analysis.
+```
+
+### Requirements
+
+**System Requirements**:
+- Root access on Proxmox node
+- pvestatd service running
+- `strace` command available (usually pre-installed)
+- Sufficient disk space in `/tmp/` (typically 300KB-1MB for tarball)
+
+**Storage Requirements**: None (bundle is system-wide, not storage-specific)
+
+### Troubleshooting
+
+**"pvestatd is not running"**:
+```bash
+systemctl start pvestatd
+```
+
+**"strace: attach: ptrace(PTRACE_SEIZE, 12345): Operation not permitted"**:
+- Ensure running as root: `sudo bash install.sh`
+- Check SELinux restrictions: `getenforce`
+
+**Bundle file not created**:
+- Check `/tmp/` disk space: `df -h /tmp`
+- Check file permissions on `/tmp/`
+- Verify strace ran successfully (check console output)
+
+### See Also
+
+- [Health Check Tool](#health-check-tool) - For configuration and connectivity validation
+- [Integrated Plugin Test](#integrated-plugin-test) - For function testing
+- [FIO Storage Benchmark](#fio-storage-benchmark) - For performance testing
 
 ---
 
