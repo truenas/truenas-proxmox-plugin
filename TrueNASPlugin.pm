@@ -962,6 +962,19 @@ sub _ws_get_persistent($scfg) {
 
 sub _ws_cleanup_connections() {
     # Clean up all stored connections (called during shutdown)
+    # Fork safety: if we're in a child process, don't close parent's sockets
+    if ($$ != $_ws_creator_pid) {
+        # Neuter inherited sockets and clear hash (same pattern as _ws_get_persistent)
+        for my $conn (values %_ws_connections) {
+            if ($conn && $conn->{sock}) {
+                bless $conn->{sock}, 'PVE::Storage::Custom::TrueNASPlugin::NullDestructor';
+            }
+        }
+        %_ws_connections = ();
+        $_ws_creator_pid = $$;
+        return;
+    }
+    # Normal cleanup in parent process
     for my $key (keys %_ws_connections) {
         my $conn = $_ws_connections{$key};
         if ($conn && $conn->{sock}) {
