@@ -2127,6 +2127,7 @@ menu_diagnostics() {
 
         show_menu "Select diagnostic action" \
             "Run health check" \
+            "Create diagnostics bundle" \
             "Cleanup orphaned resources" \
             "Run plugin function test" \
             "Run FIO storage benchmark"
@@ -2136,14 +2137,14 @@ menu_diagnostics() {
 
         # Read choice allowing both numeric and special inputs
         while true; do
-            read -rp "Enter choice [0-4]: " raw_choice
+            read -rp "Enter choice [0-5]: " raw_choice
 
             # Check for special extended benchmark mode
-            if [[ "$raw_choice" == "4+" ]]; then
+            if [[ "$raw_choice" == "5+" ]]; then
                 EXTENDED_BENCHMARK=true
-                choice=4
+                choice=5
                 break
-            elif [[ "$raw_choice" =~ ^[0-9]+$ ]] && [[ "$raw_choice" -ge 0 ]] && [[ "$raw_choice" -le 4 ]]; then
+            elif [[ "$raw_choice" =~ ^[0-9]+$ ]] && [[ "$raw_choice" -ge 0 ]] && [[ "$raw_choice" -le 5 ]]; then
                 EXTENDED_BENCHMARK=false
                 choice="$raw_choice"
                 break
@@ -2151,7 +2152,7 @@ menu_diagnostics() {
                 # Move cursor up, clear to end of screen, show error, then re-prompt
                 printf "\\033[1A\\033[J"
                 echo ""
-                echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and 4"
+                echo "  ${c5}✗${c0} Invalid choice. Please enter a number between 0 and 5"
                 echo ""
             fi
         done
@@ -2166,16 +2167,21 @@ menu_diagnostics() {
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
             2)
+                # Create diagnostics bundle
+                menu_create_diagnostics_bundle
+                read -rp "Press Enter to return to diagnostics menu..."
+                ;;
+            3)
                 # Cleanup orphans
                 menu_cleanup_orphans
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
-            3)
+            4)
                 # Run plugin function test
                 menu_plugin_test
                 read -rp "Press Enter to return to diagnostics menu..."
                 ;;
-            4)
+            5)
                 # Run FIO benchmark (normal or extended based on EXTENDED_BENCHMARK flag)
                 menu_fio_benchmark
                 read -rp "Press Enter to return to diagnostics menu..."
@@ -2456,6 +2462,321 @@ menu_fio_benchmark() {
 
     # Run the benchmark suite (pass extended flag)
     run_fio_benchmark "$storage_name" "${EXTENDED_BENCHMARK:-false}" || true
+
+    return 0
+}
+
+# ============================================================================
+# Diagnostics Bundle Functions
+# ============================================================================
+
+# Menu: Create diagnostics bundle
+menu_create_diagnostics_bundle() {
+    clear_screen
+    print_banner
+    echo
+
+    print_header "Diagnostics Bundle"
+    echo
+
+    warning "This will capture the following for 10 minutes:"
+    echo "  - System and plugin information"
+    echo "  - All TrueNAS storage configurations (API keys redacted)"
+    echo "  - strace of pvestatd (captures fork/socket activity)"
+    echo "  - Crash logs and coredump info"
+    echo "  - pvestatd journal logs"
+    echo
+
+    # Check pvestatd is running
+    local pvestatd_pid
+    pvestatd_pid=$(cat /var/run/pvestatd.pid 2>/dev/null)
+
+    if [[ -z "$pvestatd_pid" ]] || [[ ! -d "/proc/$pvestatd_pid" ]]; then
+        error "pvestatd is not running. Please start it first:"
+        echo "  systemctl start pvestatd"
+        return 1
+    fi
+
+    info "pvestatd found (PID: $pvestatd_pid)"
+    echo
+
+    warning "This capture will take 10 minutes."
+    echo
+
+    info "Type ${c8}CAPTURE${c0} to start or any other input to cancel"
+    local confirmation
+    read -rp "Confirmation: " confirmation
+
+    if [[ "$confirmation" != "CAPTURE" ]]; then
+        warning "Operation cancelled by user"
+        return 0
+    fi
+
+    echo
+    run_diagnostics_bundle "$pvestatd_pid"
+}
+
+# Run diagnostics bundle capture
+run_diagnostics_bundle() {
+    local pvestatd_pid="$1"
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    local logfile="/tmp/truenas-diag-${timestamp}.log"
+    local strace_file="/tmp/truenas-strace-${timestamp}.log"
+    local tarball="/tmp/truenas-diag-${timestamp}.tar.gz"
+    local strace_duration=600  # 10 minutes
+    local strace_pid=""
+    local cleanup_done=false
+
+    # Cleanup function for interrupts
+    cleanup_diagnostics() {
+        local sig="${1:-EXIT}"
+
+        if [[ "${cleanup_done:-false}" == "true" ]]; then
+            return 0
+        fi
+        cleanup_done=true
+
+        # Disable further interrupts during cleanup
+        trap '' INT TERM
+
+        # Stop spinner if running
+        stop_spinner 2>/dev/null || true
+
+        # Kill strace if still running
+        if [[ -n "${strace_pid:-}" ]] && kill -0 "$strace_pid" 2>/dev/null; then
+            kill "$strace_pid" 2>/dev/null || true
+            wait "$strace_pid" 2>/dev/null || true
+        fi
+
+        # Clean up temp files on interrupt (but not on normal exit)
+        if [[ "$sig" == "INT" ]] || [[ "$sig" == "TERM" ]]; then
+            rm -f "$logfile" "$strace_file" 2>/dev/null || true
+            echo
+            warning "Diagnostics bundle creation interrupted by user (CTRL+C)"
+        fi
+
+        # Restore traps
+        trap - EXIT INT TERM
+    }
+
+    # Set traps for cleanup
+    trap 'cleanup_diagnostics INT' INT
+    trap 'cleanup_diagnostics TERM' TERM
+    trap 'cleanup_diagnostics EXIT' EXIT
+
+    # Start strace immediately
+    info "Starting strace capture (10 minutes)..."
+    timeout ${strace_duration} strace -f -tt -o "$strace_file" \
+        -e trace=clone,fork,vfork,socket,close,connect,read,write,exit_group \
+        -p "$pvestatd_pid" 2>/dev/null &
+    strace_pid=$!
+
+    sleep 2  # Let strace attach
+
+    # Collect diagnostics to log file
+    printf "%-30s " "Collecting diagnostics:"
+    start_spinner
+
+    # Use subshell to disable pipefail for diagnostic collection
+    # (prevents SIGPIPE errors when head/tail close pipes early)
+    (
+        set +o pipefail
+        echo "========================================"
+        echo "  TrueNAS Proxmox Plugin Diagnostics"
+        echo "  Generated: $(date)"
+        echo "========================================"
+        echo
+
+        # Section 1: Plugin version + MD5 checksum
+        echo "=== Plugin Information ==="
+        if [[ -f "$PLUGIN_PATH" ]]; then
+            echo "Plugin path: $PLUGIN_PATH"
+            plugin_version=$(grep -E "^our \\\$VERSION" "$PLUGIN_PATH" 2>/dev/null | head -1 || echo "unknown")
+            echo "Version: $plugin_version"
+            echo "MD5: $(md5sum "$PLUGIN_PATH" 2>/dev/null | awk '{print $1}')"
+            echo "Size: $(ls -lh "$PLUGIN_PATH" 2>/dev/null | awk '{print $5}')"
+        else
+            echo "Plugin not found at $PLUGIN_PATH"
+        fi
+        echo
+
+        # Section 2: Environment
+        echo "=== Environment ==="
+        echo "--- Perl Version ---"
+        perl -v 2>&1 | head -5
+        echo
+        echo "--- IO::Socket::SSL ---"
+        perl -MIO::Socket::SSL -e 'print "IO::Socket::SSL version: $IO::Socket::SSL::VERSION\n"' 2>&1 || echo "Not installed"
+        echo
+        echo "--- OpenSSL ---"
+        openssl version 2>&1 || echo "Not available"
+        echo
+        echo "--- Proxmox Version ---"
+        pveversion -v 2>&1 || echo "pveversion not available"
+        echo
+
+        # Section 3: Storage config (all TrueNAS storages, API keys redacted)
+        echo "=== Storage Configuration (API keys redacted) ==="
+        if [[ -f "$STORAGE_CFG" ]]; then
+            grep -A 20 "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | sed 's/api_key .*/api_key [REDACTED]/g' || echo "No TrueNAS storages configured"
+        else
+            echo "Storage config not found at $STORAGE_CFG"
+        fi
+        echo
+
+        # Section 4: pvestatd status at start
+        echo "=== pvestatd Status (Start) ==="
+        systemctl status pvestatd --no-pager 2>&1 | head -20
+        echo
+        echo "PID file: $(cat /var/run/pvestatd.pid 2>/dev/null || echo 'not found')"
+        echo "Process check: $(ps -p "$pvestatd_pid" -o pid,ppid,stat,etime,cmd --no-headers 2>/dev/null || echo 'process not found')"
+        echo
+
+        # Section 5: Open file descriptors + socket connections
+        echo "=== Open File Descriptors (pvestatd) ==="
+        ls -la /proc/"$pvestatd_pid"/fd 2>/dev/null | head -50 || echo "Cannot read fd info"
+        echo
+        echo "--- Socket Connections ---"
+        ss -tunap 2>/dev/null | grep -E "pvestatd|:443|:8006" | head -30 || echo "No relevant sockets found"
+        echo
+
+        # Section 6: Process tree
+        echo "=== Process Tree ==="
+        pstree -p "$pvestatd_pid" 2>/dev/null || echo "pstree not available"
+        echo
+
+        # Section 7: Existing coredumps
+        echo "=== Existing Coredumps ==="
+        coredumpctl list 2>/dev/null | grep -E "pvestatd|perl" | tail -10 || echo "No relevant coredumps found"
+        echo
+
+        # Section 8: Kernel crash logs (last 7 days)
+        echo "=== Kernel Crash Logs (last 7 days) ==="
+        journalctl -k --since "7 days ago" 2>/dev/null | grep -iE "segfault|oops|bug|panic|killed" | tail -20 || echo "No kernel crash logs found"
+        echo
+
+        # Section 9: pvestatd error logs (last 7 days)
+        echo "=== pvestatd Error Logs (last 7 days) ==="
+        journalctl -u pvestatd --since "7 days ago" 2>/dev/null | grep -iE "error|fail|die|crash|segfault|warn" | tail -50 || echo "No error logs found"
+        echo
+
+        # Section 10: System info
+        echo "=== System Information ==="
+        echo "Hostname: $(hostname)"
+        echo "Kernel: $(uname -r)"
+        echo "Uptime: $(uptime)"
+        echo "Memory:"
+        free -h 2>/dev/null || echo "free not available"
+        echo
+        echo "CPU:"
+        lscpu 2>/dev/null | grep -E "Model name|CPU\(s\)|Thread|Core" | head -5 || echo "lscpu not available"
+        echo
+
+    ) > "$logfile" 2>&1 || true
+
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Collecting diagnostics:")${c2}✓${c0} Complete"
+
+    # Wait for strace with progress
+    info "Monitoring pvestatd for $((strace_duration / 60)) minutes..."
+    echo
+
+    local elapsed=0
+    local crashed=false
+    while kill -0 $strace_pid 2>/dev/null && [[ $elapsed -lt $strace_duration ]]; do
+        if [[ ! -d "/proc/$pvestatd_pid" ]]; then
+            echo
+            warning "*** PVESTATD CRASHED OR RESTARTED ***"
+            info "Capturing post-crash state..."
+            crashed=true
+            break
+        fi
+
+        printf "\r  Capturing: %d/%d seconds (pvestatd running)    " $elapsed $strace_duration
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+
+    echo
+    echo
+
+    # Collect post-capture state
+    printf "%-30s " "Collecting final state:"
+    start_spinner
+
+    # Use subshell to disable pipefail for diagnostic collection
+    (
+        set +o pipefail
+        echo
+        echo "========================================"
+        echo "  Post-Capture State"
+        echo "  Captured at: $(date)"
+        echo "========================================"
+        echo
+
+        # Section 11: Post-capture pvestatd status
+        echo "=== pvestatd Status (End) ==="
+        systemctl status pvestatd --no-pager 2>&1 | head -20
+        echo
+        new_pid=$(cat /var/run/pvestatd.pid 2>/dev/null || echo 'not found')
+        echo "PID file: $new_pid"
+        if [[ "$new_pid" != "$pvestatd_pid" ]]; then
+            echo "*** WARNING: PID changed from $pvestatd_pid to $new_pid ***"
+        fi
+        echo
+
+        # Section 12: New crash logs (if crash occurred during capture)
+        if [[ "$crashed" == "true" ]]; then
+            echo "=== Crash Detected During Capture ==="
+            echo "--- Recent Coredumps ---"
+            coredumpctl list 2>/dev/null | tail -5 || echo "No coredumps"
+            echo
+            echo "--- Recent Kernel Messages ---"
+            dmesg 2>/dev/null | tail -30 || journalctl -k -n 30 2>/dev/null || echo "Cannot read kernel logs"
+            echo
+        fi
+
+        # Section 13: Recent pvestatd logs
+        echo "=== Recent pvestatd Logs ==="
+        journalctl -u pvestatd --since "15 minutes ago" --no-pager 2>&1 | tail -100 || echo "No recent logs"
+        echo
+
+    ) >> "$logfile" 2>&1 || true
+
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Collecting final state:")${c2}✓${c0} Complete"
+
+    # Wait for strace to finish if still running
+    if kill -0 $strace_pid 2>/dev/null; then
+        kill "$strace_pid" 2>/dev/null || true
+        wait "$strace_pid" 2>/dev/null || true
+    fi
+
+    # Compress
+    printf "%-30s " "Compressing bundle:"
+    start_spinner
+
+    cd /tmp
+    tar -czf "$tarball" \
+        "$(basename "$logfile")" \
+        "$(basename "$strace_file")" \
+        2>/dev/null
+
+    rm -f "$logfile" "$strace_file" 2>/dev/null
+
+    stop_spinner
+    echo -e "\r$(printf "%-30s " "Compressing bundle:")${c2}✓${c0} Complete"
+
+    # Clear the cleanup trap since we completed successfully
+    trap - EXIT INT TERM
+
+    echo
+    success "Diagnostics bundle created successfully"
+    echo
+    echo "  Output file: ${c8}${tarball}${c0}"
+    echo "  File size:   $(du -h "$tarball" 2>/dev/null | cut -f1)"
+    echo
+    info "Please send this file for analysis."
 
     return 0
 }

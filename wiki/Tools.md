@@ -802,7 +802,7 @@ The benchmark suite performs 6 categories of tests, each at 5 different queue de
 ```bash
 bash install.sh
 # Select: "Diagnostics" from the main menu
-# Select: "Run FIO storage benchmark" from the diagnostics menu
+# Select: "Run FIO storage benchmark" (option 5) from the diagnostics menu
 # Read the benchmark description and warnings
 # Type "ACCEPT" (in caps) to confirm and proceed
 # Select storage to benchmark from the list
@@ -821,6 +821,15 @@ bash install.sh
 8. **Benchmark Execution** - Runs 30 tests with progress indicators (25-30 minutes)
 9. **Results Summary** - Displays performance metrics for all tests
 10. **Automatic Cleanup** - Removes test volume and cleans up resources
+
+#### Extended Mode (5+)
+
+For more comprehensive testing, the benchmark supports an extended mode that adds additional queue depths and test variations. To activate extended mode:
+
+1. At the diagnostics menu prompt, type `5+` instead of `5`
+2. The benchmark will run with extended test parameters
+
+**Note**: Extended mode significantly increases benchmark duration. Use this option when you need deeper performance analysis or are investigating specific I/O patterns.
 
 ### Requirements
 
