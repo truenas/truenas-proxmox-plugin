@@ -858,7 +858,7 @@ download_stdout() {
             curl -fsSL --connect-timeout "$timeout" --max-time "$((timeout * 2))" "$url" || return 1
             ;;
         wget)
-            wget -q -O - --timeout="$timeout" "$url" || return 1
+            wget -q -O - --connect-timeout="$timeout" --read-timeout="$((timeout * 2))" "$url" || return 1
             ;;
         *)
             return 1
@@ -7723,7 +7723,8 @@ execute_provisioning() {
 
     success "Provisioning completed successfully!"
     echo
-    read -rp "Press Enter to continue..." _
+    read -rp "Press any key to continue..." -n1 _
+    echo
     clear_rollback_state
     return 0
 }
@@ -8156,6 +8157,7 @@ handle_provisioning_error() {
 }
 
 # Backup storage.cfg
+# Outputs: backup file path to stdout on success
 backup_storage_cfg() {
     if [[ ! -f "$STORAGE_CFG" ]]; then
         log "INFO" "No storage.cfg to backup"
@@ -8169,12 +8171,12 @@ backup_storage_cfg() {
     local backup_file="${BACKUP_DIR}/storage.cfg.backup.${timestamp}"
 
     cp "$STORAGE_CFG" "$backup_file" || {
-        error "Failed to create storage.cfg backup"
+        error "Failed to create storage.cfg backup" >&2
         return 1
     }
 
-    success "Storage config backed up: $backup_file"
     log "INFO" "Storage config backed up: $backup_file"
+    echo "$backup_file"  # Output path to stdout for capture
     return 0
 }
 
@@ -9149,18 +9151,21 @@ menu_configure_storage() {
             # Step 1: Backup storage.cfg
             printf "%-30s " "Configuration backup:"
             start_spinner
-            local backup_timestamp
-            backup_timestamp=$(date '+%Y%m%d_%H%M%S')
-            local backup_path="${BACKUP_DIR}/storage.cfg.backup.${backup_timestamp}"
-            local backup_result
-            backup_result=$(backup_storage_cfg 2>&1)
+            local backup_path
+            local backup_error
+            backup_error=$(backup_storage_cfg 2>&1 1>/tmp/backup_path_$$)
             local backup_exit=$?
+            backup_path=$(cat /tmp/backup_path_$$ 2>/dev/null)
+            rm -f /tmp/backup_path_$$ 2>/dev/null
             stop_spinner
-            if [[ $backup_exit -eq 0 ]]; then
+            if [[ $backup_exit -eq 0 ]] && [[ -n "$backup_path" ]]; then
                 echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} $backup_path"
+            elif [[ $backup_exit -eq 0 ]]; then
+                # No backup needed (no existing storage.cfg)
+                echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} Not needed"
             else
                 echo -e "\r$(printf "%-30s " "Configuration backup:")${c1}✗${c0} Failed"
-                echo "  $backup_result"
+                echo "  $backup_error"
                 ((finalize_errors++))
             fi
 
