@@ -849,15 +849,16 @@ download_file() {
 # Download to stdout
 download_stdout() {
     local url="$1"
+    local timeout="${2:-5}"  # Default 5 second timeout
     local tool
     tool=$(get_download_tool)
 
     case "$tool" in
         curl)
-            curl -fsSL "$url" || return 1
+            curl -fsSL --connect-timeout "$timeout" --max-time "$((timeout * 2))" "$url" || return 1
             ;;
         wget)
-            wget -q -O - "$url" || return 1
+            wget -q -O - --timeout="$timeout" "$url" || return 1
             ;;
         *)
             return 1
@@ -7453,11 +7454,9 @@ show_provisioning_summary() {
     # Clear screen and show summary header
     clear_screen
     print_banner
-    echo
     print_header "Provisioning Summary"
-    echo
+
     info "The following resources will be configured:"
-    echo
 
     # Connection settings
     printf "  ${c2}✓${c0} %-20s %s\n" "Storage Name:" "$storage_name"
@@ -7723,6 +7722,8 @@ execute_provisioning() {
     fi
 
     success "Provisioning completed successfully!"
+    echo
+    read -rp "Press Enter to continue..." _
     clear_rollback_state
     return 0
 }
@@ -8526,9 +8527,7 @@ WIZARD_HOSTNQN=""            # Host NQN for NVMe/TCP
 show_wizard_summary() {
     local current_step="$1"
 
-    echo
     info "Configuration Progress:"
-    echo
 
     # Configuration Mode
     if [[ -n "$WIZARD_CONFIG_MODE" ]]; then
@@ -8613,18 +8612,16 @@ show_wizard_summary() {
         # Target/Subsystem
         if [[ -n "$WIZARD_TARGET" ]]; then
             local tgt_status=""
-            local tgt_label="Target:"
-            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
-                tgt_label="Subsystem NQN:"
-            else
-                tgt_label="Target IQN:"
-            fi
             if [[ "$WIZARD_TARGET_EXISTS" == "true" ]]; then
                 tgt_status=" ${c3}(exists)${c0}"
             else
                 tgt_status=" ${c2}(new)${c0}"
             fi
-            echo -e "  ${c2}✓${c0} $(printf "%-17s" "$tgt_label") $WIZARD_TARGET$tgt_status"
+            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+                echo -e "  ${c2}✓${c0} Subsystem NQN:       $WIZARD_TARGET$tgt_status"
+            else
+                echo -e "  ${c2}✓${c0} Target IQN:          $WIZARD_TARGET$tgt_status"
+            fi
         elif [[ "$current_step" == "target" ]]; then
             if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
                 echo -e "  ${c6}▸${c0} Subsystem NQN:       ${c6}(configuring...)${c0}"
@@ -8885,9 +8882,6 @@ wizard_add_storage() {
     print_header "Storage Provisioning"
     show_wizard_summary "complete"
 
-    success "Configuration collected successfully!"
-    echo
-
     return 0
 }
 
@@ -8896,9 +8890,6 @@ menu_configure_storage() {
     clear_screen
     print_banner
     print_header "Storage Configuration Wizard"
-
-    info "This wizard will help you configure TrueNAS storage for Proxmox"
-    echo
 
     # Check for existing storage entries
     local existing_storages
@@ -8912,7 +8903,7 @@ menu_configure_storage() {
         storage_count=$(echo "$existing_storages" | wc -l)
 
         # Present menu (don't show storage list yet)
-        info "Found $storage_count existing TrueNAS storage configuration(s)"
+        echo -e "  Found ${c6}$storage_count${c0} existing TrueNAS storage configuration(s)"
         echo
         info "What would you like to do?"
         echo "  1) Edit an existing storage"
@@ -8973,8 +8964,11 @@ menu_configure_storage() {
                 # Continue with provisioning using wizard-collected values
                 ;;
             3)
-                # Delete mode - show storage list and confirm deletion
-                echo
+                # Delete mode - clear screen and show storage list
+                clear_screen
+                print_banner
+                print_header "Delete Storage Configuration"
+
                 info "Available storage configurations:"
                 local idx=1
                 local -a storage_array=()
@@ -8990,6 +8984,8 @@ menu_configure_storage() {
                     read -rp "Select storage to delete [1-${#storage_array[@]}] or 0 to cancel: " storage_idx
                     if [[ "$storage_idx" == "0" ]]; then
                         info "Deletion cancelled"
+                        read -rp "Press any key to return to main menu..." -n1 _
+                        echo
                         return 0
                     elif [[ "$storage_idx" =~ ^[0-9]+$ ]] && [[ "$storage_idx" -ge 1 ]] && [[ "$storage_idx" -le "${#storage_array[@]}" ]]; then
                         storage_name="${storage_array[$((storage_idx-1))]}"
@@ -8999,18 +8995,24 @@ menu_configure_storage() {
                     fi
                 done
 
-                # Warning and confirmation
-                echo
-                warning "WARNING: Deleting storage configuration '$storage_name'"
+                # Clear screen and show warning
+                clear_screen
+                print_banner
+                print_header "Delete Storage Configuration"
+
+                warning "WARNING: Deleting storage configuration '${c1}$storage_name${c0}'"
                 warning "This will remove the storage from Proxmox configuration."
                 warning "VMs using disks on this storage will lose access until reconfigured."
                 echo
 
                 local confirm
-                read -rp "Type storage name '$storage_name' to confirm deletion: " confirm
+                echo -en "Type storage name '${c1}$storage_name${c0}' to confirm deletion: "
+                read -r confirm
                 if [[ "$confirm" != "$storage_name" ]]; then
                     warning "Confirmation failed. Deletion cancelled."
-                    return 1
+                    read -rp "Press any key to return to main menu..." -n1 _
+                    echo
+                    return 0
                 fi
 
                 # Read transport_mode BEFORE deletion (config will be gone after)
@@ -9018,7 +9020,32 @@ menu_configure_storage() {
                 transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
 
                 # Perform deletion
-                if remove_storage_config "$storage_name"; then
+                echo
+                printf "%-30s " "Removing from storage.cfg:"
+                start_spinner
+                local remove_result
+                remove_result=$(remove_storage_config "$storage_name" 2>&1)
+                local remove_exit=$?
+                stop_spinner
+
+                if [[ $remove_exit -eq 0 ]]; then
+                    echo -e "\r$(printf "%-30s " "Removing from storage.cfg:")${c2}✓${c0} Removed"
+
+                    # Verify removal from pvesm
+                    printf "%-30s " "Verifying removal:"
+                    start_spinner
+                    sleep 1
+                    local pvesm_check
+                    pvesm_check=$(pvesm status 2>&1 | grep -E "^${storage_name}\s" || true)
+                    stop_spinner
+
+                    if [[ -z "$pvesm_check" ]]; then
+                        echo -e "\r$(printf "%-30s " "Verifying removal:")${c2}✓${c0} Not in pvesm"
+                    else
+                        echo -e "\r$(printf "%-30s " "Verifying removal:")${c3}!${c0} May need service restart"
+                    fi
+
+                    echo
                     success "Storage '$storage_name' has been deleted"
 
                     # Check if this was an iSCSI storage and offer orphan cleanup
@@ -9030,10 +9057,13 @@ menu_configure_storage() {
                         fi
                     fi
                 else
+                    echo -e "\r$(printf "%-30s " "Removing from storage.cfg:")${c1}✗${c0} Failed"
+                    echo "  $remove_result"
                     error "Failed to delete storage configuration"
-                    return 1
                 fi
 
+                read -rp "Press any key to return to main menu..." -n1 _
+                echo
                 return 0
                 ;;
         esac
@@ -9087,7 +9117,6 @@ menu_configure_storage() {
             fi
 
             # Generate configuration using wizard-collected values
-            echo
             local config
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
                 config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
@@ -9096,14 +9125,14 @@ menu_configure_storage() {
             fi
 
             # Show final configuration summary
-            echo "─────────────────────────────────────────────────────────"
-            info "Final Storage Configuration"
-            echo "─────────────────────────────────────────────────────────"
+            clear_screen
+            print_banner
+            print_header "Final Storage Configuration"
+
             echo "$config"
             echo "─────────────────────────────────────────────────────────"
-            echo
 
-            read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
+            read -rp "Add this configuration to Proxmox? [Y/n]: " confirm
             if [[ "$confirm" =~ ^[Nn] ]]; then
                 warning "Configuration cancelled"
                 return 1
@@ -9120,12 +9149,15 @@ menu_configure_storage() {
             # Step 1: Backup storage.cfg
             printf "%-30s " "Configuration backup:"
             start_spinner
+            local backup_timestamp
+            backup_timestamp=$(date '+%Y%m%d_%H%M%S')
+            local backup_path="${BACKUP_DIR}/storage.cfg.backup.${backup_timestamp}"
             local backup_result
             backup_result=$(backup_storage_cfg 2>&1)
             local backup_exit=$?
             stop_spinner
             if [[ $backup_exit -eq 0 ]]; then
-                echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} Saved"
+                echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} $backup_path"
             else
                 echo -e "\r$(printf "%-30s " "Configuration backup:")${c1}✗${c0} Failed"
                 echo "  $backup_result"
@@ -9150,19 +9182,25 @@ menu_configure_storage() {
                 fi
             fi
 
-            # Step 3: Validate storage with pvesm
+            # Step 3: Validate storage with pvesm (retry for up to 10 seconds)
             if [[ $finalize_errors -eq 0 ]]; then
                 printf "%-30s " "Storage validation:"
                 start_spinner
-                # Give Proxmox a moment to recognize the new config
-                sleep 1
-                local pvesm_result
-                pvesm_result=$(pvesm status 2>&1 | grep -E "^${storage_name}\s" || true)
+                local pvesm_result=""
+                local validation_timeout=10
+                local validation_start=$SECONDS
+                while [[ $((SECONDS - validation_start)) -lt $validation_timeout ]]; do
+                    pvesm_result=$(pvesm status 2>&1 | grep -E "^${storage_name}\s" || true)
+                    if [[ -n "$pvesm_result" ]]; then
+                        break
+                    fi
+                    sleep 1
+                done
                 stop_spinner
                 if [[ -n "$pvesm_result" ]]; then
-                    echo -e "\r$(printf "%-30s " "Storage validation:")${c2}✓${c0} Active in Proxmox"
+                    echo -e "\r$(printf "%-30s " "Storage validation:")${c2}✓${c0} Valid"
                 else
-                    echo -e "\r$(printf "%-30s " "Storage validation:")${c3}?${c0} May need a moment to activate"
+                    echo -e "\r$(printf "%-30s " "Storage validation:")${c3}!${c0} May need service restart"
                 fi
             fi
 
@@ -9173,14 +9211,9 @@ menu_configure_storage() {
             fi
 
             success "Storage '$storage_name' configured successfully!"
-            echo
-            info "Next steps:"
-            echo "  1. Test the storage by creating a VM disk:"
-            echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
-            echo "  2. Check storage status: pvesm status"
-            echo "  3. View storage details: pvesm list ${storage_name}"
 
-            read -rp "Press Enter to continue..."
+            read -rp "Press any key to return to main menu..." -n1 _
+            echo
             return 0
         fi
     fi
