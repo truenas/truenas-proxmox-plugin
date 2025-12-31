@@ -6571,9 +6571,58 @@ tn_delete_subsystem() {
     return 0
 }
 
-# Create NVMe port for subsystem
+# Find existing NVMe port by address and transport
+# Parameters: host, api_key, listen_ip, listen_port
+# Returns: port ID if found, empty string if not found
+tn_find_nvme_port() {
+    local host="$1"
+    local api_key="$2"
+    local listen_ip="$3"
+    local listen_port="${4:-4420}"
+
+    log "INFO" "Searching for existing NVMe port: $listen_ip:$listen_port"
+
+    # Query all ports
+    local ports_result
+    ports_result=$(tn_api_call "$host" "$api_key" "nvmet.port.query" "[]" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        log "WARNING" "Failed to query NVMe ports: $ports_result"
+        echo ""
+        return 1
+    fi
+
+    # Find port matching address and transport
+    local port_id
+    port_id=$(echo "$ports_result" | python3 -c "
+import sys, json
+try:
+    ports = json.load(sys.stdin)
+    for port in ports:
+        if (port.get('addr_trtype') == 'TCP' and
+            port.get('addr_traddr') == '$listen_ip' and
+            str(port.get('addr_trsvcid')) == '$listen_port'):
+            print(port.get('id', ''))
+            break
+except:
+    pass
+" 2>/dev/null)
+
+    if [[ -n "$port_id" ]]; then
+        log "INFO" "Found existing NVMe port with ID: $port_id"
+        echo "$port_id"
+        return 0
+    fi
+
+    log "INFO" "No existing NVMe port found for $listen_ip:$listen_port"
+    echo ""
+    return 1
+}
+
+# Create NVMe port for subsystem (or reuse existing port)
 # Parameters: host, api_key, subsystem_id, listen_ip, listen_port
-# Returns: JSON with created port info
+# Returns: JSON with port info (created or existing)
 tn_create_nvme_port() {
     local host="$1"
     local api_key="$2"
@@ -6581,33 +6630,45 @@ tn_create_nvme_port() {
     local listen_ip="$4"
     local listen_port="${5:-4420}"
 
-    log "INFO" "Creating NVMe port for subsystem $subsystem_id: $listen_ip:$listen_port"
+    log "INFO" "Creating/finding NVMe port for subsystem $subsystem_id: $listen_ip:$listen_port"
 
-    # Step 1: Create the port (TrueNAS 25.10+ uses separate port and subsystem association)
-    local port_params
-    port_params=$(printf '[{"addr_trtype": "TCP", "addr_traddr": "%s", "addr_trsvcid": %s}]' "$listen_ip" "$listen_port")
+    local port_id=""
+    local port_result=""
+    local port_reused=false
 
-    local port_result
-    port_result=$(tn_api_call_write "$host" "$api_key" "nvmet.port.create" "$port_params" 2>&1)
-    local exit_code=$?
+    # Step 1: Check if port already exists
+    port_id=$(tn_find_nvme_port "$host" "$api_key" "$listen_ip" "$listen_port" 2>/dev/null)
 
-    if [[ $exit_code -ne 0 ]]; then
-        log "ERROR" "NVMe port creation failed: $port_result"
-        echo "$port_result" >&2
-        return 1
+    if [[ -n "$port_id" ]]; then
+        log "INFO" "Reusing existing NVMe port ID: $port_id"
+        port_reused=true
+        # Create a JSON result for consistency
+        port_result=$(printf '{"id": %s, "addr_trtype": "TCP", "addr_traddr": "%s", "addr_trsvcid": %s, "reused": true}' "$port_id" "$listen_ip" "$listen_port")
+    else
+        # Create the port (TrueNAS 25.10+ uses separate port and subsystem association)
+        local port_params
+        port_params=$(printf '[{"addr_trtype": "TCP", "addr_traddr": "%s", "addr_trsvcid": %s}]' "$listen_ip" "$listen_port")
+
+        port_result=$(tn_api_call_write "$host" "$api_key" "nvmet.port.create" "$port_params" 2>&1)
+        local exit_code=$?
+
+        if [[ $exit_code -ne 0 ]]; then
+            log "ERROR" "NVMe port creation failed: $port_result"
+            echo "$port_result" >&2
+            return 1
+        fi
+
+        # Extract port ID from result
+        port_id=$(echo "$port_result" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+
+        if [[ -z "$port_id" ]]; then
+            log "ERROR" "Failed to extract port ID from result: $port_result"
+            echo "Failed to extract port ID" >&2
+            return 1
+        fi
+
+        log "INFO" "NVMe port created with ID: $port_id"
     fi
-
-    # Extract port ID from result
-    local port_id
-    port_id=$(echo "$port_result" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
-
-    if [[ -z "$port_id" ]]; then
-        log "ERROR" "Failed to extract port ID from result: $port_result"
-        echo "Failed to extract port ID" >&2
-        return 1
-    fi
-
-    log "INFO" "NVMe port created with ID: $port_id"
 
     # Step 2: Associate port with subsystem
     local assoc_params
@@ -6615,15 +6676,25 @@ tn_create_nvme_port() {
 
     local assoc_result
     assoc_result=$(tn_api_call_write "$host" "$api_key" "nvmet.port_subsys.create" "$assoc_params" 2>&1)
-    exit_code=$?
+    local exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
-        log "ERROR" "NVMe port-subsystem association failed: $assoc_result"
-        echo "$assoc_result" >&2
-        return 1
+        # Check if association already exists (common when reusing ports)
+        if echo "$assoc_result" | grep -q "already"; then
+            log "INFO" "Port-subsystem association already exists"
+        else
+            log "ERROR" "NVMe port-subsystem association failed: $assoc_result"
+            echo "$assoc_result" >&2
+            return 1
+        fi
     fi
 
-    log "INFO" "NVMe port associated with subsystem successfully"
+    if [[ "$port_reused" == "true" ]]; then
+        log "INFO" "Reused existing NVMe port and associated with subsystem"
+    else
+        log "INFO" "NVMe port created and associated with subsystem successfully"
+    fi
+
     echo "$port_result"
     return 0
 }
@@ -6904,32 +6975,109 @@ select_provisioning_mode() {
 }
 
 # ============================================================================
-# PROVISIONING WORKFLOW ORCHESTRATION
+# PROVISIONING WORKFLOW - INPUT COLLECTION
 # ============================================================================
 
-# Provision dataset with user input
-# Parameters: host, api_key
-# Returns: dataset path on success, empty on failure
-# Sets: PROVISIONED_DATASET variable
-provision_dataset() {
-    local host="$1"
-    local api_key="$2"
+# Global variables for provisioning configuration
+PROV_POOL=""
+PROV_DATASET_NAME=""
+PROV_DATASET_PATH=""
+PROV_DATASET_EXISTS="false"
+PROV_NQN=""
+PROV_IQN=""
+PROV_TARGET_EXISTS="false"
+PROV_PORTAL_IP=""
+PROV_PORTAL_PORT=""
+PROV_PORTAL_ID=""
+PROV_BLOCKSIZE=""
+PROV_SPARSE=""
+PROV_HOSTNQN=""
+
+# Show progressive summary of collected configuration
+# Parameters: storage_name, transport_mode
+show_progress_summary() {
+    local storage_name="$1"
+    local transport_mode="$2"
 
     echo
-    print_header "Dataset Configuration"
+    printf "  ${c4}%-18s${c0} %s\n" "Storage Name:" "$storage_name"
+    printf "  ${c4}%-18s${c0} %s\n" "Transport:" "$transport_mode"
 
-    # List available pools
-    info "Fetching available ZFS pools..."
+    if [[ -n "$PROV_POOL" ]]; then
+        printf "  ${c4}%-18s${c0} %s\n" "Pool:" "$PROV_POOL"
+    fi
+
+    if [[ -n "$PROV_DATASET_NAME" ]]; then
+        local ds_status=""
+        if [[ "$PROV_DATASET_EXISTS" == "true" ]]; then
+            ds_status=" ${c3}(existing)${c0}"
+        else
+            ds_status=" ${c2}(new)${c0}"
+        fi
+        printf "  ${c4}%-18s${c0} %s%s\n" "Dataset:" "$PROV_DATASET_PATH" "$ds_status"
+    fi
+
+    if [[ -n "$PROV_NQN" ]]; then
+        local tgt_status=""
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            tgt_status=" ${c3}(existing)${c0}"
+        else
+            tgt_status=" ${c2}(new)${c0}"
+        fi
+        printf "  ${c4}%-18s${c0} %s%s\n" "Subsystem NQN:" "$PROV_NQN" "$tgt_status"
+    fi
+
+    if [[ -n "$PROV_IQN" ]]; then
+        local tgt_status=""
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            tgt_status=" ${c3}(existing)${c0}"
+        else
+            tgt_status=" ${c2}(new)${c0}"
+        fi
+        printf "  ${c4}%-18s${c0} %s%s\n" "Target IQN:" "$PROV_IQN" "$tgt_status"
+    fi
+
+    if [[ -n "$PROV_PORTAL_IP" ]]; then
+        printf "  ${c4}%-18s${c0} %s:%s\n" "Portal:" "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT"
+    fi
+
+    echo
+    echo "  ---"
+    echo
+}
+
+# Collect all provisioning configuration upfront using progressive wizard
+# Parameters: host, api_key, storage_name, transport_mode
+# Returns: 0 on success (config collected), 1 on cancel/failure
+# Sets: PROV_* global variables and updates WIZARD_* for display
+collect_provisioning_config() {
+    local host="$1"
+    local api_key="$2"
+    local storage_name="$3"
+    local transport_mode="$4"
+
+    # Reset all config variables
+    PROV_POOL=""
+    PROV_DATASET_NAME=""
+    PROV_DATASET_PATH=""
+    PROV_DATASET_EXISTS="false"
+    PROV_NQN=""
+    PROV_IQN=""
+    PROV_TARGET_EXISTS="false"
+    PROV_PORTAL_IP=""
+    PROV_PORTAL_PORT=""
+    PROV_BLOCKSIZE=""
+    PROV_SPARSE=""
+    PROV_HOSTNQN=""
+
+    # Fetch pools first (before showing UI)
     local pools_json
     pools_json=$(tn_list_pools "$host" "$api_key" 2>&1)
-    local exit_code=$?
-
-    if [[ $exit_code -ne 0 ]]; then
+    if [[ $? -ne 0 ]]; then
         error "Failed to list pools: $pools_json"
         return 1
     fi
 
-    # Parse pool names (only top-level pool names, not nested vdev names)
     local -a pool_names=()
     while IFS= read -r name; do
         [[ -n "$name" ]] && pool_names+=("$name")
@@ -6940,9 +7088,14 @@ provision_dataset() {
         return 1
     fi
 
-    # Display pools for selection
+    # --- Step 1: Pool Selection ---
+    clear_screen
+    print_banner
     echo
-    info "Available ZFS pools:"
+    print_header "Storage Provisioning"
+    show_wizard_summary "pool"
+
+    info "Select ZFS pool:"
     local idx=1
     for pool in "${pool_names[@]}"; do
         echo "  $idx) $pool"
@@ -6950,85 +7103,634 @@ provision_dataset() {
     done
     echo
 
-    # Select pool
     local pool_choice
-    local selected_pool
     while true; do
         read -rp "Select pool [1-${#pool_names[@]}]: " pool_choice
         if [[ "$pool_choice" =~ ^[0-9]+$ ]] && [[ "$pool_choice" -ge 1 ]] && [[ "$pool_choice" -le "${#pool_names[@]}" ]]; then
-            selected_pool="${pool_names[$((pool_choice-1))]}"
+            PROV_POOL="${pool_names[$((pool_choice-1))]}"
+            WIZARD_POOL="$PROV_POOL"
             break
         else
             error "Invalid selection"
         fi
     done
 
-    # Get dataset name
-    local dataset_name
+    # --- Step 2: Dataset Name ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "dataset"
+
+    info "Enter dataset name (will be created under ${WIZARD_POOL}/):"
     while true; do
-        read -rp "Dataset name (e.g., proxmox): " dataset_name
-        if [[ -z "$dataset_name" ]]; then
+        read -rp "Dataset name (e.g., proxmox): " PROV_DATASET_NAME
+        if [[ -z "$PROV_DATASET_NAME" ]]; then
             error "Dataset name cannot be empty"
             continue
         fi
-        if [[ ! "$dataset_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        if [[ ! "$PROV_DATASET_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             error "Dataset name can only contain letters, numbers, hyphens, and underscores"
             continue
         fi
         break
     done
 
-    local full_dataset="${selected_pool}/${dataset_name}"
+    PROV_DATASET_PATH="${PROV_POOL}/${PROV_DATASET_NAME}"
+    WIZARD_DATASET="$PROV_DATASET_NAME"
+    WIZARD_DATASET_PATH="$PROV_DATASET_PATH"
 
-    # Check if dataset exists
-    if tn_check_dataset "$host" "$api_key" "$full_dataset" >/dev/null 2>&1; then
+    # Check if dataset exists with spinner
+    echo
+    printf "  %-30s" "Checking dataset..."
+    start_spinner
+    if tn_check_dataset "$host" "$api_key" "$PROV_DATASET_PATH" >/dev/null 2>&1; then
+        PROV_DATASET_EXISTS="true"
+        WIZARD_DATASET_EXISTS="true"
+    else
+        PROV_DATASET_EXISTS="false"
+        WIZARD_DATASET_EXISTS="false"
+    fi
+    stop_spinner
+    if [[ "$PROV_DATASET_EXISTS" == "true" ]]; then
+        echo -e "\r  $(printf "%-30s" "Checking dataset...")${c3}EXISTS${c0} (will use existing)"
+    else
+        echo -e "\r  $(printf "%-30s" "Checking dataset...")${c2}OK${c0} (will create new)"
+    fi
+    sleep 1
+
+    # --- Step 3: Target/Subsystem Configuration ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "target"
+
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # NVMe subsystem configuration
+        local auto_nqn
+        auto_nqn="nqn.$(date +%Y-%m).org.freenas.ctl:${storage_name}"
+
+        info "NVMe Subsystem Configuration:"
+        echo "  1) Use auto-generated NQN: $auto_nqn"
+        echo "  2) Enter custom NQN"
         echo
-        warning "Dataset '$full_dataset' already exists"
-        echo "  1) Use existing dataset"
-        echo "  2) Enter a different name"
-        echo "  0) Cancel"
 
-        local exist_choice
-        while true; do
-            read -rp "Select option [0-2]: " exist_choice
-            case "$exist_choice" in
-                0)
-                    return 1
-                    ;;
-                1)
-                    info "Using existing dataset: $full_dataset"
-                    PROVISIONED_DATASET="$full_dataset"
-                    return 0
-                    ;;
-                2)
-                    # Recursive call to try again
-                    provision_dataset "$host" "$api_key"
-                    return $?
-                    ;;
-                *)
-                    error "Invalid choice"
-                    ;;
-            esac
-        done
+        local nqn_choice
+        read -rp "Select option [1-2] [1]: " nqn_choice
+        nqn_choice=${nqn_choice:-1}
+
+        case "$nqn_choice" in
+            1) PROV_NQN="$auto_nqn" ;;
+            2)
+                while true; do
+                    read -rp "Enter NQN: " PROV_NQN
+                    if [[ -z "$PROV_NQN" ]]; then
+                        error "NQN cannot be empty"
+                        continue
+                    fi
+                    break
+                done
+                ;;
+            *) PROV_NQN="$auto_nqn" ;;
+        esac
+
+        WIZARD_TARGET="$PROV_NQN"
+
+        # Check if subsystem exists with spinner
+        echo
+        printf "  %-30s" "Checking subsystem..."
+        start_spinner
+        if tn_check_subsystem "$host" "$api_key" "$PROV_NQN" >/dev/null 2>&1; then
+            PROV_TARGET_EXISTS="true"
+            WIZARD_TARGET_EXISTS="true"
+        else
+            PROV_TARGET_EXISTS="false"
+            WIZARD_TARGET_EXISTS="false"
+        fi
+        stop_spinner
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            echo -e "\r  $(printf "%-30s" "Checking subsystem...")${c3}EXISTS${c0} (will use existing)"
+        else
+            echo -e "\r  $(printf "%-30s" "Checking subsystem...")${c2}OK${c0} (will create new)"
+        fi
+        sleep 1
+    else
+        # iSCSI target configuration
+        local auto_iqn
+        auto_iqn="iqn.$(date +%Y-%m).org.freenas.ctl:${storage_name}"
+
+        info "iSCSI Target Configuration:"
+        echo "  1) Use auto-generated IQN: $auto_iqn"
+        echo "  2) Enter custom IQN"
+        echo
+
+        local iqn_choice
+        read -rp "Select option [1-2] [1]: " iqn_choice
+        iqn_choice=${iqn_choice:-1}
+
+        case "$iqn_choice" in
+            1) PROV_IQN="$auto_iqn" ;;
+            2)
+                while true; do
+                    read -rp "Enter IQN: " PROV_IQN
+                    if [[ -z "$PROV_IQN" ]]; then
+                        error "IQN cannot be empty"
+                        continue
+                    fi
+                    break
+                done
+                ;;
+            *) PROV_IQN="$auto_iqn" ;;
+        esac
+
+        WIZARD_TARGET="$PROV_IQN"
+
+        # Check if target exists with spinner
+        echo
+        printf "  %-30s" "Checking target..."
+        start_spinner
+        if tn_check_target "$host" "$api_key" "$PROV_IQN" >/dev/null 2>&1; then
+            PROV_TARGET_EXISTS="true"
+            WIZARD_TARGET_EXISTS="true"
+        else
+            PROV_TARGET_EXISTS="false"
+            WIZARD_TARGET_EXISTS="false"
+        fi
+        stop_spinner
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            echo -e "\r  $(printf "%-30s" "Checking target...")${c3}EXISTS${c0} (will use existing)"
+        else
+            echo -e "\r  $(printf "%-30s" "Checking target...")${c2}OK${c0} (will create new)"
+        fi
+        sleep 1
     fi
 
-    # Create new dataset
-    info "Creating dataset: $full_dataset"
-    local result
-    result=$(tn_create_dataset "$host" "$api_key" "$selected_pool" "$dataset_name" 2>&1)
-    local create_exit=$?
+    # --- Step 4: Portal Configuration ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "portal"
 
-    if [[ $create_exit -ne 0 ]]; then
-        error "Failed to create dataset: $result"
+    local default_port
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        info "NVMe Portal Configuration:"
+        default_port="4420"
+    else
+        info "iSCSI Portal Configuration:"
+        default_port="3260"
+    fi
+
+    # Portal IP with validation
+    while true; do
+        read -rp "Portal IP address [${host}]: " PROV_PORTAL_IP
+        PROV_PORTAL_IP=${PROV_PORTAL_IP:-$host}
+        if validate_ip "$PROV_PORTAL_IP"; then
+            break
+        else
+            error "Invalid IP address format"
+        fi
+    done
+
+    # Portal port with validation
+    while true; do
+        read -rp "Portal port [${default_port}]: " PROV_PORTAL_PORT
+        PROV_PORTAL_PORT=${PROV_PORTAL_PORT:-$default_port}
+        if [[ "$PROV_PORTAL_PORT" =~ ^[0-9]+$ ]] && [[ "$PROV_PORTAL_PORT" -ge 1 ]] && [[ "$PROV_PORTAL_PORT" -le 65535 ]]; then
+            break
+        else
+            error "Invalid port number (must be 1-65535)"
+        fi
+    done
+
+    WIZARD_PORTAL_IP="$PROV_PORTAL_IP"
+    WIZARD_PORTAL_PORT="$PROV_PORTAL_PORT"
+
+    # --- Step 5: Block Size Configuration ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "blocksize"
+
+    info "ZFS Block Size Configuration:"
+    echo "  Recommended sizes based on workload:"
+    echo "    4K  - Databases with small random I/O (PostgreSQL, MySQL)"
+    echo "    8K  - General-purpose databases, mixed workloads"
+    echo "    16K - Default, balanced for most VM workloads (Recommended)"
+    echo "    32K - Large sequential I/O, media files"
+    echo "    64K - Very large files, backup storage"
+    echo "    128K - Maximum for large sequential workloads"
+    echo
+
+    while true; do
+        read -rp "Block size [16K]: " PROV_BLOCKSIZE
+        PROV_BLOCKSIZE="${PROV_BLOCKSIZE:-16K}"
+        # Validate blocksize format (number followed by K or M)
+        if [[ "$PROV_BLOCKSIZE" =~ ^[0-9]+[KkMm]$ ]]; then
+            # Normalize to uppercase
+            PROV_BLOCKSIZE="${PROV_BLOCKSIZE^^}"
+            # Extract numeric part
+            local bs_num="${PROV_BLOCKSIZE%[KM]}"
+            local bs_unit="${PROV_BLOCKSIZE: -1}"
+            # Convert to bytes for validation
+            local bs_bytes
+            if [[ "$bs_unit" == "K" ]]; then
+                bs_bytes=$((bs_num * 1024))
+            else
+                bs_bytes=$((bs_num * 1024 * 1024))
+            fi
+            # Valid range: 512 bytes to 1M (ZFS limit)
+            if [[ "$bs_bytes" -ge 512 ]] && [[ "$bs_bytes" -le 1048576 ]]; then
+                # Must be power of 2
+                if (( (bs_bytes & (bs_bytes - 1)) == 0 )); then
+                    break
+                else
+                    error "Block size must be a power of 2 (e.g., 4K, 8K, 16K, 32K, 64K, 128K)"
+                fi
+            else
+                error "Block size must be between 512 bytes and 1M"
+            fi
+        else
+            error "Invalid format. Use number followed by K or M (e.g., 16K, 128K, 1M)"
+        fi
+    done
+    WIZARD_BLOCKSIZE="$PROV_BLOCKSIZE"
+
+    # --- Step 6: Sparse Volume Configuration ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "sparse"
+
+    info "Sparse Volume Configuration:"
+    echo "  Sparse volumes (thin provisioning) allocate space on-demand rather than"
+    echo "  pre-allocating the full size. This saves storage space but may cause"
+    echo "  slight fragmentation over time. Recommended for most use cases."
+    echo
+
+    while true; do
+        read -rp "Enable sparse volumes? (Y/n) [Y]: " sparse_choice
+        sparse_choice="${sparse_choice:-Y}"
+        if [[ "$sparse_choice" =~ ^[Yy]$ ]]; then
+            PROV_SPARSE="1"
+            break
+        elif [[ "$sparse_choice" =~ ^[Nn]$ ]]; then
+            PROV_SPARSE="0"
+            break
+        else
+            error "Please enter Y or N"
+        fi
+    done
+    WIZARD_SPARSE="$PROV_SPARSE"
+
+    # --- Step 7: Host NQN Configuration (NVMe only) ---
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        clear_screen
+        print_banner
+        echo
+        print_header "Storage Provisioning"
+        show_wizard_summary "hostnqn"
+
+        info "Host NQN Configuration:"
+        echo "  The Host NQN (NVMe Qualified Name) identifies this Proxmox host to the"
+        echo "  TrueNAS storage system. It is used for access control and connection"
+        echo "  tracking."
+        echo
+
+        # Check for existing host NQN
+        local existing_hostnqn=""
+        if [[ -f /etc/nvme/hostnqn ]]; then
+            existing_hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
+        fi
+
+        if [[ -n "$existing_hostnqn" ]]; then
+            success "Found existing host NQN:"
+            echo "  $existing_hostnqn"
+            echo
+            while true; do
+                read -rp "Use this host NQN? (Y/n) [Y]: " use_existing
+                use_existing="${use_existing:-Y}"
+                if [[ "$use_existing" =~ ^[Yy]$ ]]; then
+                    PROV_HOSTNQN="$existing_hostnqn"
+                    break
+                elif [[ "$use_existing" =~ ^[Nn]$ ]]; then
+                    echo
+                    read -rp "Enter custom host NQN: " PROV_HOSTNQN
+                    if [[ -z "$PROV_HOSTNQN" ]]; then
+                        error "Host NQN cannot be empty"
+                        continue
+                    fi
+                    break
+                else
+                    error "Please enter Y or N"
+                fi
+            done
+        else
+            warning "No existing host NQN found in /etc/nvme/hostnqn"
+            echo
+            echo "  You can:"
+            echo "    1) Enter a custom NQN"
+            echo "    2) Leave empty to use system default"
+            echo
+            read -rp "Host NQN (or press Enter for default): " PROV_HOSTNQN
+        fi
+        WIZARD_HOSTNQN="$PROV_HOSTNQN"
+    fi
+
+    return 0
+}
+
+# Show provisioning summary and get confirmation
+# Parameters: storage_name, transport_mode
+# Returns: 0 if confirmed, 1 if cancelled
+show_provisioning_summary() {
+    local storage_name="$1"
+    local transport_mode="$2"
+
+    # Clear screen and show summary header
+    clear_screen
+    print_banner
+    echo
+    print_header "Provisioning Summary"
+    echo
+    info "The following resources will be configured:"
+    echo
+
+    # Connection settings
+    printf "  ${c2}✓${c0} %-20s %s\n" "Storage Name:" "$storage_name"
+    printf "  ${c2}✓${c0} %-20s %s\n" "TrueNAS IP:" "$WIZARD_TRUENAS_IP"
+    # API Key - show masked
+    local masked_key="****${WIZARD_API_KEY: -4}"
+    printf "  ${c2}✓${c0} %-20s %s\n" "API Key:" "$masked_key"
+    printf "  ${c2}✓${c0} %-20s %s\n" "Transport Mode:" "$transport_mode"
+    echo
+
+    # Storage resources
+    info "Storage Resources:"
+    echo
+    # Dataset
+    if [[ "$PROV_DATASET_EXISTS" == "true" ]]; then
+        printf "  ${c3}○${c0} %-20s %s %s\n" "Dataset:" "$PROV_DATASET_PATH" "${c3}(existing)${c0}"
+    else
+        printf "  ${c2}+${c0} %-20s %s %s\n" "Dataset:" "$PROV_DATASET_PATH" "${c2}(create new)${c0}"
+    fi
+
+    # Target/Subsystem
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            printf "  ${c3}○${c0} %-20s %s %s\n" "Subsystem NQN:" "$PROV_NQN" "${c3}(existing)${c0}"
+        else
+            printf "  ${c2}+${c0} %-20s %s %s\n" "Subsystem NQN:" "$PROV_NQN" "${c2}(create new)${c0}"
+        fi
+        printf "  ${c2}✓${c0} %-20s %s\n" "NVMe Port:" "${PROV_PORTAL_IP}:${PROV_PORTAL_PORT}"
+    else
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            printf "  ${c3}○${c0} %-20s %s %s\n" "Target IQN:" "$PROV_IQN" "${c3}(existing)${c0}"
+        else
+            printf "  ${c2}+${c0} %-20s %s %s\n" "Target IQN:" "$PROV_IQN" "${c2}(create new)${c0}"
+        fi
+        printf "  ${c2}✓${c0} %-20s %s\n" "iSCSI Portal:" "${PROV_PORTAL_IP}:${PROV_PORTAL_PORT}"
+    fi
+    echo
+
+    # Volume settings
+    info "Volume Settings:"
+    echo
+    printf "  ${c2}✓${c0} %-20s %s\n" "Block Size:" "$PROV_BLOCKSIZE"
+    local sparse_display="Yes (thin provisioning)"
+    [[ "$PROV_SPARSE" == "0" ]] && sparse_display="No (thick provisioning)"
+    printf "  ${c2}✓${c0} %-20s %s\n" "Sparse Volumes:" "$sparse_display"
+
+    # Host NQN (NVMe only)
+    if [[ "$transport_mode" == "nvme-tcp" ]] && [[ -n "$PROV_HOSTNQN" ]]; then
+        # Truncate long NQN for display
+        local nqn_display="$PROV_HOSTNQN"
+        if [[ ${#nqn_display} -gt 45 ]]; then
+            nqn_display="${nqn_display:0:42}..."
+        fi
+        printf "  ${c2}✓${c0} %-20s %s\n" "Host NQN:" "$nqn_display"
+    fi
+    echo
+
+    # Legend
+    echo "  ${c2}✓${c0} = Validated  ${c2}+${c0} = Will create  ${c3}○${c0} = Existing"
+    echo
+
+    read -rp "Proceed with provisioning? (Y/n): " confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        info "Provisioning cancelled"
         return 1
     fi
 
-    # Register for rollback
-    register_resource "dataset" "$full_dataset"
-
-    success "Dataset created: $full_dataset"
-    PROVISIONED_DATASET="$full_dataset"
     return 0
+}
+
+# Execute provisioning with progress display
+# Parameters: host, api_key, storage_name, transport_mode
+# Returns: 0 on success, 1 on failure
+execute_provisioning() {
+    local host="$1"
+    local api_key="$2"
+    local storage_name="$3"
+    local transport_mode="$4"
+
+    # Clear any previous rollback state
+    clear_rollback_state
+
+    # Reset provisioned resource variables
+    PROVISIONED_DATASET=""
+    PROVISIONED_TARGET_IQN=""
+    PROVISIONED_SUBSYSTEM_NQN=""
+    PROVISIONED_PORTAL_IP=""
+    PROVISIONED_PORTAL_PORT=""
+    PROVISIONED_PORTAL_ID=""
+
+    # Clear screen and show execution header
+    clear_screen
+    print_banner
+    echo
+    print_header "Executing Provisioning"
+
+    local errors=0
+
+    # --- Create Dataset ---
+    if [[ "$PROV_DATASET_EXISTS" == "true" ]]; then
+        echo -e "$(printf "%-30s " "Dataset:")${c2}✓${c0} Using existing"
+        PROVISIONED_DATASET="$PROV_DATASET_PATH"
+    else
+        printf "%-30s " "Dataset:"
+        start_spinner
+        local result
+        result=$(tn_create_dataset "$host" "$api_key" "$PROV_POOL" "$PROV_DATASET_NAME" 2>&1)
+        local exit_code=$?
+        stop_spinner
+        if [[ $exit_code -eq 0 ]]; then
+            echo -e "\r$(printf "%-30s " "Dataset:")${c2}✓${c0} Created"
+            register_resource "dataset" "$PROV_DATASET_PATH"
+            PROVISIONED_DATASET="$PROV_DATASET_PATH"
+        else
+            echo -e "\r$(printf "%-30s " "Dataset:")${c1}✗${c0} Failed to create"
+            echo "  $result"
+            ((errors++))
+        fi
+    fi
+
+    # --- Create Target/Subsystem ---
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            echo -e "$(printf "%-30s " "NVMe subsystem:")${c2}✓${c0} Using existing"
+            PROVISIONED_SUBSYSTEM_NQN="$PROV_NQN"
+            # Get subsystem ID for port association
+            local subsys_info
+            subsys_info=$(tn_check_subsystem "$host" "$api_key" "$PROV_NQN" 2>/dev/null)
+            PROV_SUBSYSTEM_ID=$(echo "$subsys_info" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+        else
+            printf "%-30s " "NVMe subsystem:"
+            start_spinner
+            local result
+            # Extract subsystem name from NQN (part after last colon)
+            local subsys_name="${PROV_NQN##*:}"
+            result=$(tn_create_subsystem "$host" "$api_key" "$subsys_name" "$PROV_NQN" 2>&1)
+            local exit_code=$?
+            stop_spinner
+            if [[ $exit_code -eq 0 ]]; then
+                echo -e "\r$(printf "%-30s " "NVMe subsystem:")${c2}✓${c0} Created"
+                PROV_SUBSYSTEM_ID=$(echo "$result" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+                register_resource "subsystem" "$PROV_NQN"
+                PROVISIONED_SUBSYSTEM_NQN="$PROV_NQN"
+            else
+                echo -e "\r$(printf "%-30s " "NVMe subsystem:")${c1}✗${c0} Failed to create"
+                echo "  $result"
+                ((errors++))
+            fi
+        fi
+
+        # Create or reuse NVMe port
+        if [[ $errors -eq 0 ]] && [[ -n "$PROV_SUBSYSTEM_ID" ]]; then
+            printf "%-30s " "NVMe port:"
+            start_spinner
+            local result
+            result=$(tn_create_nvme_port "$host" "$api_key" "$PROV_SUBSYSTEM_ID" "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT" 2>&1)
+            local exit_code=$?
+            stop_spinner
+            if [[ $exit_code -eq 0 ]]; then
+                # Check if port was reused
+                if echo "$result" | grep -q '"reused": true'; then
+                    echo -e "\r$(printf "%-30s " "NVMe port:")${c2}✓${c0} Using existing"
+                else
+                    echo -e "\r$(printf "%-30s " "NVMe port:")${c2}✓${c0} Created"
+                fi
+                PROVISIONED_PORTAL_IP="$PROV_PORTAL_IP"
+                PROVISIONED_PORTAL_PORT="$PROV_PORTAL_PORT"
+            else
+                echo -e "\r$(printf "%-30s " "NVMe port:")${c1}✗${c0} Failed to configure"
+                echo "  $result"
+                ((errors++))
+            fi
+        fi
+    else
+        # iSCSI provisioning
+        if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
+            echo -e "$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Using existing"
+            PROVISIONED_TARGET_IQN="$PROV_IQN"
+        else
+            printf "%-30s " "iSCSI target:"
+            start_spinner
+            local result
+            result=$(tn_create_target "$host" "$api_key" "$PROV_IQN" "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT" 2>&1)
+            local exit_code=$?
+            stop_spinner
+            if [[ $exit_code -eq 0 ]]; then
+                echo -e "\r$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Created"
+                register_resource "target" "$PROV_IQN"
+                PROVISIONED_TARGET_IQN="$PROV_IQN"
+                PROVISIONED_PORTAL_IP="$PROV_PORTAL_IP"
+                PROVISIONED_PORTAL_PORT="$PROV_PORTAL_PORT"
+            else
+                echo -e "\r$(printf "%-30s " "iSCSI target:")${c1}✗${c0} Failed to create"
+                echo "  $result"
+                ((errors++))
+            fi
+        fi
+    fi
+
+    # --- Validation ---
+    printf "%-30s " "Dataset validation:"
+    start_spinner
+    local dataset_valid=false
+    validate_dataset_exists "$host" "$api_key" "$PROVISIONED_DATASET" && dataset_valid=true
+    stop_spinner
+    if [[ "$dataset_valid" == "true" ]]; then
+        echo -e "\r$(printf "%-30s " "Dataset validation:")${c2}✓${c0} Verified"
+    else
+        echo -e "\r$(printf "%-30s " "Dataset validation:")${c1}✗${c0} Not found"
+        ((errors++))
+    fi
+
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        printf "%-30s " "NVMe discovery:"
+        start_spinner
+        local discovery_valid=false
+        validate_nvme_discovery "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT" "$PROVISIONED_SUBSYSTEM_NQN" && discovery_valid=true
+        stop_spinner
+        if [[ "$discovery_valid" == "true" ]]; then
+            echo -e "\r$(printf "%-30s " "NVMe discovery:")${c2}✓${c0} Subsystem visible"
+        else
+            echo -e "\r$(printf "%-30s " "NVMe discovery:")${c3}?${c0} May need service restart"
+        fi
+    else
+        printf "%-30s " "iSCSI discovery:"
+        start_spinner
+        local discovery_valid=false
+        validate_iscsi_discovery "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT" "$PROVISIONED_TARGET_IQN" && discovery_valid=true
+        stop_spinner
+        if [[ "$discovery_valid" == "true" ]]; then
+            echo -e "\r$(printf "%-30s " "iSCSI discovery:")${c2}✓${c0} Target visible"
+        else
+            echo -e "\r$(printf "%-30s " "iSCSI discovery:")${c3}?${c0} May need service restart"
+        fi
+    fi
+
+    echo
+    if [[ $errors -gt 0 ]]; then
+        error "Provisioning completed with $errors error(s)"
+        echo
+        echo "  1) Continue anyway"
+        echo "  2) Rollback created resources"
+        echo "  0) Cancel (keep resources)"
+        echo
+
+        local choice
+        read -rp "Select option [0-2]: " choice
+        case "$choice" in
+            1)
+                warning "Continuing with errors"
+                clear_rollback_state
+                return 0
+                ;;
+            2)
+                rollback_provisioning "$host" "$api_key"
+                return 1
+                ;;
+            *)
+                clear_rollback_state
+                return 1
+                ;;
+        esac
+    fi
+
+    success "Provisioning completed successfully!"
+    clear_rollback_state
+    return 0
+}
+
+# Legacy function - deprecated, use collect_provisioning_config + execute_provisioning instead
+provision_dataset() {
+    error "provision_dataset: This function is deprecated"
+    return 1
 }
 
 # Provision iSCSI resources (portal and target)
@@ -7387,131 +8089,30 @@ provision_nvme() {
     return 0
 }
 
-# Main provisioning orchestrator
+# Main provisioning orchestrator - new workflow
 # Parameters: storage_name, host, api_key, transport_mode
 # Returns: 0 on success, 1 on failure
+# Uses three-phase approach: collect -> summary -> execute
 provision_storage_resources() {
     local storage_name="$1"
     local host="$2"
     local api_key="$3"
     local transport_mode="$4"
 
-    # Clear any previous rollback state
-    clear_rollback_state
-
-    # Reset provisioned resource variables
-    PROVISIONED_DATASET=""
-    PROVISIONED_TARGET_IQN=""
-    PROVISIONED_SUBSYSTEM_NQN=""
-    PROVISIONED_PORTAL_IP=""
-    PROVISIONED_PORTAL_PORT=""
-    PROVISIONED_PORTAL_ID=""
-
-    echo
-    info "Starting automated storage provisioning..."
-    info "Storage name: $storage_name"
-    info "TrueNAS host: $host"
-    info "Transport mode: $transport_mode"
-
-    # Step 1: Validate API connectivity
-    echo
-    printf "  %-30s" "Validating API connectivity..."
-    if tn_validate_api "$host" "$api_key"; then
-        echo "${c2}OK${c0}"
-    else
-        echo "${c1}FAILED${c0}"
-        error "Cannot connect to TrueNAS API"
-        error "Please check:"
-        error "  - TrueNAS IP address is correct"
-        error "  - API key is valid"
-        error "  - Network connectivity"
+    # Phase 1: Collect all configuration
+    if ! collect_provisioning_config "$host" "$api_key" "$storage_name" "$transport_mode"; then
         return 1
     fi
 
-    # Step 2: Provision dataset
-    if ! provision_dataset "$host" "$api_key"; then
-        error "Dataset provisioning failed"
-        handle_provisioning_error "$host" "$api_key"
-        return 1
-    fi
-    local dataset="$PROVISIONED_DATASET"
-    if [[ -z "$dataset" ]]; then
-        error "Dataset provisioning failed - no dataset returned"
-        handle_provisioning_error "$host" "$api_key"
+    # Phase 2: Show summary and get confirmation
+    if ! show_provisioning_summary "$storage_name" "$transport_mode"; then
         return 1
     fi
 
-    # Step 3: Provision transport-specific resources
-    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        if ! provision_nvme "$host" "$api_key" "$storage_name"; then
-            error "NVMe/TCP provisioning failed"
-            handle_provisioning_error "$host" "$api_key"
-            return 1
-        fi
-    else
-        if ! provision_iscsi "$host" "$api_key" "$storage_name"; then
-            error "iSCSI provisioning failed"
-            handle_provisioning_error "$host" "$api_key"
-            return 1
-        fi
+    # Phase 3: Execute provisioning with progress display
+    if ! execute_provisioning "$host" "$api_key" "$storage_name" "$transport_mode"; then
+        return 1
     fi
-
-    # Step 4: Validate provisioned resources
-    echo
-    local target_or_nqn
-    local portal_port
-    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        target_or_nqn="$PROVISIONED_SUBSYSTEM_NQN"
-        portal_port="$PROVISIONED_PORTAL_PORT"
-    else
-        target_or_nqn="$PROVISIONED_TARGET_IQN"
-        portal_port="$PROVISIONED_PORTAL_PORT"
-    fi
-
-    if ! validate_provisioning "$host" "$api_key" "$transport_mode" "$dataset" "$target_or_nqn" "$PROVISIONED_PORTAL_IP" "$portal_port"; then
-        warning "Some validations failed"
-        echo
-        echo "  1) Continue anyway (storage may not work until issues are resolved)"
-        echo "  2) Rollback created resources"
-        echo "  0) Cancel (keep resources for manual troubleshooting)"
-        echo
-
-        local val_choice
-        read -rp "Select option [0-2]: " val_choice
-        case "$val_choice" in
-            0)
-                warning "Cancelled. Resources have been created but not validated."
-                clear_rollback_state
-                return 1
-                ;;
-            1)
-                warning "Continuing with unvalidated resources"
-                ;;
-            2)
-                rollback_provisioning "$host" "$api_key"
-                return 1
-                ;;
-            *)
-                warning "Invalid choice, cancelling"
-                return 1
-                ;;
-        esac
-    fi
-
-    # Clear rollback state on success
-    clear_rollback_state
-
-    echo
-    success "Storage provisioning completed successfully!"
-    echo
-    info "Provisioned resources:"
-    info "  Dataset: $dataset"
-    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        info "  Subsystem NQN: $PROVISIONED_SUBSYSTEM_NQN"
-    else
-        info "  Target IQN: $PROVISIONED_TARGET_IQN"
-    fi
-    info "  Portal: $PROVISIONED_PORTAL_IP:$portal_port"
 
     return 0
 }
@@ -7897,6 +8498,399 @@ menu_edit_storage() {
     return 0
 }
 
+# ============================================================================
+# PROGRESSIVE WIZARD FOR STORAGE CONFIGURATION
+# ============================================================================
+
+# Global wizard state variables
+WIZARD_CONFIG_MODE=""        # "create" or "existing"
+WIZARD_STORAGE_NAME=""
+WIZARD_TRUENAS_IP=""
+WIZARD_API_KEY=""
+WIZARD_API_VALIDATED=""      # "true" if API connectivity confirmed
+WIZARD_TRANSPORT_MODE=""     # "iscsi" or "nvme-tcp"
+WIZARD_POOL=""               # ZFS pool name
+WIZARD_DATASET=""            # Dataset name (without pool prefix)
+WIZARD_DATASET_PATH=""       # Full dataset path (pool/dataset)
+WIZARD_DATASET_EXISTS=""     # "true" if dataset already exists
+WIZARD_TARGET=""             # IQN or NQN
+WIZARD_TARGET_EXISTS=""      # "true" if target/subsystem already exists
+WIZARD_PORTAL_IP=""          # Portal IP address
+WIZARD_PORTAL_PORT=""        # Portal port
+WIZARD_BLOCKSIZE=""          # Block size (e.g., 16K)
+WIZARD_SPARSE=""             # Sparse volume (0 or 1)
+WIZARD_HOSTNQN=""            # Host NQN for NVMe/TCP
+
+# Display wizard progress summary with validated inputs
+# Shows checkmarks for validated items
+show_wizard_summary() {
+    local current_step="$1"
+
+    echo
+    info "Configuration Progress:"
+    echo
+
+    # Configuration Mode
+    if [[ -n "$WIZARD_CONFIG_MODE" ]]; then
+        if [[ "$WIZARD_CONFIG_MODE" == "create" ]]; then
+            echo -e "  ${c2}✓${c0} Configuration Mode:  Automated Provisioning"
+        else
+            echo -e "  ${c2}✓${c0} Configuration Mode:  Manual Configuration"
+        fi
+    elif [[ "$current_step" == "mode" ]]; then
+        echo -e "  ${c6}▸${c0} Configuration Mode:  ${c6}(selecting...)${c0}"
+    else
+        echo -e "    Configuration Mode:  ${c6}(pending)${c0}"
+    fi
+
+    # Storage Name
+    if [[ -n "$WIZARD_STORAGE_NAME" ]]; then
+        echo -e "  ${c2}✓${c0} Storage Name:        $WIZARD_STORAGE_NAME"
+    elif [[ "$current_step" == "name" ]]; then
+        echo -e "  ${c6}▸${c0} Storage Name:        ${c6}(entering...)${c0}"
+    elif [[ -n "$WIZARD_CONFIG_MODE" ]]; then
+        echo -e "    Storage Name:        ${c6}(pending)${c0}"
+    fi
+
+    # TrueNAS IP
+    if [[ -n "$WIZARD_TRUENAS_IP" ]]; then
+        echo -e "  ${c2}✓${c0} TrueNAS IP:          $WIZARD_TRUENAS_IP"
+    elif [[ "$current_step" == "ip" ]]; then
+        echo -e "  ${c6}▸${c0} TrueNAS IP:          ${c6}(entering...)${c0}"
+    elif [[ -n "$WIZARD_STORAGE_NAME" ]]; then
+        echo -e "    TrueNAS IP:          ${c6}(pending)${c0}"
+    fi
+
+    # API Key
+    if [[ "$WIZARD_API_VALIDATED" == "true" ]]; then
+        echo -e "  ${c2}✓${c0} API Key:             ****${WIZARD_API_KEY: -4} ${c2}(connected)${c0}"
+    elif [[ -n "$WIZARD_API_KEY" ]]; then
+        echo -e "  ${c3}?${c0} API Key:             ****${WIZARD_API_KEY: -4} ${c3}(unverified)${c0}"
+    elif [[ "$current_step" == "apikey" ]]; then
+        echo -e "  ${c6}▸${c0} API Key:             ${c6}(entering...)${c0}"
+    elif [[ -n "$WIZARD_TRUENAS_IP" ]]; then
+        echo -e "    API Key:             ${c6}(pending)${c0}"
+    fi
+
+    # Transport Mode (only for automated provisioning)
+    if [[ "$WIZARD_CONFIG_MODE" == "create" ]]; then
+        if [[ -n "$WIZARD_TRANSPORT_MODE" ]]; then
+            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+                echo -e "  ${c2}✓${c0} Transport Mode:      NVMe/TCP"
+            else
+                echo -e "  ${c2}✓${c0} Transport Mode:      iSCSI"
+            fi
+        elif [[ "$current_step" == "transport" ]]; then
+            echo -e "  ${c6}▸${c0} Transport Mode:      ${c6}(selecting...)${c0}"
+        elif [[ "$WIZARD_API_VALIDATED" == "true" ]]; then
+            echo -e "    Transport Mode:      ${c6}(pending)${c0}"
+        fi
+
+        # Pool (only shown after transport mode for automated)
+        if [[ -n "$WIZARD_POOL" ]]; then
+            echo -e "  ${c2}✓${c0} ZFS Pool:            $WIZARD_POOL"
+        elif [[ "$current_step" == "pool" ]]; then
+            echo -e "  ${c6}▸${c0} ZFS Pool:            ${c6}(selecting...)${c0}"
+        elif [[ -n "$WIZARD_TRANSPORT_MODE" ]]; then
+            echo -e "    ZFS Pool:            ${c6}(pending)${c0}"
+        fi
+
+        # Dataset
+        if [[ -n "$WIZARD_DATASET_PATH" ]]; then
+            local ds_status=""
+            if [[ "$WIZARD_DATASET_EXISTS" == "true" ]]; then
+                ds_status=" ${c3}(exists)${c0}"
+            else
+                ds_status=" ${c2}(new)${c0}"
+            fi
+            echo -e "  ${c2}✓${c0} Dataset:             $WIZARD_DATASET_PATH$ds_status"
+        elif [[ "$current_step" == "dataset" ]]; then
+            echo -e "  ${c6}▸${c0} Dataset:             ${c6}(entering...)${c0}"
+        elif [[ -n "$WIZARD_POOL" ]]; then
+            echo -e "    Dataset:             ${c6}(pending)${c0}"
+        fi
+
+        # Target/Subsystem
+        if [[ -n "$WIZARD_TARGET" ]]; then
+            local tgt_status=""
+            local tgt_label="Target:"
+            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+                tgt_label="Subsystem NQN:"
+            else
+                tgt_label="Target IQN:"
+            fi
+            if [[ "$WIZARD_TARGET_EXISTS" == "true" ]]; then
+                tgt_status=" ${c3}(exists)${c0}"
+            else
+                tgt_status=" ${c2}(new)${c0}"
+            fi
+            echo -e "  ${c2}✓${c0} $(printf "%-17s" "$tgt_label") $WIZARD_TARGET$tgt_status"
+        elif [[ "$current_step" == "target" ]]; then
+            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+                echo -e "  ${c6}▸${c0} Subsystem NQN:       ${c6}(configuring...)${c0}"
+            else
+                echo -e "  ${c6}▸${c0} Target IQN:          ${c6}(configuring...)${c0}"
+            fi
+        elif [[ -n "$WIZARD_DATASET_PATH" ]]; then
+            if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+                echo -e "    Subsystem NQN:       ${c6}(pending)${c0}"
+            else
+                echo -e "    Target IQN:          ${c6}(pending)${c0}"
+            fi
+        fi
+
+        # Portal
+        if [[ -n "$WIZARD_PORTAL_IP" ]]; then
+            echo -e "  ${c2}✓${c0} Portal:              ${WIZARD_PORTAL_IP}:${WIZARD_PORTAL_PORT}"
+        elif [[ "$current_step" == "portal" ]]; then
+            echo -e "  ${c6}▸${c0} Portal:              ${c6}(configuring...)${c0}"
+        elif [[ -n "$WIZARD_TARGET" ]]; then
+            echo -e "    Portal:              ${c6}(pending)${c0}"
+        fi
+
+        # Block Size
+        if [[ -n "$WIZARD_BLOCKSIZE" ]]; then
+            echo -e "  ${c2}✓${c0} Block Size:          $WIZARD_BLOCKSIZE"
+        elif [[ "$current_step" == "blocksize" ]]; then
+            echo -e "  ${c6}▸${c0} Block Size:          ${c6}(configuring...)${c0}"
+        elif [[ -n "$WIZARD_PORTAL_IP" ]]; then
+            echo -e "    Block Size:          ${c6}(pending)${c0}"
+        fi
+
+        # Sparse Volumes
+        if [[ -n "$WIZARD_SPARSE" ]]; then
+            local sparse_display="Yes (thin)"
+            [[ "$WIZARD_SPARSE" == "0" ]] && sparse_display="No (thick)"
+            echo -e "  ${c2}✓${c0} Sparse Volumes:      $sparse_display"
+        elif [[ "$current_step" == "sparse" ]]; then
+            echo -e "  ${c6}▸${c0} Sparse Volumes:      ${c6}(configuring...)${c0}"
+        elif [[ -n "$WIZARD_BLOCKSIZE" ]]; then
+            echo -e "    Sparse Volumes:      ${c6}(pending)${c0}"
+        fi
+
+        # Host NQN (NVMe only)
+        if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+            if [[ -n "$WIZARD_HOSTNQN" ]]; then
+                # Truncate long NQN for display
+                local nqn_display="$WIZARD_HOSTNQN"
+                if [[ ${#nqn_display} -gt 40 ]]; then
+                    nqn_display="${nqn_display:0:37}..."
+                fi
+                echo -e "  ${c2}✓${c0} Host NQN:            $nqn_display"
+            elif [[ "$current_step" == "hostnqn" ]]; then
+                echo -e "  ${c6}▸${c0} Host NQN:            ${c6}(configuring...)${c0}"
+            elif [[ -n "$WIZARD_SPARSE" ]]; then
+                echo -e "    Host NQN:            ${c6}(pending)${c0}"
+            fi
+        fi
+    fi
+
+    echo
+}
+
+# Reset wizard state
+reset_wizard_state() {
+    WIZARD_CONFIG_MODE=""
+    WIZARD_STORAGE_NAME=""
+    WIZARD_TRUENAS_IP=""
+    WIZARD_API_KEY=""
+    WIZARD_API_VALIDATED=""
+    WIZARD_TRANSPORT_MODE=""
+    WIZARD_POOL=""
+    WIZARD_DATASET=""
+    WIZARD_DATASET_PATH=""
+    WIZARD_DATASET_EXISTS=""
+    WIZARD_TARGET=""
+    WIZARD_TARGET_EXISTS=""
+    WIZARD_PORTAL_IP=""
+    WIZARD_PORTAL_PORT=""
+    WIZARD_BLOCKSIZE=""
+    WIZARD_SPARSE=""
+    WIZARD_HOSTNQN=""
+}
+
+# Progressive wizard for adding new storage
+# Returns: 0 on success (config collected), 1 on cancel/failure
+wizard_add_storage() {
+    reset_wizard_state
+
+    local can_provision=false
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        can_provision=true
+    fi
+
+    # --- Step 1: Configuration Mode ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "mode"
+
+    if [[ "$can_provision" == "true" ]]; then
+        info "How would you like to configure TrueNAS storage?"
+        echo "  1) Create new storage on TrueNAS (automated provisioning)"
+        echo "  2) Use existing storage (manual configuration)"
+        echo "  0) Cancel"
+        echo
+
+        local mode_choice
+        while true; do
+            read -rp "Select option [0-2]: " mode_choice
+            case "$mode_choice" in
+                0) info "Configuration cancelled"; return 1 ;;
+                1) WIZARD_CONFIG_MODE="create"; break ;;
+                2) WIZARD_CONFIG_MODE="existing"; break ;;
+                *) error "Invalid choice. Please enter 0, 1, or 2" ;;
+            esac
+        done
+    else
+        info "Plugin not installed - using manual configuration mode"
+        WIZARD_CONFIG_MODE="existing"
+        sleep 1
+    fi
+
+    # --- Step 2: Storage Name ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "name"
+
+    info "Enter a unique name for this storage configuration:"
+    while true; do
+        read -rp "Storage name (e.g., truenas-main): " WIZARD_STORAGE_NAME
+        if [[ -z "$WIZARD_STORAGE_NAME" ]]; then
+            error "Storage name cannot be empty"
+            continue
+        fi
+        if ! validate_storage_name "$WIZARD_STORAGE_NAME"; then
+            error "Invalid storage name. Use only letters, numbers, hyphens, and underscores"
+            continue
+        fi
+        if storage_name_exists "$WIZARD_STORAGE_NAME"; then
+            error "Storage name '$WIZARD_STORAGE_NAME' already exists"
+            WIZARD_STORAGE_NAME=""
+            continue
+        fi
+        break
+    done
+
+    # --- Step 3: TrueNAS IP ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "ip"
+
+    info "Enter the IP address of your TrueNAS server:"
+    while true; do
+        read -rp "TrueNAS IP address: " WIZARD_TRUENAS_IP
+        if validate_ip "$WIZARD_TRUENAS_IP"; then
+            break
+        else
+            error "Invalid IP address format"
+            WIZARD_TRUENAS_IP=""
+        fi
+    done
+
+    # --- Step 4: API Key ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "apikey"
+
+    info "Enter your TrueNAS API key:"
+    info "(Generate one in TrueNAS: Settings → API Keys → Add)"
+    echo
+    while true; do
+        read -rp "API key: " WIZARD_API_KEY
+        if [[ -z "$WIZARD_API_KEY" ]]; then
+            error "API key cannot be empty"
+            continue
+        fi
+        break
+    done
+
+    # Test API connectivity
+    echo
+    printf "  %-30s" "Testing API connectivity..."
+    start_spinner
+    local api_test_result
+    api_test_result=$(test_truenas_api "$WIZARD_TRUENAS_IP" "$WIZARD_API_KEY" 2>&1)
+    local api_test_code=$?
+    stop_spinner
+
+    if [[ $api_test_code -eq 0 ]]; then
+        echo -e "\r  $(printf "%-30s" "Testing API connectivity...")${c2}OK${c0}"
+        WIZARD_API_VALIDATED="true"
+    else
+        echo -e "\r  $(printf "%-30s" "Testing API connectivity...")${c1}FAILED${c0}"
+        echo
+        warning "Could not connect to TrueNAS API"
+        read -rp "Continue anyway? (y/N): " continue_choice
+        if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
+            return 1
+        fi
+        WIZARD_API_VALIDATED="false"
+    fi
+
+    # --- Step 5: Transport Mode (for automated provisioning) ---
+    if [[ "$WIZARD_CONFIG_MODE" == "create" ]]; then
+        clear_screen
+        print_banner
+        echo
+        print_header "Storage Provisioning"
+        show_wizard_summary "transport"
+
+        info "Select transport protocol:"
+        echo "  1) iSCSI (traditional, widely compatible)"
+        echo "  2) NVMe/TCP (modern, lower latency)"
+        echo
+
+        local transport_choice
+        while true; do
+            read -rp "Transport mode [1-2]: " transport_choice
+            case "$transport_choice" in
+                1) WIZARD_TRANSPORT_MODE="iscsi"; break ;;
+                2) WIZARD_TRANSPORT_MODE="nvme-tcp"; break ;;
+                *) error "Invalid choice. Please enter 1 or 2" ;;
+            esac
+        done
+
+        # Check nvme-cli for NVMe/TCP
+        if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+            if ! check_nvme_cli; then
+                echo
+                warning "nvme-cli package is not installed"
+                info "NVMe/TCP requires nvme-cli for management"
+                read -rp "Install nvme-cli now? (Y/n): " install_nvme
+                if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
+                    info "Installing nvme-cli..."
+                    if apt-get update -qq && apt-get install -y -qq nvme-cli; then
+                        success "nvme-cli installed successfully"
+                    else
+                        error "Failed to install nvme-cli"
+                        return 1
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # --- Final Summary ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "complete"
+
+    success "Configuration collected successfully!"
+    echo
+
+    return 0
+}
+
 # Configuration wizard
 menu_configure_storage() {
     clear_screen
@@ -7972,7 +8966,11 @@ menu_configure_storage() {
                 done
                 ;;
             2)
-                # Add new storage mode - continue with existing workflow below
+                # Add new storage mode - use progressive wizard
+                if ! wizard_add_storage; then
+                    return 1
+                fi
+                # Continue with provisioning using wizard-collected values
                 ;;
             3)
                 # Delete mode - show storage list and confirm deletion
@@ -8042,219 +9040,152 @@ menu_configure_storage() {
     fi
 
     # Continue with "Add New Storage" workflow
-    # Prompt for storage name
-    local storage_name
-    while true; do
-        read -rp "Storage name (e.g., truenas-main): " storage_name
-        if [[ -z "$storage_name" ]]; then
-            error "Storage name cannot be empty"
-            continue
+    # If wizard hasn't been run yet (no existing storages case), run it now
+    if [[ -z "$WIZARD_CONFIG_MODE" ]]; then
+        if ! wizard_add_storage; then
+            return 1
         fi
-        if ! validate_storage_name "$storage_name"; then
-            error "Invalid storage name. Use only letters, numbers, hyphens, and underscores"
-            continue
-        fi
-        if storage_name_exists "$storage_name"; then
-            error "Storage name '$storage_name' already exists in $STORAGE_CFG"
-            read -rp "Choose a different name? (Y/n): " choice
-            [[ ! "$choice" =~ ^[Nn] ]] && continue || return 1
-        fi
-        break
-    done
+    fi
 
-    # TrueNAS IP
-    local truenas_ip
-    while true; do
-        read -rp "TrueNAS IP address: " truenas_ip
-        if validate_ip "$truenas_ip"; then
-            break
+    # Use wizard-collected values
+    local storage_name="$WIZARD_STORAGE_NAME"
+    local truenas_ip="$WIZARD_TRUENAS_IP"
+    local api_key="$WIZARD_API_KEY"
+    local provisioning_mode="$WIZARD_CONFIG_MODE"
+    local transport_mode="$WIZARD_TRANSPORT_MODE"
+
+    # Handle automated provisioning mode
+    if [[ "$provisioning_mode" == "create" ]]; then
+        # Run automated provisioning workflow
+        if ! provision_storage_resources "$storage_name" "$truenas_ip" "$api_key" "$transport_mode"; then
+            error "Automated provisioning failed"
+            read -rp "Would you like to continue with manual configuration? (y/N): " manual_choice
+            if [[ ! "$manual_choice" =~ ^[Yy] ]]; then
+                return 1
+            fi
+            # Fall through to manual workflow
+            provisioning_mode="existing"
         else
-            error "Invalid IP address format"
-        fi
-    done
+            # Provisioning succeeded - use provisioned values and wizard settings
+            local dataset="$PROVISIONED_DATASET"
+            local target=""
+            local subsystem_nqn=""
+            local portal=""
+            local hostnqn=""
+            local blocksize="$PROV_BLOCKSIZE"
+            local sparse="$PROV_SPARSE"
+            local use_multipath=""
+            local portals=""
 
-    # API Key
-    local api_key
-    read -rp "TrueNAS API key: " api_key
-    if [[ -z "$api_key" ]]; then
-        error "API key cannot be empty"
-        return 1
-    fi
+            if [[ "$transport_mode" == "nvme-tcp" ]]; then
+                subsystem_nqn="$PROVISIONED_SUBSYSTEM_NQN"
+                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
+                hostnqn="$PROV_HOSTNQN"
+            else
+                target="$PROVISIONED_TARGET_IQN"
+                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
+            fi
 
-    # Test connectivity
-    if ! test_truenas_api "$truenas_ip" "$api_key"; then
-        error "Failed to connect to TrueNAS. Please check IP and API key."
-        read -rp "Continue anyway? (y/N): " choice
-        [[ "$choice" =~ ^[Yy] ]] || return 1
-    fi
+            # Generate configuration using wizard-collected values
+            echo
+            local config
+            if [[ "$transport_mode" == "nvme-tcp" ]]; then
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+            else
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+            fi
 
-    # Check if plugin is installed for automated provisioning
-    local can_provision=false
-    if [[ -f "$PLUGIN_FILE" ]]; then
-        can_provision=true
-    fi
+            # Show final configuration summary
+            echo "─────────────────────────────────────────────────────────"
+            info "Final Storage Configuration"
+            echo "─────────────────────────────────────────────────────────"
+            echo "$config"
+            echo "─────────────────────────────────────────────────────────"
+            echo
 
-    # Provisioning mode selection (Requirement 1: Storage Mode Selection)
-    local provisioning_mode="existing"
-    if [[ "$can_provision" == "true" ]]; then
-        provisioning_mode=$(select_provisioning_mode)
+            read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
+            if [[ "$confirm" =~ ^[Nn] ]]; then
+                warning "Configuration cancelled"
+                return 1
+            fi
 
-        case "$provisioning_mode" in
-            cancel)
-                info "Configuration cancelled"
-                return 0
-                ;;
-            create)
-                # Transport mode selection first for automated provisioning
-                echo
-                info "Select transport protocol:"
-                echo "  1) iSCSI (traditional, widely compatible)"
-                echo "  2) NVMe/TCP (modern, lower latency)"
-                read -rp "Transport mode (1-2) [1]: " transport_choice
-                transport_choice=${transport_choice:-1}
+            # Clear screen and show finalization header
+            clear_screen
+            print_banner
+            echo
+            print_header "Finalizing Storage Configuration"
 
-                local transport_mode
-                case "$transport_choice" in
-                    1) transport_mode="iscsi" ;;
-                    2) transport_mode="nvme-tcp" ;;
-                    *)
-                        error "Invalid choice, defaulting to iSCSI"
-                        transport_mode="iscsi"
-                        ;;
-                esac
+            local finalize_errors=0
 
-                # Check nvme-cli for NVMe/TCP before provisioning
-                if [[ "$transport_mode" == "nvme-tcp" ]]; then
-                    if ! check_nvme_cli; then
-                        warning "nvme-cli package is not installed"
-                        info "NVMe/TCP requires nvme-cli for management"
-                        read -rp "Install nvme-cli now? (Y/n): " install_nvme
-                        if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
-                            info "Installing nvme-cli..."
-                            if ! apt-get update; then
-                                error "Failed to update package lists (check network/repositories)"
-                                return 1
-                            fi
-                            if ! apt-get install -y nvme-cli; then
-                                error "Failed to install nvme-cli package"
-                                return 1
-                            fi
-                            if ! check_nvme_cli; then
-                                error "nvme-cli installed but 'nvme' command not found in PATH"
-                                info "Try running: hash -r  # to refresh PATH"
-                                return 1
-                            fi
-                            success "nvme-cli installed successfully"
-                        else
-                            warning "Proceeding without nvme-cli (some features may not work)"
-                        fi
-                    fi
-                fi
+            # Step 1: Backup storage.cfg
+            printf "%-30s " "Configuration backup:"
+            start_spinner
+            local backup_result
+            backup_result=$(backup_storage_cfg 2>&1)
+            local backup_exit=$?
+            stop_spinner
+            if [[ $backup_exit -eq 0 ]]; then
+                echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} Saved"
+            else
+                echo -e "\r$(printf "%-30s " "Configuration backup:")${c1}✗${c0} Failed"
+                echo "  $backup_result"
+                ((finalize_errors++))
+            fi
 
-                # Run automated provisioning workflow
-                if ! provision_storage_resources "$storage_name" "$truenas_ip" "$api_key" "$transport_mode"; then
-                    error "Automated provisioning failed"
-                    read -rp "Would you like to continue with manual configuration? (y/N): " manual_choice
-                    if [[ ! "$manual_choice" =~ ^[Yy] ]]; then
-                        return 1
-                    fi
-                    # Fall through to manual workflow
-                    provisioning_mode="existing"
+            # Step 2: Add storage configuration
+            if [[ $finalize_errors -eq 0 ]]; then
+                printf "%-30s " "Storage configuration:"
+                start_spinner
+                # Append configuration directly (backup already done)
+                echo "" >> "$STORAGE_CFG" 2>/dev/null
+                echo "$config" >> "$STORAGE_CFG" 2>/dev/null
+                local config_exit=$?
+                stop_spinner
+                if [[ $config_exit -eq 0 ]]; then
+                    echo -e "\r$(printf "%-30s " "Storage configuration:")${c2}✓${c0} Added to storage.cfg"
+                    log "INFO" "Storage configuration added"
                 else
-                    # Provisioning succeeded - use provisioned values
-                    local dataset="$PROVISIONED_DATASET"
-                    local target=""
-                    local subsystem_nqn=""
-                    local portal=""
-                    local hostnqn=""
-
-                    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-                        subsystem_nqn="$PROVISIONED_SUBSYSTEM_NQN"
-                        portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
-                        hostnqn=$(get_hostnqn)
-                    else
-                        target="$PROVISIONED_TARGET_IQN"
-                        portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
-                    fi
-
-                    # Get additional configuration options
-                    echo
-                    info "Additional Configuration Options:"
-
-                    # Blocksize (optional)
-                    local blocksize
-                    read -rp "Block size [16K]: " blocksize
-                    blocksize="${blocksize:-16K}"
-
-                    # Sparse (optional)
-                    local sparse
-                    read -rp "Enable sparse volumes? (0/1) [1]: " sparse
-                    sparse="${sparse:-1}"
-
-                    # Multipath for iSCSI
-                    local use_multipath=""
-                    local portals=""
-                    if [[ "$transport_mode" == "iscsi" ]]; then
-                        read -rp "Enable multipath I/O? (y/N): " enable_mp
-                        if [[ "$enable_mp" =~ ^[Yy] ]]; then
-                            use_multipath="1"
-                        else
-                            use_multipath="0"
-                        fi
-                    fi
-
-                    # Generate configuration
-                    echo
-                    info "Configuration summary:"
-                    info "Transport mode: ${transport_mode}"
-                    echo "-------------------------------------------------------------------"
-                    local config
-                    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-                        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
-                    else
-                        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
-                    fi
-                    echo "$config"
-                    echo "-------------------------------------------------------------------"
-                    echo
-
-                    read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
-                    if [[ "$confirm" =~ ^[Nn] ]]; then
-                        warning "Configuration cancelled"
-                        return 1
-                    fi
-
-                    # Add configuration
-                    if add_storage_config "$config"; then
-                        echo
-                        success "Storage configured successfully!"
-                        info "You can now use '$storage_name' storage in Proxmox"
-                        echo
-                        info "Next steps:"
-                        echo "  1. Test the storage by creating a VM disk:"
-                        echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
-                        echo "  2. Check storage status: pvesm status"
-                        echo "  3. View storage details: pvesm list ${storage_name}"
-                    else
-                        error "Failed to add configuration"
-                        return 1
-                    fi
-
-                    read -rp "Press Enter to continue..."
-                    return 0
+                    echo -e "\r$(printf "%-30s " "Storage configuration:")${c1}✗${c0} Failed to write"
+                    ((finalize_errors++))
                 fi
-                ;;
-            existing)
-                # Continue with manual workflow below
-                ;;
-        esac
-    else
-        info "Plugin not installed - using manual configuration mode"
-        info "Install the plugin first to enable automated TrueNAS provisioning"
-        echo
+            fi
+
+            # Step 3: Validate storage with pvesm
+            if [[ $finalize_errors -eq 0 ]]; then
+                printf "%-30s " "Storage validation:"
+                start_spinner
+                # Give Proxmox a moment to recognize the new config
+                sleep 1
+                local pvesm_result
+                pvesm_result=$(pvesm status 2>&1 | grep -E "^${storage_name}\s" || true)
+                stop_spinner
+                if [[ -n "$pvesm_result" ]]; then
+                    echo -e "\r$(printf "%-30s " "Storage validation:")${c2}✓${c0} Active in Proxmox"
+                else
+                    echo -e "\r$(printf "%-30s " "Storage validation:")${c3}?${c0} May need a moment to activate"
+                fi
+            fi
+
+            echo
+            if [[ $finalize_errors -gt 0 ]]; then
+                error "Storage configuration failed"
+                return 1
+            fi
+
+            success "Storage '$storage_name' configured successfully!"
+            echo
+            info "Next steps:"
+            echo "  1. Test the storage by creating a VM disk:"
+            echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
+            echo "  2. Check storage status: pvesm status"
+            echo "  3. View storage details: pvesm list ${storage_name}"
+
+            read -rp "Press Enter to continue..."
+            return 0
+        fi
     fi
 
-    # Manual workflow continues here (when provisioning_mode="existing" or plugin not installed)
+    # Manual workflow continues here (when provisioning_mode="existing")
 
     # Dataset
     local dataset
@@ -8374,23 +9305,99 @@ menu_configure_storage() {
         default_port="3260"
     fi
 
-    read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
-    if [[ -z "$portal" ]]; then
-        portal="${truenas_ip}:${default_port}"
-    elif [[ ! "$portal" =~ : ]]; then
-        # Add default port if not specified
-        portal="${portal}:${default_port}"
-    fi
+    while true; do
+        read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
+        if [[ -z "$portal" ]]; then
+            portal="${truenas_ip}:${default_port}"
+            break
+        else
+            # Extract IP part (may or may not have port)
+            local portal_ip="${portal%%:*}"
+            if ! validate_ip "$portal_ip"; then
+                error "Invalid IP address format"
+                continue
+            fi
+            if [[ ! "$portal" =~ : ]]; then
+                # Add default port if not specified
+                portal="${portal}:${default_port}"
+            else
+                # Validate port number
+                local portal_port="${portal##*:}"
+                if ! [[ "$portal_port" =~ ^[0-9]+$ ]] || [[ "$portal_port" -lt 1 ]] || [[ "$portal_port" -gt 65535 ]]; then
+                    error "Invalid port number (must be 1-65535)"
+                    continue
+                fi
+            fi
+            break
+        fi
+    done
 
-    # Blocksize (optional)
+    # Blocksize configuration
+    echo
+    info "ZFS Block Size Configuration:"
+    echo "  Recommended sizes based on workload:"
+    echo "    4K  - Databases with small random I/O (PostgreSQL, MySQL)"
+    echo "    8K  - General-purpose databases, mixed workloads"
+    echo "    16K - Default, balanced for most VM workloads (Recommended)"
+    echo "    32K - Large sequential I/O, media files"
+    echo "    64K - Very large files, backup storage"
+    echo "    128K - Maximum for large sequential workloads"
+    echo
     local blocksize
-    read -rp "Block size [16K]: " blocksize
-    blocksize="${blocksize:-16K}"
+    while true; do
+        read -rp "Block size [16K]: " blocksize
+        blocksize="${blocksize:-16K}"
+        # Validate blocksize format (number followed by K or M)
+        if [[ "$blocksize" =~ ^[0-9]+[KkMm]$ ]]; then
+            # Normalize to uppercase
+            blocksize="${blocksize^^}"
+            # Extract numeric part
+            local bs_num="${blocksize%[KM]}"
+            local bs_unit="${blocksize: -1}"
+            # Convert to bytes for validation
+            local bs_bytes
+            if [[ "$bs_unit" == "K" ]]; then
+                bs_bytes=$((bs_num * 1024))
+            else
+                bs_bytes=$((bs_num * 1024 * 1024))
+            fi
+            # Valid range: 512 bytes to 1M (ZFS limit)
+            if [[ "$bs_bytes" -ge 512 ]] && [[ "$bs_bytes" -le 1048576 ]]; then
+                # Must be power of 2
+                if (( (bs_bytes & (bs_bytes - 1)) == 0 )); then
+                    break
+                else
+                    error "Block size must be a power of 2 (e.g., 4K, 8K, 16K, 32K, 64K, 128K)"
+                fi
+            else
+                error "Block size must be between 512 bytes and 1M"
+            fi
+        else
+            error "Invalid format. Use number followed by K or M (e.g., 16K, 128K, 1M)"
+        fi
+    done
 
-    # Sparse (optional)
+    # Sparse volume configuration
+    echo
+    info "Sparse Volume Configuration:"
+    echo "  Sparse volumes (thin provisioning) allocate space on-demand rather than"
+    echo "  pre-allocating the full size. This saves storage space but may cause"
+    echo "  slight fragmentation over time. Recommended for most use cases."
+    echo
     local sparse
-    read -rp "Enable sparse volumes? (0/1) [1]: " sparse
-    sparse="${sparse:-1}"
+    while true; do
+        read -rp "Enable sparse volumes? (Y/n) [Y]: " sparse_choice
+        sparse_choice="${sparse_choice:-Y}"
+        if [[ "$sparse_choice" =~ ^[Yy]$ ]]; then
+            sparse="1"
+            break
+        elif [[ "$sparse_choice" =~ ^[Nn]$ ]]; then
+            sparse="0"
+            break
+        else
+            error "Please enter Y or N"
+        fi
+    done
 
     # Multipath configuration
     echo
@@ -8511,16 +9518,63 @@ menu_configure_storage() {
     fi
 
     # Generate configuration
-    echo
-    info "Configuration summary:"
-    info "Transport mode: ${transport_mode}"
-    echo "─────────────────────────────────────────────────────────"
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
     else
         config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
     fi
+
+    # Display summary with validation status
+    echo
+    echo "─────────────────────────────────────────────────────────"
+    info "Configuration Summary"
+    echo "─────────────────────────────────────────────────────────"
+    echo
+    # Storage name - validated for format
+    printf "  ${c2}✓${c0} %-20s %s\n" "Storage Name:" "$storage_name"
+    # TrueNAS IP - validated with validate_ip
+    printf "  ${c2}✓${c0} %-20s %s\n" "TrueNAS IP:" "$truenas_ip"
+    # API Key - show masked, validated via API test
+    local masked_key="${api_key:0:8}...${api_key: -4}"
+    printf "  ${c2}✓${c0} %-20s %s\n" "API Key:" "$masked_key"
+    # Dataset - may or may not be verified
+    printf "  ${c2}✓${c0} %-20s %s\n" "Dataset:" "$dataset"
+    # Transport mode - validated via selection
+    printf "  ${c2}✓${c0} %-20s %s\n" "Transport Mode:" "$transport_mode"
+    # Target/Subsystem based on mode
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        printf "  ${c4}○${c0} %-20s %s\n" "Subsystem NQN:" "$subsystem_nqn"
+        if [[ -n "$hostnqn" ]]; then
+            printf "  ${c4}○${c0} %-20s %s\n" "Host NQN:" "$hostnqn"
+        fi
+    else
+        printf "  ${c4}○${c0} %-20s %s\n" "Target IQN:" "$target"
+    fi
+    # Portal - validated for IP and port
+    printf "  ${c2}✓${c0} %-20s %s\n" "Discovery Portal:" "$portal"
+    # Block size - validated
+    printf "  ${c2}✓${c0} %-20s %s\n" "Block Size:" "$blocksize"
+    # Sparse - validated
+    local sparse_display="Yes (thin provisioning)"
+    [[ "$sparse" == "0" ]] && sparse_display="No (thick provisioning)"
+    printf "  ${c2}✓${c0} %-20s %s\n" "Sparse Volumes:" "$sparse_display"
+    # Multipath - display based on transport mode
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        local mp_display="Disabled"
+        [[ "$use_multipath" == "1" ]] && mp_display="Enabled"
+        printf "  ${c2}✓${c0} %-20s %s\n" "Multipath:" "$mp_display"
+    fi
+    # Additional portals if configured
+    if [[ -n "$portals" ]]; then
+        printf "  ${c2}✓${c0} %-20s %s\n" "Additional Portals:" "$portals"
+    fi
+    echo
+    echo "  ${c2}✓${c0} = Validated    ${c4}○${c0} = User provided (not validated)"
+    echo
+    echo "─────────────────────────────────────────────────────────"
+    echo "Raw configuration to be added:"
+    echo "─────────────────────────────────────────────────────────"
     echo "$config"
     echo "─────────────────────────────────────────────────────────"
     echo
