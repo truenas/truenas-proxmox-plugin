@@ -3590,7 +3590,8 @@ sub free_image {
     my $full_ds = $scfg->{dataset} . '/' . $zname;
 
     # Protect weight volume from deletion - it maintains target visibility
-    if ($zname eq 'pve-plugin-weight') {
+    # Match both old format (pve-plugin-weight) and new format (pve-weight-*)
+    if ($zname eq 'pve-plugin-weight' || $zname =~ /^pve-weight-/) {
         die "Cannot delete weight volume '$volname' - it maintains target visibility and prevents storage outages.\n" .
             "Weight volumes are critical infrastructure and must persist to keep iSCSI targets discoverable.\n";
     }
@@ -4378,18 +4379,32 @@ sub _ensure_target_visible {
 
     my $iqn = $scfg->{target_iqn};
     my $portal = _normalize_portal($scfg->{discovery_portal});
-    my $weight_name = 'pve-plugin-weight';
+
+    # Create a unique weight volume name per target
+    # Extract short name from IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
+    my $target_suffix = $iqn;
+    if ($iqn =~ /:([^:]+)$/) {
+        $target_suffix = $1;
+    }
+    # Sanitize for use in zvol name (replace non-alphanumeric with dash)
+    $target_suffix =~ s/[^a-zA-Z0-9]/-/g;
+    $target_suffix =~ s/-+/-/g;  # Collapse multiple dashes
+    $target_suffix =~ s/^-|-$//g;  # Remove leading/trailing dashes
+
+    my $weight_name = "pve-weight-$target_suffix";
     my $weight_zname = $scfg->{dataset} . '/' . $weight_name;
 
     # Level 1: Log pre-flight check start
-    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: checking target visibility for $iqn");
+    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: checking target visibility for $iqn (weight: $weight_name)");
 
     # Step 1: Check if target exists on TrueNAS
-    # Note: TrueNAS stores the target name without the IQN prefix
-    # Extract target name from full IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
-    my $target_name = $iqn;
+    # Note: TrueNAS may store the target name as either:
+    # - Just the short name (e.g., "proxmox")
+    # - The full IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox")
+    # We check for both formats
+    my $target_short_name = $iqn;
     if ($iqn =~ /:([^:]+)$/) {
-        $target_name = $1;
+        $target_short_name = $1;
     }
 
     my $target_exists = 0;
@@ -4399,8 +4414,9 @@ sub _ensure_target_visible {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: retrieved " . scalar(@$targets) . " targets from TrueNAS");
         for my $t (@$targets) {
             my $tname = $t->{name} // 'undefined';
-            _log($scfg, 2, 'debug', "[TrueNAS] Pre-flight: checking target '$tname' against '$target_name'");
-            if ($tname eq $target_name) {
+            _log($scfg, 2, 'debug', "[TrueNAS] Pre-flight: checking target '$tname' against '$target_short_name' or '$iqn'");
+            # Match either the short name or the full IQN
+            if ($tname eq $target_short_name || $tname eq $iqn) {
                 $target_exists = 1;
                 $target_id = $t->{id};
                 last;
@@ -4412,11 +4428,11 @@ sub _ensure_target_visible {
     }
 
     if (!$target_exists) {
-        _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: target $target_name does not exist on TrueNAS");
-        die "iSCSI target $target_name not found on TrueNAS. Please configure the target first.\n";
+        _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: target $iqn does not exist on TrueNAS");
+        die "iSCSI target $iqn not found on TrueNAS. Please configure the target first.\n";
     }
 
-    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $target_name exists on TrueNAS (ID: $target_id)");
+    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn exists on TrueNAS (ID: $target_id)");
 
     # Step 2: Proactively ensure weight zvol exists (regardless of current discoverability)
     # This prevents issues where weight gets deleted and target becomes undiscoverable
@@ -4467,7 +4483,7 @@ sub _ensure_target_visible {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent already exists");
     }
 
-    # Step 5: Ensure extent is mapped to target
+    # Step 5: Ensure extent is mapped to THIS target (not just any target)
     my $weight_mapped = 0;
     my $weight_extent_id;
     eval {
@@ -4482,7 +4498,8 @@ sub _ensure_target_visible {
         if ($weight_extent_id) {
             my $targetextents = _tn_targetextents($scfg);
             for my $te (@$targetextents) {
-                if ($te->{extent} == $weight_extent_id) {
+                # Check if extent is mapped to THIS specific target
+                if ($te->{extent} == $weight_extent_id && $te->{target} == $target_id) {
                     $weight_mapped = 1;
                     last;
                 }

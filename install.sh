@@ -1474,7 +1474,7 @@ perform_cluster_wide_installation() {
 
     if ! validate_cluster_ssh; then
         echo
-        read -rp "Continue with only reachable nodes? (y/N): " continue_choice
+        read -rp "Continue with only reachable nodes? [y/N]: " continue_choice
         if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
             info "Cluster installation cancelled"
             return 1
@@ -1488,7 +1488,7 @@ perform_cluster_wide_installation() {
     warning "This will install/update the TrueNAS plugin on all cluster nodes"
     info "Total nodes to update: $((${#remote_nodes[@]} + 1)) (1 local + ${#remote_nodes[@]} remote)"
     echo
-    read -rp "Do you want to proceed? (y/N): " confirm_choice
+    read -rp "Do you want to proceed? [y/N]: " confirm_choice
     if [[ ! "$confirm_choice" =~ ^[Yy] ]]; then
         info "Cluster installation cancelled"
         return 1
@@ -1518,7 +1518,7 @@ perform_cluster_wide_installation() {
         warning "⚠️  This is a PRE-RELEASE version"
         info "Pre-release versions may contain bugs and are not recommended for production use"
         echo
-        read -rp "Do you want to continue with cluster-wide installation? (y/N): " confirm
+        read -rp "Do you want to continue with cluster-wide installation? [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy] ]]; then
             info "Installation cancelled"
             return 1
@@ -1603,7 +1603,7 @@ perform_cluster_wide_installation() {
     # Offer retry for failed nodes
     if [[ ${#failed_nodes[@]} -gt 0 ]]; then
         echo
-        read -rp "Retry failed nodes? (y/N): " retry_choice
+        read -rp "Retry failed nodes? [y/N]: " retry_choice
         if [[ "$retry_choice" =~ ^[Yy] ]]; then
             info "Waiting 5 seconds before retry..."
             sleep 5
@@ -1716,7 +1716,7 @@ perform_installation() {
         warning "⚠️  This is a PRE-RELEASE version"
         info "Pre-release versions may contain bugs and are not recommended for production use"
         echo
-        read -rp "Do you want to continue? (y/N): " confirm
+        read -rp "Do you want to continue? [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy] ]]; then
             info "Installation cancelled"
             return 1
@@ -1884,12 +1884,12 @@ menu_not_installed() {
                     # Prompt to configure storage after successful installation
                     if [[ "$NON_INTERACTIVE" != "true" ]]; then
                         echo
-                        read -rp "Would you like to configure storage now? (y/N): " response
+                        read -rp "Would you like to configure storage now? [y/N]: " response
                         if [[ "$response" =~ ^[Yy] ]]; then
                             menu_configure_storage
                             # Offer health check after configuration
                             echo
-                            read -rp "Would you like to run a health check now? (y/N): " hc_response
+                            read -rp "Would you like to run a health check now? [y/N]: " hc_response
                             if [[ "$hc_response" =~ ^[Yy] ]]; then
                                 echo
                                 menu_health_check
@@ -1984,7 +1984,7 @@ menu_update_choice() {
                 # Offer to run health check after successful update
                 if [[ "$NON_INTERACTIVE" != "true" ]]; then
                     echo
-                    read -rp "Would you like to run a health check now? (y/N): " response
+                    read -rp "Would you like to run a health check now? [y/N]: " response
                     if [[ "$response" =~ ^[Yy] ]]; then
                         echo
                         menu_health_check
@@ -4184,7 +4184,7 @@ run_fio_benchmark() {
             warning "FIO JSON output format may not be supported"
             info "Benchmark results parsing may fail"
             echo
-            read -rp "Continue anyway? (y/N): " continue_choice
+            read -rp "Continue anyway? [y/N]: " continue_choice
             if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
                 return 1
             fi
@@ -5673,7 +5673,7 @@ menu_install_specific_version() {
         # (cluster-wide shows next steps automatically)
         if [[ "$install_cluster_wide" == "false" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
             echo
-            read -rp "Would you like to configure storage now? (y/N): " response
+            read -rp "Would you like to configure storage now? [y/N]: " response
             if [[ "$response" =~ ^[Yy] ]]; then
                 menu_configure_storage
             else
@@ -5779,7 +5779,7 @@ get_hostnqn() {
         hostnqn=$(cat /etc/nvme/hostnqn 2>/dev/null | tr -d '\n')
         if [[ -n "$hostnqn" ]]; then
             info "Found existing host NQN: $hostnqn" >&2
-            read -rp "Use this host NQN? (Y/n): " use_existing
+            read -rp "Use this host NQN? [Y/n]: " use_existing
             if [[ ! "$use_existing" =~ ^[Nn] ]]; then
                 echo "$hostnqn"
                 return 0
@@ -5789,7 +5789,7 @@ get_hostnqn() {
 
     # Generate new hostnqn
     warning "No host NQN found or user declined existing one"
-    read -rp "Generate new host NQN? (Y/n): " gen_new
+    read -rp "Generate new host NQN? [Y/n]: " gen_new
     if [[ ! "$gen_new" =~ ^[Nn] ]]; then
         if check_nvme_cli; then
             mkdir -p /etc/nvme
@@ -6100,8 +6100,13 @@ tn_api_call_write() {
             api_insecure => 1,
         };
 
-        # Decode params
-        my $params = eval { decode_json($params_json) } // [];
+        # Decode params - fail fast if JSON is invalid
+        my $params = eval { decode_json($params_json) };
+        if ($@ || !defined $params) {
+            print STDERR "ERROR: Failed to decode params JSON: $@\n";
+            print STDERR "Params received: $params_json\n";
+            exit 1;
+        }
 
         # Make the API call with ephemeral connection
         my $result = eval {
@@ -6200,7 +6205,17 @@ tn_check_dataset() {
     log "INFO" "Checking if dataset exists: $dataset"
 
     local params
-    params=$(printf '[[["id", "=", "%s"]]]' "$dataset")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [[['id', '=', sys.argv[1]]]]
+print(json.dumps(data))
+" "$dataset" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct dataset query params: $params"
+        return 1
+    fi
 
     local result
     result=$(tn_api_call "$host" "$api_key" "pool.dataset.query" "$params" 2>&1)
@@ -6237,7 +6252,18 @@ tn_create_dataset() {
 
     # Create dataset with FILESYSTEM type (for zvol children)
     local params
-    params=$(printf '[{"name": "%s", "type": "FILESYSTEM"}]' "$full_path")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [{'name': sys.argv[1], 'type': 'FILESYSTEM'}]
+print(json.dumps(data))
+" "$full_path" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct dataset params JSON: $params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local result
     result=$(tn_api_call_write "$host" "$api_key" "pool.dataset.create" "$params" 2>&1)
@@ -6265,7 +6291,18 @@ tn_delete_dataset() {
     log "INFO" "Deleting dataset: $dataset"
 
     local params
-    params=$(printf '["%s", {"recursive": true, "force": true}]' "$dataset")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [sys.argv[1], {'recursive': True, 'force': True}]
+print(json.dumps(data))
+" "$dataset" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct dataset delete params: $params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local result
     result=$(tn_api_call_write "$host" "$api_key" "pool.dataset.delete" "$params" 2>&1)
@@ -6292,6 +6329,55 @@ tn_query_portals() {
     tn_api_call "$host" "$api_key" "iscsi.portal.query" "[]"
 }
 
+# Find an existing iSCSI portal by IP and port
+# Parameters: host, api_key, listen_ip, listen_port
+# Returns: portal_id if found (empty string if not found)
+tn_find_portal() {
+    local host="$1"
+    local api_key="$2"
+    local listen_ip="$3"
+    local listen_port="${4:-3260}"
+
+    log "INFO" "Searching for existing iSCSI portal: $listen_ip:$listen_port"
+
+    # Query all portals
+    local portals_result
+    portals_result=$(tn_api_call "$host" "$api_key" "iscsi.portal.query" "[]" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        log "WARNING" "Failed to query iSCSI portals: $portals_result"
+        echo ""
+        return 1
+    fi
+
+    # Find portal matching IP and port
+    local portal_id
+    portal_id=$(echo "$portals_result" | python3 -c "
+import sys, json
+try:
+    portals = json.load(sys.stdin)
+    for portal in portals:
+        listen = portal.get('listen', [])
+        for addr in listen:
+            if (addr.get('ip') == '$listen_ip' and
+                str(addr.get('port')) == '$listen_port'):
+                print(portal.get('id', ''))
+                sys.exit(0)
+except:
+    pass
+" 2>/dev/null)
+
+    if [[ -n "$portal_id" ]]; then
+        log "INFO" "Found existing iSCSI portal ID: $portal_id"
+    else
+        log "INFO" "No existing iSCSI portal found for $listen_ip:$listen_port"
+    fi
+
+    echo "$portal_id"
+    return 0
+}
+
 # Create a new iSCSI portal
 # Parameters: host, api_key, listen_ip, listen_port
 # Returns: JSON with created portal info
@@ -6304,7 +6390,19 @@ tn_create_portal() {
     log "INFO" "Creating iSCSI portal: $listen_ip:$listen_port"
 
     local params
-    params=$(printf '[{"listen": [{"ip": "%s", "port": %s}]}]' "$listen_ip" "$listen_port")
+    # Use Python to construct JSON with proper escaping
+    # Note: TrueNAS 25.10+ only accepts 'ip' in listen items, port is auto-assigned
+    params=$(python3 -c "
+import json, sys
+data = [{'listen': [{'ip': sys.argv[1]}]}]
+print(json.dumps(data))
+" "$listen_ip" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct portal params JSON: $params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local result
     result=$(tn_api_call_write "$host" "$api_key" "iscsi.portal.create" "$params" 2>&1)
@@ -6370,7 +6468,17 @@ tn_check_target() {
     log "INFO" "Checking if iSCSI target exists: $target_iqn"
 
     local params
-    params=$(printf '[[["name", "=", "%s"]]]' "$target_iqn")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [[['name', '=', sys.argv[1]]]]
+print(json.dumps(data))
+" "$target_iqn" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct target query params: $params"
+        return 1
+    fi
 
     local result
     result=$(tn_api_call "$host" "$api_key" "iscsi.target.query" "$params" 2>&1)
@@ -6404,19 +6512,87 @@ generate_iqn() {
 }
 
 # Create an iSCSI target with portal association
-# Parameters: host, api_key, target_iqn, portal_id
-# Returns: JSON with created target info
+# Parameters: host, api_key, target_iqn, listen_ip, listen_port
+# Returns: JSON with created target info (includes portal_id and portal_reused flag)
+# Note: Automatically finds or creates portal matching the listen address
 tn_create_target() {
     local host="$1"
     local api_key="$2"
     local target_iqn="$3"
-    local portal_id="$4"
+    local listen_ip="$4"
+    local listen_port="${5:-3260}"
 
-    log "INFO" "Creating iSCSI target: $target_iqn with portal: $portal_id"
+    log "INFO" "Creating iSCSI target: $target_iqn for portal $listen_ip:$listen_port"
 
-    # Create target with portal group association
+    local portal_id=""
+    local portal_reused=false
+
+    # Step 1: Check if portal already exists
+    portal_id=$(tn_find_portal "$host" "$api_key" "$listen_ip" "$listen_port" 2>/dev/null)
+
+    if [[ -n "$portal_id" ]]; then
+        log "INFO" "Reusing existing iSCSI portal ID: $portal_id"
+        portal_reused=true
+    else
+        # Create the portal
+        local portal_params
+        # Use Python to construct JSON with proper escaping
+        # Note: TrueNAS 25.10+ only accepts 'ip' in listen items, port is auto-assigned
+        portal_params=$(python3 -c "
+import json, sys
+data = [{'listen': [{'ip': sys.argv[1]}]}]
+print(json.dumps(data))
+" "$listen_ip" 2>&1)
+
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Failed to construct portal params JSON: $portal_params"
+            echo "Failed to construct JSON params" >&2
+            return 1
+        fi
+
+        local portal_result
+        portal_result=$(tn_api_call_write "$host" "$api_key" "iscsi.portal.create" "$portal_params" 2>&1)
+        local exit_code=$?
+
+        if [[ $exit_code -ne 0 ]]; then
+            log "ERROR" "iSCSI portal creation failed: $portal_result"
+            echo "$portal_result" >&2
+            return 1
+        fi
+
+        # Extract portal ID from result
+        portal_id=$(echo "$portal_result" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+
+        if [[ -z "$portal_id" ]]; then
+            log "ERROR" "Failed to extract portal ID from result: $portal_result"
+            echo "Failed to extract portal ID" >&2
+            return 1
+        fi
+
+        log "INFO" "iSCSI portal created with ID: $portal_id"
+    fi
+
+    # Step 2: Create target with portal group association
     local params
-    params=$(printf '[{"name": "%s", "groups": [{"portal": %s, "authmethod": "NONE", "auth": null}]}]' "$target_iqn" "$portal_id")
+    # Use Python to construct JSON with proper escaping to prevent JSON injection
+    params=$(python3 -c "
+import json, sys
+data = [{
+    'name': sys.argv[1],
+    'groups': [{
+        'portal': int(sys.argv[2]),
+        'authmethod': 'NONE',
+        'auth': None
+    }]
+}]
+print(json.dumps(data))
+" "$target_iqn" "$portal_id" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct target params JSON: $params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local result
     result=$(tn_api_call_write "$host" "$api_key" "iscsi.target.create" "$params" 2>&1)
@@ -6426,6 +6602,25 @@ tn_create_target() {
         log "ERROR" "Target creation failed: $result"
         echo "$result" >&2
         return 1
+    fi
+
+    # Add reused flag to result for consistency with NVMe pattern
+    if [[ "$portal_reused" == "true" ]]; then
+        result=$(echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+data['portal_reused'] = True
+data['portal_id'] = $portal_id
+print(json.dumps(data))
+" 2>/dev/null || echo "$result")
+    else
+        result=$(echo "$result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+data['portal_reused'] = False
+data['portal_id'] = $portal_id
+print(json.dumps(data))
+" 2>/dev/null || echo "$result")
     fi
 
     log "INFO" "Target created successfully: $target_iqn"
@@ -6482,7 +6677,17 @@ tn_check_subsystem() {
     log "INFO" "Checking if NVMe subsystem exists: $subsystem_nqn"
 
     local params
-    params=$(printf '[[["subnqn", "=", "%s"]]]' "$subsystem_nqn")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [[['subnqn', '=', sys.argv[1]]]]
+print(json.dumps(data))
+" "$subsystem_nqn" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct subsystem query params: $params"
+        return 1
+    fi
 
     local result
     result=$(tn_api_call "$host" "$api_key" "nvmet.subsys.query" "$params" 2>&1)
@@ -6528,7 +6733,22 @@ tn_create_subsystem() {
 
     # Create subsystem with allow_any_host=true (as per design non-goals)
     local params
-    params=$(printf '[{"name": "%s", "subnqn": "%s", "allow_any_host": true}]' "$subsystem_name" "$subsystem_nqn")
+    # Use Python to construct JSON with proper escaping
+    params=$(python3 -c "
+import json, sys
+data = [{
+    'name': sys.argv[1],
+    'subnqn': sys.argv[2],
+    'allow_any_host': True
+}]
+print(json.dumps(data))
+" "$subsystem_name" "$subsystem_nqn" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct subsystem params JSON: $params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local result
     result=$(tn_api_call_write "$host" "$api_key" "nvmet.subsys.create" "$params" 2>&1)
@@ -6644,11 +6864,26 @@ tn_create_nvme_port() {
         log "INFO" "Reusing existing NVMe port ID: $port_id"
         port_reused=true
         # Create a JSON result for consistency
-        port_result=$(printf '{"id": %s, "addr_trtype": "TCP", "addr_traddr": "%s", "addr_trsvcid": %s, "reused": true}' "$port_id" "$listen_ip" "$listen_port")
+        port_result=$(python3 -c "
+import json, sys
+data = {'id': int(sys.argv[1]), 'addr_trtype': 'TCP', 'addr_traddr': sys.argv[2], 'addr_trsvcid': int(sys.argv[3]), 'reused': True}
+print(json.dumps(data))
+" "$port_id" "$listen_ip" "$listen_port" 2>&1)
     else
         # Create the port (TrueNAS 25.10+ uses separate port and subsystem association)
         local port_params
-        port_params=$(printf '[{"addr_trtype": "TCP", "addr_traddr": "%s", "addr_trsvcid": %s}]' "$listen_ip" "$listen_port")
+        # Use Python to construct JSON with proper escaping
+        port_params=$(python3 -c "
+import json, sys
+data = [{'addr_trtype': 'TCP', 'addr_traddr': sys.argv[1], 'addr_trsvcid': int(sys.argv[2])}]
+print(json.dumps(data))
+" "$listen_ip" "$listen_port" 2>&1)
+
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Failed to construct port params JSON: $port_params"
+            echo "Failed to construct JSON params" >&2
+            return 1
+        fi
 
         port_result=$(tn_api_call_write "$host" "$api_key" "nvmet.port.create" "$port_params" 2>&1)
         local exit_code=$?
@@ -6673,7 +6908,18 @@ tn_create_nvme_port() {
 
     # Step 2: Associate port with subsystem
     local assoc_params
-    assoc_params=$(printf '[{"port_id": %s, "subsys_id": %s}]' "$port_id" "$subsystem_id")
+    # Use Python to construct JSON (port_id and subsys_id are integers)
+    assoc_params=$(python3 -c "
+import json, sys
+data = [{'port_id': int(sys.argv[1]), 'subsys_id': int(sys.argv[2])}]
+print(json.dumps(data))
+" "$port_id" "$subsystem_id" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        log "ERROR" "Failed to construct association params JSON: $assoc_params"
+        echo "Failed to construct JSON params" >&2
+        return 1
+    fi
 
     local assoc_result
     assoc_result=$(tn_api_call_write "$host" "$api_key" "nvmet.port_subsys.create" "$assoc_params" 2>&1)
@@ -6725,10 +6971,13 @@ validate_dataset_exists() {
 # Validate iSCSI target is discoverable from Proxmox
 # Parameters: portal_ip, portal_port, target_iqn
 # Returns: 0 if discoverable, 1 if not
+# Note: Retries for up to 10 seconds to allow iSCSI service to register new targets
 validate_iscsi_discovery() {
     local portal_ip="$1"
     local portal_port="${2:-3260}"
     local target_iqn="$3"
+    local max_attempts=10
+    local attempt=1
 
     log "INFO" "Validating iSCSI discovery: $target_iqn at $portal_ip:$portal_port"
 
@@ -6738,23 +6987,29 @@ validate_iscsi_discovery() {
         return 0  # Don't fail if tool not available
     fi
 
-    # Perform discovery
-    local discovery_output
-    discovery_output=$(iscsiadm -m discovery -t sendtargets -p "${portal_ip}:${portal_port}" 2>&1)
-    local exit_code=$?
+    # Retry loop - wait up to 10 seconds for target to become discoverable
+    while [[ $attempt -le $max_attempts ]]; do
+        # Perform discovery
+        local discovery_output
+        discovery_output=$(iscsiadm -m discovery -t sendtargets -p "${portal_ip}:${portal_port}" 2>&1)
+        local exit_code=$?
 
-    if [[ $exit_code -ne 0 ]]; then
-        log "ERROR" "iSCSI discovery failed: $discovery_output"
-        return 1
-    fi
+        if [[ $exit_code -eq 0 ]]; then
+            # Check if target is in discovery output
+            if echo "$discovery_output" | grep -q "$target_iqn"; then
+                log "INFO" "iSCSI target discovered successfully: $target_iqn (attempt $attempt)"
+                return 0
+            fi
+        fi
 
-    # Check if target is in discovery output
-    if echo "$discovery_output" | grep -q "$target_iqn"; then
-        log "INFO" "iSCSI target discovered successfully: $target_iqn"
-        return 0
-    fi
+        # Wait 1 second before retry (except on last attempt)
+        if [[ $attempt -lt $max_attempts ]]; then
+            sleep 1
+        fi
+        ((attempt++))
+    done
 
-    log "ERROR" "Target not found in discovery: $target_iqn"
+    log "ERROR" "Target not found in discovery after ${max_attempts}s: $target_iqn"
     return 1
 }
 
@@ -7294,16 +7549,8 @@ collect_provisioning_config() {
         fi
     done
 
-    # Portal port with validation
-    while true; do
-        read -rp "Portal port [${default_port}]: " PROV_PORTAL_PORT
-        PROV_PORTAL_PORT=${PROV_PORTAL_PORT:-$default_port}
-        if [[ "$PROV_PORTAL_PORT" =~ ^[0-9]+$ ]] && [[ "$PROV_PORTAL_PORT" -ge 1 ]] && [[ "$PROV_PORTAL_PORT" -le 65535 ]]; then
-            break
-        else
-            error "Invalid port number (must be 1-65535)"
-        fi
-    done
+    # Port is auto-assigned by TrueNAS (3260 for iSCSI, 4420 for NVMe)
+    PROV_PORTAL_PORT="$default_port"
 
     WIZARD_PORTAL_IP="$PROV_PORTAL_IP"
     WIZARD_PORTAL_PORT="$PROV_PORTAL_PORT"
@@ -7373,7 +7620,7 @@ collect_provisioning_config() {
     echo
 
     while true; do
-        read -rp "Enable sparse volumes? (Y/n) [Y]: " sparse_choice
+        read -rp "Enable sparse volumes? [Y/n]: " sparse_choice
         sparse_choice="${sparse_choice:-Y}"
         if [[ "$sparse_choice" =~ ^[Yy]$ ]]; then
             PROV_SPARSE="1"
@@ -7412,7 +7659,7 @@ collect_provisioning_config() {
             echo "  $existing_hostnqn"
             echo
             while true; do
-                read -rp "Use this host NQN? (Y/n) [Y]: " use_existing
+                read -rp "Use this host NQN? [Y/n] [Y]: " use_existing
                 use_existing="${use_existing:-Y}"
                 if [[ "$use_existing" =~ ^[Yy]$ ]]; then
                     PROV_HOSTNQN="$existing_hostnqn"
@@ -7518,7 +7765,7 @@ show_provisioning_summary() {
     echo "  ${c2}✓${c0} = Validated  ${c2}+${c0} = Will create  ${c3}○${c0} = Existing"
     echo
 
-    read -rp "Proceed with provisioning? (Y/n): " confirm
+    read -rp "Proceed with provisioning? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
         info "Provisioning cancelled"
         return 1
@@ -7681,6 +7928,42 @@ execute_provisioning() {
             echo -e "\r$(printf "%-30s " "NVMe discovery:")${c3}?${c0} May need service restart"
         fi
     else
+        # For iSCSI, invoke the plugin's _ensure_target_visible to create weight volume
+        # This makes the target discoverable via iscsiadm
+        printf "%-30s " "Weight volume:"
+        start_spinner
+        local weight_result
+        weight_result=$(perl -e '
+            use lib "/usr/share/perl5/PVE/Storage/Custom";
+            use TrueNASPlugin;
+
+            my $scfg = {
+                api_host => $ARGV[0],
+                api_key => $ARGV[1],
+                api_insecure => 1,
+                dataset => $ARGV[2],
+                target_iqn => $ARGV[3],
+                discovery_portal => $ARGV[4],
+            };
+
+            eval { PVE::Storage::Custom::TrueNASPlugin::_ensure_target_visible($scfg) };
+            if ($@) {
+                print "ERROR: $@";
+                exit 1;
+            }
+            print "OK";
+        ' "$host" "$api_key" "$PROVISIONED_DATASET" "$PROVISIONED_TARGET_IQN" "${PROV_PORTAL_IP}:${PROV_PORTAL_PORT}" 2>&1)
+        local weight_exit=$?
+        stop_spinner
+
+        if [[ $weight_exit -eq 0 ]]; then
+            echo -e "\r$(printf "%-30s " "Weight volume:")${c2}✓${c0} Created"
+        else
+            echo -e "\r$(printf "%-30s " "Weight volume:")${c1}✗${c0} Failed"
+            log "ERROR" "Weight volume creation failed: $weight_result"
+        fi
+
+        # Now verify with iscsiadm discovery
         printf "%-30s " "iSCSI discovery:"
         start_spinner
         local discovery_valid=false
@@ -7817,8 +8100,8 @@ provision_iscsi() {
             return 1
         fi
 
-        read -rp "Portal port [3260]: " portal_port
-        portal_port="${portal_port:-3260}"
+        # Port is auto-assigned by TrueNAS (default 3260)
+        portal_port="3260"
 
         info "Creating iSCSI portal: $portal_ip:$portal_port"
         local portal_result
@@ -7911,7 +8194,7 @@ provision_iscsi() {
     # Create target with portal association
     info "Creating iSCSI target: $target_iqn"
     local target_result
-    target_result=$(tn_create_target "$host" "$api_key" "$target_iqn" "$portal_id" 2>&1)
+    target_result=$(tn_create_target "$host" "$api_key" "$target_iqn" "$portal_ip" "$portal_port" 2>&1)
     local target_exit=$?
 
     if [[ $target_exit -ne 0 ]]; then
@@ -8385,7 +8668,7 @@ menu_edit_storage() {
     # Test connectivity
     if ! test_truenas_api "$truenas_ip" "$api_key"; then
         error "Failed to connect to TrueNAS. Please check IP and API key."
-        read -rp "Continue anyway? (y/N): " choice
+        read -rp "Continue anyway? [y/N]: " choice
         [[ "$choice" =~ ^[Yy] ]] || return 1
     fi
 
@@ -8453,7 +8736,7 @@ menu_edit_storage() {
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         echo
         info "Current host NQN: ${hostnqn:-system default}"
-        read -rp "Update host NQN? (y/N): " update_hostnqn
+        read -rp "Update host NQN? [y/N]: " update_hostnqn
         if [[ "$update_hostnqn" =~ ^[Yy] ]]; then
             read -rp "New host NQN: " hostnqn
         fi
@@ -8475,7 +8758,7 @@ menu_edit_storage() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
 
-    read -rp "Apply these changes to $STORAGE_CFG? (Y/n): " confirm
+    read -rp "Apply these changes to $STORAGE_CFG? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
         warning "Configuration changes cancelled"
         return 1
@@ -8827,7 +9110,7 @@ wizard_add_storage() {
         echo -e "\r  $(printf "%-30s" "Testing API connectivity...")${c1}FAILED${c0}"
         echo
         warning "Could not connect to TrueNAS API"
-        read -rp "Continue anyway? (y/N): " continue_choice
+        read -rp "Continue anyway? [y/N]: " continue_choice
         if [[ ! "$continue_choice" =~ ^[Yy] ]]; then
             return 1
         fi
@@ -8863,7 +9146,7 @@ wizard_add_storage() {
                 echo
                 warning "nvme-cli package is not installed"
                 info "NVMe/TCP requires nvme-cli for management"
-                read -rp "Install nvme-cli now? (Y/n): " install_nvme
+                read -rp "Install nvme-cli now? [Y/n]: " install_nvme
                 if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
                     info "Installing nvme-cli..."
                     if apt-get update -qq && apt-get install -y -qq nvme-cli; then
@@ -9053,7 +9336,7 @@ menu_configure_storage() {
                     # Check if this was an iSCSI storage and offer orphan cleanup
                     if [[ "$transport_mode" != "nvme-tcp" ]]; then
                         echo
-                        read -rp "Would you like to cleanup orphaned resources on TrueNAS? (y/N): " cleanup_response
+                        read -rp "Would you like to cleanup orphaned resources on TrueNAS? [y/N]: " cleanup_response
                         if [[ "$cleanup_response" =~ ^[Yy] ]]; then
                             info "Note: Storage no longer exists in config. Manual cleanup may be needed."
                         fi
@@ -9091,7 +9374,7 @@ menu_configure_storage() {
         # Run automated provisioning workflow
         if ! provision_storage_resources "$storage_name" "$truenas_ip" "$api_key" "$transport_mode"; then
             error "Automated provisioning failed"
-            read -rp "Would you like to continue with manual configuration? (y/N): " manual_choice
+            read -rp "Would you like to continue with manual configuration? [y/N]: " manual_choice
             if [[ ! "$manual_choice" =~ ^[Yy] ]]; then
                 return 1
             fi
@@ -9238,7 +9521,7 @@ menu_configure_storage() {
         if ! verify_dataset "$truenas_ip" "$api_key" "$dataset"; then
             echo
             warning "Dataset verification failed. The dataset may not exist or may not be accessible."
-            read -rp "Continue anyway? (y/N): " continue_choice
+            read -rp "Continue anyway? [y/N]: " continue_choice
             if [[ "$continue_choice" =~ ^[Yy] ]]; then
                 warning "Proceeding with unverified dataset '$dataset'"
                 break
@@ -9287,7 +9570,7 @@ menu_configure_storage() {
         if ! check_nvme_cli; then
             warning "nvme-cli package is not installed"
             info "NVMe/TCP requires nvme-cli for management"
-            read -rp "Install nvme-cli now? (Y/n): " install_nvme
+            read -rp "Install nvme-cli now? [Y/n]: " install_nvme
             if [[ ! "$install_nvme" =~ ^[Nn] ]]; then
                 info "Installing nvme-cli..."
                 if ! apt-get update; then
@@ -9424,7 +9707,7 @@ menu_configure_storage() {
     echo
     local sparse
     while true; do
-        read -rp "Enable sparse volumes? (Y/n) [Y]: " sparse_choice
+        read -rp "Enable sparse volumes? [Y/n]: " sparse_choice
         sparse_choice="${sparse_choice:-Y}"
         if [[ "$sparse_choice" =~ ^[Yy]$ ]]; then
             sparse="1"
@@ -9442,7 +9725,7 @@ menu_configure_storage() {
     info "Advanced Options:"
     local use_multipath=""
     local portals=""
-    read -rp "Enable multipath I/O for redundancy/load balancing? (y/N): " enable_mp
+    read -rp "Enable multipath I/O for redundancy/load balancing? [y/N]: " enable_mp
 
     if [[ "$enable_mp" =~ ^[Yy] ]]; then
         if [[ "$transport_mode" == "iscsi" ]]; then
@@ -9450,7 +9733,7 @@ menu_configure_storage() {
             if ! command -v multipath &> /dev/null; then
                 warning "multipath-tools package is not installed"
                 info "Multipath requires: apt-get install multipath-tools"
-                read -rp "Continue configuring multipath anyway? (y/N): " continue_mp
+                read -rp "Continue configuring multipath anyway? [y/N]: " continue_mp
                 if [[ ! "$continue_mp" =~ ^[Yy] ]]; then
                     info "Multipath disabled"
                 else
@@ -9617,7 +9900,7 @@ menu_configure_storage() {
     echo "─────────────────────────────────────────────────────────"
     echo
 
-    read -rp "Add this configuration to $STORAGE_CFG? (Y/n): " confirm
+    read -rp "Add this configuration to $STORAGE_CFG? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn] ]]; then
         warning "Configuration cancelled"
         return 1
@@ -9758,7 +10041,7 @@ menu_rollback() {
 
     echo
     warning "This will replace the current plugin with the selected backup"
-    read -rp "Continue with rollback? (y/N): " confirm
+    read -rp "Continue with rollback? [y/N]: " confirm
 
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Rollback cancelled"
@@ -9897,7 +10180,7 @@ delete_old_backups() {
     done
     echo
 
-    read -rp "Delete these backups? (y/N): " confirm
+    read -rp "Delete these backups? [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Deletion cancelled"
         return 0
@@ -9960,7 +10243,7 @@ keep_latest_backups() {
 
     echo
     warning "This will delete $delete_count backup(s), keeping only the $keep_count most recent"
-    read -rp "Continue? (y/N): " confirm
+    read -rp "Continue? [y/N]: " confirm
 
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Deletion cancelled"
@@ -10180,7 +10463,7 @@ uninstall_plugin() {
             done
             echo
 
-            read -rp "Remove all TrueNAS storage configurations? (y/N): " confirm
+            read -rp "Remove all TrueNAS storage configurations? [y/N]: " confirm
             if [[ "$confirm" =~ ^[Yy] ]]; then
                 echo "$storages" | while read -r storage; do
                     remove_storage_config "$storage"
@@ -10223,14 +10506,14 @@ menu_uninstall() {
     echo "  • You can rollback using the backup if needed"
     echo
 
-    read -rp "Are you sure you want to uninstall? (y/N): " confirm
+    read -rp "Are you sure you want to uninstall? [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
         info "Uninstallation cancelled"
         return 0
     fi
 
     echo
-    read -rp "Also remove storage configuration from $STORAGE_CFG? (y/N): " remove_config_choice
+    read -rp "Also remove storage configuration from $STORAGE_CFG? [y/N]: " remove_config_choice
 
     local remove_config=false
     [[ "$remove_config_choice" =~ ^[Yy] ]] && remove_config=true
