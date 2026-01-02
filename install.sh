@@ -5850,35 +5850,22 @@ check_nvme_multipath() {
 }
 
 # Test TrueNAS API connectivity
+# Uses WebSocket API via TrueNASPlugin (REST not available)
 test_truenas_api() {
     local ip="$1"
     local apikey="$2"
-
-    local url="https://${ip}/api/v2.0/system/info"
-    local tool
-    tool=$(get_download_tool)
 
     printf "  Testing connection to TrueNAS at %s..." "$ip"
     start_spinner
 
     local response
-    case "$tool" in
-        curl)
-            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            ;;
-        wget)
-            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            ;;
-        *)
-            stop_spinner
-            echo ""
-            return 1
-            ;;
-    esac
+    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null)
+    local exit_code=$?
 
     stop_spinner
     printf "\r\033[K"  # Clear spinner line
-    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
+
+    if [[ $exit_code -eq 0 ]] && [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
         local version
         version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
         success "Connected to TrueNAS successfully (version: $version)"
@@ -5890,46 +5877,31 @@ test_truenas_api() {
 }
 
 # Verify dataset exists
+# Uses WebSocket API via TrueNASPlugin (REST not available)
 verify_dataset() {
     local ip="$1"
     local apikey="$2"
     local dataset="$3"
 
-    local url="https://${ip}/api/v2.0/pool/dataset?id=${dataset}"
-    local tool
-    tool=$(get_download_tool)
-
     printf "  Verifying dataset '%s'..." "$dataset"
     start_spinner
 
+    # Use pool.dataset.query with filter for specific dataset
+    local filter="[[\"id\", \"=\", \"${dataset}\"]]"
     local response
-    local http_code
-    case "$tool" in
-        curl)
-            response=$(curl -sk -w "\n%{http_code}" -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            http_code=$(echo "$response" | tail -n1)
-            response=$(echo "$response" | head -n-1)
-            ;;
-        wget)
-            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            http_code="200"
-            ;;
-        *)
-            stop_spinner
-            echo ""
-            return 1
-            ;;
-    esac
+    response=$(tn_api_call "$ip" "$apikey" "pool.dataset.query" "$filter" 2>/dev/null)
+    local exit_code=$?
 
     stop_spinner
     echo ""
 
-    if [[ "$http_code" != "200" ]]; then
+    if [[ $exit_code -ne 0 ]]; then
         warning "Dataset '$dataset' not found or not accessible"
         return 1
     fi
 
-    if [[ -n "$response" ]] && echo "$response" | grep -q "\"id\": \"${dataset}\""; then
+    # Check if response contains the dataset (non-empty array)
+    if [[ -n "$response" ]] && [[ "$response" != "[]" ]] && echo "$response" | grep -q "\"id\""; then
         success "Dataset '$dataset' verified"
         return 0
     else
@@ -5939,27 +5911,15 @@ verify_dataset() {
 }
 
 # Discover available TrueNAS portals from network interfaces
+# Uses WebSocket API via TrueNASPlugin (REST not available)
 discover_truenas_portals() {
     local ip="$1"
     local apikey="$2"
     local primary_ip="$3"
 
-    local url="https://${ip}/api/v2.0/interface"
-    local tool
-    tool=$(get_download_tool)
-
+    # Use tn_query_interfaces which already uses WebSocket
     local response
-    case "$tool" in
-        curl)
-            response=$(curl -sk -H "Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            ;;
-        wget)
-            response=$(wget --no-check-certificate --quiet -O - --header="Authorization: Bearer $apikey" "$url" 2>/dev/null)
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    response=$(tn_query_interfaces "$ip" "$apikey")
 
     if [[ -z "$response" ]]; then
         return 1
@@ -5968,13 +5928,731 @@ discover_truenas_portals() {
     # Extract IP addresses from interfaces, excluding the primary IP
     # Parse JSON to find all "address" fields with IPv4 addresses
     local portals
-    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v "^${primary_ip}$" | sort -u)
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v -- "^${primary_ip}$" | sort -u)
 
     if [[ -z "$portals" ]]; then
         return 1
     fi
 
     echo "$portals"
+    return 0
+}
+
+# Query TrueNAS network interfaces with detailed information
+# Returns JSON with interface name, IP, speed, link state
+# Uses WebSocket API via TrueNASPlugin (REST not available for this endpoint)
+tn_query_interfaces() {
+    local ip="$1"
+    local apikey="$2"
+
+    # Use WebSocket API call via TrueNASPlugin
+    local response
+    response=$(tn_api_call "$ip" "$apikey" "interface.query" "[]" 2>/dev/null)
+
+    if [[ -z "$response" ]] || [[ "$response" == "null" ]]; then
+        return 1
+    fi
+
+    echo "$response"
+    return 0
+}
+
+# Parse link speed from TrueNAS active_media_subtype to human-readable format
+# Input: "40000Mb/s Direct Attach Copper" or "10000baseT/Full" or "1000Mb/s"
+# Output: "40 Gb" or "10 Gb" or "1 Gb"
+parse_link_speed() {
+    local media_subtype="$1"
+
+    if [[ -z "$media_subtype" ]]; then
+        echo "-"
+        return
+    fi
+
+    # Pattern: "40000Mb/s..." -> extract number before "Mb/s"
+    if [[ "$media_subtype" =~ ([0-9]+)Mb/s ]]; then
+        local mbps="${BASH_REMATCH[1]}"
+        if [[ $mbps -ge 1000 ]]; then
+            echo "$((mbps / 1000)) Gb"
+        else
+            echo "${mbps} Mb"
+        fi
+    # Pattern: "10000baseT..." -> extract number before "base"
+    elif [[ "$media_subtype" =~ ([0-9]+)base ]]; then
+        local mbps="${BASH_REMATCH[1]}"
+        if [[ $mbps -ge 1000 ]]; then
+            echo "$((mbps / 1000)) Gb"
+        else
+            echo "${mbps} Mb"
+        fi
+    else
+        echo "-"
+    fi
+}
+
+# Query TrueNAS iSCSI service configuration for the listen port
+# Returns: port number (e.g., "3260") or empty on failure
+# Uses WebSocket API via TrueNASPlugin (REST not available)
+tn_get_iscsi_port() {
+    local ip="$1"
+    local apikey="$2"
+
+    local response
+    response=$(tn_api_call "$ip" "$apikey" "iscsi.global.config" "[]" 2>/dev/null)
+
+    if [[ -z "$response" ]] || [[ "$response" == "null" ]]; then
+        return 1
+    fi
+
+    # Extract listen_port from response
+    local port
+    port=$(echo "$response" | grep -Po '"listen_port":\s*\K[0-9]+')
+
+    if [[ -n "$port" ]]; then
+        echo "$port"
+        return 0
+    fi
+
+    return 1
+}
+
+# Global array populated by tn_check_existing_portals with all IPs that have portals configured
+ISCSI_PORTAL_IPS=()
+
+# Check for existing iSCSI portals matching selected IPs
+# Returns: "exact:<portal_id>" if exact match, "partial:<portal_id>:<matched_ips>" if partial, "none" if no match
+# Also populates global ISCSI_PORTAL_IPS array with all IPs that have existing portals
+# Uses WebSocket API via TrueNASPlugin (REST not available)
+tn_check_existing_portals() {
+    local ip="$1"
+    local apikey="$2"
+    local selected_ips="$3"  # Space-separated list of IPs
+
+    # Reset global array
+    ISCSI_PORTAL_IPS=()
+
+    # Use WebSocket API call via TrueNASPlugin
+    local response
+    response=$(tn_api_call "$ip" "$apikey" "iscsi.portal.query" "[]" 2>/dev/null)
+
+    if [[ -z "$response" ]] || [[ "$response" == "[]" ]] || [[ "$response" == "null" ]]; then
+        echo "none"
+        return
+    fi
+
+    # Convert selected IPs to array for comparison
+    local -a sel_ips
+    read -ra sel_ips <<< "$selected_ips"
+    local num_selected=${#sel_ips[@]}
+
+    # Parse portals using awk to properly extract per-portal listen IPs
+    # Portal format: [{"id":1,"listen":[{"ip":"10.20.30.20","port":3260},...]}, ...]
+    # Note: Uses mawk-compatible syntax (no gawk-specific capture groups)
+    local parsed_portals
+    parsed_portals=$(echo "$response" | awk '
+    # Extract numeric ID value after "id": pattern
+    function extract_id(block,    pos, start, num, c, i) {
+        # Try "id": with space
+        pos = index(block, "\"id\": ")
+        if (pos > 0) { start = pos + 6 }
+        else {
+            # Try "id": without space
+            pos = index(block, "\"id\":")
+            if (pos > 0) { start = pos + 5 }
+            else { return "" }
+        }
+        # Extract digits
+        num = ""
+        for (i = start; i <= length(block); i++) {
+            c = substr(block, i, 1)
+            if (c >= "0" && c <= "9") { num = num c }
+            else if (num != "") { break }
+        }
+        return num
+    }
+
+    # Find all IPv4 addresses from "ip":"X.X.X.X" patterns
+    function find_ips(block, ips,    count, remainder, pos, addr, i, c) {
+        count = 0
+        remainder = block
+        while (1) {
+            pos = index(remainder, "\"ip\":")
+            if (pos == 0) break
+            remainder = substr(remainder, pos + 5)
+            # Skip whitespace and opening quote
+            while (substr(remainder, 1, 1) == " ") remainder = substr(remainder, 2)
+            if (substr(remainder, 1, 1) != "\"") continue
+            remainder = substr(remainder, 2)
+            # Extract until closing quote
+            addr = ""
+            for (i = 1; i <= length(remainder); i++) {
+                c = substr(remainder, i, 1)
+                if (c == "\"") break
+                addr = addr c
+            }
+            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                count++
+                ips[count] = addr
+            }
+            remainder = substr(remainder, i + 1)
+        }
+        return count
+    }
+
+    BEGIN { RS=""; FS="" }
+    {
+        json = $0
+        gsub(/\n/, " ", json)
+        gsub(/  +/, " ", json)
+
+        n = split(json, chars, "")
+        depth = 0
+        portal_start = 0
+        in_top_array = 0
+
+        for (i = 1; i <= n; i++) {
+            c = chars[i]
+
+            if (c == "[" && depth == 0) {
+                in_top_array = 1
+                continue
+            }
+            if (c == "{") {
+                depth++
+                if (depth == 1) {
+                    portal_start = i
+                }
+            }
+            if (c == "}") {
+                depth--
+                if (depth == 0 && portal_start > 0) {
+                    # Extract portal block
+                    portal_block = ""
+                    for (j = portal_start; j <= i; j++) {
+                        portal_block = portal_block chars[j]
+                    }
+
+                    # Extract portal ID
+                    portal_id = extract_id(portal_block)
+
+                    # Extract all IPs from listen array for this portal
+                    if (portal_id != "") {
+                        delete ip_list
+                        ip_count = find_ips(portal_block, ip_list)
+                        for (k = 1; k <= ip_count; k++) {
+                            print portal_id "|" ip_list[k]
+                        }
+                    }
+
+                    portal_start = 0
+                }
+            }
+        }
+    }')
+
+    # Build associative arrays of portal IPs
+    local best_match_count=0
+    local best_portal_id=""
+    local current_portal=""
+    local -a current_ips=()
+
+    # Process parsed output, grouping by portal ID
+    while IFS='|' read -r portal_id portal_ip; do
+        [[ -z "$portal_id" ]] && continue
+
+        # Add to global array of all portal IPs (for per-IP display)
+        ISCSI_PORTAL_IPS+=("$portal_ip")
+
+        if [[ "$portal_id" != "$current_portal" ]]; then
+            # Check previous portal if any
+            if [[ -n "$current_portal" ]] && [[ ${#current_ips[@]} -gt 0 ]]; then
+                local match_count=0
+                for sel_ip in "${sel_ips[@]}"; do
+                    for pip in "${current_ips[@]}"; do
+                        if [[ "$sel_ip" == "$pip" ]]; then
+                            ((match_count++))
+                            break
+                        fi
+                    done
+                done
+                if [[ $match_count -gt $best_match_count ]]; then
+                    best_match_count=$match_count
+                    best_portal_id=$current_portal
+                fi
+            fi
+            # Start new portal
+            current_portal="$portal_id"
+            current_ips=("$portal_ip")
+        else
+            current_ips+=("$portal_ip")
+        fi
+    done <<< "$parsed_portals"
+
+    # Check last portal
+    if [[ -n "$current_portal" ]] && [[ ${#current_ips[@]} -gt 0 ]]; then
+        local match_count=0
+        for sel_ip in "${sel_ips[@]}"; do
+            for pip in "${current_ips[@]}"; do
+                if [[ "$sel_ip" == "$pip" ]]; then
+                    ((match_count++))
+                    break
+                fi
+            done
+        done
+        if [[ $match_count -gt $best_match_count ]]; then
+            best_match_count=$match_count
+            best_portal_id=$current_portal
+        fi
+    fi
+
+    if [[ $best_match_count -eq 0 ]]; then
+        echo "none"
+    elif [[ $best_match_count -eq $num_selected ]]; then
+        echo "exact:${best_portal_id}"
+    else
+        echo "partial:${best_portal_id}:${best_match_count}/${num_selected}"
+    fi
+}
+
+# Check for existing NVMe ports matching selected IPs
+# Returns space-separated list: "ip:port_id ip:port_id" for existing, or "none"
+# Uses WebSocket API via TrueNASPlugin (REST not available)
+tn_check_existing_nvme_ports() {
+    local ip="$1"
+    local apikey="$2"
+    local selected_ips="$3"  # Space-separated list of IPs
+
+    # Use WebSocket API call via TrueNASPlugin
+    local response
+    response=$(tn_api_call "$ip" "$apikey" "nvmet.port.query" "[]" 2>/dev/null)
+
+    if [[ -z "$response" ]] || [[ "$response" == "[]" ]] || [[ "$response" == "null" ]]; then
+        echo "none"
+        return
+    fi
+
+    # Convert selected IPs to array
+    local -a sel_ips
+    read -ra sel_ips <<< "$selected_ips"
+
+    local existing_ports=""
+
+    # Parse NVMe ports - format: {"id":1,"addr_traddr":"10.20.30.20","addr_trsvcid":4420,...}
+    for sel_ip in "${sel_ips[@]}"; do
+        # Check if this IP has an existing port
+        local port_id
+        port_id=$(echo "$response" | grep -Po '"id":\s*([0-9]+)[^}]*"addr_traddr":\s*"'"$sel_ip"'"' | grep -Po '"id":\s*\K[0-9]+' | head -1)
+        if [[ -z "$port_id" ]]; then
+            # Try alternate order in JSON
+            port_id=$(echo "$response" | grep -Po '"addr_traddr":\s*"'"$sel_ip"'"[^}]*"id":\s*([0-9]+)' | grep -Po '"id":\s*\K[0-9]+' | head -1)
+        fi
+        if [[ -n "$port_id" ]]; then
+            existing_ports+="${sel_ip}:${port_id} "
+        fi
+    done
+
+    if [[ -z "$existing_ports" ]]; then
+        echo "none"
+    else
+        echo "${existing_ports% }"  # Trim trailing space
+    fi
+}
+
+# Display TrueNAS network interfaces in a formatted table
+# Sets global arrays: IFACE_NAMES, IFACE_IPS, IFACE_SPEEDS, IFACE_STATES, IFACE_MGMT
+display_interface_table() {
+    local interfaces_json="$1"
+    local transport_mode="$2"
+    local api_host="$3"
+    local apikey="$4"
+
+    # Initialize global arrays
+    IFACE_NAMES=()
+    IFACE_IPS=()
+    IFACE_SPEEDS=()
+    IFACE_STATES=()
+    IFACE_MGMT=()
+
+    # Check for existing portals/ports
+    local existing_portals=""
+    local existing_nvme_ports=""
+
+    # Parse interfaces from JSON using awk to properly extract per-interface data
+    # TrueNAS interface.query returns: [{name, aliases:[{address,...}], state:{link_state, active_media_subtype}}]
+    # We use awk to parse JSON structure and output: name|ip|link_state|media_subtype (one line per IP)
+    # Note: Uses mawk-compatible syntax (no gawk-specific capture groups)
+    local parsed_interfaces
+    parsed_interfaces=$(echo "$interfaces_json" | awk '
+    # Helper function to extract quoted value after a key
+    # Returns the value between quotes after "key": "value" or "key":"value"
+    # Note: index() does literal matching, so we try both patterns
+    function extract_value(block, key,    pattern, pos, start, end, val) {
+        # Try "key":"value" (no space)
+        pattern = "\"" key "\":\""
+        pos = index(block, pattern)
+        if (pos > 0) {
+            start = pos + length(pattern)
+            end = index(substr(block, start), "\"")
+            if (end > 0) return substr(block, start, end - 1)
+        }
+        # Try "key": "value" (with space)
+        pattern = "\"" key "\": \""
+        pos = index(block, pattern)
+        if (pos > 0) {
+            start = pos + length(pattern)
+            end = index(substr(block, start), "\"")
+            if (end > 0) return substr(block, start, end - 1)
+        }
+        return ""
+    }
+
+    # Helper function to find all IPv4 addresses in a block
+    function find_ipv4_addresses(block, ips,    count, pos, remainder, addr, i, c, in_addr) {
+        count = 0
+        # Look for "address": "X.X.X.X" patterns
+        remainder = block
+        while (1) {
+            pos = index(remainder, "\"address\":")
+            if (pos == 0) break
+            remainder = substr(remainder, pos + 10)  # Skip past "address":
+            # Skip whitespace and opening quote
+            while (substr(remainder, 1, 1) == " ") remainder = substr(remainder, 2)
+            if (substr(remainder, 1, 1) != "\"") continue
+            remainder = substr(remainder, 2)  # Skip opening quote
+            # Extract until closing quote
+            addr = ""
+            for (i = 1; i <= length(remainder); i++) {
+                c = substr(remainder, i, 1)
+                if (c == "\"") break
+                addr = addr c
+            }
+            # Check if it looks like IPv4 (contains only digits and dots)
+            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                count++
+                ips[count] = addr
+            }
+            remainder = substr(remainder, i + 1)
+        }
+        return count
+    }
+
+    BEGIN { RS=""; FS="" }
+    {
+        json = $0
+        # Remove newlines and normalize whitespace
+        gsub(/\n/, " ", json)
+        gsub(/  +/, " ", json)
+
+        # Track brace depth to find interface boundaries
+        n = split(json, chars, "")
+        depth = 0
+        in_array = 0
+        iface_start = 0
+        current_name = ""
+        current_link = "UP"
+        current_speed = ""
+
+        for (i = 1; i <= n; i++) {
+            c = chars[i]
+
+            if (c == "[" && depth == 0) {
+                in_array = 1
+                continue
+            }
+            if (c == "{") {
+                depth++
+                if (depth == 1) {
+                    iface_start = i
+                    current_name = ""
+                    current_link = "UP"
+                    current_speed = ""
+                }
+            }
+            if (c == "}") {
+                depth--
+                if (depth == 0 && iface_start > 0) {
+                    # Extract interface block
+                    iface_block = ""
+                    for (j = iface_start; j <= i; j++) {
+                        iface_block = iface_block chars[j]
+                    }
+
+                    # Extract name using helper function
+                    current_name = extract_value(iface_block, "name")
+
+                    # Extract link_state from state object
+                    link_val = extract_value(iface_block, "link_state")
+                    if (link_val ~ /DOWN/) {
+                        current_link = "DOWN"
+                    } else {
+                        current_link = "UP"
+                    }
+
+                    # Extract active_media_subtype from state object
+                    current_speed = extract_value(iface_block, "active_media_subtype")
+
+                    # Extract all IPv4 addresses from aliases array
+                    delete ip_list
+                    ip_count = find_ipv4_addresses(iface_block, ip_list)
+                    for (k = 1; k <= ip_count; k++) {
+                        ip = ip_list[k]
+                        # Skip localhost
+                        if (ip !~ /^127\./) {
+                            print current_name "|" ip "|" current_link "|" current_speed
+                        }
+                    }
+
+                    iface_start = 0
+                }
+            }
+        }
+    }')
+
+    # Process parsed output into arrays
+    while IFS='|' read -r iface_name ipv4 link_state media_subtype; do
+        [[ -z "$ipv4" ]] && continue
+
+        # Skip if we already have this IP (shouldn't happen with proper parsing)
+        local already_added=false
+        for existing_ip in "${IFACE_IPS[@]}"; do
+            if [[ "$existing_ip" == "$ipv4" ]]; then
+                already_added=true
+                break
+            fi
+        done
+        [[ "$already_added" == "true" ]] && continue
+
+        # Parse speed
+        local speed
+        speed=$(parse_link_speed "$media_subtype")
+
+        # Check if this is the management interface
+        local is_mgmt=""
+        if [[ "$ipv4" == "$api_host" ]]; then
+            is_mgmt="mgmt"
+        fi
+
+        IFACE_NAMES+=("$iface_name")
+        IFACE_IPS+=("$ipv4")
+        IFACE_SPEEDS+=("$speed")
+        IFACE_STATES+=("$link_state")
+        IFACE_MGMT+=("$is_mgmt")
+    done <<< "$parsed_interfaces"
+
+    # Fallback: if awk parsing failed, try simple grep extraction
+    if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
+        local all_ips
+        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=")' | grep -v "^127\." | sort -u)
+        local idx=1
+        for ipv4 in $all_ips; do
+            IFACE_NAMES+=("if${idx}")
+            IFACE_IPS+=("$ipv4")
+            IFACE_SPEEDS+=("-")
+            IFACE_STATES+=("UP")
+            if [[ "$ipv4" == "$api_host" ]]; then
+                IFACE_MGMT+=("mgmt")
+            else
+                IFACE_MGMT+=("")
+            fi
+            ((idx++))
+        done
+    fi
+
+    if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
+        error "No network interfaces with IPv4 addresses found on TrueNAS"
+        return 1
+    fi
+
+    # Check if ALL interfaces are DOWN
+    local all_down=true
+    for state in "${IFACE_STATES[@]}"; do
+        if [[ "$state" == "UP" ]]; then
+            all_down=false
+            break
+        fi
+    done
+
+    if [[ "$all_down" == "true" ]]; then
+        echo
+        warning "All available interfaces are DOWN"
+        warning "Storage may not be accessible until interfaces are active"
+        read -rp "Continue anyway? [y/N]: " continue_down
+        if [[ ! "$continue_down" =~ ^[Yy] ]]; then
+            return 1
+        fi
+    fi
+
+    # Get existing portal/port info for display
+    local all_ips_space="${IFACE_IPS[*]}"
+    if [[ "$transport_mode" == "iscsi" ]]; then
+        existing_portals=$(tn_check_existing_portals "$api_host" "$apikey" "$all_ips_space")
+    else
+        existing_nvme_ports=$(tn_check_existing_nvme_ports "$api_host" "$apikey" "$all_ips_space")
+    fi
+
+    # Display header
+    echo
+    printf '%b%b%s%b\n' "${c6}" "${c8}" "TrueNAS Network Interfaces" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+
+    local portal_col
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        portal_col="NVMe Port"
+    else
+        portal_col="Portal"
+    fi
+    printf "  %-3s %-14s %-17s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+
+    # Display each interface
+    for ((i=0; i<${#IFACE_IPS[@]}; i++)); do
+        local num=$((i+1))
+        local name="${IFACE_NAMES[$i]}"
+        local ip="${IFACE_IPS[$i]}"
+        local speed="${IFACE_SPEEDS[$i]}"
+        local state="${IFACE_STATES[$i]}"
+        local mgmt="${IFACE_MGMT[$i]}"
+
+        # Color for link state
+        local state_color="${c2}"  # Green for UP
+        if [[ "$state" == "DOWN" ]]; then
+            state_color="${c1}"  # Red for DOWN
+        fi
+
+        # Portal/Port status - check per-IP
+        local portal_status="-"
+        if [[ "$mgmt" == "mgmt" ]]; then
+            portal_status="${c3}⚠ Mgmt${c0}"
+        elif [[ "$transport_mode" == "nvme-tcp" ]] && [[ "$existing_nvme_ports" != "none" ]]; then
+            if echo "$existing_nvme_ports" | grep -q -- "^${ip}:"; then
+                portal_status="${c2}✓ Exists${c0}"
+            fi
+        elif [[ "$transport_mode" == "iscsi" ]]; then
+            # Check if this specific IP has an existing portal
+            for portal_ip in "${ISCSI_PORTAL_IPS[@]}"; do
+                if [[ "$portal_ip" == "$ip" ]]; then
+                    portal_status="${c2}✓ Exists${c0}"
+                    break
+                fi
+            done
+        fi
+
+        printf "  %-3s %-14s %-17s %-8s %b%-6s%b %b\n" \
+            "$num" "$name" "$ip" "$speed" "$state_color" "$state" "${c0}" "$portal_status"
+    done
+
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    echo
+
+    return 0
+}
+
+# Handle interface selection with validation
+# Returns selected indices (1-based) in SELECTED_IFACE_INDICES array
+select_interfaces() {
+    local max_index="$1"
+
+    SELECTED_IFACE_INDICES=()
+
+    while true; do
+        read -rp "Select interfaces (space-separated, e.g., '2 3'): " selection
+
+        if [[ -z "$selection" ]]; then
+            error "Must select at least 1 interface"
+            continue
+        fi
+
+        local -a selected=()
+        local -a invalid=()
+
+        for num in $selection; do
+            # Check if it's a number
+            if [[ ! "$num" =~ ^[0-9]+$ ]]; then
+                invalid+=("$num")
+                continue
+            fi
+
+            # Check range
+            if [[ $num -lt 1 ]] || [[ $num -gt $max_index ]]; then
+                invalid+=("$num")
+                continue
+            fi
+
+            # Check for duplicates
+            local is_dup=false
+            for s in "${selected[@]}"; do
+                if [[ "$s" == "$num" ]]; then
+                    is_dup=true
+                    break
+                fi
+            done
+            if [[ "$is_dup" == "false" ]]; then
+                selected+=("$num")
+            fi
+        done
+
+        if [[ ${#invalid[@]} -gt 0 ]]; then
+            warning "Invalid selections: ${invalid[*]}"
+        fi
+
+        if [[ ${#selected[@]} -eq 0 ]]; then
+            error "No valid interfaces selected"
+            continue
+        fi
+
+        # Check for DOWN interfaces and warn
+        local down_ifaces=""
+        for idx in "${selected[@]}"; do
+            local arr_idx=$((idx-1))
+            if [[ "${IFACE_STATES[$arr_idx]}" == "DOWN" ]]; then
+                down_ifaces+="${IFACE_NAMES[$arr_idx]} "
+            fi
+        done
+
+        if [[ -n "$down_ifaces" ]]; then
+            warning "Selected interface(s) are DOWN: ${down_ifaces}"
+            read -rp "Continue with DOWN interfaces? [y/N]: " confirm_down
+            if [[ ! "$confirm_down" =~ ^[Yy] ]]; then
+                continue
+            fi
+        fi
+
+        # Check for management interface
+        for idx in "${selected[@]}"; do
+            local arr_idx=$((idx-1))
+            if [[ "${IFACE_MGMT[$arr_idx]}" == "mgmt" ]]; then
+                warning "Interface ${IFACE_IPS[$arr_idx]} is the management interface"
+                info "Using it for storage may impact API connectivity"
+                read -rp "Include management interface? [y/N]: " confirm_mgmt
+                if [[ ! "$confirm_mgmt" =~ ^[Yy] ]]; then
+                    # Remove from selection
+                    local new_selected=()
+                    for s in "${selected[@]}"; do
+                        if [[ "$s" != "$idx" ]]; then
+                            new_selected+=("$s")
+                        fi
+                    done
+                    selected=("${new_selected[@]}")
+                fi
+            fi
+        done
+
+        if [[ ${#selected[@]} -eq 0 ]]; then
+            error "No interfaces selected after filtering"
+            continue
+        fi
+
+        SELECTED_IFACE_INDICES=("${selected[@]}")
+        break
+    done
+
+    # Display confirmation
+    echo
+    info "Selected interfaces:"
+    for idx in "${SELECTED_IFACE_INDICES[@]}"; do
+        local arr_idx=$((idx-1))
+        printf "  • %-14s %-17s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
+    done
+
     return 0
 }
 
@@ -7245,6 +7923,9 @@ PROV_TARGET_EXISTS="false"
 PROV_PORTAL_IP=""
 PROV_PORTAL_PORT=""
 PROV_PORTAL_ID=""
+PROV_PORTAL_IPS=()           # Array of selected portal IPs for multipath
+PROV_USE_MULTIPATH=""        # "1" if multipath enabled
+PROV_ADDITIONAL_PORTALS=""   # Comma-separated additional portals (IP:port)
 PROV_BLOCKSIZE=""
 PROV_SPARSE=""
 PROV_HOSTNQN=""
@@ -7294,7 +7975,15 @@ show_progress_summary() {
     fi
 
     if [[ -n "$PROV_PORTAL_IP" ]]; then
-        printf "  ${c4}%-18s${c0} %s:%s\n" "Portal:" "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT"
+        if [[ ${#PROV_PORTAL_IPS[@]} -gt 1 ]]; then
+            # Multiple portals - show multipath
+            printf "  ${c4}%-18s${c0} %s ${c2}(multipath: %d)${c0}\n" "Portals:" "${PROV_PORTAL_IPS[0]}:${PROV_PORTAL_PORT}" "${#PROV_PORTAL_IPS[@]}"
+            for ((i=1; i<${#PROV_PORTAL_IPS[@]}; i++)); do
+                printf "  ${c4}%-18s${c0} %s:%s\n" "" "${PROV_PORTAL_IPS[$i]}" "$PROV_PORTAL_PORT"
+            done
+        else
+            printf "  ${c4}%-18s${c0} %s:%s\n" "Portal:" "$PROV_PORTAL_IP" "$PROV_PORTAL_PORT"
+        fi
     fi
 
     echo
@@ -7322,6 +8011,9 @@ collect_provisioning_config() {
     PROV_TARGET_EXISTS="false"
     PROV_PORTAL_IP=""
     PROV_PORTAL_PORT=""
+    PROV_PORTAL_IPS=()
+    PROV_USE_MULTIPATH=""
+    PROV_ADDITIONAL_PORTALS=""
     PROV_BLOCKSIZE=""
     PROV_SPARSE=""
     PROV_HOSTNQN=""
@@ -7522,7 +8214,7 @@ collect_provisioning_config() {
         sleep 1
     fi
 
-    # --- Step 4: Portal Configuration ---
+    # --- Step 4: Portal Configuration (Interface Selection) ---
     clear_screen
     print_banner
     echo
@@ -7535,25 +8227,111 @@ collect_provisioning_config() {
         default_port="4420"
     else
         info "iSCSI Portal Configuration:"
-        default_port="3260"
+        # Query TrueNAS for configured iSCSI port (may differ from default 3260)
+        default_port=$(tn_get_iscsi_port "$host" "$api_key" 2>/dev/null)
+        if [[ -z "$default_port" ]]; then
+            default_port="3260"  # Fallback to standard port
+        fi
     fi
 
-    # Portal IP with validation
-    while true; do
-        read -rp "Portal IP address [${host}]: " PROV_PORTAL_IP
-        PROV_PORTAL_IP=${PROV_PORTAL_IP:-$host}
-        if validate_ip "$PROV_PORTAL_IP"; then
-            break
-        else
-            error "Invalid IP address format"
-        fi
-    done
+    # Query TrueNAS network interfaces
+    echo
+    info "Querying TrueNAS network interfaces..."
+    local interfaces_json
+    interfaces_json=$(tn_query_interfaces "$host" "$api_key")
 
-    # Port is auto-assigned by TrueNAS (3260 for iSCSI, 4420 for NVMe)
-    PROV_PORTAL_PORT="$default_port"
+    local interface_selection_ok=false
+    if [[ -n "$interfaces_json" ]] && [[ "$interfaces_json" != "[]" ]]; then
+        # Display interface table and allow selection
+        if display_interface_table "$interfaces_json" "$transport_mode" "$host" "$api_key"; then
+            local num_interfaces=${#IFACE_IPS[@]}
+
+            if [[ $num_interfaces -gt 0 ]]; then
+                info "Select one or more interfaces for storage access"
+                if [[ $num_interfaces -gt 1 ]]; then
+                    info "Selecting multiple interfaces enables multipath for redundancy/performance"
+                fi
+
+                select_interfaces "$num_interfaces"
+
+                if [[ ${#SELECTED_IFACE_INDICES[@]} -gt 0 ]]; then
+                    interface_selection_ok=true
+
+                    # Build portal IP array from selection
+                    PROV_PORTAL_IPS=()
+                    for idx in "${SELECTED_IFACE_INDICES[@]}"; do
+                        local arr_idx=$((idx-1))
+                        PROV_PORTAL_IPS+=("${IFACE_IPS[$arr_idx]}")
+                    done
+
+                    # Set primary portal from first selection
+                    PROV_PORTAL_IP="${PROV_PORTAL_IPS[0]}"
+                    PROV_PORTAL_PORT="$default_port"
+
+                    # NVMe-specific: prompt for port number
+                    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+                        echo
+                        read -rp "NVMe port [${default_port}]: " nvme_port
+                        nvme_port="${nvme_port:-$default_port}"
+                        PROV_PORTAL_PORT="$nvme_port"
+                    fi
+
+                    # Handle multipath if multiple interfaces selected
+                    if [[ ${#PROV_PORTAL_IPS[@]} -gt 1 ]]; then
+                        # Build additional portals (all except first)
+                        local additional=()
+                        for ((i=1; i<${#PROV_PORTAL_IPS[@]}; i++)); do
+                            additional+=("${PROV_PORTAL_IPS[$i]}:${PROV_PORTAL_PORT}")
+                        done
+                        PROV_ADDITIONAL_PORTALS=$(IFS=,; echo "${additional[*]}")
+
+                        # Check for multipath support
+                        if [[ "$transport_mode" == "iscsi" ]]; then
+                            if ! command -v multipath &> /dev/null; then
+                                warning "multipath-tools package is not installed"
+                                info "Multipath requires: apt-get install multipath-tools"
+                                read -rp "Continue configuring multipath anyway? [y/N]: " continue_mp
+                                if [[ "$continue_mp" =~ ^[Yy] ]]; then
+                                    PROV_USE_MULTIPATH="1"
+                                else
+                                    info "Using first interface only for storage access"
+                                    PROV_PORTAL_IPS=("${PROV_PORTAL_IPS[0]}")
+                                    PROV_ADDITIONAL_PORTALS=""
+                                fi
+                            else
+                                PROV_USE_MULTIPATH="1"
+                                info "Multipath enabled with ${#PROV_PORTAL_IPS[@]} interfaces"
+                            fi
+                        else
+                            # NVMe/TCP uses native kernel multipath
+                            info "NVMe/TCP will use native kernel multipath with ${#PROV_PORTAL_IPS[@]} interfaces"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # Fallback to manual entry if interface selection failed
+    if [[ "$interface_selection_ok" != "true" ]]; then
+        warning "Could not query TrueNAS interfaces, using manual entry"
+        while true; do
+            read -rp "Portal IP address [${host}]: " PROV_PORTAL_IP
+            PROV_PORTAL_IP=${PROV_PORTAL_IP:-$host}
+            if validate_ip "$PROV_PORTAL_IP"; then
+                break
+            else
+                error "Invalid IP address format"
+            fi
+        done
+        PROV_PORTAL_PORT="$default_port"
+        PROV_PORTAL_IPS=("$PROV_PORTAL_IP")
+    fi
 
     WIZARD_PORTAL_IP="$PROV_PORTAL_IP"
     WIZARD_PORTAL_PORT="$PROV_PORTAL_PORT"
+    WIZARD_PORTAL_IPS=("${PROV_PORTAL_IPS[@]}")
+    WIZARD_USE_MULTIPATH="$PROV_USE_MULTIPATH"
 
     # --- Step 5: Block Size Configuration ---
     clear_screen
@@ -7659,7 +8437,7 @@ collect_provisioning_config() {
             echo "  $existing_hostnqn"
             echo
             while true; do
-                read -rp "Use this host NQN? [Y/n] [Y]: " use_existing
+                read -rp "Use this host NQN? [Y/n]: " use_existing
                 use_existing="${use_existing:-Y}"
                 if [[ "$use_existing" =~ ^[Yy]$ ]]; then
                     PROV_HOSTNQN="$existing_hostnqn"
@@ -8803,6 +9581,8 @@ WIZARD_TARGET=""             # IQN or NQN
 WIZARD_TARGET_EXISTS=""      # "true" if target/subsystem already exists
 WIZARD_PORTAL_IP=""          # Portal IP address
 WIZARD_PORTAL_PORT=""        # Portal port
+WIZARD_PORTAL_IPS=()         # Array of portal IPs for multipath
+WIZARD_USE_MULTIPATH=""      # "1" if multipath enabled
 WIZARD_BLOCKSIZE=""          # Block size (e.g., 16K)
 WIZARD_SPARSE=""             # Sparse volume (0 or 1)
 WIZARD_HOSTNQN=""            # Host NQN for NVMe/TCP
@@ -8921,13 +9701,23 @@ show_wizard_summary() {
             fi
         fi
 
-        # Portal
+        # Portal (iSCSI) / Discovery (NVMe/TCP)
+        local portal_label="Portal"
+        local portals_label="Portals"
+        if [[ "$WIZARD_TRANSPORT_MODE" == "nvme-tcp" ]]; then
+            portal_label="Discovery"
+            portals_label="Discovery"
+        fi
         if [[ -n "$WIZARD_PORTAL_IP" ]]; then
-            echo -e "  ${c2}✓${c0} Portal:              ${WIZARD_PORTAL_IP}:${WIZARD_PORTAL_PORT}"
+            if [[ ${#WIZARD_PORTAL_IPS[@]} -gt 1 ]]; then
+                echo -e "  ${c2}✓${c0} ${portals_label}:             ${WIZARD_PORTAL_IP}:${WIZARD_PORTAL_PORT} ${c2}(multipath: ${#WIZARD_PORTAL_IPS[@]})${c0}"
+            else
+                echo -e "  ${c2}✓${c0} ${portal_label}:              ${WIZARD_PORTAL_IP}:${WIZARD_PORTAL_PORT}"
+            fi
         elif [[ "$current_step" == "portal" ]]; then
-            echo -e "  ${c6}▸${c0} Portal:              ${c6}(configuring...)${c0}"
+            echo -e "  ${c6}▸${c0} ${portal_label}:              ${c6}(configuring...)${c0}"
         elif [[ -n "$WIZARD_TARGET" ]]; then
-            echo -e "    Portal:              ${c6}(pending)${c0}"
+            echo -e "    ${portal_label}:              ${c6}(pending)${c0}"
         fi
 
         # Block Size
@@ -8986,6 +9776,8 @@ reset_wizard_state() {
     WIZARD_TARGET_EXISTS=""
     WIZARD_PORTAL_IP=""
     WIZARD_PORTAL_PORT=""
+    WIZARD_PORTAL_IPS=()
+    WIZARD_USE_MULTIPATH=""
     WIZARD_BLOCKSIZE=""
     WIZARD_SPARSE=""
     WIZARD_HOSTNQN=""
@@ -9389,8 +10181,8 @@ menu_configure_storage() {
             local hostnqn=""
             local blocksize="$PROV_BLOCKSIZE"
             local sparse="$PROV_SPARSE"
-            local use_multipath=""
-            local portals=""
+            local use_multipath="$PROV_USE_MULTIPATH"
+            local portals="$PROV_ADDITIONAL_PORTALS"
 
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
                 subsystem_nqn="$PROVISIONED_SUBSYSTEM_NQN"
