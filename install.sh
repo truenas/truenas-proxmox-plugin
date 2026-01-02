@@ -5477,25 +5477,54 @@ run_health_check() {
 
     # Check 13: Weight volume presence (iSCSI only)
     if [[ "$transport_mode" == "iscsi" ]]; then
-        local weight_zvol="${dataset}/pve-plugin-weight"
-        local weight_encoded=$(echo "$weight_zvol" | sed 's/\//%2F/g')
         local weight_check_failed=0
+        local weight_name=""
 
-        # Check if weight zvol exists via API
+        # Get target IQN to derive weight volume name
+        local target_iqn
+        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+
+        # Derive weight name from IQN (same logic as plugin)
+        # Extract suffix from IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
+        local target_suffix="$target_iqn"
+        if [[ "$target_iqn" =~ :([^:]+)$ ]]; then
+            target_suffix="${BASH_REMATCH[1]}"
+        fi
+        # Sanitize for zvol name (replace non-alphanumeric with dash)
+        target_suffix=$(echo "$target_suffix" | sed 's/[^a-zA-Z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//')
+        local new_weight_name="pve-weight-$target_suffix"
+        local old_weight_name="pve-plugin-weight"
+
+        # Check for new format first, then old format for backwards compatibility
+        local weight_zvol_new="${dataset}/${new_weight_name}"
+        local weight_zvol_old="${dataset}/${old_weight_name}"
+        local weight_encoded_new=$(echo "$weight_zvol_new" | sed 's/\//%2F/g')
+        local weight_encoded_old=$(echo "$weight_zvol_old" | sed 's/\//%2F/g')
+
+        # Check if weight zvol exists via API (try new format first)
         local zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
-            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded" 2>/dev/null)
+            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded_new" 2>/dev/null)
 
-        if ! echo "$zvol_response" | grep -q '"id"'; then
-            check_result "Weight volume presence" "WARNING" "Weight zvol missing"
-            weight_check_failed=1
+        if echo "$zvol_response" | grep -q '"id"'; then
+            weight_name="$new_weight_name"
+        else
+            # Try old format for backwards compatibility
+            zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
+                "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded_old" 2>/dev/null)
+            if echo "$zvol_response" | grep -q '"id"'; then
+                weight_name="$old_weight_name"
+            else
+                check_result "Weight volume presence" "WARNING" "Weight zvol missing"
+                weight_check_failed=1
+            fi
         fi
 
         # Check if weight extent exists (only if zvol exists)
-        if [[ $weight_check_failed -eq 0 ]]; then
+        if [[ $weight_check_failed -eq 0 ]] && [[ -n "$weight_name" ]]; then
             local extent_response=$(curl -sk -H "Authorization: Bearer $api_key" \
                 "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null)
 
-            if ! echo "$extent_response" | grep -q '"name": "pve-plugin-weight"'; then
+            if ! echo "$extent_response" | grep -q "\"name\": \"$weight_name\""; then
                 check_result "Weight volume presence" "WARNING" "Weight extent missing"
                 weight_check_failed=1
             fi
@@ -5503,7 +5532,7 @@ run_health_check() {
 
         # If both exist, report OK
         if [[ $weight_check_failed -eq 0 ]]; then
-            check_result "Weight volume presence" "OK" "Present and configured"
+            check_result "Weight volume presence" "OK" "Present ($weight_name)"
         fi
     else
         # NVMe/TCP mode - skip weight check (not applicable)
