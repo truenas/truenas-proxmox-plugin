@@ -38,6 +38,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - ["Volume created but device not accessible after 10 seconds"](#volume-created-but-device-not-accessible-after-10-seconds)
 - [VM Deletion Issues](#vm-deletion-issues)
   - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
+  - [Stale NVMe Namespaces](#stale-nvme-namespaces)
   - [Warnings During VM Deletion](#warnings-during-vm-deletion)
   - [Stale SCSI Devices After Disk Deletion](#stale-scsi-devices-after-disk-deletion)
 - [Snapshot Issues](#snapshot-issues)
@@ -1444,7 +1445,28 @@ multipath -r
 
 **Solutions**:
 
-#### 1. Manual Cleanup
+#### 1. Use Installer Cleanup Tool (Recommended)
+
+The installer includes an integrated orphan cleanup utility that supports both iSCSI and NVMe/TCP:
+
+```bash
+./install.sh
+# Choose: Diagnostics
+# Choose: Cleanup orphaned resources
+# Select the affected storage
+# Review detected orphans
+# Type 'DELETE' to confirm cleanup
+```
+
+This tool automatically:
+- Detects transport mode (iSCSI or NVMe/TCP)
+- Identifies orphaned resources (zvols, extents/namespaces, mappings)
+- Deletes them in the correct dependency order
+- Reports success/failure for each resource
+
+See [Advanced Features - Orphan Resource Cleanup](Advanced-Features.md#orphan-resource-cleanup) for detailed documentation.
+
+#### 2. Manual Cleanup via pvesm
 ```bash
 # List remaining volumes for deleted VM
 pvesm list truenas-storage | grep vm-100
@@ -1454,7 +1476,7 @@ pvesm free truenas-storage:vm-100-disk-0-lun1
 pvesm free truenas-storage:vm-100-disk-1-lun2
 ```
 
-#### 2. Direct ZFS Cleanup (if plugin fails)
+#### 3. Direct ZFS Cleanup (if plugin fails)
 ```bash
 # On TrueNAS, list zvols
 zfs list -t volume | grep vm-100
@@ -1463,16 +1485,34 @@ zfs list -t volume | grep vm-100
 zfs destroy tank/proxmox/vm-100-disk-0
 zfs destroy tank/proxmox/vm-100-disk-1
 
-# Clean up iSCSI extents via web UI:
-# Shares > Block Shares (iSCSI) > Extents
-# Delete extents for vm-100
+# Clean up transport mappings via TrueNAS web UI:
+# For iSCSI: Shares > Block Shares (iSCSI) > Extents
+# For NVMe: Shares > Block Shares (NVMe-oF) > Namespaces
+# Delete entries for vm-100
 ```
 
-#### 3. Prevention: Use GUI for Deletion
+#### 4. Prevention: Use GUI for Deletion
 ```bash
 # Recommended: Always delete VMs via Proxmox web UI
 # This ensures proper cleanup of all resources
 ```
+
+### Stale NVMe Namespaces
+
+**Symptom**: NVMe namespaces exist on TrueNAS but the corresponding zvol is missing
+
+**Cause**: Partial deletion where zvol was removed but namespace deletion failed
+
+**Diagnosis**:
+```bash
+# Check for stale namespaces via installer
+./install.sh
+# Choose: Diagnostics
+# Choose: Cleanup orphaned resources
+# Select NVMe/TCP storage
+```
+
+**Solution**: Use the installer cleanup tool as described above. The tool will detect namespaces with invalid `device_path` entries and offer to delete them.
 
 ### Warnings During VM Deletion
 

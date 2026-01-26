@@ -3663,6 +3663,8 @@ run_plugin_test() {
 
 # Menu: Cleanup orphaned resources
 menu_cleanup_orphans() {
+    local storage_name
+
     clear_screen
     print_banner
     echo
@@ -3677,37 +3679,64 @@ menu_cleanup_orphans() {
         return 1
     fi
 
-    local storages
-    storages=$(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
+    # Build array of storage names
+    local -a storage_list=()
+    while IFS= read -r storage; do
+        [[ -n "$storage" ]] && storage_list+=("$storage")
+    done < <(grep "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | awk '{print $2}')
 
-    if [[ -z "$storages" ]]; then
+    if [[ ${#storage_list[@]} -eq 0 ]]; then
         warning "No TrueNAS storage configured"
         info "Please configure storage first from the main menu"
         read -rp "Press Enter to continue..."
         return 1
     fi
 
-    # Show available storage
-    info "Available TrueNAS storage:"
-    while IFS= read -r storage; do
-        echo "  • $storage"
-    done <<< "$storages"
+    # Auto-select if only one storage exists
+    if [[ ${#storage_list[@]} -eq 1 ]]; then
+        storage_name="${storage_list[0]}"
+        info "Using storage: $storage_name"
+        echo
+    else
+        # Show numbered list for selection
+        info "Select storage for orphan cleanup:"
+        echo
+        local i=1
+        for storage in "${storage_list[@]}"; do
+            local mode
+            mode=$(get_storage_config_value "$storage" "transport_mode" || true)
+            [[ -z "$mode" ]] && mode="iscsi"
+            echo "  $i) $storage ($mode)"
+            ((i++))
+        done
+        echo "  0) Cancel"
+        echo
+
+        # Prompt for selection
+        local choice
+        while true; do
+            read -rp "Enter choice [0-$((${#storage_list[@]}))]: " choice
+
+            # Handle cancel
+            if [[ "$choice" == "0" ]]; then
+                info "Returning to main menu"
+                return 0
+            fi
+
+            # Validate numeric input
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#storage_list[@]} ]]; then
+                storage_name="${storage_list[$((choice-1))]}"
+                break
+            fi
+
+            warning "Invalid choice - please enter a number between 0 and ${#storage_list[@]}"
+        done
+    fi
+
+    # Clear screen after valid storage selection
+    clear_screen
+    print_banner
     echo
-
-    # Prompt for storage selection
-    local storage_name
-    read -rp "Enter storage name: " storage_name
-
-    if [[ -z "$storage_name" ]]; then
-        warning "Storage name cannot be empty"
-        return 1
-    fi
-
-    # Verify storage exists
-    if ! echo "$storages" | grep -q "^${storage_name}$"; then
-        error "Storage '$storage_name' not found"
-        return 1
-    fi
 
     # Get storage configuration
     local api_host api_key dataset api_insecure transport_mode
@@ -3720,206 +3749,463 @@ menu_cleanup_orphans() {
     # Default to iscsi if not specified
     [[ -z "$transport_mode" ]] && transport_mode="iscsi"
 
-    # Check if NVMe mode
-    if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        warning "Orphan cleanup is not supported for NVMe/TCP storage"
-        info "NVMe/TCP orphan detection requires WebSocket API (not yet implemented)"
-        return 0
-    fi
-
     echo
-    info "Detecting orphaned resources for storage '$storage_name'..."
-    echo
-
-    # Set curl options
-    local curl_opts="-s"
-    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
-
-    # Fetch data from TrueNAS API
-    info "Fetching iSCSI extents..."
-    local extents
-    extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || {
-        error "Failed to fetch extents from TrueNAS API"
-        return 1
-    }
-
-    info "Fetching zvols..."
-    local zvols
-    zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || {
-        error "Failed to fetch zvols from TrueNAS API"
-        return 1
-    }
-
-    info "Fetching target-extent mappings..."
-    local targetextents
-    targetextents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/targetextent" 2>/dev/null) || {
-        error "Failed to fetch targetextents from TrueNAS API"
-        return 1
-    }
-
-    echo
-    info "Analyzing resources..."
+    info "Detecting orphaned resources for storage '$storage_name' (transport: $transport_mode)..."
     echo
 
     # Arrays to store orphan IDs
-    local -a extent_orphans=()
-    local -a te_orphans=()
-    local -a zvol_orphans=()
+    # iSCSI uses local arrays populated within this function
+    local -a iscsi_extent_orphans=()
+    local -a iscsi_te_orphans=()
+    local -a iscsi_zvol_orphans=()
+    # NVMe uses global arrays populated by _detect_orphaned_resources_nvme
+    declare -ga nvme_ns_orphans=()
+    declare -ga zvol_orphans=()
+    declare -ga nvme_subsys_orphans=()
     local orphan_count=0
 
-    # Check extents without zvols
-    local extent_data
-    extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # NVMe/TCP mode - use WebSocket API via tn_api_call
+        # Note: Call directly (not via $(...)) to preserve global array modifications
+        # Temporarily disable errexit to capture non-zero orphan count without exiting
+        info "Fetching NVMe namespaces and zvols..."
+        set +e
+        _detect_orphaned_resources_nvme "$api_host" "$api_key" "$dataset"
+        orphan_count=$?
+        set -e
+        if [[ $orphan_count -eq 255 ]]; then
+            error "Failed to detect orphaned NVMe resources"
+            return 1
+        fi
+        echo
+        info "Analyzing resources..."
+        echo
+    else
+        # iSCSI mode - use WebSocket API via tn_api_call
+        # Fetch data from TrueNAS API
+        info "Fetching iSCSI extents..."
+        local extents
+        extents=$(tn_api_call "$api_host" "$api_key" "iscsi.extent.query" '[[]]' 2>&1) || {
+            error "Failed to fetch extents from TrueNAS API"
+            return 1
+        }
 
-    for extent_id in $extent_data; do
-        local extent_disk
-        extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /\"id\": *${extent_id}/,/}/p }" | \
-                     grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1 || true)
+        info "Fetching zvols..."
+        local zvols
+        zvols=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" '[[["type", "=", "VOLUME"]]]' 2>&1) || {
+            error "Failed to fetch zvols from TrueNAS API"
+            return 1
+        }
 
-        [[ -z "$extent_disk" ]] && continue
+        info "Fetching target-extent mappings..."
+        local targetextents
+        targetextents=$(tn_api_call "$api_host" "$api_key" "iscsi.targetextent.query" '[[]]' 2>&1) || {
+            error "Failed to fetch targetextents from TrueNAS API"
+            return 1
+        }
 
-        # Check if zvol is under our dataset and exists
-        if [[ "$extent_disk" == "$dataset/"* ]]; then
+        echo
+        info "Analyzing resources..."
+        echo
+
+        # Check extents without zvols
+        local extent_data
+        extent_data=$(echo "$extents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+        for extent_id in $extent_data; do
+            local extent_disk
+            extent_disk=$(echo "$extents" | sed -n "/{/,/}/{ /\"id\": *${extent_id}/,/}/p }" | \
+                         grep -o '"disk": *"zvol/[^"]*"' | sed 's/"disk": *"zvol\///' | sed 's/"$//' | head -1 || true)
+
+            [[ -z "$extent_disk" ]] && continue
+
+            # Check if zvol is under our dataset and exists
+            if [[ "$extent_disk" == "$dataset/"* ]]; then
+                # Use grep -c and capture first line only to avoid newline issues
+                local zvol_match_count
+                zvol_match_count=$(echo "$zvols" | grep -c "\"id\": *\"${extent_disk}\"" 2>/dev/null | head -1) || zvol_match_count=0
+                if [[ "${zvol_match_count:-0}" -eq 0 ]]; then
+                    iscsi_extent_orphans+=("$extent_id")
+                    orphan_count=$((orphan_count + 1))
+                fi
+            fi
+        done
+
+        # Check targetextents without extents
+        local te_data
+        te_data=$(echo "$targetextents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+
+        for te_id in $te_data; do
+            local extent_ref
+            extent_ref=$(echo "$targetextents" | sed -n "/{/,/}/{ /\"id\": *${te_id}/,/}/p }" | \
+                        grep -o '"extent": *[0-9]*' | sed 's/"extent": *//' | head -1 || true)
+
+            [[ -z "$extent_ref" ]] && continue
+
             # Use grep -c and capture first line only to avoid newline issues
-            local zvol_match_count
-            zvol_match_count=$(echo "$zvols" | grep -c "\"id\": *\"${extent_disk}\"" 2>/dev/null | head -1) || zvol_match_count=0
-            if [[ "${zvol_match_count:-0}" -eq 0 ]]; then
-                extent_orphans+=("$extent_id")
+            local extent_match_count
+            extent_match_count=$(echo "$extents" | grep -c "\"id\": *${extent_ref}" 2>/dev/null | head -1) || extent_match_count=0
+            if [[ "${extent_match_count:-0}" -eq 0 ]]; then
+                iscsi_te_orphans+=("$te_id")
+                orphan_count=$((orphan_count + 1))
+            # Also check if this target-extent references an orphan extent (zvol missing)
+            elif [[ " ${iscsi_extent_orphans[*]} " == *" ${extent_ref} "* ]]; then
+                iscsi_te_orphans+=("$te_id")
                 orphan_count=$((orphan_count + 1))
             fi
-        fi
-    done
+        done
 
-    # Check targetextents without extents
-    local te_data
-    te_data=$(echo "$targetextents" | grep -o '"id": *[0-9]*' | sed 's/"id": *//' || true)
+        # Check zvols without extents
+        local zvol_ids
+        zvol_ids=$(echo "$zvols" | { grep -B2 -A2 "\"type\": *\"VOLUME\"" || true; } | \
+                  { grep "\"id\": *\"${dataset}/" || true; } | sed 's/.*"id": *"\([^"]*\)".*/\1/' || true)
 
-    for te_id in $te_data; do
-        local extent_ref
-        extent_ref=$(echo "$targetextents" | sed -n "/{/,/}/{ /\"id\": *${te_id}/,/}/p }" | \
-                    grep -o '"extent": *[0-9]*' | sed 's/"extent": *//' | head -1 || true)
+        for zvol_id in $zvol_ids; do
+            local zvol_disk="zvol/${zvol_id}"
+            # Use grep -c and capture first line only to avoid newline issues
+            local match_count
+            match_count=$(echo "$extents" | grep -c "\"disk\": *\"${zvol_disk}\"" 2>/dev/null | head -1) || match_count=0
+            if [[ "${match_count:-0}" -eq 0 ]]; then
+                iscsi_zvol_orphans+=("$zvol_id")
+                orphan_count=$((orphan_count + 1))
+            fi
+        done
+    fi
 
-        [[ -z "$extent_ref" ]] && continue
+    # Calculate storage-scoped vs global orphan counts
+    local storage_orphan_count=0
+    local global_orphan_count=0
 
-        # Use grep -c and capture first line only to avoid newline issues
-        local extent_match_count
-        extent_match_count=$(echo "$extents" | grep -c "\"id\": *${extent_ref}" 2>/dev/null | head -1) || extent_match_count=0
-        if [[ "${extent_match_count:-0}" -eq 0 ]]; then
-            te_orphans+=("$te_id")
-            orphan_count=$((orphan_count + 1))
-        # Also check if this target-extent references an orphan extent (zvol missing)
-        elif [[ " ${extent_orphans[*]} " == *" ${extent_ref} "* ]]; then
-            te_orphans+=("$te_id")
-            orphan_count=$((orphan_count + 1))
-        fi
-    done
-
-    # Check zvols without extents
-    local zvol_ids
-    zvol_ids=$(echo "$zvols" | { grep -B2 -A2 "\"type\": *\"VOLUME\"" || true; } | \
-              { grep "\"id\": *\"${dataset}/" || true; } | sed 's/.*"id": *"\([^"]*\)".*/\1/' || true)
-
-    for zvol_id in $zvol_ids; do
-        local zvol_disk="zvol/${zvol_id}"
-        # Use grep -c and capture first line only to avoid newline issues
-        local match_count
-        match_count=$(echo "$extents" | grep -c "\"disk\": *\"${zvol_disk}\"" 2>/dev/null | head -1) || match_count=0
-        if [[ "${match_count:-0}" -eq 0 ]]; then
-            zvol_orphans+=("$zvol_id")
-            orphan_count=$((orphan_count + 1))
-        fi
-    done
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        storage_orphan_count=$((${#nvme_ns_orphans[@]} + ${#zvol_orphans[@]}))
+        global_orphan_count=${#nvme_subsys_orphans[@]}
+    else
+        storage_orphan_count=$((${#iscsi_extent_orphans[@]} + ${#iscsi_te_orphans[@]} + ${#iscsi_zvol_orphans[@]}))
+        global_orphan_count=0
+    fi
 
     # Report findings
     if [[ $orphan_count -eq 0 ]]; then
         success "No orphaned resources found"
+        read -rp "Press Enter to continue..."
         return 0
     fi
 
-    error "Found $orphan_count orphaned resource(s):"
-    echo
+    # Display orphans grouped by category with reasoning headers
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # Storage-scoped orphans section
+        if [[ $storage_orphan_count -gt 0 ]]; then
+            info "Storage Orphans for '$storage_name' ($storage_orphan_count):"
+            echo "  Scoped to dataset: $dataset"
+            echo
 
-    # Display orphans
-    for extent_id in "${extent_orphans[@]}"; do
-        echo "  • [EXTENT] ID: $extent_id (zvol missing)"
-    done
+            if [[ ${#nvme_ns_orphans[@]} -gt 0 ]]; then
+                echo "  Orphaned Namespaces (${#nvme_ns_orphans[@]}):"
+                echo "    These namespaces reference zvols that no longer exist."
+                for ns_entry in "${nvme_ns_orphans[@]}"; do
+                    local ns_id="${ns_entry%%:*}"
+                    local ns_path="${ns_entry#*:}"
+                    echo "    • ID: $ns_id, Path: $ns_path"
+                done
+                echo
+            fi
 
-    for te_id in "${te_orphans[@]}"; do
-        echo "  • [TARGET-EXTENT] ID: $te_id (extent missing)"
-    done
+            if [[ ${#zvol_orphans[@]} -gt 0 ]]; then
+                echo "  Orphaned Zvols (${#zvol_orphans[@]}):"
+                echo "    These zvols exist but have no NVMe namespace exposing them."
+                for zvol_id in "${zvol_orphans[@]}"; do
+                    echo "    • $zvol_id"
+                done
+                echo
+            fi
+        fi
 
-    for zvol_id in "${zvol_orphans[@]}"; do
-        echo "  • [ZVOL] $zvol_id (no extent pointing to this zvol)"
-    done
+        # Global orphans section (subsystems)
+        if [[ ${#nvme_subsys_orphans[@]} -gt 0 ]]; then
+            warning "Global Orphans (${#nvme_subsys_orphans[@]}):"
+            echo "  These affect ALL storages on this TrueNAS server."
+            echo
 
-    echo
-    warning "WARNING: This will permanently delete these orphaned resources!"
-    echo
+            echo "  Orphaned Subsystems (${#nvme_subsys_orphans[@]}):"
+            echo "    Empty subsystems not referenced by any storage configuration."
+            for subsys_entry in "${nvme_subsys_orphans[@]}"; do
+                local subsys_id="${subsys_entry%%|*}"
+                local rest="${subsys_entry#*|}"
+                local subsys_name="${rest%%|*}"
+                echo "    • ID: $subsys_id, Name: $subsys_name"
+            done
+            echo
+        fi
+    else
+        # iSCSI orphans - all storage-scoped
+        info "Storage Orphans for '$storage_name' ($storage_orphan_count):"
+        echo "  Scoped to dataset: $dataset"
+        echo
 
-    # Typed confirmation
-    local confirm
-    read -rp "Type 'DELETE' (all caps) to confirm deletion: " confirm
-    if [[ "$confirm" != "DELETE" ]]; then
-        warning "Confirmation failed. Cleanup cancelled."
-        return 1
+        if [[ ${#iscsi_extent_orphans[@]} -gt 0 ]]; then
+            echo "  Orphaned Extents (${#iscsi_extent_orphans[@]}):"
+            echo "    These extents reference zvols that no longer exist."
+            for extent_id in "${iscsi_extent_orphans[@]}"; do
+                echo "    • ID: $extent_id"
+            done
+            echo
+        fi
+
+        if [[ ${#iscsi_te_orphans[@]} -gt 0 ]]; then
+            echo "  Orphaned Target-Extents (${#iscsi_te_orphans[@]}):"
+            echo "    These target-extent mappings reference extents that no longer exist."
+            for te_id in "${iscsi_te_orphans[@]}"; do
+                echo "    • ID: $te_id"
+            done
+            echo
+        fi
+
+        if [[ ${#iscsi_zvol_orphans[@]} -gt 0 ]]; then
+            echo "  Orphaned Zvols (${#iscsi_zvol_orphans[@]}):"
+            echo "    These zvols exist but have no iSCSI extent exposing them."
+            for zvol_id in "${iscsi_zvol_orphans[@]}"; do
+                echo "    • $zvol_id"
+            done
+            echo
+        fi
     fi
 
+    # DRYRUN/DELETE prompt
+    local action
+    read -rp "Type DRYRUN to preview deletion details, or DELETE to remove now: " action
+
+    if [[ "$action" == "DRYRUN" ]]; then
+        # Show detailed dry run preview
+        clear_screen
+        print_banner
+        echo
+        info "=== DRY RUN PREVIEW ==="
+        echo
+
+        local op_num=0
+
+        if [[ "$transport_mode" == "nvme-tcp" ]]; then
+            # Storage-scoped operations
+            if [[ $storage_orphan_count -gt 0 ]]; then
+                echo "Storage-scoped operations (dataset: $dataset):"
+                echo
+
+                for ns_entry in "${nvme_ns_orphans[@]}"; do
+                    local ns_id="${ns_entry%%:*}"
+                    local ns_path="${ns_entry#*:}"
+                    ((++op_num))
+                    echo "  [$op_num] Delete NVMe namespace ID: $ns_id"
+                    echo "      Reason: References $ns_path which no longer exists"
+                    echo
+                done
+
+                for zvol_id in "${zvol_orphans[@]}"; do
+                    ((++op_num))
+                    echo "  [$op_num] Delete zvol: $zvol_id"
+                    echo "      Reason: No NVMe namespace exposes this zvol"
+                    echo
+                done
+            fi
+
+            # Global operations (subsystems)
+            if [[ ${#nvme_subsys_orphans[@]} -gt 0 ]]; then
+                echo "Global operations (affects ALL storages on this TrueNAS):"
+                echo
+
+                for subsys_entry in "${nvme_subsys_orphans[@]}"; do
+                    local subsys_id="${subsys_entry%%|*}"
+                    local rest="${subsys_entry#*|}"
+                    local subsys_name="${rest%%|*}"
+                    ((++op_num))
+                    echo "  [$op_num] Delete NVMe subsystem: $subsys_name (ID: $subsys_id)"
+                    echo "      Reason: Subsystem is empty and not referenced in any storage.cfg"
+                    echo
+                done
+            fi
+        else
+            # iSCSI - all storage-scoped
+            echo "Storage-scoped operations (dataset: $dataset):"
+            echo
+
+            for te_id in "${iscsi_te_orphans[@]}"; do
+                ((++op_num))
+                echo "  [$op_num] Delete target-extent mapping ID: $te_id"
+                echo "      Reason: References an extent that no longer exists"
+                echo
+            done
+
+            for extent_id in "${iscsi_extent_orphans[@]}"; do
+                ((++op_num))
+                echo "  [$op_num] Delete extent ID: $extent_id"
+                echo "      Reason: References a zvol that no longer exists"
+                echo
+            done
+
+            for zvol_id in "${iscsi_zvol_orphans[@]}"; do
+                ((++op_num))
+                echo "  [$op_num] Delete zvol: $zvol_id"
+                echo "      Reason: No iSCSI extent exposes this zvol"
+                echo
+            done
+        fi
+
+        info "=== END DRY RUN ($op_num operations) ==="
+        echo
+
+        # Post-preview prompt
+        local confirm_action
+        read -rp "Type DELETE to proceed, or press Enter to cancel: " confirm_action
+
+        if [[ "$confirm_action" != "DELETE" ]]; then
+            info "Cleanup cancelled - returning to main menu"
+            return 0
+        fi
+        # Fall through to deletion
+    elif [[ "$action" != "DELETE" ]]; then
+        # Invalid option - return to menu
+        info "Invalid option - returning to main menu"
+        read -rp "Press Enter to continue..."
+        return 0
+    fi
+
+    # Clear screen before deletion
+    clear_screen
+    print_banner
     echo
-    info "Cleaning up orphaned resources..."
+    info "Deleting Orphaned Resources"
     echo
 
-    # Delete targetextents first (they reference extents)
-    if [[ ${#te_orphans[@]} -gt 0 ]]; then
-        local response http_code
-        for te_id in "${te_orphans[@]}"; do
-            info "Deleting target-extent mapping ID: $te_id..."
-            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/targetextent/id/$te_id" 2>&1)
-            http_code="${response: -3}"
-            response="${response:0:-3}"
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                success "  Deleted target-extent $te_id"
+    local delete_success=0
+    local delete_failed=0
+
+    if [[ "$transport_mode" == "nvme-tcp" ]]; then
+        # NVMe/TCP cleanup using WebSocket API with spinner progress
+
+        # Storage-scoped deletions
+        if [[ $storage_orphan_count -gt 0 ]]; then
+            echo "Storage-scoped (dataset: $dataset):"
+
+            # Delete namespaces first
+            for ns_entry in "${nvme_ns_orphans[@]}"; do
+                local ns_id="${ns_entry%%:*}"
+                local ns_path="${ns_entry#*:}"
+                printf "%-40s " "  Namespace $ns_id:"
+                start_spinner
+                local result rc=0
+                result=$(tn_api_call_write "$api_host" "$api_key" "nvmet.namespace.delete" "[$ns_id]" 2>&1) || rc=$?
+                stop_spinner
+                if [[ $rc -eq 0 ]]; then
+                    echo -e "\r\033[K$(printf "%-40s " "  Namespace $ns_id:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                    ((++delete_success))
+                else
+                    echo -e "\r\033[K$(printf "%-40s " "  Namespace $ns_id:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                    ((++delete_failed))
+                fi
+            done
+
+            # Delete orphaned zvols
+            for zvol_id in "${zvol_orphans[@]}"; do
+                local short_zvol="${zvol_id##*/}"
+                printf "%-40s " "  Zvol $short_zvol:"
+                start_spinner
+                local result rc=0
+                result=$(tn_api_call_write "$api_host" "$api_key" "pool.dataset.delete" "[\"$zvol_id\"]" 2>&1) || rc=$?
+                stop_spinner
+                if [[ $rc -eq 0 ]]; then
+                    echo -e "\r\033[K$(printf "%-40s " "  Zvol $short_zvol:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                    ((++delete_success))
+                else
+                    echo -e "\r\033[K$(printf "%-40s " "  Zvol $short_zvol:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                    ((++delete_failed))
+                fi
+            done
+            echo
+        fi
+
+        # Global deletions (subsystems)
+        if [[ ${#nvme_subsys_orphans[@]} -gt 0 ]]; then
+            echo "Global (affects all storages):"
+
+            for subsys_entry in "${nvme_subsys_orphans[@]}"; do
+                local subsys_id="${subsys_entry%%|*}"
+                local rest="${subsys_entry#*|}"
+                local subsys_name="${rest%%|*}"
+                printf "%-40s " "  Subsystem $subsys_name:"
+                start_spinner
+                local result rc=0
+                # Use force=true to also remove port associations (subsystem is already empty per orphan detection)
+                result=$(tn_api_call_write "$api_host" "$api_key" "nvmet.subsys.delete" "[$subsys_id, {\"force\": true}]" 2>&1) || rc=$?
+                stop_spinner
+                if [[ $rc -eq 0 ]]; then
+                    echo -e "\r\033[K$(printf "%-40s " "  Subsystem $subsys_name:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                    ((++delete_success))
+                else
+                    echo -e "\r\033[K$(printf "%-40s " "  Subsystem $subsys_name:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                    ((++delete_failed))
+                fi
+            done
+        fi
+    else
+        # iSCSI cleanup using WebSocket API with spinner progress
+        echo "Storage-scoped (dataset: $dataset):"
+
+        # Delete targetextents first (they reference extents)
+        for te_id in "${iscsi_te_orphans[@]}"; do
+            printf "%-40s " "  Target-extent $te_id:"
+            start_spinner
+            local result rc=0
+            result=$(tn_api_call_write "$api_host" "$api_key" "iscsi.targetextent.delete" "[$te_id]" 2>&1) || rc=$?
+            stop_spinner
+            if [[ $rc -eq 0 ]]; then
+                echo -e "\r\033[K$(printf "%-40s " "  Target-extent $te_id:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                ((++delete_success))
             else
-                error "  Failed to delete target-extent $te_id (HTTP $http_code): $response"
+                echo -e "\r\033[K$(printf "%-40s " "  Target-extent $te_id:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                ((++delete_failed))
+            fi
+        done
+
+        # Delete extents
+        for extent_id in "${iscsi_extent_orphans[@]}"; do
+            printf "%-40s " "  Extent $extent_id:"
+            start_spinner
+            local result rc=0
+            result=$(tn_api_call_write "$api_host" "$api_key" "iscsi.extent.delete" "[$extent_id]" 2>&1) || rc=$?
+            stop_spinner
+            if [[ $rc -eq 0 ]]; then
+                echo -e "\r\033[K$(printf "%-40s " "  Extent $extent_id:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                ((++delete_success))
+            else
+                echo -e "\r\033[K$(printf "%-40s " "  Extent $extent_id:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                ((++delete_failed))
+            fi
+        done
+
+        # Delete zvols
+        for zvol_id in "${iscsi_zvol_orphans[@]}"; do
+            local short_zvol="${zvol_id##*/}"
+            printf "%-40s " "  Zvol $short_zvol:"
+            start_spinner
+            local result rc=0
+            result=$(tn_api_call_write "$api_host" "$api_key" "pool.dataset.delete" "[\"$zvol_id\"]" 2>&1) || rc=$?
+            stop_spinner
+            if [[ $rc -eq 0 ]]; then
+                echo -e "\r\033[K$(printf "%-40s " "  Zvol $short_zvol:")${COLOR_GREEN}✓${COLOR_RESET} Deleted"
+                ((++delete_success))
+            else
+                echo -e "\r\033[K$(printf "%-40s " "  Zvol $short_zvol:")${COLOR_RED}✗${COLOR_RESET} Failed"
+                ((++delete_failed))
             fi
         done
     fi
 
-    # Delete extents
-    if [[ ${#extent_orphans[@]} -gt 0 ]]; then
-        local response http_code
-        for extent_id in "${extent_orphans[@]}"; do
-            info "Deleting extent ID: $extent_id..."
-            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/iscsi/extent/id/$extent_id" 2>&1)
-            http_code="${response: -3}"
-            response="${response:0:-3}"
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                success "  Deleted extent $extent_id"
-            else
-                error "  Failed to delete extent $extent_id (HTTP $http_code): $response"
-            fi
-        done
-    fi
-
-    # Delete zvols
-    if [[ ${#zvol_orphans[@]} -gt 0 ]]; then
-        local zvol_encoded response http_code
-        for zvol_id in "${zvol_orphans[@]}"; do
-            info "Deleting zvol: $zvol_id..."
-            # URL encode the zvol path
-            zvol_encoded=$(echo "$zvol_id" | sed 's|/|%2F|g')
-            response=$(curl $curl_opts -w '%{http_code}' -H "Authorization: Bearer $api_key" -X DELETE "https://$api_host/api/v2.0/pool/dataset/id/$zvol_encoded" 2>&1)
-            http_code="${response: -3}"
-            response="${response:0:-3}"
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                success "  Deleted zvol $zvol_id"
-            else
-                error "  Failed to delete zvol $zvol_id (HTTP $http_code): $response"
-            fi
-        done
-    fi
-
     echo
-    success "Cleanup complete!"
+    if [[ $delete_failed -eq 0 ]]; then
+        success "Cleanup complete! Deleted $delete_success resource(s)"
+    else
+        warning "Cleanup finished with errors: $delete_success deleted, $delete_failed failed"
+    fi
+    read -rp "Press Enter to continue..."
     return 0
 }
 
@@ -4014,22 +4300,18 @@ detect_orphaned_resources() {
     local dataset="$5"
     local api_insecure="$6"
 
-    # Set curl options
-    local curl_opts="-s"
-    [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
-
     local orphan_count=0
 
     if [[ "$transport_mode" == "iscsi" ]]; then
-        # iSCSI orphan detection
+        # iSCSI orphan detection using WebSocket API
 
         # Fetch extents
         local extents
-        extents=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null) || return 1
+        extents=$(tn_api_call "$api_host" "$api_key" "iscsi.extent.query" '[[]]' 2>&1) || return 1
 
         # Fetch zvols
         local zvols
-        zvols=$(curl $curl_opts -H "Authorization: Bearer $api_key" "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null) || return 1
+        zvols=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" '[[["type", "=", "VOLUME"]]]' 2>&1) || return 1
 
         # Extract extent IDs and disks using grep/sed
         # Parse JSON: look for "id": <number> and "disk": "zvol/..."
@@ -4066,12 +4348,211 @@ detect_orphaned_resources() {
         done
 
     else
-        # NVMe/TCP mode - not supported yet (requires WebSocket API)
-        # Return 0 to indicate no orphans found (skip check)
-        return 0
+        # NVMe/TCP mode - delegate to NVMe-specific detection
+        orphan_count=$(_detect_orphaned_resources_nvme "$api_host" "$api_key" "$dataset")
     fi
 
     echo "$orphan_count"
+}
+
+# Detect orphaned NVMe resources (namespaces without zvols, zvols without namespaces)
+# Parameters: api_host, api_key, dataset
+# Returns: Count of orphaned resources
+# Side effects: Populates global arrays nvme_ns_orphans and zvol_orphans
+_detect_orphaned_resources_nvme() {
+    local api_host="$1"
+    local api_key="$2"
+    local dataset="$3"
+
+    # Reset arrays (declared in menu_cleanup_orphans)
+    nvme_ns_orphans=()
+    zvol_orphans=()
+    nvme_subsys_orphans=()
+    local orphan_count=0
+
+    # Fetch all zvols from the dataset
+    log "INFO" "_detect_orphaned_resources_nvme: Fetching zvols from dataset $dataset"
+    local zvols_response
+    zvols_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" '[[["type", "=", "VOLUME"]]]' 2>&1)
+    if [[ $? -ne 0 || -z "$zvols_response" ]]; then
+        log "ERROR" "_detect_orphaned_resources_nvme: Failed to fetch zvols"
+        return 255
+    fi
+
+    # Extract zvol IDs that are under our dataset and match plugin pattern (vm-XXX-disk-YYY)
+    local zvol_ids=()
+    while IFS= read -r zvol_id; do
+        [[ -n "$zvol_id" ]] && zvol_ids+=("$zvol_id")
+    done < <(echo "$zvols_response" | grep -oP '"id"\s*:\s*"'"$dataset"'/vm-[0-9]+-disk-[0-9]+"' | \
+             sed 's/"id"\s*:\s*"//;s/"$//')
+
+    log "INFO" "_detect_orphaned_resources_nvme: Found ${#zvol_ids[@]} plugin-managed zvols"
+
+    # Fetch all NVMe namespaces
+    log "INFO" "_detect_orphaned_resources_nvme: Fetching NVMe namespaces"
+    local ns_response
+    ns_response=$(tn_api_call "$api_host" "$api_key" "nvmet.namespace.query" '[[]]' 2>&1)
+    if [[ $? -ne 0 || -z "$ns_response" ]]; then
+        log "ERROR" "_detect_orphaned_resources_nvme: Failed to fetch namespaces"
+        return 255
+    fi
+
+    # Parse namespaces into arrays using Perl for proper JSON handling
+    # (regex-based parsing fails on nested objects like "subsys": {"id": ...})
+    # Output format: ns_id TAB device_path TAB subsys_id
+    local ns_ids=()
+    local ns_device_paths=()
+    local ns_subsys_ids=()
+    local ns_parsed
+    ns_parsed=$(echo "$ns_response" | perl -MJSON::PP -e '
+        my $json = do { local $/; <STDIN> };
+        my $data = eval { decode_json($json) } // [];
+        for my $ns (@$data) {
+            next unless ref($ns) eq "HASH" && defined $ns->{id} && defined $ns->{device_path};
+            my $subsys_id = (ref($ns->{subsys}) eq "HASH") ? ($ns->{subsys}{id} // "") : "";
+            print "$ns->{id}\t$ns->{device_path}\t$subsys_id\n";
+        }
+    ' 2>/dev/null)
+
+    while IFS=$'\t' read -r ns_id ns_path ns_subsys; do
+        [[ -n "$ns_id" && -n "$ns_path" ]] || continue
+        ns_ids+=("$ns_id")
+        ns_device_paths+=("$ns_path")
+        ns_subsys_ids+=("$ns_subsys")
+    done <<< "$ns_parsed"
+
+    log "INFO" "_detect_orphaned_resources_nvme: Found ${#ns_ids[@]} namespaces"
+
+    # Check for orphaned namespaces (namespace points to zvol that doesn't exist)
+    for i in "${!ns_ids[@]}"; do
+        local ns_id="${ns_ids[$i]}"
+        local ns_path="${ns_device_paths[$i]:-}"
+
+        # Skip if no device path
+        [[ -z "$ns_path" ]] && continue
+
+        # Extract zvol path from device_path (remove 'zvol/' prefix)
+        local zvol_path="${ns_path#zvol/}"
+
+        # Only check namespaces pointing to our dataset
+        [[ "$zvol_path" != "$dataset/"* ]] && continue
+
+        # Check if zvol exists in our zvol list
+        local zvol_found=false
+        for zvol_id in "${zvol_ids[@]}"; do
+            if [[ "$zvol_id" == "$zvol_path" ]]; then
+                zvol_found=true
+                break
+            fi
+        done
+
+        if [[ "$zvol_found" == "false" ]]; then
+            # Namespace points to missing zvol - orphan
+            nvme_ns_orphans+=("$ns_id:$ns_path")
+            ((orphan_count++))
+            log "INFO" "_detect_orphaned_resources_nvme: Orphan namespace id=$ns_id path=$ns_path"
+        fi
+    done
+
+    # Check for orphaned zvols (zvol exists but no namespace points to it)
+    for zvol_id in "${zvol_ids[@]}"; do
+        local zvol_path="zvol/$zvol_id"
+        local ns_found=false
+
+        for ns_path in "${ns_device_paths[@]}"; do
+            if [[ "$ns_path" == "$zvol_path" ]]; then
+                ns_found=true
+                break
+            fi
+        done
+
+        if [[ "$ns_found" == "false" ]]; then
+            # Zvol has no namespace pointing to it - orphan
+            zvol_orphans+=("$zvol_id")
+            ((orphan_count++))
+            log "INFO" "_detect_orphaned_resources_nvme: Orphan zvol $zvol_id"
+        fi
+    done
+
+    # Fetch all NVMe subsystems and detect orphans (empty subsystems not in storage.cfg)
+    log "INFO" "_detect_orphaned_resources_nvme: Fetching NVMe subsystems"
+    local subsys_response
+    subsys_response=$(tn_api_call "$api_host" "$api_key" "nvmet.subsys.query" '[[]]' 2>&1)
+    if [[ $? -eq 0 && -n "$subsys_response" ]]; then
+        # Get list of subsystem NQNs configured in storage.cfg
+        local configured_nqns=()
+        while IFS= read -r nqn; do
+            [[ -n "$nqn" ]] && configured_nqns+=("$nqn")
+        done < <(grep -h "subsystem_nqn" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}')
+
+        log "INFO" "_detect_orphaned_resources_nvme: ${#configured_nqns[@]} subsystems configured in storage.cfg"
+
+        # Get unique subsystem IDs that have namespaces (from earlier Perl parsing)
+        local subsys_ids_with_ns=()
+        for subsys_id in "${ns_subsys_ids[@]}"; do
+            [[ -z "$subsys_id" ]] && continue
+            # Check if already in array (dedup)
+            local already_added=false
+            for existing in "${subsys_ids_with_ns[@]}"; do
+                [[ "$existing" == "$subsys_id" ]] && { already_added=true; break; }
+            done
+            [[ "$already_added" == "false" ]] && subsys_ids_with_ns+=("$subsys_id")
+        done
+
+        # Validate: if namespaces exist but no subsystem mappings found, skip subsystem orphan detection
+        # This prevents false positives if the JSON structure changes or parsing fails
+        if [[ ${#ns_ids[@]} -gt 0 && ${#subsys_ids_with_ns[@]} -eq 0 ]]; then
+            log "WARN" "_detect_orphaned_resources_nvme: Found ${#ns_ids[@]} namespaces but could not map to subsystems, skipping subsystem orphan detection"
+        else
+
+        # Parse subsystems using Perl and check for orphans
+        local subsys_parsed
+        subsys_parsed=$(echo "$subsys_response" | perl -MJSON::PP -e '
+            my $json = do { local $/; <STDIN> };
+            my $data = eval { decode_json($json) } // [];
+            for my $s (@$data) {
+                next unless ref($s) eq "HASH" && defined $s->{id} && defined $s->{subnqn};
+                my $name = $s->{name} // "";
+                print "$s->{id}\t$name\t$s->{subnqn}\n";
+            }
+        ' 2>/dev/null)
+
+        while IFS=$'\t' read -r subsys_id subsys_name subsys_nqn; do
+            [[ -z "$subsys_id" || -z "$subsys_nqn" ]] && continue
+
+            # Check if subsystem has any namespaces
+            local has_namespaces=false
+            for used_id in "${subsys_ids_with_ns[@]}"; do
+                if [[ "$used_id" == "$subsys_id" ]]; then
+                    has_namespaces=true
+                    break
+                fi
+            done
+
+            # Check if subsystem is configured in storage.cfg
+            local is_configured=false
+            for cfg_nqn in "${configured_nqns[@]}"; do
+                if [[ "$cfg_nqn" == "$subsys_nqn" ]]; then
+                    is_configured=true
+                    break
+                fi
+            done
+
+            # Orphan: no namespaces AND not configured
+            if [[ "$has_namespaces" == "false" && "$is_configured" == "false" ]]; then
+                nvme_subsys_orphans+=("$subsys_id|$subsys_name|$subsys_nqn")
+                ((orphan_count++))
+                log "INFO" "_detect_orphaned_resources_nvme: Orphan subsystem id=$subsys_id name=$subsys_name nqn=$subsys_nqn"
+            fi
+        done <<< "$subsys_parsed"
+        fi  # End of namespace-to-subsystem mapping validation
+    else
+        log "WARN" "_detect_orphaned_resources_nvme: Failed to query subsystems, skipping subsystem orphan detection"
+    fi
+
+    log "INFO" "_detect_orphaned_resources_nvme: Found $orphan_count orphans (${#nvme_ns_orphans[@]} namespaces, ${#zvol_orphans[@]} zvols, ${#nvme_subsys_orphans[@]} subsystems)"
+    # Return orphan count as exit code (0-254 valid, 255 = error)
+    return "$orphan_count"
 }
 
 # ============================================================================
@@ -10121,9 +10602,12 @@ menu_configure_storage() {
                     return 0
                 fi
 
-                # Read transport_mode BEFORE deletion (config will be gone after)
-                local transport_mode
+                # Read config values BEFORE deletion (config will be gone after)
+                local transport_mode api_host api_key subsystem_nqn
                 transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
+                api_host=$(get_storage_config_value "$storage_name" "api_host" 2>/dev/null)
+                api_key=$(get_storage_config_value "$storage_name" "api_key" 2>/dev/null)
+                subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn" 2>/dev/null)
 
                 # Perform deletion
                 echo
@@ -10154,12 +10638,53 @@ menu_configure_storage() {
                     echo
                     success "Storage '$storage_name' has been deleted"
 
-                    # Check if this was an iSCSI storage and offer orphan cleanup
-                    if [[ "$transport_mode" != "nvme-tcp" ]]; then
-                        echo
-                        read -rp "Would you like to cleanup orphaned resources on TrueNAS? [y/N]: " cleanup_response
-                        if [[ "$cleanup_response" =~ ^[Yy] ]]; then
-                            info "Note: Storage no longer exists in config. Manual cleanup may be needed."
+                    # Offer to cleanup TrueNAS resources
+                    if [[ -n "$api_host" && -n "$api_key" ]]; then
+                        if [[ "$transport_mode" == "nvme-tcp" && -n "$subsystem_nqn" ]]; then
+                            # NVMe/TCP: offer to delete the subsystem
+                            echo
+                            warning "The NVMe subsystem still exists on TrueNAS:"
+                            echo "  Subsystem NQN: $subsystem_nqn"
+                            echo
+                            read -rp "Would you like to delete the NVMe subsystem on TrueNAS? [y/N]: " cleanup_response
+                            if [[ "$cleanup_response" =~ ^[Yy] ]]; then
+                                # Get subsystem ID by querying
+                                printf "%-30s " "Looking up subsystem:"
+                                start_spinner
+                                local subsys_query subsys_id
+                                subsys_query=$(tn_api_call "$api_host" "$api_key" "nvmet.subsys.query" '[[["subnqn", "=", "'"$subsystem_nqn"'"]]]' 2>&1)
+                                subsys_id=$(echo "$subsys_query" | grep -oP '"id"\s*:\s*\K[0-9]+' | head -1)
+                                stop_spinner
+
+                                if [[ -n "$subsys_id" ]]; then
+                                    echo -e "\r$(printf "%-30s " "Looking up subsystem:")${c2}✓${c0} Found (ID: $subsys_id)"
+
+                                    printf "%-30s " "Deleting subsystem:"
+                                    start_spinner
+                                    local delete_result
+                                    # Use force=true to handle port associations and any remaining namespaces
+                                    delete_result=$(tn_api_call_write "$api_host" "$api_key" "nvmet.subsys.delete" "[$subsys_id, {\"force\": true}]" 2>&1)
+                                    local delete_exit=$?
+                                    stop_spinner
+
+                                    if [[ $delete_exit -eq 0 ]]; then
+                                        echo -e "\r$(printf "%-30s " "Deleting subsystem:")${c2}✓${c0} Deleted"
+                                        success "NVMe subsystem deleted from TrueNAS"
+                                    else
+                                        echo -e "\r$(printf "%-30s " "Deleting subsystem:")${c1}✗${c0} Failed"
+                                        error "Failed to delete subsystem: $delete_result"
+                                        warning "The subsystem may have active namespaces. Use orphan cleanup to remove them first."
+                                    fi
+                                else
+                                    echo -e "\r$(printf "%-30s " "Looking up subsystem:")${c3}!${c0} Not found"
+                                    info "Subsystem may have already been deleted"
+                                fi
+                            fi
+                        else
+                            # iSCSI: Note about orphan cleanup
+                            echo
+                            info "Tip: Use Diagnostics > Cleanup orphaned resources to remove"
+                            info "any remaining iSCSI extents, targets, or zvols on TrueNAS."
                         fi
                     fi
                 else

@@ -29,6 +29,7 @@ Advanced configuration, performance tuning, clustering, and security features of
 - [Pre-flight Validation](#pre-flight-validation)
 - [Automatic Target Visibility](#automatic-target-visibility)
 - [Storage Status and Health Monitoring](#storage-status-and-health-monitoring)
+- [Orphan Resource Cleanup](#orphan-resource-cleanup)
 - [Advanced Troubleshooting](#advanced-troubleshooting)
   - [Force Delete on In-Use](#force-delete-on-inuse)
   - [Logout on Free](#logout-on-free)
@@ -1452,6 +1453,102 @@ When storage becomes inactive:
 - New volume operations fail with clear errors
 - Storage auto-recovers when issue resolved
 - No manual intervention needed for transient issues
+
+## Orphan Resource Cleanup
+
+The installer provides an integrated orphan detection and cleanup utility for both iSCSI and NVMe/TCP storage. This helps identify and remove storage resources that are no longer associated with active Proxmox volumes.
+
+### What Are Orphaned Resources?
+
+Orphaned resources occur when:
+- A VM is deleted but storage cleanup fails (e.g., network issue during deletion)
+- Manual intervention on TrueNAS removes part of a volume's configuration
+- A zvol exists without its corresponding transport mapping (extent/namespace)
+- A transport mapping exists but points to a non-existent zvol
+
+### Orphan Types by Transport
+
+**iSCSI Storage:**
+- **[EXTENT]** - iSCSI extent pointing to a missing zvol
+- **[TARGET-EXTENT]** - Target-extent mapping referencing a missing extent
+- **[ZVOL]** - Zvol with no iSCSI extent pointing to it
+
+**NVMe/TCP Storage:**
+- **[NAMESPACE]** - NVMe namespace with `device_path` pointing to a missing zvol
+- **[ZVOL]** - Zvol with no NVMe namespace referencing it
+- **[SUBSYSTEM]** - Empty NVMe subsystem (no namespaces) not configured in storage.cfg
+
+### Running Orphan Cleanup
+
+Access the cleanup utility through the installer diagnostics menu:
+
+```bash
+./install.sh
+# Choose: Diagnostics
+# Choose: Cleanup orphaned resources
+```
+
+**Interactive Flow:**
+1. Select the storage to scan
+2. Installer detects transport mode (iSCSI or NVMe/TCP) automatically
+3. Queries TrueNAS for all relevant resources
+4. Correlates zvols with their transport mappings
+5. Displays list of identified orphans
+6. Requires typed confirmation (`DELETE`) before proceeding
+7. Deletes orphaned resources in the correct order
+
+### Cleanup Order
+
+**iSCSI**: Target-extents (first) -> Extents -> Zvols (last)
+
+**NVMe/TCP**: Namespaces (first) -> Zvols -> Subsystems (last)
+
+This order ensures dependent resources are removed before their parents.
+
+### Safety Features
+
+- **Dry Run by Default**: Detection phase shows what would be deleted without making changes
+- **Typed Confirmation**: Requires typing `DELETE` exactly to proceed
+- **Dataset Scoping**: Only scans zvols under the configured dataset (e.g., `tank/proxmox`)
+- **Plugin Pattern Matching**: Only considers zvols matching the plugin naming pattern (`vm-XXX-disk-YYY`)
+- **Error Reporting**: Reports individual failures without aborting the entire operation
+
+### Example Output
+
+```
+Detecting orphaned resources for storage 'truenas-nvme' (transport: nvme-tcp)...
+Fetching NVMe namespaces and zvols...
+
+Found 3 orphaned resource(s):
+
+  [NAMESPACE] ID: 15 (device_path: zvol/tank/proxmox/vm-100-disk-0 - zvol missing)
+  [ZVOL] tank/proxmox/vm-101-disk-0 (no namespace pointing to this zvol)
+  [SUBSYSTEM] ID: 8, Name: old-storage (empty, not in storage.cfg)
+
+WARNING: This will permanently delete these orphaned resources!
+
+Type 'DELETE' (all caps) to confirm deletion: DELETE
+
+Cleaning up orphaned resources...
+
+Deleting NVMe namespace ID: 15...
+  Deleted namespace 15
+Deleting zvol: tank/proxmox/vm-101-disk-0...
+  Deleted zvol tank/proxmox/vm-101-disk-0
+
+Cleanup complete!
+```
+
+### When to Run Cleanup
+
+- After recovering from network outages during VM deletions
+- When storage shows inconsistent state
+- Before migrating to a new storage configuration
+- As part of periodic maintenance
+
+### See Also
+
+- [Troubleshooting - Orphaned Volumes After VM Deletion](Troubleshooting.md#orphaned-volumes-after-vm-deletion)
 
 ## Advanced Troubleshooting
 
