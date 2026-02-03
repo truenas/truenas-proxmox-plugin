@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.0';
+our $VERSION = '2.0.1';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -282,10 +282,6 @@ sub plugindata {
 sub properties {
     return {
         # Transport & connection
-        api_transport => {
-            description => "API transport: 'ws' (JSON-RPC) or 'rest'.",
-            type => 'string', optional => 1,
-        },
         api_host => {
             description => "TrueNAS hostname or IP.",
             type => 'string', format => 'pve-storage-server',
@@ -295,11 +291,11 @@ sub properties {
             type => 'string',
         },
         api_scheme => {
-            description => "wss/ws for WS, https/http for REST (defaults: wss/https).",
+            description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
         },
         api_port => {
-            description => "TCP port (defaults: 443 for wss/https, 80 for ws/http).",
+            description => "TCP port (defaults: 443 for wss, 80 for ws).",
             type => 'integer', optional => 1,
         },
         api_insecure => {
@@ -448,7 +444,6 @@ sub options {
         shared  => { optional => 1 },
 
         # Connection (fixed to avoid orphaning volumes)
-        api_transport => { optional => 1, fixed => 1 },
         api_host      => { fixed => 1 },
         api_key       => { fixed => 1 },
         api_scheme    => { optional => 1, fixed => 1 },
@@ -550,26 +545,12 @@ sub check_config {
         }
     }
 
-    # Warn if using insecure transport (HTTP/WS instead of HTTPS/WSS)
-    if (defined $opts->{api_transport}) {
-        my $transport = lc($opts->{api_transport});
-        if ($transport eq 'rest' && defined $opts->{api_scheme}) {
-            my $scheme = lc($opts->{api_scheme});
-            if ($scheme eq 'http') {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId' is using insecure HTTP transport. " .
-                    "Consider using HTTPS for API communication."
-                );
-            }
-        } elsif ($transport eq 'ws') {
-            # WebSocket uses wss:// or ws:// - check if scheme is insecure
-            if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
-                syslog('warning',
-                    "[TrueNAS] Storage '$sectionId' is using insecure WebSocket (ws://). " .
-                    "Consider using secure WebSocket (wss://) for API communication."
-                );
-            }
-        }
+    # Warn if using insecure WebSocket
+    if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
+        syslog('warning',
+            "[TrueNAS] Storage '$sectionId' is using insecure WebSocket (ws://). " .
+            "Consider using secure WebSocket (wss://) for API communication."
+        );
     }
 
     # Validate required fields are present
@@ -670,34 +651,7 @@ sub _ua($scfg) {
     );
     return $ua;
 }
-sub _rest_base($scfg) {
-    my $scheme = ($scfg->{api_scheme} && $scfg->{api_scheme} =~ /^http$/i) ? 'http' : 'https';
-    my $port   = $scfg->{api_port} // ($scheme eq 'https' ? 443 : 80);
-    return "$scheme://$scfg->{api_host}:$port/api/v2.0";
-}
-sub _rest_call($scfg, $method, $path, $payload=undef) {
-    return _retry_with_backoff($scfg, "REST $method $path", sub {
-        my $ua  = _ua($scfg);
-        my $url = _rest_base($scfg) . $path;
-        my $req = HTTP::Request->new(uc($method) => $url);
-        $req->header('Authorization' => "Bearer $scfg->{api_key}");
-        $req->header('Content-Type'  => 'application/json');
-        $req->content(encode_json($payload)) if defined $payload;
-        my $res = $ua->request($req);
-        die "TrueNAS REST $method $path failed: ".$res->status_line."\nBody: ".$res->decoded_content."\n"
-            if !$res->is_success;
-        my $content = $res->decoded_content // '';
-        return undef unless length($content);
-        my $decoded = eval { decode_json($content) };
-        if ($@ || !$decoded) {
-            my $len = length($content);
-            my $preview = substr($content, 0, 200);
-            _log(undef, 0, 'err', "[TrueNAS] REST JSON decode failed (len=$len): $@ Preview: $preview");
-            die "REST response decode failed: $@";
-        }
-        return $decoded;
-    });
-}
+
 
 # ======== WebSocket JSON-RPC client ========
 # Connect to ws(s)://<host>/api/current; auth via auth.login_with_api_key.
@@ -726,11 +680,11 @@ sub _ws_open($scfg) {
             SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
             SSL_hostname    => $host,
             Timeout => 15,
-        ) or die "wss connect failed: $SSL_ERROR\n";
+        ) or die "WebSocket secure connection failed (wss://): $SSL_ERROR\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     } else {
         $sock = IO::Socket::INET->new(
             PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
-        ) or die "ws connect failed: $!\n";
+        ) or die "WebSocket connection failed (ws://): $!\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     }
     # WebSocket handshake
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
@@ -750,17 +704,17 @@ sub _ws_open($scfg) {
         $resp .= $buf;
         last if $resp =~ /\r\n\r\n/s;
     }
-    die "WebSocket handshake failed (no 101)" if $resp !~ m#^HTTP/1\.([01]) 101#;
+    die "WebSocket handshake failed (no HTTP 101 response). Ensure TrueNAS 25.10+ is running with WebSocket API enabled.\n" if $resp !~ m#^HTTP/1\.([01]) 101#;
     my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
     my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
-    die "WebSocket handshake invalid accept key" if ($accept // '') ne $expect;
+    die "WebSocket handshake invalid: invalid accept key. Ensure TrueNAS 25.10+ is running with WebSocket API enabled.\n" if ($accept // '') ne $expect;
     # Authenticate with API key (JSON-RPC)
     my $conn = { sock => $sock, next_id => 1 };
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
         params  => [ $scfg->{api_key} ],
-    }) or die "TrueNAS auth.login_with_api_key failed";
+    }) or die "TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.\n";
     return $conn;
 }
 # ---- WS framing helpers (text only) ----
@@ -894,8 +848,7 @@ sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
     my $host = $scfg->{api_host};
     my $key = $scfg->{api_key};
-    my $transport = $scfg->{api_transport} // 'ws';
-    return "$transport:$host:$key";
+    return "$host:$key";
 }
 
 sub _ws_get_persistent($scfg) {
@@ -1024,7 +977,7 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
 
     # Bulk operations are always write operations, use ephemeral connection
     return _api_call_write($scfg, 'core.bulk', [$method_name, $params_array, $description],
-        sub { die "Bulk operations require WebSocket transport"; });
+        sub { die "Bulk operations require WebSocket transport (TrueNAS 25.10+ only)\n"; });
 }
 
 # Bulk snapshot deletion helper
@@ -1137,8 +1090,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             # Fall back to individual deletion if bulk fails
             foreach my $id (@targetextent_ids) {
                 eval {
-                    _api_call($scfg, 'iscsi.targetextent.delete', [$id],
-                        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                    _api_call($scfg, 'iscsi.targetextent.delete', [$id]);
                 };
                 push @all_errors, "Failed to delete targetextent $id: $@" if $@;
             }
@@ -1149,8 +1101,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
         # Individual deletion for single item or when bulk disabled
         foreach my $id (@targetextent_ids) {
             eval {
-                _api_call($scfg, 'iscsi.targetextent.delete', [$id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$id", undef) });
+                _api_call($scfg, 'iscsi.targetextent.delete', [$id]);
             };
             push @all_errors, "Failed to delete targetextent $id: $@" if $@;
         }
@@ -1163,8 +1114,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             # Fall back to individual deletion if bulk fails
             foreach my $id (@extent_ids) {
                 eval {
-                    _api_call($scfg, 'iscsi.extent.delete', [$id],
-                        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                    _api_call($scfg, 'iscsi.extent.delete', [$id]);
                 };
                 push @all_errors, "Failed to delete extent $id: $@" if $@;
             }
@@ -1175,8 +1125,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
         # Individual deletion for single item or when bulk disabled
         foreach my $id (@extent_ids) {
             eval {
-                _api_call($scfg, 'iscsi.extent.delete', [$id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$id", undef) });
+                _api_call($scfg, 'iscsi.extent.delete', [$id]);
             };
             push @all_errors, "Failed to delete extent $id: $@" if $@;
         }
@@ -1188,8 +1137,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             my $full_ds = $scfg->{dataset} . '/' . $dataset;
             my $id = URI::Escape::uri_escape($full_ds);
             my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
-            _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload],
-                sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id", $payload) });
+            _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload]);
         };
         push @all_errors, "Failed to delete dataset $dataset: $@" if $@;
     }
@@ -1235,8 +1183,7 @@ sub _wait_for_job_completion {
 
         my $job_status;
         eval {
-            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]],
-                                  sub { _rest_call($scfg, 'GET', "/core/get_jobs") });
+            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]]);
         };
 
         if ($@) {
@@ -1372,8 +1319,7 @@ sub _delete_dataset_with_retry {
     for my $attempt (1..$max_retries) {
         eval {
             _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
-            my $result = _api_call_write($scfg,'pool.dataset.delete',[ $full_ds, $payload ],
-                sub { _rest_call($scfg,'DELETE',"/pool/dataset/id/$id",$payload) });
+            my $result = _api_call_write($scfg,'pool.dataset.delete',[ $full_ds, $payload ]);
 
             my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
             if (!$job_result->{success}) {
@@ -1411,81 +1357,66 @@ sub _delete_dataset_with_retry {
     die "Failed to delete dataset $full_ds after $max_retries attempts";
 }
 
-# ======== Transport-agnostic API wrapper ========
+# ======== WebSocket API operations ========
 # $opts is an optional hashref with:
 #   - use_ephemeral: if true, use an ephemeral connection (for write operations)
-sub _api_call($scfg, $ws_method, $ws_params, $rest_fallback, $opts = undef) {
-    my $transport = lc($scfg->{api_transport} // 'ws');
+sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     my $use_ephemeral = $opts && $opts->{use_ephemeral};
 
     # Level 2: Verbose - log all API calls with parameters
     my $conn_type = $use_ephemeral ? 'ephemeral' : 'persistent';
     if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport, conn=$conn_type, params=" . encode_json($ws_params));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=$conn_type, params=" . encode_json($ws_params));
     } else {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, transport=$transport, conn=$conn_type");
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=$conn_type");
     }
 
-    if ($transport eq 'ws') {
-        if ($use_ephemeral) {
-            # Use ephemeral connection for write operations to avoid race conditions
-            # Each write gets its own isolated connection
-            return _retry_with_backoff($scfg, "WS $ws_method", sub {
-                my $conn = _ws_open_ephemeral($scfg);
-                my $res;
-                eval {
-                    $res = _ws_rpc($conn, {
-                        jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-                    });
-                };
-                my $err = $@;
-                # Always close ephemeral connection, even on error
-                _ws_close_ephemeral($conn);
-                die $err if $err;
-
-                # Level 2: Verbose - log API response
-                _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
-
-                return $res;
-            });
-        } else {
-            # Use persistent connection for read operations (original behavior)
-            return _retry_with_backoff($scfg, "WS $ws_method", sub {
-                my $conn = _ws_get_persistent($scfg);
-                my $res = _ws_rpc($conn, {
+    if ($use_ephemeral) {
+        # Use ephemeral connection for write operations to avoid race conditions
+        # Each write gets its own isolated connection
+        return _retry_with_backoff($scfg, "WS $ws_method", sub {
+            my $conn = _ws_open_ephemeral($scfg);
+            my $res;
+            eval {
+                $res = _ws_rpc($conn, {
                     jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
                 });
+            };
+            my $err = $@;
+            # Always close ephemeral connection, even on error
+            _ws_close_ephemeral($conn);
+            die $err if $err;
 
-                # Level 2: Verbose - log API response
-                _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+            # Level 2: Verbose - log API response
+            _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
 
-                return $res;
-            });
-        }
-    } elsif ($transport eq 'rest') {
-        return $rest_fallback->() if $rest_fallback;
-        die "REST fallback not provided for $ws_method";
+            return $res;
+        });
     } else {
-        die "Invalid api_transport '$transport' (use 'ws' or 'rest')";
+        # Use persistent connection for read operations (original behavior)
+        return _retry_with_backoff($scfg, "WS $ws_method", sub {
+            my $conn = _ws_get_persistent($scfg);
+            my $res = _ws_rpc($conn, {
+                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+            });
+
+            # Level 2: Verbose - log API response
+            _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+
+            return $res;
+        });
     }
 }
 
 # Convenience wrapper for write operations that need ephemeral connections
 # Use this for create, update, delete operations to avoid WebSocket race conditions
-sub _api_call_write($scfg, $ws_method, $ws_params, $rest_fallback) {
-    return _api_call($scfg, $ws_method, $ws_params, $rest_fallback, { use_ephemeral => 1 });
+sub _api_call_write($scfg, $ws_method, $ws_params) {
+    return _api_call($scfg, $ws_method, $ws_params, { use_ephemeral => 1 });
 }
 
-# ======== TrueNAS API ops (WS with REST fallback) ========
+# ======== TrueNAS API ops (WebSocket) ========
 sub _tn_get_target($scfg) {
-    my $res = _api_call($scfg, 'iscsi.target.query', [],
-        sub { _rest_call($scfg, 'GET', '/iscsi/target') }
-    );
-    if (ref($res) eq 'ARRAY' && !@$res) {
-        my $rest = _rest_call($scfg, 'GET', '/iscsi/target');
-        $res = $rest if ref($rest) eq 'ARRAY';
-    }
-    return $res;
+    return _api_call($scfg, 'iscsi.target.query', []);
 }
 sub _tn_targetextents($scfg) {
     my $storage_id = $scfg->{storeid} || 'unknown';
@@ -1495,13 +1426,7 @@ sub _tn_targetextents($scfg) {
     return $cached if $cached;
 
     # Cache miss - fetch from API
-    my $res = _api_call($scfg, 'iscsi.targetextent.query', [],
-        sub { _rest_call($scfg, 'GET', '/iscsi/targetextent') }
-    );
-    if (ref($res) eq 'ARRAY' && !@$res) {
-        my $rest = _rest_call($scfg, 'GET', '/iscsi/targetextent');
-        $res = $rest if ref($rest) eq 'ARRAY';
-    }
+    my $res = _api_call($scfg, 'iscsi.targetextent.query', []);
 
     # Cache with shorter TTL for dynamic data
     return _set_cache($storage_id, 'targetextents', $res);
@@ -1514,33 +1439,18 @@ sub _tn_extents($scfg) {
     return $cached if $cached;
 
     # Cache miss - fetch from API
-    my $res = _api_call($scfg, 'iscsi.extent.query', [],
-        sub { _rest_call($scfg, 'GET', '/iscsi/extent') }
-    );
-    if (ref($res) eq 'ARRAY' && !@$res) {
-        my $rest = _rest_call($scfg, 'GET', '/iscsi/extent');
-        $res = $rest if ref($rest) eq 'ARRAY';
-    }
+    my $res = _api_call($scfg, 'iscsi.extent.query', []);
 
     # Cache and return
     return _set_cache($storage_id, 'extents', $res);
 }
 
 sub _tn_snapshots($scfg) {
-    my $res = _api_call($scfg, 'zfs.snapshot.query', [],
-        sub { _rest_call($scfg, 'GET', '/zfs/snapshot') }
-    );
-    if (ref($res) eq 'ARRAY' && !@$res) {
-        my $rest = _rest_call($scfg, 'GET', '/zfs/snapshot');
-        $res = $rest if ref($rest) eq 'ARRAY';
-    }
-    return $res;
+    return _api_call($scfg, 'zfs.snapshot.query', []);
 }
 
 sub _tn_global($scfg) {
-    return _api_call($scfg, 'iscsi.global.config', [],
-        sub { _rest_call($scfg, 'GET', '/iscsi/global') }
-    );
+    return _api_call($scfg, 'iscsi.global.config', []);
 }
 
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
@@ -1556,17 +1466,13 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     if ($blocksize) {
         $payload->{volblocksize} = _normalize_blocksize($blocksize);
     }
-    return _api_call_write($scfg, 'pool.dataset.create', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/pool/dataset', $payload) }
-    );
+    return _api_call_write($scfg, 'pool.dataset.create', [ $payload ]);
 }
 sub _tn_dataset_delete($scfg, $full) {
-    my $id = uri_escape($full); # encode '/' as %2F for REST
+    my $id = uri_escape($full);
 
     _log($scfg, 1, 'info', "[TrueNAS] _tn_dataset_delete: deleting $full (recursive=true)");
-    my $result = _api_call_write($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ],
-        sub { _rest_call($scfg, 'DELETE', "/pool/dataset/id/$id?recursive=true") }
-    );
+    my $result = _api_call_write($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ]);
 
     # Handle potential async job for dataset deletion
     my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion (helper) for $full", 60);
@@ -1578,18 +1484,11 @@ sub _tn_dataset_delete($scfg, $full) {
     return $job_result->{result};
 }
 sub _tn_dataset_get($scfg, $full) {
-    my $id = uri_escape($full);
-    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ],
-        sub { _rest_call($scfg, 'GET', "/pool/dataset/id/$id") }
-    );
+    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ]);
 }
 sub _tn_dataset_resize($scfg, $full, $new_bytes) {
-    # REST path uses %2F for '/', same as get/delete helpers
-    my $id = URI::Escape::uri_escape($full);
     my $payload = { volsize => int($new_bytes) }; # grow-only
-    return _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ],
-        sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) }
-    );
+    return _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ]);
 }
 sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
     # Clone a ZFS snapshot to create a new dataset
@@ -1599,22 +1498,18 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call_write($scfg, 'zfs.snapshot.clone', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/zfs/snapshot/clone', $payload) }
-    );
+    return _api_call_write($scfg, 'zfs.snapshot.clone', [ $payload ]);
 }
 
-# ---- WebSocket-only snapshot rollback for TrueNAS 25.04+ ----
+# ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
 sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     my $FORCE     = $force_bool     ? JSON::PP::true  : JSON::PP::false;
     my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
 
-    # Force WebSocket transport for snapshot rollback (REST API removed in 25.04+)
-    my $ws_scfg = { %$scfg, api_transport => 'ws' };
-
-    # TrueNAS 25.04+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
+    # WebSocket-only for snapshot rollback (requires TrueNAS 25.10+)
+    # TrueNAS 25.10+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
     my $attempt_rollback = sub {
-        my $conn = _ws_open_ephemeral($ws_scfg);
+        my $conn = _ws_open_ephemeral($scfg);
         my $result;
         eval {
             $result = _ws_rpc($conn, {
@@ -1638,7 +1533,7 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
             if ($force_bool && !$recursive_bool) {
                 # Retry with recursive=1 to delete newer snapshots
                 eval {
-                    my $conn = _ws_open_ephemeral($ws_scfg);
+                    my $conn = _ws_open_ephemeral($scfg);
                     my $result;
                     eval {
                         $result = _ws_rpc($conn, {
@@ -1794,13 +1689,11 @@ sub volume_resize {
     # ---- End preflight ----
 
     # Perform the TrueNAS zvol grow
-    my $id = URI::Escape::uri_escape($full);
     my $payload = { volsize => int($req_bytes) };
     my $result = _api_call(
         $scfg,
         'pool.dataset.update',
         [ $full, $payload ],
-        sub { _rest_call($scfg, 'PUT', "/pool/dataset/id/$id", $payload) },
     );
 
     # Wait for resize job completion before rescanning (prevent race condition)
@@ -1890,12 +1783,9 @@ sub volume_snapshot {
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: creating $snap_full");
 
     # Create ZFS snapshot for the disk
-    # TrueNAS REST: POST /zfs/snapshot { "dataset": "<pool/ds/...>", "name": "<snap>", "recursive": false }
-    # Snapshot will be <pool/ds/...>@<snapname>
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
     my $result = _api_call_write(
         $scfg, 'zfs.snapshot.create', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/zfs/snapshot', $payload) },
     );
 
     # Handle potential async job for snapshot creation
@@ -1926,10 +1816,8 @@ sub volume_snapshot_delete {
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
 
-    # TrueNAS REST: DELETE /zfs/snapshot/id/<pool%2Fds%40snap> with job completion waiting
     my $result = _api_call_write(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
-        sub { _rest_call($scfg, 'DELETE', "/zfs/snapshot/id/$id", undef) },
     );
 
     # Handle potential async job for snapshot deletion
@@ -2003,10 +1891,7 @@ sub volume_snapshot_info {
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
-    # Use WebSocket API for fresh snapshot data (TrueNAS 25.04+)
-    my $list = _api_call($scfg, 'zfs.snapshot.query', [],
-        sub { _rest_call($scfg, 'GET', '/zfs/snapshot', undef) }
-    ) // [];
+    my $list = _api_call($scfg, 'zfs.snapshot.query', []) // [];
 
     my $snaps = {};
     for my $s (@$list) {
@@ -2030,7 +1915,7 @@ sub volume_snapshot_info {
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
 sub _tn_targets {
     my ($scfg) = @_;
-    my $list = _rest_call($scfg, 'GET', '/iscsi/target', undef);
+    my $list = _api_call($scfg, 'iscsi.target.query', []);
     return $list // [];
 }
 
@@ -2038,17 +1923,13 @@ sub _tn_extent_create($scfg, $zname, $full) {
     my $payload = {
         name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/iscsi/extent', $payload) }
-    );
+    my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ]);
     # Invalidate cache since extents list has changed
     _clear_cache($scfg->{storeid}) if $result;
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ],
-        sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id") }
-    );
+    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ]);
     # Invalidate cache since extents list has changed
     _clear_cache($scfg->{storeid}) if $result;
     return $result;
@@ -2068,17 +1949,13 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
 
     # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ],
-        sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $payload) }
-    );
+    my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]);
     # Invalidate cache since targetextents list has changed
     _clear_cache($scfg->{storeid}) if $result;
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ],
-        sub { _rest_call($scfg, 'DELETE', "/iscsi/targetextent/id/$tx_id") }
-    );
+    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ]);
     # Invalidate cache since targetextents list has changed
     _clear_cache($scfg->{storeid}) if $result;
     return $result;
@@ -2106,8 +1983,7 @@ sub _preflight_check_alloc {
 
     # Check 1: TrueNAS API is reachable
     eval {
-        _api_call($scfg, 'core.ping', [],
-            sub { _rest_call($scfg, 'GET', '/core/ping') });
+        _api_call($scfg, 'core.ping', []);
     };
     if ($@) {
         push @errors, "TrueNAS API is unreachable: $@";
@@ -2117,8 +1993,7 @@ sub _preflight_check_alloc {
     if ($mode eq 'iscsi') {
         eval {
             my $services = _api_call($scfg, 'service.query',
-                [[ ["service", "=", "iscsitarget"] ]],
-                sub { _rest_call($scfg, 'GET', '/service?service=iscsitarget') });
+                [[ ["service", "=", "iscsitarget"] ]]);
 
             if (!$services || !@$services) {
                 push @errors, "Unable to query iSCSI service status";
@@ -2136,8 +2011,7 @@ sub _preflight_check_alloc {
     } elsif ($mode eq 'nvme-tcp') {
         eval {
             my $services = _api_call($scfg, 'service.query',
-                [[ ["service", "=", "nvmet"] ]],
-                sub { die "REST API not supported for NVMe-oF operations\n"; });
+                [[ ["service", "=", "nvmet"] ]]);
 
             if (!$services || !@$services) {
                 push @errors, "Unable to query NVMe-oF service status";
@@ -2204,8 +2078,7 @@ sub _preflight_check_alloc {
 
             # Query subsystem to ensure it exists
             my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
-                [[ ["subnqn", "=", $nqn] ]],
-                sub { die "REST API not supported for NVMe-oF operations\n"; });
+                [[ ["subnqn", "=", $nqn] ]]);
 
             if (!$subsystems || !@$subsystems) {
                 push @errors, sprintf(
@@ -2249,7 +2122,7 @@ sub _resolve_target_id {
     my $targets = _tn_targets($scfg) // [];
     if (!@$targets) {
         # Try to fetch the base name for a more helpful message
-        my $global   = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef) } // {};
+        my $global   = eval { _api_call($scfg, 'iscsi.global.config', []) } // {};
         my $basename = $global->{basename} // '(unknown)';
         my $portal   = $scfg->{discovery_portal} // '(none)';
         my $msg = join("\n",
@@ -2267,7 +2140,7 @@ sub _resolve_target_id {
     }
 
     # 2) Get global base name to construct full IQNs
-    my $global   = eval { _rest_call($scfg, 'GET', '/iscsi/global', undef) } // {};
+    my $global   = eval { _api_call($scfg, 'iscsi.global.config', []) } // {};
     my $basename = $global->{basename} // '';
 
     # 3) Try several matching strategies
@@ -2915,7 +2788,7 @@ sub _nvme_get_namespace_info {
     my $namespaces = eval {
         _api_call($scfg, 'nvmet.namespace.query', [
             [["device_uuid", "=", $device_uuid]]
-        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+        ]);
     };
 
     return undef if $@ || !$namespaces || !@$namespaces;
@@ -3018,7 +2891,7 @@ sub _nvme_ensure_subsystem {
     # Query existing subsystems
     my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
         [["subnqn", "=", $nqn]]
-    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    ]);
 
     if ($subsystems && @$subsystems) {
         my $subsys = $subsystems->[0];
@@ -3039,7 +2912,7 @@ sub _nvme_ensure_subsystem {
         name => $name,
         subnqn => $nqn,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
-    }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    }]);
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
 
@@ -3059,7 +2932,7 @@ sub _nvme_ensure_subsystem {
                 trtype => 'TCP',
                 traddr => $host,
                 trsvcid => "$port",  # Must be string
-            }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+            }]);
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_ensure_subsystem: failed to create port for $portal: $@");
@@ -3086,7 +2959,7 @@ sub _nvme_create_namespace {
         device_path => $zvol_path,  # Already has 'zvol/' prefix
         subsys_id => $subsys_id,
         enabled => JSON::PP::true,
-    }], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    }]);
 
     my $device_uuid = $ns->{device_uuid};
     die "Failed to get device_uuid from namespace creation\n" unless $device_uuid;
@@ -3113,7 +2986,7 @@ sub _nvme_delete_namespace {
     my $nqn = $scfg->{subsystem_nqn};
     my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
         [["subnqn", "=", $nqn]]
-    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    ]);
 
     return unless $subsystems && @$subsystems;
     my $subsys_id = $subsystems->[0]{id};
@@ -3122,15 +2995,14 @@ sub _nvme_delete_namespace {
     my $zvol_path = "zvol/$full_ds";
     my $namespaces = _api_call($scfg, 'nvmet.namespace.query', [
         [["subsys_id", "=", $subsys_id], ["device_path", "=", $zvol_path]]
-    ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+    ]);
 
     return unless $namespaces && @$namespaces;
 
     for my $ns (@$namespaces) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_delete_namespace: deleting namespace id=$ns->{id}");
         eval {
-            _api_call($scfg, 'nvmet.namespace.delete', [$ns->{id}],
-                sub { die "REST API not supported for NVMe-oF operations\n"; });
+            _api_call($scfg, 'nvmet.namespace.delete', [$ns->{id}]);
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_delete_namespace: failed to delete namespace $ns->{id}: $@");
@@ -3316,7 +3188,6 @@ sub alloc_image {
                 $scfg,
                 'pool.dataset.create',
                 [ $create_payload ],
-                sub { _rest_call($scfg, 'POST', '/pool/dataset', $create_payload) },
             );
         };
 
@@ -3393,9 +3264,8 @@ sub _alloc_image_iscsi {
             $scfg,
             'iscsi.extent.create',
             [ $extent_payload ],
-            sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
         );
-        # normalize id from either WS result or REST (hashref)
+        # normalize id from WebSocket result (hashref)
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
     }
     if (!defined $extent_id) {
@@ -3435,7 +3305,6 @@ sub _alloc_image_iscsi {
             $scfg,
             'iscsi.targetextent.create',
             [ $tx_payload ],
-            sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
         );
 
         # Invalidate cache after creating new mapping to ensure we get fresh data
@@ -3680,8 +3549,7 @@ sub _free_image_iscsi {
     if ($tx && defined $tx->{id}) {
         my $id = $tx->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
-                sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+            _api_call($scfg,'iscsi.targetextent.delete',[ $id ]);
             1;
         };
         if (!$ok) {
@@ -3700,8 +3568,7 @@ sub _free_image_iscsi {
     if ($extent && defined $extent->{id}) {
         my $eid = $extent->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.extent.delete',[ $eid ],
-                sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+            _api_call($scfg,'iscsi.extent.delete',[ $eid ]);
             1;
         };
         if (!$ok) {
@@ -3744,8 +3611,7 @@ sub _free_image_iscsi {
         if ($tx && defined $tx->{id}) {
             my $id = $tx->{id};
             eval {
-                _api_call($scfg,'iscsi.targetextent.delete',[ $id ],
-                    sub { _rest_call($scfg,'DELETE',"/iscsi/targetextent/id/$id",undef) });
+                _api_call($scfg,'iscsi.targetextent.delete',[ $id ]);
             };
             if ($@) {
                 # In cluster environments, other nodes may have active sessions causing "in use" errors
@@ -3759,8 +3625,7 @@ sub _free_image_iscsi {
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
-                _api_call($scfg,'iscsi.extent.delete',[ $eid ],
-                    sub { _rest_call($scfg,'DELETE',"/iscsi/extent/id/$eid",undef) });
+                _api_call($scfg,'iscsi.extent.delete',[ $eid ]);
             };
             if ($@) {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete extent id=$eid (may be in use by other cluster nodes)");
@@ -3915,14 +3780,12 @@ sub _free_image_nvme {
         eval {
             my $nqn = $scfg->{subsystem_nqn};
             my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
-                [[ ["subnqn", "=", $nqn] ]],
-                sub { die "REST API not supported for NVMe-oF operations\n"; });
+                [[ ["subnqn", "=", $nqn] ]]);
 
             if ($subsystems && @$subsystems) {
                 my $subsys_id = $subsystems->[0]{id};
                 my $namespaces = _api_call($scfg, 'nvmet.namespace.query',
-                    [[ ["subsys_id", "=", $subsys_id] ]],
-                    sub { die "REST API not supported for NVMe-oF operations\n"; });
+                    [[ ["subsys_id", "=", $subsys_id] ]]);
                 $active_ns_count = $namespaces ? scalar(@$namespaces) : 0;
             }
         };
@@ -4086,11 +3949,7 @@ sub _list_images_iscsi {
         # This is significantly faster than individual _tn_dataset_get() calls per volume
         my $datasets = _api_call($scfg, 'pool.dataset.query', [
             [["id", "^", "$scfg->{dataset}/"]]
-        ], sub {
-            # REST API fallback - less efficient but functional
-            my $parent_ds = _tn_dataset_get($scfg, $scfg->{dataset});
-            return $parent_ds->{children} // [];
-        });
+        ]);
 
         # Build hash lookup table: dataset_id => dataset_info
         if ($datasets && ref($datasets) eq 'ARRAY') {
@@ -4191,7 +4050,7 @@ sub _list_images_nvme {
     my $subsystems = eval {
         _api_call($scfg, 'nvmet.subsys.query', [
             [["subnqn", "=", $nqn]]
-        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+        ]);
     };
     if ($@) {
         _log($scfg, 0, 'err', "[TrueNAS] list_images_nvme: failed to query subsystem: $@");
@@ -4206,7 +4065,7 @@ sub _list_images_nvme {
     # Get all namespaces for this subsystem
     # Note: Query without filter because TrueNAS API filter syntax is inconsistent
     my $namespaces = eval {
-        _api_call($scfg, 'nvmet.namespace.query', [[]], sub { die "REST API not supported for NVMe-oF operations\n"; });
+        _api_call($scfg, 'nvmet.namespace.query', [[]]);
     } // [];
 
     # Filter to only our subsystem
@@ -4231,11 +4090,7 @@ sub _list_images_nvme {
         # This is significantly faster than individual _tn_dataset_get() calls per volume
         my $datasets = _api_call($scfg, 'pool.dataset.query', [
             [["id", "^", "$scfg->{dataset}/"]]
-        ], sub {
-            # REST API fallback - less efficient but functional
-            my $parent_ds = _tn_dataset_get($scfg, $scfg->{dataset});
-            return $parent_ds->{children} // [];
-        });
+        ]);
 
         # Build hash lookup table: dataset_id => dataset_info
         if ($datasets && ref($datasets) eq 'ARRAY') {
@@ -4733,7 +4588,6 @@ sub _clone_image_iscsi {
                 $scfg,
                 'iscsi.extent.create',
                 [ $extent_payload ],
-                sub { _rest_call($scfg, 'POST', '/iscsi/extent', $extent_payload) },
             );
         };
         if ($@) {
@@ -4764,14 +4618,12 @@ sub _clone_image_iscsi {
                 $scfg,
                 'iscsi.targetextent.create',
                 [ $tx_payload ],
-                sub { _rest_call($scfg, 'POST', '/iscsi/targetextent', $tx_payload) },
             );
         };
         if ($@) {
             # Cleanup: delete extent and zvol if mapping creation failed
             eval {
-                _api_call($scfg, 'iscsi.extent.delete', [$extent_id],
-                    sub { _rest_call($scfg, 'DELETE', "/iscsi/extent/id/$extent_id", undef) });
+                _api_call($scfg, 'iscsi.extent.delete', [$extent_id]);
             };
             eval { _tn_dataset_delete($scfg, $target_full) };
             die "Failed to create target-extent mapping for clone: $@\n";
@@ -4862,7 +4714,7 @@ sub _clone_image_nvme {
     my $subsystems = eval {
         _api_call($scfg, 'nvmet.subsys.query', [
             [["subnqn", "=", $nqn]]
-        ], sub { die "REST API not supported for NVMe-oF operations\n"; });
+        ]);
     };
     if ($@ || !$subsystems || !@$subsystems) {
         die "Failed to query NVMe subsystem $nqn: $@\n";
@@ -4879,8 +4731,7 @@ sub _clone_image_nvme {
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
     my $ns = eval {
-        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
-            sub { die "REST API not supported for NVMe-oF operations\n"; });
+        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
     };
     if ($@) {
         # Cleanup: delete the zvol clone if namespace creation failed
@@ -4895,8 +4746,7 @@ sub _clone_image_nvme {
     if (!$dev) {
         # Cleanup on failure
         eval {
-            _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ],
-                sub { die "REST API not supported for NVMe-oF operations\n"; });
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ]);
         };
         eval { _tn_dataset_delete($scfg, $target_full) };
         die "Device did not appear for cloned namespace (UUID: $device_uuid)\n";
