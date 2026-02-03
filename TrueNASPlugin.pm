@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '1.2.6';
+our $VERSION = '2.0.0';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -3302,10 +3302,11 @@ sub alloc_image {
         $create_error = undef;
 
         my $create_payload = {
-            name    => $full_ds,
-            type    => 'VOLUME',
-            volsize => $bytes,
-            sparse  => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+            name     => $full_ds,
+            type     => 'VOLUME',
+            volsize  => $bytes,
+            sparse   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+            comments => 'Autocreated by Proxmox Plugin',
         };
         # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
         $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
