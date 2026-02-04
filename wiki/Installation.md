@@ -621,13 +621,13 @@ If you prefer manual installation or need more control over the process, follow 
 
 ### Software Requirements
 - **Proxmox VE** - 8.x or later (9.x recommended for volume chains)
-- **TrueNAS SCALE** - 22.x or later (25.04+ recommended)
-  - **For TrueNAS 25.04+**: Must use WebSocket transport (`api_transport ws`) - REST API is deprecated and will be removed in 26.04
+- **TrueNAS SCALE** - 25.10 or later (required)
+
 - **Perl** - 5.36 or later (included with Proxmox VE)
 
 ### Network Requirements
 - **iSCSI Connectivity** - TCP/3260 between Proxmox nodes and TrueNAS
-- **TrueNAS API Access** - HTTPS/443 or HTTP/80 for management API
+- **TrueNAS API Access** - HTTPS/443 for WebSocket API (HTTP is not supported)
 - **Cluster Networks** - Shared storage network for cluster deployments
 
 ### TrueNAS Prerequisites
@@ -874,12 +874,12 @@ truenasplugin: truenas-storage
 ### 7. Verify TrueNAS Configuration
 
 #### Test API Access
+Note: `STORAGE_ID` should be an existing TrueNAS plugin storage ID in `/etc/pve/storage.cfg`.
 ```bash
-# Replace with your values
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/iscsi/target
+# Replace STORAGE_ID with your storage name
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"iscsi.target.query\", [[]]); my $count = ref($res) eq \"ARRAY\" ? scalar(@$res) : 0; print \"targets=\$count\\n\";'"
 
-# Should return JSON list of targets
+# Should report a non-zero target count
 ```
 
 #### Verify Dataset
@@ -967,8 +967,7 @@ journalctl -u pvedaemon -n 50
 **Solution**:
 ```bash
 # Test API connectivity
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/system/info
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print $res->{version}, \"\\n\" if ref($res) eq \"HASH\" && $res->{version}; print \"\\n\";'"
 
 # Check firewall
 iptables -L -n | grep 443

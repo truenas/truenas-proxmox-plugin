@@ -2,6 +2,8 @@
 #
 # Add these configurations to your /etc/pve/storage.cfg file
 # Choose the configuration that best matches your environment
+#
+# TrueNAS 25.10+ required - WebSocket is only supported transport
 
 # =============================================================================
 # BASIC CONFIGURATION (iSCSI)
@@ -27,7 +29,6 @@ truenasplugin: truenas-nvme
     subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     dataset tank/proxmox
     discovery_portal 192.168.1.100:4420
-    api_transport ws
     content images
     shared 1
 
@@ -95,7 +96,6 @@ truenasplugin: truenas-dev
     api_scheme http
     api_port 80
     api_insecure 1
-    api_transport rest
     target_iqn iqn.2005-10.org.freenas.ctl:dev-target
     dataset tank/development
     discovery_portal 192.168.1.50:3260
@@ -137,7 +137,6 @@ truenasplugin: truenas-ipv6
 truenasplugin: truenas-websocket
     api_host 192.168.1.100
     api_key 1-websocket123456789abcdef123456789abcdef12
-    api_transport ws
     api_scheme wss
     api_port 443
     target_iqn iqn.2005-10.org.freenas.ctl:ws-target
@@ -150,24 +149,6 @@ truenasplugin: truenas-websocket
     tn_sparse 1
     vmstate_storage local
 
-# =============================================================================
-# REST API CONFIGURATION
-# =============================================================================
-# Fallback configuration using REST API
-truenasplugin: truenas-rest
-    api_host 192.168.1.100
-    api_key 1-restapi123456789abcdef123456789abcdef123
-    api_transport rest
-    api_scheme https
-    api_port 443
-    target_iqn iqn.2005-10.org.freenas.ctl:rest-target
-    dataset tank/rest
-    discovery_portal 192.168.1.100:3260
-    content images
-    shared 1
-    # REST specific
-    zvol_blocksize 64K
-    tn_sparse 1
 
 # =============================================================================
 # NVME/TCP WITH DH-CHAP AUTHENTICATION
@@ -182,7 +163,6 @@ truenasplugin: truenas-nvme-secure
     discovery_portal 192.168.10.100:4420
     nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
     nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
-    api_transport ws
     api_scheme wss
     api_port 443
     content images
@@ -201,7 +181,6 @@ truenasplugin: truenas-nvme-multipath
     dataset tank/proxmox
     discovery_portal 192.168.10.100:4420
     portals 192.168.10.101:4420,192.168.10.102:4420
-    api_transport ws
     content images
     shared 1
     zvol_blocksize 128K
@@ -254,7 +233,6 @@ truenasplugin: truenas-soho
 # - Subsystem NQN: Format nqn.YYYY-MM.domain:identifier
 # - Plugin auto-creates subsystem if it doesn't exist
 # - Default port: 4420
-# - Requires api_transport = ws (WebSocket)
 # - Install nvme-cli on Proxmox nodes: apt-get install nvme-cli
 # - Generate host NQN: nvme gen-hostnqn > /etc/nvme/hostnqn
 # - Optional DH-CHAP authentication (generate with: nvme gen-dhchap-key)

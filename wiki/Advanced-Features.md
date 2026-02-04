@@ -795,28 +795,6 @@ vmstate_storage shared
 
 ### API Performance
 
-#### WebSocket vs REST
-
-WebSocket transport offers better performance:
-
-```ini
-# Recommended for production
-api_transport ws
-api_scheme wss
-```
-
-**WebSocket Benefits**:
-- Persistent connection - no repeated TLS handshake
-- Lower latency - ~20-30ms faster per operation
-- Connection pooling - reused across calls
-
-**REST Fallback**:
-Use REST if WebSocket is unreliable:
-```ini
-api_transport rest
-api_scheme https
-```
-
 #### Bulk Operations
 
 Enable bulk API operations to batch multiple calls:
@@ -1131,9 +1109,7 @@ systemctl restart pvedaemon pveproxy
 Always use encrypted transport in production:
 
 ```ini
-api_scheme wss      # For WebSocket
-# or
-api_scheme https    # For REST
+api_scheme wss      # For WebSocket (TrueNAS 25.10+)
 api_insecure 0      # Verify TLS certificates
 ```
 
@@ -1401,7 +1377,10 @@ iscsiadm -m discovery -t sendtargets -p <portal-ip>:<port>
 **Network Issues**:
 - Weight creation requires API connectivity to TrueNAS
 - Check network between Proxmox node and TrueNAS
-- Verify API endpoint accessible: `curl -k https://<truenas-ip>/api/v2.0/system/info`
+- Verify API access from Proxmox with the plugin-based call:
+  ```bash
+  ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+  ```
 
 ### Benefits
 
@@ -1615,10 +1594,9 @@ Relaxed security for testing:
 truenasplugin: dev-storage
     api_host 192.168.1.50
     api_key 1-dev-key
-    api_scheme http
+    api_scheme ws
     api_port 80
     api_insecure 1
-    api_transport rest
     target_iqn iqn.2005-10.org.freenas.ctl:dev
     dataset tank/dev
     discovery_portal 192.168.1.50:3260

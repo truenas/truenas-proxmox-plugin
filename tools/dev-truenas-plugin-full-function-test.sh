@@ -318,17 +318,79 @@ log_warning() {
 }
 
 # Get storage configuration from storage.cfg
-# Returns: "api_host|api_key|dataset"
+# Returns: "api_host|api_key|dataset|api_insecure"
 get_storage_config() {
     local storage_id="$1"
     local config_file="/etc/pve/storage.cfg"
 
-    local api_host api_key dataset
+    local api_host api_key dataset api_insecure
     api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_host" | awk '{print $2}' | head -1)
     api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_key" | awk '{print $2}' | head -1)
     dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "dataset" | awk '{print $2}' | head -1)
+    api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_insecure" | awk '{print $2}' | head -1)
 
-    echo "$api_host|$api_key|$dataset"
+    echo "$api_host|$api_key|$dataset|$api_insecure"
+}
+
+# WebSocket API helpers using TrueNASPlugin
+tn_api_call() {
+    local host="$1"
+    local api_key="$2"
+    local method="$3"
+    local params="${4:-[]}";
+    local api_insecure="${5:-0}"
+
+    perl -e '
+        use strict;
+        use warnings;
+        use lib "/usr/share/perl5/PVE/Storage/Custom";
+        use TrueNASPlugin;
+        use JSON::PP;
+
+        my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
+        my $scfg = {
+            api_host => $host,
+            api_key => $api_key,
+            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+        };
+        my $params = eval { decode_json($params_json) } // [];
+        my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, $method, $params); };
+        if ($@) {
+            print STDERR "ERROR: $@";
+            exit 1;
+        }
+        print encode_json($result) if defined $result;
+    ' "$host" "$api_key" "$method" "$params" "$api_insecure"
+}
+
+tn_api_call_write() {
+    local host="$1"
+    local api_key="$2"
+    local method="$3"
+    local params="${4:-[]}";
+    local api_insecure="${5:-0}"
+
+    perl -e '
+        use strict;
+        use warnings;
+        use lib "/usr/share/perl5/PVE/Storage/Custom";
+        use TrueNASPlugin;
+        use JSON::PP;
+
+        my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
+        my $scfg = {
+            api_host => $host,
+            api_key => $api_key,
+            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+        };
+        my $params = eval { decode_json($params_json) } // [];
+        my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params); };
+        if ($@) {
+            print STDERR "ERROR: $@";
+            exit 1;
+        }
+        print encode_json($result) if defined $result;
+    ' "$host" "$api_key" "$method" "$params" "$api_insecure"
 }
 
 # Check for APIVER mismatch between system and plugin
@@ -437,9 +499,9 @@ verify_truenas_zvol_deleted() {
     local disk_name="$2"
 
     # Get TrueNAS API credentials
-    local config api_host api_key dataset
+    local config api_host api_key dataset api_insecure
     config=$(get_storage_config "$STORAGE_ID")
-    IFS='|' read -r api_host api_key dataset <<< "$config"
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]]; then
         log_warning "Cannot verify TrueNAS zvol deletion without API access"
@@ -448,13 +510,10 @@ verify_truenas_zvol_deleted() {
 
     # Build zvol path
     local zvol_path="${dataset}/${disk_name}"
-    local encoded_path
-    encoded_path=$(echo -n "$zvol_path" | sed 's|/|%2F|g')
-
-    # Query TrueNAS for the zvol
+    # Query TrueNAS for the zvol via WebSocket API
     local api_response
-    api_response=$(timeout 30 curl -sk -H "Authorization: Bearer $api_key" \
-        "https://$api_host/api/v2.0/pool/dataset/id/$encoded_path" 2>/dev/null || echo "{}")
+    api_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" \
+        "[[[\"id\",\"=\",\"$zvol_path\"]]]" "$api_insecure" 2>/dev/null || echo "[]")
 
     # Check if zvol still exists (response contains valid JSON with id field)
     if echo "$api_response" | grep -q "\"id\":\"$zvol_path\""; then
@@ -464,58 +523,45 @@ verify_truenas_zvol_deleted() {
     fi
 }
 
-# Force delete zvol via TrueNAS REST API
+# Force delete zvol via TrueNAS WebSocket API
 # Args: $1 = disk_name (e.g., "vm-9030-disk-0-ns7126c4b8...")
 # Returns: 0 if deletion succeeded or zvol doesn't exist, 1 on error
 force_delete_truenas_zvol() {
     local disk_name="$1"
 
     # Get TrueNAS API credentials
-    local config api_host api_key dataset
+    local config api_host api_key dataset api_insecure
     config=$(get_storage_config "$STORAGE_ID")
-    IFS='|' read -r api_host api_key dataset <<< "$config"
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]]; then
         echo "[DEBUG] Cannot force delete without API credentials" | tee -a "$LOG_FILE"
         return 1
     fi
 
-    # Build zvol path and encode it
+    # Build zvol path
     local zvol_path="${dataset}/${disk_name}"
-    local encoded_path
-    encoded_path=$(echo -n "$zvol_path" | sed 's|/|%2F|g')
 
-    echo "[DEBUG] Force deleting zvol via TrueNAS API: $zvol_path" | tee -a "$LOG_FILE"
+    echo "[DEBUG] Force deleting zvol via WebSocket API: $zvol_path" | tee -a "$LOG_FILE"
 
-    # Delete via REST API with recursive=true and force=true
-    local api_response http_code
-    api_response=$(timeout 30 curl -sk -w "\n%{http_code}" \
-        -H "Authorization: Bearer $api_key" \
-        -H "Content-Type: application/json" \
-        -X DELETE \
-        -d '{"recursive": true, "force": true}' \
-        "https://$api_host/api/v2.0/pool/dataset/id/$encoded_path" 2>&1)
+    # Delete via WebSocket API with recursive=true and force=true
+    local params_json
+    params_json=$(printf '["%s", {"recursive": true, "force": true}]' "$zvol_path")
 
-    http_code=$(echo "$api_response" | tail -1)
-    local response_body=$(echo "$api_response" | head -n -1)
-
-    echo "[DEBUG] TrueNAS API response code: $http_code" | tee -a "$LOG_FILE"
-
-    # Success cases:
-    # - 200 OK: zvol was deleted
-    # - 404 Not Found: zvol doesn't exist (already deleted)
-    # - 422 Unprocessable Entity: zvol doesn't exist (metadata desync - Proxmox has stale entry)
-    if [[ "$http_code" == "200" ]] || [[ "$http_code" == "404" ]] || [[ "$http_code" == "422" ]]; then
-        if [[ "$http_code" == "422" ]]; then
-            echo "[DEBUG] HTTP 422: zvol doesn't exist on TrueNAS (metadata desync - treating as success)" | tee -a "$LOG_FILE"
-        else
-            echo "[DEBUG] Force delete successful or zvol already gone" | tee -a "$LOG_FILE"
-        fi
+    local api_response
+    if api_response=$(tn_api_call_write "$api_host" "$api_key" "pool.dataset.delete" \
+        "$params_json" "$api_insecure" 2>&1); then
+        echo "[DEBUG] Force delete successful or zvol already gone" | tee -a "$LOG_FILE"
         return 0
-    else
-        echo "[DEBUG] Force delete failed with HTTP $http_code: $response_body" | tee -a "$LOG_FILE"
-        return 1
     fi
+
+    if echo "$api_response" | grep -qiE "not found|does not exist"; then
+        echo "[DEBUG] Zvol not found on TrueNAS (treating as success)" | tee -a "$LOG_FILE"
+        return 0
+    fi
+
+    echo "[DEBUG] Force delete failed: $api_response" | tee -a "$LOG_FILE"
+    return 1
 }
 
 # ============================================================================
@@ -723,9 +769,9 @@ test_truenas_size_verification() {
     local start_time=$(date +%s)
 
     # Get TrueNAS API credentials from storage.cfg
-    local config api_host api_key dataset
+    local config api_host api_key dataset api_insecure
     config=$(get_storage_config "$STORAGE_ID")
-    IFS='|' read -r api_host api_key dataset <<< "$config"
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]] || [[ -z "$dataset" ]]; then
         log_error "Failed to read storage configuration"
@@ -745,16 +791,13 @@ test_truenas_size_verification() {
         return 1
     fi
 
-    # Get size from TrueNAS - URL encode the path manually
+    # Get size from TrueNAS
     local dataset_path="${dataset}/vm-${vmid}-disk-0"
-    local encoded_path
-    # Simple URL encoding: replace / with %2F
-    encoded_path=$(echo -n "$dataset_path" | sed 's|/|%2F|g')
 
     local truenas_size
     local api_response
-    api_response=$(timeout 30 curl -sk -H "Authorization: Bearer $api_key" \
-        "https://$api_host/api/v2.0/pool/dataset/id/$encoded_path" 2>/dev/null || echo "{}")
+    api_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" \
+        "[[[\"id\",\"=\",\"$dataset_path\"]]]" "$api_insecure" 2>/dev/null || echo "[]")
 
     # Parse volsize.parsed from JSON without jq
     # TrueNAS returns volsize as an object with a "parsed" field containing the numeric value
@@ -2936,9 +2979,9 @@ test_storage_exhaustion() {
     sleep $API_SETTLE_TIME
 
     # Get TrueNAS API credentials
-    local config api_host api_key dataset
+    local config api_host api_key dataset api_insecure
     config=$(get_storage_config "$STORAGE_ID")
-    IFS='|' read -r api_host api_key dataset <<< "$config"
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]]; then
         log_warning "Cannot test space exhaustion without TrueNAS API access"
@@ -2949,12 +2992,10 @@ test_storage_exhaustion() {
 
     # Get available space on dataset
     local dataset_path="$dataset"
-    local encoded_path
-    encoded_path=$(echo -n "$dataset_path" | sed 's|/|%2F|g')
 
     local api_response
-    api_response=$(timeout 30 curl -sk -H "Authorization: Bearer $api_key" \
-        "https://$api_host/api/v2.0/pool/dataset/id/$encoded_path" 2>/dev/null || echo "{}")
+    api_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" \
+        "[[[\"id\",\"=\",\"$dataset_path\"]]]" "$api_insecure" 2>/dev/null || echo "[]")
 
     # Parse available space (in bytes)
     local available_bytes
@@ -4578,6 +4619,7 @@ test_dataset_property_inheritance() {
     local api_host=""
     local api_key=""
     local dataset=""
+    local api_insecure=""
     local in_storage_block=0
 
     while IFS= read -r line; do
@@ -4597,6 +4639,8 @@ test_dataset_property_inheritance() {
                 api_key="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^[[:space:]]*dataset[[:space:]]+(.+)$ ]]; then
                 dataset="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*api_insecure[[:space:]]+(.+)$ ]]; then
+                api_insecure="${BASH_REMATCH[1]}"
             fi
         fi
     done < "$storage_cfg"
@@ -4612,14 +4656,9 @@ test_dataset_property_inheritance() {
 
     # Query parent dataset properties
     log_verbose "Querying parent dataset properties" "INFO" "$CURRENT_OP_ID"
-    local api_url="https://${api_host}/api/v2.0/pool/dataset/id/${dataset}"
-    api_url="${api_url//\/\//\/}"  # Replace // with /
-
-    local curl_rc=0
     local dataset_props
-    dataset_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$api_url" 2>/dev/null) || curl_rc=$?
-
-    if [[ $curl_rc -ne 0 ]]; then
+    if ! dataset_props=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" \
+        "[[[\"id\",\"=\",\"$dataset\"]]]" "$api_insecure" 2>/dev/null); then
         log_error "Failed to query TrueNAS API for dataset properties"
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - API query failed")
@@ -4663,13 +4702,9 @@ test_dataset_property_inheritance() {
     log_verbose "Querying zvol properties" "INFO" "$CURRENT_OP_ID"
     local zvol_name="vm-$vmid-disk-0"
     local zvol_path="${dataset}/${zvol_name}"
-    local zvol_api_url="https://${api_host}/api/v2.0/pool/dataset/id/${zvol_path}"
-    zvol_api_url="${zvol_api_url//\/\//\/}"
-
     local zvol_props
-    zvol_props=$(curl -sk -H "Authorization: Bearer ${api_key}" "$zvol_api_url" 2>/dev/null) || curl_rc=$?
-
-    if [[ $curl_rc -ne 0 ]]; then
+    if ! zvol_props=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" \
+        "[[[\"id\",\"=\",\"$zvol_path\"]]]" "$api_insecure" 2>/dev/null); then
         log_warning "Could not query zvol properties - may not be exposed via API"
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         wait_for_vm_deletion "$vmid" "$vmid" 5

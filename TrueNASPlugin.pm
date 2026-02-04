@@ -14,8 +14,6 @@ use IO::Socket::SSL;
 use Time::HiRes qw(usleep);
 use POSIX ();
 use Socket qw(inet_ntoa);
-use LWP::UserAgent;
-use HTTP::Request;
 use Cwd qw(abs_path);
 use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
@@ -638,20 +636,6 @@ sub _host_ipv4($host) {
     }
     return $host; # fallback (could be IPv6 literal or DNS)
 }
-
-# ======== REST client (fallback) ========
-sub _ua($scfg) {
-    my $ua = LWP::UserAgent->new(
-        timeout   => 30,
-        keep_alive=> 1,
-        ssl_opts  => {
-            verify_hostname => !$scfg->{api_insecure},
-            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
-        }
-    );
-    return $ua;
-}
-
 
 # ======== WebSocket JSON-RPC client ========
 # Connect to ws(s)://<host>/api/current; auth via auth.login_with_api_key.

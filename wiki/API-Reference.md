@@ -4,58 +4,30 @@ Technical reference for TrueNAS API integration used by the Proxmox VE Storage P
 
 ## Overview
 
-The plugin integrates with TrueNAS SCALE via two API transports:
-- **WebSocket (JSON-RPC)** - Default, recommended for performance
-- **REST (HTTP)** - Fallback, more compatible
+The plugin integrates with TrueNAS SCALE via WebSocket (JSON-RPC) only.
 
-## API Transport Selection
+## API Transport
 
-### WebSocket Transport
+### WebSocket Transport (Required)
 
 **Configuration**:
 ```ini
-api_transport ws
 api_scheme wss      # or ws for unencrypted
 api_port 443        # or 80 for unencrypted
 ```
 
 **Connection URL**:
-- TrueNAS 24.10 and earlier: `wss://TRUENAS_HOST:443/websocket`
-- TrueNAS 25.04+: `wss://TRUENAS_HOST:443/api/current` (legacy `/websocket` still supported)
+- `wss://TRUENAS_HOST:443/api/current/websocket`
 
 **Benefits**:
 - Persistent connection (no repeated TLS handshake)
 - Lower latency (~20-30ms faster per operation)
 - Connection pooling and reuse
 - Real-time updates (not currently used)
-- **Required for TrueNAS 26.04+**
+- **Required for TrueNAS 25.10+**
 
 **Limitations**:
-- May be unstable on some networks
-- Requires TrueNAS SCALE 22.12+
-
-### REST Transport
-
-**⚠️ DEPRECATION NOTICE**: The TrueNAS REST API was deprecated in TrueNAS SCALE 25.04 and will be removed in version 26.04 (expected April 2026). Use WebSocket transport for TrueNAS 25.04 and later.
-
-**Configuration** (Legacy - TrueNAS 24.10 and earlier only):
-```ini
-api_transport rest
-api_scheme https    # or http for unencrypted
-api_port 443        # or 80 for unencrypted
-```
-
-**Base URL**: `https://TRUENAS_HOST:443/api/v2.0/`
-
-**Benefits**:
-- More stable on unreliable networks
-- Compatible with TrueNAS SCALE versions 22.x through 25.04
-- Standard HTTP semantics
-
-**Limitations**:
-- Higher latency (new connection per request)
-- Repeated TLS handshakes
-- **Not available in TrueNAS 26.04+**
+- Requires TrueNAS SCALE 25.10+
 
 ## Authentication
 
@@ -90,7 +62,6 @@ API user must have permissions for:
 #### List Datasets
 ```
 WebSocket: pool.dataset.query
-REST: GET /api/v2.0/pool/dataset
 ```
 
 **Parameters**:
@@ -122,7 +93,6 @@ The plugin uses batch fetching for efficient list operations, retrieving all chi
 
 ```
 WebSocket: pool.dataset.query
-REST: GET /api/v2.0/pool/dataset?filters=[["id","^","tank/proxmox/"]]
 ```
 
 **Parameters**:
@@ -169,7 +139,6 @@ If batch fetch fails (network error, API issue), plugin falls back to individual
 #### Get Dataset Info
 ```
 WebSocket: pool.dataset.query
-REST: GET /api/v2.0/pool/dataset/id/tank%2Fproxmox
 ```
 
 **Response**: Same as list, single object
@@ -177,7 +146,6 @@ REST: GET /api/v2.0/pool/dataset/id/tank%2Fproxmox
 #### Create Zvol
 ```
 WebSocket: pool.dataset.create
-REST: POST /api/v2.0/pool/dataset
 ```
 
 **Parameters**:
@@ -205,7 +173,6 @@ REST: POST /api/v2.0/pool/dataset
 #### Resize Zvol
 ```
 WebSocket: pool.dataset.update
-REST: PUT /api/v2.0/pool/dataset/id/tank%2Fproxmox%2Fvm-100-disk-0
 ```
 
 **Parameters**:
@@ -218,7 +185,6 @@ REST: PUT /api/v2.0/pool/dataset/id/tank%2Fproxmox%2Fvm-100-disk-0
 #### Delete Zvol
 ```
 WebSocket: pool.dataset.delete
-REST: DELETE /api/v2.0/pool/dataset/id/tank%2Fproxmox%2Fvm-100-disk-0
 ```
 
 **Parameters**: `{"recursive": true}`
@@ -228,7 +194,6 @@ REST: DELETE /api/v2.0/pool/dataset/id/tank%2Fproxmox%2Fvm-100-disk-0
 #### Create Snapshot
 ```
 WebSocket: zfs.snapshot.create
-REST: POST /api/v2.0/zfs/snapshot
 ```
 
 **Parameters**:
@@ -252,7 +217,6 @@ REST: POST /api/v2.0/zfs/snapshot
 #### List Snapshots
 ```
 WebSocket: zfs.snapshot.query
-REST: GET /api/v2.0/zfs/snapshot
 ```
 
 **Parameters**:
@@ -265,13 +229,11 @@ REST: GET /api/v2.0/zfs/snapshot
 #### Delete Snapshot
 ```
 WebSocket: zfs.snapshot.delete
-REST: DELETE /api/v2.0/zfs/snapshot/id/tank%2Fproxmox%2Fvm-100-disk-0@snap1
 ```
 
 #### Rollback Snapshot
 ```
 WebSocket: zfs.snapshot.rollback
-REST: POST /api/v2.0/zfs/snapshot/id/tank%2Fproxmox%2Fvm-100-disk-0@snap1/rollback
 ```
 
 ### iSCSI Operations
@@ -279,7 +241,6 @@ REST: POST /api/v2.0/zfs/snapshot/id/tank%2Fproxmox%2Fvm-100-disk-0@snap1/rollba
 #### List Targets
 ```
 WebSocket: iscsi.target.query
-REST: GET /api/v2.0/iscsi/target
 ```
 
 **Response**:
@@ -297,7 +258,6 @@ REST: GET /api/v2.0/iscsi/target
 #### List Extents
 ```
 WebSocket: iscsi.extent.query
-REST: GET /api/v2.0/iscsi/extent
 ```
 
 **Response**:
@@ -318,7 +278,6 @@ REST: GET /api/v2.0/iscsi/extent
 #### Create Extent
 ```
 WebSocket: iscsi.extent.create
-REST: POST /api/v2.0/iscsi/extent
 ```
 
 **Parameters**:
@@ -338,7 +297,6 @@ REST: POST /api/v2.0/iscsi/extent
 #### Delete Extent
 ```
 WebSocket: iscsi.extent.delete
-REST: DELETE /api/v2.0/iscsi/extent/id/10
 ```
 
 **Parameters**: `{"force": true}` (optional)
@@ -346,7 +304,6 @@ REST: DELETE /api/v2.0/iscsi/extent/id/10
 #### List Target Extents
 ```
 WebSocket: iscsi.targetextent.query
-REST: GET /api/v2.0/iscsi/targetextent
 ```
 
 **Response**:
@@ -364,7 +321,6 @@ REST: GET /api/v2.0/iscsi/targetextent
 #### Create Target Extent
 ```
 WebSocket: iscsi.targetextent.create
-REST: POST /api/v2.0/iscsi/targetextent
 ```
 
 **Parameters**:
@@ -381,17 +337,13 @@ REST: POST /api/v2.0/iscsi/targetextent
 #### Delete Target Extent
 ```
 WebSocket: iscsi.targetextent.delete
-REST: DELETE /api/v2.0/iscsi/targetextent/id/5
 ```
 
 ### NVMe-oF Operations
 
-**Note**: NVMe-oF operations are only available via WebSocket transport. REST API does not support `nvmet.*` endpoints.
-
 #### List NVMe Subsystems
 ```
 WebSocket: nvmet.subsys.query
-REST: Not supported
 ```
 
 **Response**:
@@ -409,7 +361,6 @@ REST: Not supported
 #### List NVMe Namespaces
 ```
 WebSocket: nvmet.namespace.query
-REST: Not supported
 ```
 
 **Parameters** (filter by device UUID):
@@ -465,7 +416,6 @@ The plugin uses a three-tier matching strategy in `_nvme_find_device_by_subsyste
 #### Create NVMe Namespace
 ```
 WebSocket: nvmet.namespace.create
-REST: Not supported
 ```
 
 **Parameters**:
@@ -483,7 +433,6 @@ REST: Not supported
 #### Delete NVMe Namespace
 ```
 WebSocket: nvmet.namespace.delete
-REST: Not supported
 ```
 
 **Parameters**: `{"id": <namespace_id>}`
@@ -493,7 +442,6 @@ REST: Not supported
 #### Query Service Status
 ```
 WebSocket: service.query
-REST: GET /api/v2.0/service
 ```
 
 **Parameters**:
@@ -520,7 +468,6 @@ REST: GET /api/v2.0/service
 #### Get System Info
 ```
 WebSocket: system.info
-REST: GET /api/v2.0/system/info
 ```
 
 **Response**:
@@ -540,7 +487,6 @@ When `enable_bulk_operations=1`, multiple operations are batched:
 
 ```
 WebSocket: core.bulk
-REST: POST /api/v2.0/core/bulk
 ```
 
 **Parameters**:
@@ -602,14 +548,6 @@ REST: POST /api/v2.0/core/bulk
 }
 ```
 
-**REST**:
-```json
-{
-  "message": "Dataset tank/proxmox/vm-999-disk-0 does not exist",
-  "errno": 2
-}
-```
-
 ### Retryable Errors
 
 The plugin automatically retries these errors:
@@ -642,12 +580,7 @@ These errors fail immediately:
 
 ### Rate Limit Headers
 
-REST responses include rate limit headers:
-```
-X-RateLimit-Limit: 20
-X-RateLimit-Remaining: 15
-X-RateLimit-Reset: 1640000000
-```
+WebSocket responses include rate limit information in error messages when limits are exceeded.
 
 ## Connection Management
 
@@ -795,21 +728,16 @@ API keys stored in `/etc/pve/storage.cfg`:
 
 ### TrueNAS SCALE Versions
 
-| Version | WebSocket | REST API | Bulk Ops | Recommended Transport | Notes |
-|---------|-----------|----------|----------|-----------------------|-------|
-| 22.02 | Limited | Yes | No | REST | Basic functionality only |
-| 22.12 | Yes | Yes | Limited | WebSocket | WebSocket stable |
-| 23.10 | Yes | Yes | Yes | WebSocket | Bulk operations available |
-| 24.04 | Yes | Yes | Yes | WebSocket | Improved performance |
-| 24.10 | Yes | Yes | Yes | WebSocket | Last version with full REST support |
-| 25.04 | Yes | Deprecated | Yes | **WebSocket only** | REST API deprecated, use WebSocket |
-| 26.04+ (Future) | Yes | Removed | Yes | **WebSocket only** | REST API removed, WebSocket required (Expected: April 2026) |
+| Version | WebSocket | Bulk Ops | Notes |
+|---------|-----------|----------|-------|
+| 25.10 | Yes | Yes | Minimum supported version |
+| 26.04+ (Future) | Yes | Yes | WebSocket required |
 
 ### API Endpoints
 
-All endpoints use `/api/v2.0/` base path.
+WebSocket endpoint: `/api/current/websocket` (JSON-RPC methods listed above).
 
-**Future Compatibility**: TrueNAS maintains API v2.0 compatibility across versions.
+**Compatibility**: TrueNAS maintains JSON-RPC method compatibility across versions.
 
 ## Debugging API Calls
 
@@ -832,30 +760,9 @@ tail -f /var/log/middlewared.log | grep pool.dataset
 
 ### Manual API Testing
 
-**WebSocket** (using `wscat`):
+**WebSocket** (via plugin Perl call):
 ```bash
-# Install wscat
-npm install -g wscat
-
-# Connect
-wscat -c wss://TRUENAS_IP/websocket
-
-# Send request
-{"id": "test", "msg": "method", "method": "system.info"}
-```
-
-**REST** (using `curl`):
-```bash
-# Get system info
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://TRUENAS_IP/api/v2.0/system/info
-
-# Create dataset
-curl -k -X POST \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "tank/test", "type": "FILESYSTEM"}' \
-  https://TRUENAS_IP/api/v2.0/pool/dataset
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print $res->{version}, \"\\n\";'
 ```
 
 ## See Also

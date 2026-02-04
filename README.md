@@ -12,7 +12,6 @@
 - **Cluster Compatible** - Full support for Proxmox VE clusters with shared storage
 - **Automatic Volume Management** - Dynamic zvol creation and iSCSI extent mapping
 - **Configuration Validation** - Pre-flight checks and validation prevent misconfigurations
-- **Dual API Support** - WebSocket (JSON-RPC) and REST API transports
 - **Rate Limiting Protection** - Automatic retry with exponential backoff for TrueNAS API limits
 - **Storage Efficiency** - Thin provisioning and ZFS compression support
 - **Multi-path Support** - Native support for iSCSI multipathing
@@ -134,7 +133,6 @@ truenasplugin: truenas-nvme
     subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     dataset tank/proxmox
     discovery_portal 192.168.1.100:4420
-    api_transport ws
     content images
     shared 1
 ```
@@ -256,16 +254,12 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 
 ## Important: TrueNAS API Changes
 
-**TrueNAS SCALE 25.04+ Users**: The TrueNAS REST API has been deprecated as of version 25.04 and will be completely removed in version 26.04. This plugin supports both WebSocket (recommended) and REST transports. **Ensure you use WebSocket transport (`api_transport ws`) for TrueNAS 25.04+**.
-
-For TrueNAS 26.04+, REST transport will no longer function.
+**TrueNAS SCALE 25.10+ Required**: This plugin requires TrueNAS SCALE 25.10 or later. WebSocket API is the only supported transport method.
 
 ## Requirements
 
 - **Proxmox VE** 8.x or later (9.x recommended)
-- **TrueNAS SCALE** 22.x or later (25.04+ recommended)
-  - **For TrueNAS 25.04+**: Must use WebSocket transport (`api_transport ws`)
-  - **For TrueNAS 26.04+**: REST API will not be available
+- **TrueNAS SCALE** 25.10 or later
 - Network connectivity between Proxmox nodes and TrueNAS (iSCSI on port 3260, WebSocket API on port 443)
 
 ## Support

@@ -1,5 +1,35 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.1 (February 3, 2026)
+
+### ⚠️ **Breaking Change: REST API Transport Removed**
+
+#### **Removed REST API fallback, WebSocket is now only supported transport**
+- **Change**: Removed legacy REST API transport layer, WebSocket is now exclusive transport method
+- **Minimum requirement**: TrueNAS SCALE 25.10.0 or later required
+- **Removed option**: `api_transport` configuration option is no longer supported (WebSocket is always used)
+- **Code reduction**: ~40 lines of REST API fallback code removed
+- **Impact**: Users on TrueNAS versions prior to 25.10.0 must upgrade before installing this version
+
+### 🔧 **Technical Details**
+- Removed `_rest_api_call()` function and all REST-specific error handling
+- Removed transport selection logic from configuration schema
+- All API calls now route through `_ws_rpc()` WebSocket implementation
+- Simplified codebase by eliminating dual-transport complexity
+
+### 📊 **Impact**
+- **Breaking change**: Existing installations on TrueNAS < 25.10.0 will not work after upgrade
+- **Simplified configuration**: No need to specify `api_transport` (always WebSocket)
+- **Cleaner codebase**: Removed legacy code path, easier maintenance
+- **Better consistency**: Single transport method eliminates edge cases and testing complexity
+
+### ⚠️ **Migration Notes**
+- Ensure TrueNAS is upgraded to SCALE 25.10.0 or later before updating plugin
+- Verify WebSocket connectivity is working (required for all versions since 1.0.x)
+- No configuration changes needed for users already on TrueNAS 25.10+
+
+---
+
 ## Version 1.2.6 (December 20, 2025)
 
 ### 🐛 **Bug Fix: Improved Fork-Safety with NullDestructor Pattern**

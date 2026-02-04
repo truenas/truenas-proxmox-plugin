@@ -1391,7 +1391,11 @@ EXIT_CODE=$?
 - TrueNAS is offline
 - Network connectivity issue
 - Firewall blocking the API port
-- Check: `ping TRUENAS_IP` and `curl -k https://TRUENAS_IP/api/v2.0/system/info`
+- Check: `ping TRUENAS_IP`
+- Verify API access from Proxmox with the plugin-based call:
+  ```bash
+  ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+  ```
 
 **"Storage status: Inactive"**:
 - Storage is disabled in Proxmox
@@ -2033,7 +2037,10 @@ Run orphan cleanup periodically through the installer's Diagnostics menu to main
 **"Error: Failed to fetch extents from TrueNAS API"**:
 - TrueNAS is offline or unreachable
 - API key is invalid or expired
-- Check: `curl -k -H "Authorization: Bearer YOUR_KEY" https://TRUENAS_IP/api/v2.0/system/info`
+- Check with the plugin-based call from Proxmox:
+  ```bash
+  ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+  ```
 
 **"Failed to cleanup orphaned extent"**:
 - API key lacks permissions

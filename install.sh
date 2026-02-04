@@ -5687,13 +5687,9 @@ run_health_check() {
         printf "%-30s " "Dataset type:"
         start_spinner
 
-        local curl_opts="-s"
-        [[ "$api_insecure" == "1" ]] && curl_opts="$curl_opts -k"
-
-        # Make API call to fetch all datasets
+        # Make WebSocket API call to fetch dataset
         local dataset_info
-        dataset_info=$(curl $curl_opts -H "Authorization: Bearer $api_key" \
-            "https://$api_host/api/v2.0/pool/dataset" 2>/dev/null)
+        dataset_info=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$dataset\"]]]" 2>/dev/null)
         local api_status=$?
 
         stop_spinner
@@ -5705,11 +5701,9 @@ run_health_check() {
             ((warnings++))
             ((checks_total++))
         else
-            # Parse JSON to find our dataset and extract its type
-            # We need to find the entry with matching "id" and get its "type" field
+            # Parse JSON to extract dataset type
             local ds_type
-            ds_type=$(echo "$dataset_info" | grep -B2 -A10 "\"id\": *\"$dataset\"" | \
-                grep '"type"' | head -1 | sed -E 's/.*"type": *"([^"]+)".*/\1/')
+            ds_type=$(echo "$dataset_info" | grep -A6 '"type"' | head -1 | sed -E 's/.*"type": *"([^"]+)".*/\1/')
 
             local dataset_result
             if [[ "$ds_type" == "FILESYSTEM" ]]; then
@@ -5979,19 +5973,16 @@ run_health_check() {
         # Check for new format first, then old format for backwards compatibility
         local weight_zvol_new="${dataset}/${new_weight_name}"
         local weight_zvol_old="${dataset}/${old_weight_name}"
-        local weight_encoded_new=$(echo "$weight_zvol_new" | sed 's/\//%2F/g')
-        local weight_encoded_old=$(echo "$weight_zvol_old" | sed 's/\//%2F/g')
 
-        # Check if weight zvol exists via API (try new format first)
-        local zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
-            "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded_new" 2>/dev/null)
+        # Check if weight zvol exists via WebSocket API (try new format first)
+        local zvol_response
+        zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_new\"]]]" 2>/dev/null)
 
         if echo "$zvol_response" | grep -q '"id"'; then
             weight_name="$new_weight_name"
         else
             # Try old format for backwards compatibility
-            zvol_response=$(curl -sk -H "Authorization: Bearer $api_key" \
-                "https://$api_host/api/v2.0/pool/dataset/id/$weight_encoded_old" 2>/dev/null)
+            zvol_response=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$weight_zvol_old\"]]]" 2>/dev/null)
             if echo "$zvol_response" | grep -q '"id"'; then
                 weight_name="$old_weight_name"
             else
@@ -6002,10 +5993,10 @@ run_health_check() {
 
         # Check if weight extent exists (only if zvol exists)
         if [[ $weight_check_failed -eq 0 ]] && [[ -n "$weight_name" ]]; then
-            local extent_response=$(curl -sk -H "Authorization: Bearer $api_key" \
-                "https://$api_host/api/v2.0/iscsi/extent" 2>/dev/null)
+            local extent_response
+            extent_response=$(tn_api_call "$api_host" "$api_key" "iscsi.extent.query" "[[[\"name\",\"=\",\"$weight_name\"]]]" 2>/dev/null)
 
-            if ! echo "$extent_response" | grep -q "\"name\": \"$weight_name\""; then
+            if ! echo "$extent_response" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$weight_name\""; then
                 check_result "Weight volume presence" "WARNING" "Weight extent missing"
                 weight_check_failed=1
             fi
@@ -6360,7 +6351,7 @@ check_nvme_multipath() {
 }
 
 # Test TrueNAS API connectivity
-# Uses WebSocket API via TrueNASPlugin (REST not available)
+# Uses WebSocket-only API via TrueNASPlugin
 test_truenas_api() {
     local ip="$1"
     local apikey="$2"
@@ -6387,7 +6378,7 @@ test_truenas_api() {
 }
 
 # Verify dataset exists
-# Uses WebSocket API via TrueNASPlugin (REST not available)
+# Uses WebSocket-only API via TrueNASPlugin
 verify_dataset() {
     local ip="$1"
     local apikey="$2"
@@ -6421,7 +6412,6 @@ verify_dataset() {
 }
 
 # Discover available TrueNAS portals from network interfaces
-# Uses WebSocket API via TrueNASPlugin (REST not available)
 discover_truenas_portals() {
     local ip="$1"
     local apikey="$2"
@@ -6450,7 +6440,7 @@ discover_truenas_portals() {
 
 # Query TrueNAS network interfaces with detailed information
 # Returns JSON with interface name, IP, speed, link state
-# Uses WebSocket API via TrueNASPlugin (REST not available for this endpoint)
+# Uses WebSocket-only API via TrueNASPlugin
 tn_query_interfaces() {
     local ip="$1"
     local apikey="$2"
@@ -6501,7 +6491,7 @@ parse_link_speed() {
 
 # Query TrueNAS iSCSI service configuration for the listen port
 # Returns: port number (e.g., "3260") or empty on failure
-# Uses WebSocket API via TrueNASPlugin (REST not available)
+# Uses WebSocket-only API via TrueNASPlugin
 tn_get_iscsi_port() {
     local ip="$1"
     local apikey="$2"
@@ -6531,7 +6521,7 @@ ISCSI_PORTAL_IPS=()
 # Check for existing iSCSI portals matching selected IPs
 # Returns: "exact:<portal_id>" if exact match, "partial:<portal_id>:<matched_ips>" if partial, "none" if no match
 # Also populates global ISCSI_PORTAL_IPS array with all IPs that have existing portals
-# Uses WebSocket API via TrueNASPlugin (REST not available)
+# Uses WebSocket-only API via TrueNASPlugin
 tn_check_existing_portals() {
     local ip="$1"
     local apikey="$2"
@@ -6725,7 +6715,7 @@ tn_check_existing_portals() {
 
 # Check for existing NVMe ports matching selected IPs
 # Returns space-separated list: "ip:port_id ip:port_id" for existing, or "none"
-# Uses WebSocket API via TrueNASPlugin (REST not available)
+# Uses WebSocket-only API via TrueNASPlugin
 tn_check_existing_nvme_ports() {
     local ip="$1"
     local apikey="$2"
@@ -7231,8 +7221,7 @@ tn_api_call() {
 
         # Make the API call
         my $result = eval {
-            PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, $method, $params,
-                sub { die "REST API not supported for provisioning operations\n"; });
+            PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, $method, $params);
         };
 
         if ($@) {
@@ -7298,8 +7287,7 @@ tn_api_call_write() {
 
         # Make the API call with ephemeral connection
         my $result = eval {
-            PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params,
-                sub { die "REST API not supported for provisioning operations\n"; });
+            PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params);
         };
 
         if ($@) {

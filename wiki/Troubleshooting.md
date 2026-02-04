@@ -30,7 +30,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 - [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
   - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
   - [Namespace Creation Fails](#namespace-creation-fails)
-  - ["REST API not supported for NVMe-oF operations"](#rest-api-not-supported-for-nvme-of-operations)
+  - ["WebSocket transport required"](#websocket-transport-required)
 - [Volume Creation Issues](#volume-creation-issues)
   - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
   - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
@@ -324,7 +324,7 @@ systemctl restart pvedaemon pveproxy
 ```bash
 # Wizard shows:
 ✗ TrueNAS API connectivity test failed
-Could not connect to https://192.168.1.100/api/v2.0/system/info
+Could not connect to wss://192.168.1.100/api/current/websocket
 
 # Common causes:
 # 1. TrueNAS IP incorrect or unreachable
@@ -338,11 +338,10 @@ Could not connect to https://192.168.1.100/api/v2.0/system/info
 # Test connectivity manually
 ping 192.168.1.100
 
-# Test API access (replace IP and API key)
-curl -k -H "Authorization: Bearer 1-YOUR-API-KEY" \
-  https://192.168.1.100/api/v2.0/system/info
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
 
-# Should return JSON with system info
+# Should return ok if the call succeeds
 
 # Check TrueNAS API service
 # In TrueNAS web UI: System Settings → Services → Middleware (should be running)
@@ -413,6 +412,108 @@ truenasplugin: truenas-storage
     discovery_portal 192.168.1.100:3260
     content images
     shared 1
+```
+
+### WebSocket Connection Issues
+
+**Symptom**: Configuration wizard or operations fail with WebSocket connectivity errors
+
+**Common Errors**:
+```bash
+✗ TrueNAS WebSocket connection failed
+Could not connect to wss://192.168.1.100/api/current/websocket
+
+ERROR: WebSocket transport required for API operations
+Please ensure TrueNAS 25.10+ is installed and WebSocket port is accessible
+```
+
+**Solutions**:
+
+#### 1. Verify TrueNAS Version
+```bash
+# Check TrueNAS version via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# If the call succeeds, confirm version in TrueNAS UI
+# Earlier versions than 25.10 do not support WebSocket transport
+```
+
+#### 2. Test WebSocket Connectivity
+```bash
+# Test WebSocket connection via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
+
+# Should return ok with no errors
+```
+
+#### 3. Check Firewall and Network Access
+```bash
+# On Proxmox, check if WebSocket port is accessible
+# WebSocket typically uses the same port as API (443 for wss, 80 for ws)
+
+# Test HTTPS port (required for wss)
+curl -k -I https://YOUR_TRUENAS_IP
+
+# Test from all cluster nodes if using shared storage
+for node in node1 node2 node3; do
+    ssh $node "curl -k -I https://YOUR_TRUENAS_IP"
+done
+
+# Check Proxmox firewall rules
+iptables -L -n | grep 443
+
+# Check TrueNAS firewall (via TrueNAS web UI):
+# Network Settings → Firewall → Rules
+# Ensure port 443 (HTTPS) is allowed from Proxmox IP
+```
+
+#### 4. Verify TLS Certificate
+```bash
+# Test TLS certificate validity
+openssl s_client -connect YOUR_TRUENAS_IP:443 -showcerts </dev/null
+
+# Check for certificate errors (self-signed, expired, etc.)
+
+# If using self-signed certificate, set api_insecure=1 for testing:
+nano /etc/pve/storage.cfg
+# Add to storage configuration:
+api_insecure 1
+
+# For production, import TrueNAS certificate to Proxmox trust store
+# Copy TrueNAS CA cert to Proxmox:
+# mkdir -p /usr/local/share/ca-certificates/truenas
+# cp truenas-ca.crt /usr/local/share/ca-certificates/truenas/
+# update-ca-certificates
+```
+
+#### 5. Verify WebSocket URL Scheme
+```bash
+# Check storage configuration
+grep -E "api_scheme" /etc/pve/storage.cfg
+
+# Must be:
+api_scheme wss  # for secure WebSocket (recommended)
+# OR
+api_scheme ws   # for insecure WebSocket (testing only)
+
+# Common mistake: Using http/https scheme instead of ws/wss
+# WRONG:
+# api_scheme https  # Not supported
+# CORRECT:
+# api_scheme wss    # This is for WebSocket
+```
+
+#### 6. Check WebSocket Port Configuration
+```bash
+# TrueNAS WebSocket uses the same ports as the API:
+# - Port 443: Secure WebSocket (wss://) - recommended
+# - Port 80: Insecure WebSocket (ws://) - testing only
+
+# Verify port accessibility
+nc -zv YOUR_TRUENAS_IP 443
+nc -zv YOUR_TRUENAS_IP 80
+
+# Both should succeed (connection to port succeeded)
 ```
 
 ### Health Check Failures
@@ -600,8 +701,8 @@ journalctl -u pvedaemon | grep "TrueNAS storage"
 # Test network connectivity
 ping YOUR_TRUENAS_IP
 
-# Test API port
-curl -k https://YOUR_TRUENAS_IP/api/v2.0/system/info
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
 
 # Check TrueNAS is online
 # Access TrueNAS web UI to verify system is running
@@ -623,9 +724,8 @@ grep dataset /etc/pve/storage.cfg
 
 **Authentication Failed (401/403)**:
 ```bash
-# Test API key manually
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/system/info
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
 
 # If fails, regenerate API key in TrueNAS:
 # Credentials > Local Users > Edit > API Key > Add
@@ -645,11 +745,10 @@ systemctl restart pvedaemon pveproxy
 
 #### 1. Test API Connectivity
 ```bash
-# Test HTTPS API
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/system/info
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
 
-# Should return JSON system info
+# Should return ok if the call succeeds
 ```
 
 #### 2. Check Firewall Rules
@@ -667,16 +766,6 @@ iptables -L -n | grep 443
 api_insecure 1
 
 # Production: import TrueNAS cert or use valid CA cert
-```
-
-#### 4. Check API Transport
-```bash
-# Try REST fallback if WebSocket fails
-# In /etc/pve/storage.cfg:
-api_transport rest
-
-# Restart services
-systemctl restart pvedaemon pveproxy
 ```
 
 ### API Rate Limiting
@@ -764,9 +853,8 @@ Available targets:
 
 #### 1. Verify Target Exists
 ```bash
-# Via TrueNAS API
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/iscsi/target
+# Use plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"iscsi.target.query\", [[]]); print \"ok\\n\";'"
 
 # Via web UI: Shares > Block Shares (iSCSI) > Targets
 ```
@@ -933,17 +1021,13 @@ telnet 192.168.1.100 4420
 
 #### 1. Verify TrueNAS NVMe-oF Service
 ```bash
-# Check service status via API
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Check service status via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
 
-# Should show: "state": "RUNNING"
+# Should return ok if the call succeeds
 
-# Start service if not running
-curl -k -X POST 'https://TRUENAS_IP/api/v2.0/service/start' \
-  -H 'Authorization: Bearer YOUR_API_KEY' \
-  -H 'Content-Type: application/json' \
-  -d '{"service": "nvmet"}'
+# Start service if not running using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
 ```
 
 In TrueNAS Web UI:
@@ -969,11 +1053,10 @@ telnet 192.168.1.100 4420
 
 #### 3. Verify Portal Configuration
 ```bash
-# Check TrueNAS NVMe ports
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/port' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Check TrueNAS NVMe ports using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.port.query\", [[]]); print \"ok\\n\";'"
 
-# Should show port 4420 listening on 0.0.0.0 or specific IPs
+# Should return ok if the call succeeds
 # Example output:
 # {
 #   "addr_trtype": "TCP",
@@ -1033,9 +1116,8 @@ grep nvme_dhchap /etc/pve/storage.cfg
 
 #### 1. Verify Secret Matching
 ```bash
-# Check TrueNAS host configuration
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Check TrueNAS host configuration using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
 
 # Compare hostnqn and dhchap_key with Proxmox configuration
 cat /etc/nvme/hostnqn
@@ -1057,9 +1139,8 @@ nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
 
 #### 3. Check Subsystem Access Control
 ```bash
-# Verify subsystem allows host
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Verify subsystem allows host using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
 
 # Check allow_any_host setting
 # If false, host must be explicitly linked to subsystem
@@ -1154,9 +1235,8 @@ udevadm trigger
 
 #### 3. Verify Namespace Exists on TrueNAS
 ```bash
-# Check TrueNAS namespaces
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/namespace' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Check TrueNAS namespaces using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.namespace.query\", [[]]); print \"ok\\n\";'"
 
 # Look for namespace with matching device_uuid
 # Verify it's enabled and associated with correct subsystem
@@ -1203,54 +1283,46 @@ TrueNAS API returned error: subsystem not found
 
 #### 1. Verify NVMe-oF Service Running
 ```bash
-# Check service status
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Check service status using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
 
-# Must show "state": "RUNNING"
+# Should return ok if the call succeeds
 ```
 
 #### 2. Check Dataset Exists
 ```bash
-# Verify ZFS dataset configured in storage.cfg exists
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/pool/dataset/id/tank%2Fproxmox' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# Verify ZFS dataset configured in storage.cfg exists via plugin API
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"pool.dataset.get_instance\", [\"tank/proxmox\"]); print \"ok\\n\";'"
 
-# Replace tank/proxmox with your dataset path (URL-encoded)
-# %2F = / (slash)
+# Replace tank/proxmox with your dataset path
 ```
 
 #### 3. Verify WebSocket API Transport
 ```bash
-# NVMe operations require WebSocket transport
-grep api_transport /etc/pve/storage.cfg
-
-# Must be:
-api_transport ws
-
-# NOT:
-# api_transport rest  (REST does not support nvmet.* API calls)
+# WebSocket is the only supported transport for TrueNAS 25.10+
+# Verify your configuration uses ws/wss schemes:
+grep api_scheme /etc/pve/storage.cfg
+# REST API fallback has been removed
 ```
 
 #### 4. Check Subsystem Exists
 ```bash
-# List subsystems
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+# List subsystems using plugin API via STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
 
 # Verify subsystem with your configured subsystem_nqn exists
 # Plugin should auto-create it, but may fail if service issues
 ```
 
-### "REST API not supported for NVMe-oF operations"
+### "WebSocket transport required"
 
 **Symptom**: NVMe operations fail with API transport error
 
 **Error Message**:
 ```
-ERROR: REST API not supported for NVMe-oF operations
-NVMe namespace management requires WebSocket transport
-Please set api_transport = ws in storage configuration
+ERROR: WebSocket transport required for NVMe-oF operations
+NVMe namespace management requires WebSocket transport (TrueNAS 25.10+)
+Ensure api_scheme is set to wss (or ws for non-TLS) in storage configuration
 ```
 
 **Solution**:
@@ -1259,9 +1331,8 @@ Please set api_transport = ws in storage configuration
 nano /etc/pve/storage.cfg
 
 # Find your NVMe storage configuration
-# Add or change to WebSocket transport:
+# Verify WebSocket scheme:
 truenasplugin: truenas-nvme
-    api_transport ws
     api_scheme wss
     # ... other parameters
 
@@ -1270,9 +1341,9 @@ systemctl restart pvedaemon pveproxy
 ```
 
 **Why WebSocket is Required**:
-- TrueNAS `nvmet.*` API endpoints (subsystem, namespace, port) only work via WebSocket
-- REST API does not expose these endpoints
-- This is a TrueNAS SCALE limitation, not a plugin limitation
+- TrueNAS 25.10+ removed REST API support for all API operations
+- WebSocket is now the only supported transport
+- All API endpoints require WebSocket connection for TrueNAS 25.10+
 
 ## Volume Creation Issues
 
@@ -1380,11 +1451,10 @@ zfs destroy tank/proxmox/vm-999-disk-0
 
 #### 2. Verify TrueNAS API Responding
 ```bash
-# Test dataset query
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://YOUR_TRUENAS_IP/api/v2.0/pool/dataset/id/tank%2Fproxmox
+# Test dataset query via plugin API using STORAGE_ID
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"pool.dataset.get_instance\", [\"tank/proxmox\"]); print \"ok\\n\";'"
 
-# Should return dataset details
+# Should return ok if the call succeeds
 ```
 
 ### "Volume created but device not accessible after 10 seconds"

@@ -426,8 +426,7 @@ ssh root@TRUENAS_IP "zfs list tank/proxmox"
 ssh root@TRUENAS_IP "systemctl status iscsitarget"
 
 # Test API key
-curl -k -H "Authorization: Bearer YOUR_API_KEY" \
-  https://TRUENAS_IP/api/v2.0/iscsi/target
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"iscsi.target.query\", [ [] ]); print \"ok\\n\";'"
 ```
 
 ### Clone Operation Timeout

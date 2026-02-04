@@ -53,23 +53,16 @@ This guide covers setting up NVMe over TCP (NVMe/TCP) storage with the TrueNAS P
    - Click the toggle to **Start** the service
    - (Optional) Check **Start Automatically** to enable on boot
 
-2. **Via TrueNAS API:**
+2. **Via TrueNAS API (plugin call):**
    ```bash
-   curl -k -X PUT 'https://TRUENAS_IP/api/v2.0/service/id/nvmet' \
-     -H 'Authorization: Bearer YOUR_API_KEY' \
-     -H 'Content-Type: application/json' \
-     -d '{"enable": true}'
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.update\", [\"nvmet\", { enable => 1 }]); print \"ok\\n\";'"
 
-   curl -k -X POST 'https://TRUENAS_IP/api/v2.0/service/start' \
-     -H 'Authorization: Bearer YOUR_API_KEY' \
-     -H 'Content-Type: application/json' \
-     -d '{"service": "nvmet"}'
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
    ```
 
 3. **Verify service is running:**
    ```bash
-   curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
-     -H 'Authorization: Bearer YOUR_API_KEY'
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
    ```
 
    Expected output should show `"state": "RUNNING"`.
@@ -89,16 +82,9 @@ The plugin automatically creates subsystems when needed, but you can create them
 
    **SECURITY WARNING**: `allow_any_host: true` permits ANY host to access your storage without authentication. This should ONLY be used in isolated test environments. Production deployments MUST disable `allow_any_host` and explicitly link authorized hosts.
 
-2. **Via TrueNAS API:**
+2. **Via TrueNAS API (plugin call):**
    ```bash
-   curl -k -X POST 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
-     -H 'Authorization: Bearer YOUR_API_KEY' \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "name": "proxmox-nvme",
-       "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme",
-       "allow_any_host": true
-     }'
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.subsys.create\", [{ name => \"proxmox-nvme\", subnqn => \"nqn.2005-10.org.freenas.ctl:proxmox-nvme\", allow_any_host => 1 }]); print \"ok\\n\";'"
    ```
 
 **Important Notes:**
@@ -175,7 +161,6 @@ truenasplugin: truenas-nvme
     subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     dataset tank/proxmox
     discovery_portal 10.15.14.172:4420
-    api_transport ws
     content images
     shared 1
 ```
@@ -190,7 +175,6 @@ truenasplugin: truenas-nvme
     hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid
     dataset tank/proxmox
     discovery_portal 10.15.14.172:4420
-    api_transport ws
     api_scheme wss
     api_port 443
     api_insecure 1
@@ -207,12 +191,11 @@ truenasplugin: truenas-nvme
 | `subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
 | `hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
 | `discovery_portal` | Yes | Primary portal IP:port | None |
-| `api_transport` | Yes | Must be `ws` for NVMe API calls | `ws` |
 | `nvme_dhchap_secret` | No | Host authentication secret | None |
 | `nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
 
 **Important Notes:**
-- `api_transport ws` is **required** - REST API does not support NVMe operations
+- TrueNAS 25.10+ is required for NVMe-oF operations
 - The default port for NVMe/TCP is `4420` (different from iSCSI's `3260`)
 - TrueNAS SCALE 25.10+ automatically uses port 4420; manual specification is optional
 - `subsystem_nqn` cannot be changed after creation (prevents orphaned volumes)
@@ -258,7 +241,8 @@ NVMe/TCP supports native multipath for high availability and increased bandwidth
 
 2. **Ensure NVMe-oF port listens on all interfaces:**
    - Default configuration uses `0.0.0.0:4420` (all IPv4 interfaces)
-   - Verify with: `curl -k https://TRUENAS_IP/api/v2.0/nvmet/port`
+- Verify with:
+  `ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.port.query\", [[]]); print \"ok\\n\";'"`
 
 ### Proxmox Multipath Storage Configuration
 
@@ -273,7 +257,6 @@ truenasplugin: truenas-nvme-multipath
     dataset tank/proxmox
     discovery_portal 10.15.14.172:4420
     portals 10.15.14.173:4420,10.15.14.174:4420
-    api_transport ws
     content images
     shared 1
 ```
@@ -338,17 +321,9 @@ nvme gen-dhchap-key --key-length 32 --hmac 1 --nqn $(cat /etc/nvme/hostnqn)
 
 Configure host authentication on TrueNAS:
 
-**Via TrueNAS API:**
+**Via TrueNAS API (plugin call):**
 ```bash
-curl -k -X POST 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
-  -H 'Authorization: Bearer YOUR_API_KEY' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400",
-    "dhchap_key": "DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:",
-    "dhchap_ctrl_key": "DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:",
-    "dhchap_hash": "SHA-256"
-  }'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.host.create\", [{ hostnqn => \"nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400\", dhchap_key => \"DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:\", dhchap_ctrl_key => \"DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:\", dhchap_hash => \"SHA-256\" }]); print \"ok\\n\";'"
 ```
 
 **Parameters:**
@@ -363,29 +338,18 @@ To restrict access to specific hosts, disable `allow_any_host` and create host-s
 
 ```bash
 # Step 1: Disable allow_any_host on the subsystem
-curl -k -X PUT 'https://TRUENAS_IP/api/v2.0/nvmet/subsys/id/SUBSYS_ID' \
-  -H 'Authorization: Bearer YOUR_API_KEY' \
-  -H 'Content-Type: application/json' \
-  -d '{"allow_any_host": false}'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.subsys.update\", [\"SUBSYS_ID\", { allow_any_host => 0 }]); print \"ok\\n\";'"
 
 # Step 2: Get the host ID (query existing hosts)
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
 # Returns: [{"id": 1, "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:...", ...}]
 
 # Step 3: Get the subsystem ID (query existing subsystems)
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
 # Returns: [{"id": 1, "name": "proxmox-nvme", "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme", ...}]
 
 # Step 4: Link the host to the subsystem
-curl -k -X POST 'https://TRUENAS_IP/api/v2.0/nvmet/host_subsys' \
-  -H 'Authorization: Bearer YOUR_API_KEY' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "host_id": 1,
-    "subsys_id": 1
-  }'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.host_subsys.create\", [{ host_id => 1, subsys_id => 1 }]); print \"ok\\n\";'"
 ```
 
 **Important**: When `allow_any_host: false`, ONLY explicitly linked hosts can connect to the subsystem. DH-CHAP authentication is an optional additional security layer.
@@ -404,7 +368,6 @@ truenasplugin: truenas-nvme-secure
     dataset tank/proxmox
     discovery_portal 10.15.14.172:4420
     nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
-    api_transport ws
     content images
     shared 1
 ```
@@ -420,7 +383,6 @@ truenasplugin: truenas-nvme-mutual
     discovery_portal 10.15.14.172:4420
     nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
     nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
-    api_transport ws
     content images
     shared 1
 ```
@@ -587,20 +549,15 @@ telnet 10.15.14.172 4420
 
 Check TrueNAS service:
 ```bash
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
 # Should show "state": "RUNNING"
 ```
 
 Check TrueNAS NVMe port:
 ```bash
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/port' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.port.query\", [[]]); print \"ok\\n\";'"
 # Should show port 4420 with addr_traddr listening
 ```
-
-**Error: "REST API not supported for NVMe-oF operations"**
-- Set `api_transport ws` in storage.cfg (WebSocket required)
 
 ### Authentication Issues
 
@@ -609,8 +566,7 @@ curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/port' \
 Verify secrets match:
 ```bash
 # On TrueNAS - check configured host
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/host' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
 
 # Compare hostnqn and dhchap_key with Proxmox configuration
 cat /etc/nvme/hostnqn
@@ -686,11 +642,8 @@ Verify NVMe-oF service is running on TrueNAS.
 
 Check dataset exists and has space:
 ```bash
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/pool/dataset/id/tank%2Fproxmox' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"pool.dataset.get_instance\", [\"tank/proxmox\"]); print \"ok\\n\";'"
 ```
-
-Ensure WebSocket API is used (`api_transport ws`).
 
 ### Validation Commands
 
@@ -717,16 +670,13 @@ dd if=/dev/disk/by-id/nvme-uuid.XXXX of=/dev/null bs=4M count=10 iflag=direct
 dmesg | grep -i nvme | tail -50
 
 # 8. Verify TrueNAS service
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/service?service=nvmet' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"service.query\", [[[\"service\",\"=\",\"nvmet\"]]]); print \"ok\\n\";'"
 
 # 9. List TrueNAS subsystems
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/subsys' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
 
 # 10. List TrueNAS namespaces
-curl -k -X GET 'https://TRUENAS_IP/api/v2.0/nvmet/namespace' \
-  -H 'Authorization: Bearer YOUR_API_KEY'
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.namespace.query\", [[]]); print \"ok\\n\";'"
 ```
 
 ## See Also

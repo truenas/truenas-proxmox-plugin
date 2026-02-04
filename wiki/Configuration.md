@@ -14,8 +14,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 - [Content Type](#content-type)
   - [content](#content)
   - [shared](#shared)
-- [API Configuration](#api-configuration)
-  - [api_transport](#api_transport)
+ - [API Configuration](#api-configuration)
   - [api_scheme](#api_scheme)
   - [api_port](#api_port)
   - [api_insecure](#api_insecure)
@@ -164,27 +163,13 @@ shared 1
 
 ## API Configuration
 
-### `api_transport`
-**Description**: API transport protocol
-**Type**: String
-**Valid Values**: `ws` (WebSocket), `rest` (HTTP REST)
-**Default**: `ws`
-
-WebSocket is recommended for better performance and persistent connections. For write operations (create, update, delete), WebSocket uses ephemeral connections to prevent concurrent operation interference.
-
-> **IMPORTANT**: TrueNAS SCALE 25.04 (Fangtooth) and later have deprecated the REST API for storage operations. You **MUST** use `api_transport ws` for TrueNAS SCALE 25.04+. The REST API will be completely removed in TrueNAS SCALE 26.04.
-
-```ini
-api_transport ws
-```
-
 ### `api_scheme`
 **Description**: API URL scheme
 **Type**: String
-**Valid Values**: `wss`, `ws`, `https`, `http`
-**Default**: `wss` for WebSocket transport, `https` for REST
+**Valid Values**: `wss`, `ws`
+**Default**: `wss`
 
-Use `wss`/`https` in production for security.
+Use `wss` in production for security.
 
 ```ini
 api_scheme wss
@@ -343,7 +328,7 @@ transport_mode nvme-tcp
 - `transport_mode` cannot be changed after storage creation (prevents volume orphaning)
 - Different transport modes have different required parameters:
   - **iSCSI mode**: Requires `target_iqn`, `discovery_portal` (port 3260)
-  - **NVMe/TCP mode**: Requires `subsystem_nqn`, `discovery_portal` (port 4420), `api_transport ws`
+  - **NVMe/TCP mode**: Requires `subsystem_nqn`, `discovery_portal` (port 4420), TrueNAS SCALE 25.10+
 - Volume naming formats differ between modes (incompatible for migration)
 - See [NVMe-Setup.md](NVMe-Setup.md) for complete NVMe/TCP setup guide
 
@@ -667,7 +652,6 @@ truenasplugin: truenas-nvme
     subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     dataset tank/proxmox
     discovery_portal 192.168.1.100:4420
-    api_transport ws
     content images
     shared 1
 ```
@@ -704,7 +688,7 @@ truenasplugin: truenas-cluster
 truenasplugin: truenas-ha
     api_host truenas-vip.company.com
     api_key 1-your-api-key
-    api_scheme https
+    api_scheme wss
     api_port 443
     api_insecure 0
     target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
@@ -735,7 +719,6 @@ truenasplugin: truenas-nvme-secure
     discovery_portal 192.168.10.100:4420
     nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
     nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
-    api_transport ws
     api_scheme wss
     api_port 443
     content images
@@ -753,7 +736,6 @@ truenasplugin: truenas-nvme-multipath
     dataset tank/proxmox
     discovery_portal 192.168.10.100:4420
     portals 192.168.10.101:4420,192.168.10.102:4420
-    api_transport ws
     content images
     shared 1
     zvol_blocksize 128K
@@ -783,10 +765,9 @@ truenasplugin: truenas-ipv6
 truenasplugin: truenas-dev
     api_host 192.168.1.50
     api_key 1-dev-api-key
-    api_scheme http
+    api_scheme ws
     api_port 80
     api_insecure 1
-    api_transport rest
     target_iqn iqn.2005-10.org.freenas.ctl:dev
     dataset tank/development
     discovery_portal 192.168.1.50:3260
@@ -807,7 +788,6 @@ truenasplugin: enterprise-storage
     # API Configuration
     api_host truenas-ha-vip.corp.com
     api_key 1-production-api-key-here
-    api_transport ws
     api_scheme wss
     api_port 443
     api_insecure 0

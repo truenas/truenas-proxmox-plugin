@@ -392,26 +392,11 @@ tail -f /var/log/middlewared.log | grep rate
 - "WebSocket closed unexpectedly" errors
 - Increased latency
 
-**Workaround**:
-```ini
-# Use REST transport instead
-api_transport rest
-api_scheme https
-```
-
-**Trade-off**: REST is more stable but ~20-30ms slower per operation
-
-### Version Compatibility
-
-**Limitation**: Some features require specific TrueNAS SCALE versions
-
-**Feature Requirements**:
-- **Basic functionality**: TrueNAS SCALE 22.x+
-- **WebSocket API**: TrueNAS SCALE 22.12+
-- **Bulk operations**: TrueNAS SCALE 23.x+
-- **Optimal performance**: TrueNAS SCALE 25.04+
-
-**Recommendation**: Use TrueNAS SCALE 25.04 or later for best experience
+**Mitigation**:
+- Ensure reliable network path (avoid flaky links, check MTU consistency)
+- Use TLS (`api_scheme wss`) and valid certificates
+- Increase retry settings: `api_retry_max`, `api_retry_delay`
+- Verify firewall allows TCP 443 from all Proxmox nodes
 
 ## Proxmox Specific Limitations
 
@@ -727,7 +712,7 @@ zfs set quota=500G tank/proxmox
 | No backup integration | Use TrueNAS replication or Proxmox Backup Server |
 | `qm destroy` orphans | Always use GUI deletion or add cleanup to scripts |
 | API rate limits | Enable bulk operations, increase retry limits, pace operations |
-| WebSocket instability | Use REST transport |
+| WebSocket instability | Improve network stability, verify TLS/certs, tune retry settings |
 | Clone performance | Faster network, smaller images, accept limitation |
 | Multipath read performance | Upgrade to 10GbE, accept ~100 MB/s, or use parallel workloads |
 
