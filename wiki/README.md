@@ -152,6 +152,6 @@ For issues not covered in documentation:
 
 ## Version Information
 
-**Plugin Version**: 1.2.5
-**Documentation Last Updated**: December 18, 2025
-**Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 22.x+
+**Version**: 2.0.1
+**Last Updated**: February 3, 2026
+**Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
