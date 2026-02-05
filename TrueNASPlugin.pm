@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.1';
+our $VERSION = '2.0.2';
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -147,6 +147,9 @@ sub _parse_blocksize {
 #   $priority: syslog priority ('err', 'warning', 'info', 'debug')
 sub _log {
     my ($scfg, $level, $priority, $message) = @_;
+
+    # Normalize syslog priority aliases
+    $priority = 'warning' if defined($priority) && $priority eq 'warn';
 
     # Level 0 messages (errors) are always logged
     return syslog($priority, $message) if $level == 0;
@@ -1932,7 +1935,8 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     }
 
     # Mapping doesn't exist, create it
-    my $payload = { target => $target_id, extent => $extent_id, lunid => $lun };
+    my $payload = { target => $target_id, extent => $extent_id };
+    $payload->{lunid} = $lun if defined $lun;
     my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]);
     # Invalidate cache since targetextents list has changed
     _clear_cache($scfg->{storeid}) if $result;
@@ -2417,17 +2421,36 @@ sub _login_target_all_portals {
 sub _device_for_lun($scfg, $lun) {
     # Wait briefly for by-path to appear if needed
     my $by;
-    for (my $i = 1; $i <= 50; $i++) { # up to ~5s
+    my $max_retries = $scfg->{device_ready_retries} // 200; # up to ~20s with 100ms sleep
+    for (my $i = 1; $i <= $max_retries; $i++) {
         $by = _find_by_path_for_lun($scfg, $lun);
         last if $by && -e $by;
         run_command(['udevadm','settle'], outfunc => sub {});
-        if ($i == 10 || $i == 20 || $i == 35) {
+        if ($i == 10 || $i == 20 || $i == 35 || $i == 60 || $i == 100 || $i == 150) {
             _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
             run_command(['udevadm','settle'], outfunc => sub {});
         }
         usleep(DEVICE_READY_TIMEOUT_US);
     }
-    die "Could not locate by-path device for LUN $lun (IQN $scfg->{target_iqn})\n" if !$by || !-e $by;
+    if (!$by || !-e $by) {
+        my $iqn = $scfg->{target_iqn} // '';
+        my @sessions = _run_lines(['iscsiadm','-m','session']);
+        my $session_text = @sessions ? join('; ', @sessions) : 'none';
+
+        my @paths;
+        eval {
+            opendir(my $dh, "/dev/disk/by-path") or die "open by-path failed";
+            if ($iqn) {
+                @paths = grep { /iscsi-\Q$iqn\E/ } readdir($dh);
+            } else {
+                @paths = grep { /iscsi-/ } readdir($dh);
+            }
+            closedir($dh);
+        };
+        my $paths_text = @paths ? join(', ', @paths) : 'none';
+
+        die "Could not locate by-path device for LUN $lun (IQN $iqn, retries $max_retries). Sessions: $session_text. by-path: $paths_text\n";
+    }
 
     # Multipath preference
     if ($scfg->{use_multipath} && !$scfg->{use_by_path}) {
@@ -4353,7 +4376,17 @@ sub _ensure_target_visible {
             _tn_targetextent_create($scfg, $target_id, $weight_extent_id, 0);
         };
         if ($@) {
-            _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent: $@");
+            if ($@ =~ /LUN ID is already being used|lunid.*already/i) {
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: LUN 0 in use, retrying weight mapping with auto-assigned LUN");
+                eval { _tn_targetextent_create($scfg, $target_id, $weight_extent_id, undef); };
+                if ($@) {
+                    _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent with auto LUN: $@");
+                } else {
+                    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent mapped to target (auto LUN)");
+                }
+            } else {
+                _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent: $@");
+            }
             # Non-fatal - extent may already be mapped
         } else {
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent mapped to target");
@@ -4435,7 +4468,7 @@ sub activate_volume {
         _iscsi_login_all($scfg);
         if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
 
-        # Wait for the specific LUN device to appear (up to 5s)
+        # Wait for the specific LUN device to appear (up to ~20s, configurable)
         my $lun = $metadata;
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for LUN $lun device");
         eval {

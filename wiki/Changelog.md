@@ -1,5 +1,22 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.2 (February 4, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **iSCSI migration reliability and logging fixes**
+- **Fixed weight extent LUN collisions**: Weight extent mapping now retries with auto-assigned LUN if LUN 0 is already in use
+- **Extended LUN device wait**: iSCSI activation waits longer for by-path devices with additional rescans and improved diagnostics
+- **Syslog priority normalization**: `warn` priorities now map to `warning` to prevent syslog errors
+
+### 🔧 **Test Suite Improvements**
+- Robust JSON parsing for TrueNAS size and dataset space checks
+- Correct zvol name handling for NVMe and iSCSI suffixes during verification and cleanup
+- Automatic orphan cleanup in disk deletion and rapid stress tests
+- Better lock detection and recovery handling in interrupted operation tests
+
+---
+
 ## Version 2.0.1 (February 3, 2026)
 
 ### ⚠️ **Breaking Change: REST API Transport Removed**
