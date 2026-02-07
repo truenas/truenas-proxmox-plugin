@@ -2,6 +2,10 @@
 
 Comprehensive documentation for the TrueNAS Proxmox VE Storage Plugin.
 
+Official repository: <https://github.com/truenas/truenas-proxmox-plugin>
+
+Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
+
 ## Documentation Index
 
 ### Getting Started
@@ -147,8 +151,8 @@ Found an error or want to improve documentation?
 For issues not covered in documentation:
 1. Review all relevant documentation sections
 2. Check [Known Limitations](Known-Limitations.md)
-3. Search existing GitHub issues
-4. Create new GitHub issue with detailed information
+3. Search existing GitHub issues at <https://github.com/truenas/truenas-proxmox-plugin/issues>
+4. Create a new GitHub issue with detailed information
 
 ## Version Information
 

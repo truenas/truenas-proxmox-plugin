@@ -57,19 +57,19 @@
 Download and run the installer interactively:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh)
 ```
 
 Or download first, then run:
 ```bash
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh
 chmod +x install.sh
 ./install.sh
 ```
 
 **For Non-Interactive/Automated Installation:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:
@@ -87,7 +87,7 @@ If you prefer manual installation:
 
 ```bash
 # Download the plugin
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
 
 # Copy to plugin directory
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
@@ -267,7 +267,7 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 For issues, questions, or contributions:
 - Review the [Troubleshooting Guide](wiki/Troubleshooting.md)
 - Check [Known Limitations](wiki/Known-Limitations.md)
-- Report bugs or request features via GitHub issues
+- Report bugs or request features at <https://github.com/truenas/truenas-proxmox-plugin/issues>
 
 ## License
 

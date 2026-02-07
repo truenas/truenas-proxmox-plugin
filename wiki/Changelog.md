@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Repository Migration Note (February 6, 2026)
+
+- Official repository home moved to <https://github.com/truenas/truenas-proxmox-plugin>
+- Official issue tracker: <https://github.com/truenas/truenas-proxmox-plugin/issues>
+- Historical changelog references to prior issue URLs may remain for archival context
+
 ## Version 2.0.2 (February 4, 2026)
 
 ### 🐛 **Bug Fixes**

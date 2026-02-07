@@ -5,10 +5,6 @@
 # TrueNAS Proxmox VE Plugin Installer
 # Interactive installation, update, and configuration wizard
 #
-# TODO: Orphan resource detection currently only supports iSCSI mode.
-#       NVMe/TCP orphan detection requires WebSocket API support which is
-#       not yet implemented in bash. Future enhancement should add WebSocket
-#       client for nvmet.subsys.query and nvmet.namespace.query calls.
 
 set -euo pipefail
 
@@ -16,8 +12,8 @@ set -euo pipefail
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
-readonly INSTALLER_VERSION="1.3.0"
-readonly GITHUB_REPO="WarlockSyno/truenasplugin"
+readonly INSTALLER_VERSION="2.0.0"
+readonly GITHUB_REPO="truenas/truenas-proxmox-plugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
 readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
