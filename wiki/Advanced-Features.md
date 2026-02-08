@@ -1611,3 +1611,4 @@ truenasplugin: dev-storage
 - [Configuration Reference](Configuration.md) - All configuration parameters
 - [Troubleshooting Guide](Troubleshooting.md) - Common issues
 - [Known Limitations](Known-Limitations.md) - Important restrictions
+- [Multi-Tenancy](Multi-Tenancy.md) - Sharing a TrueNAS system across multiple clusters

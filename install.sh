@@ -5987,12 +5987,13 @@ run_health_check() {
             fi
         fi
 
-        # Check if weight extent exists (only if zvol exists)
+        # Check if weight extent exists (only if zvol exists) - lookup by disk path
         if [[ $weight_check_failed -eq 0 ]] && [[ -n "$weight_name" ]]; then
+            local weight_disk_path="zvol/${dataset}/${weight_name}"
             local extent_response
-            extent_response=$(tn_api_call "$api_host" "$api_key" "iscsi.extent.query" "[[[\"name\",\"=\",\"$weight_name\"]]]" 2>/dev/null)
+            extent_response=$(tn_api_call "$api_host" "$api_key" "iscsi.extent.query" "[[[\"disk\",\"=\",\"$weight_disk_path\"]]]" 2>/dev/null)
 
-            if ! echo "$extent_response" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$weight_name\""; then
+            if ! echo "$extent_response" | grep -q "\"disk\"[[:space:]]*:[[:space:]]*\"$weight_disk_path\""; then
                 check_result "Weight volume presence" "WARNING" "Weight extent missing"
                 weight_check_failed=1
             fi
@@ -6248,6 +6249,96 @@ storage_name_exists() {
     else
         return 1
     fi
+}
+
+# Check if dataset is already in use by another storage entry
+# Returns 0 (found) with conflicting storage name on stdout, 1 (not found)
+check_dataset_in_use() {
+    local dataset="$1"
+    local exclude_name="${2:-}"
+    local current_storage=""
+
+    [[ -f "$STORAGE_CFG" ]] || return 1
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
+            current_storage="${BASH_REMATCH[1]}"
+            current_storage="$(echo "$current_storage" | xargs)"
+        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+dataset[[:space:]]+(.+)$ ]]; then
+            local ds="${BASH_REMATCH[1]}"
+            ds="$(echo "$ds" | xargs)"
+            if [[ "$ds" == "$dataset" && "$current_storage" != "$exclude_name" ]]; then
+                echo "$current_storage"
+                return 0
+            fi
+        elif [[ "$line" =~ ^[^[:space:]] ]]; then
+            if [[ ! "$line" =~ ^truenasplugin: ]]; then
+                current_storage=""
+            fi
+        fi
+    done < "$STORAGE_CFG"
+
+    return 1
+}
+
+# Check if iSCSI target IQN is already in use by another storage entry
+# Returns 0 (found) with conflicting storage name on stdout, 1 (not found)
+check_target_in_use() {
+    local target_iqn="$1"
+    local exclude_name="${2:-}"
+    local current_storage=""
+
+    [[ -f "$STORAGE_CFG" ]] || return 1
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
+            current_storage="${BASH_REMATCH[1]}"
+            current_storage="$(echo "$current_storage" | xargs)"
+        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+target_iqn[[:space:]]+(.+)$ ]]; then
+            local iqn="${BASH_REMATCH[1]}"
+            iqn="$(echo "$iqn" | xargs)"
+            if [[ "$iqn" == "$target_iqn" && "$current_storage" != "$exclude_name" ]]; then
+                echo "$current_storage"
+                return 0
+            fi
+        elif [[ "$line" =~ ^[^[:space:]] ]]; then
+            if [[ ! "$line" =~ ^truenasplugin: ]]; then
+                current_storage=""
+            fi
+        fi
+    done < "$STORAGE_CFG"
+
+    return 1
+}
+
+# Check if NVMe subsystem NQN is already in use by another storage entry
+# Returns 0 (found) with conflicting storage name on stdout, 1 (not found)
+check_subsystem_in_use() {
+    local subsystem_nqn="$1"
+    local exclude_name="${2:-}"
+    local current_storage=""
+
+    [[ -f "$STORAGE_CFG" ]] || return 1
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
+            current_storage="${BASH_REMATCH[1]}"
+            current_storage="$(echo "$current_storage" | xargs)"
+        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+subsystem_nqn[[:space:]]+(.+)$ ]]; then
+            local nqn="${BASH_REMATCH[1]}"
+            nqn="$(echo "$nqn" | xargs)"
+            if [[ "$nqn" == "$subsystem_nqn" && "$current_storage" != "$exclude_name" ]]; then
+                echo "$current_storage"
+                return 0
+            fi
+        elif [[ "$line" =~ ^[^[:space:]] ]]; then
+            if [[ ! "$line" =~ ^truenasplugin: ]]; then
+                current_storage=""
+            fi
+        fi
+    done < "$STORAGE_CFG"
+
+    return 1
 }
 
 # Validate NQN format (must start with nqn.YYYY-MM.)
@@ -8575,6 +8666,21 @@ collect_provisioning_config() {
             error "Dataset name can only contain letters, numbers, hyphens, and underscores"
             continue
         fi
+
+        # Check if dataset is already in use by another storage entry
+        local full_dataset_check="${PROV_POOL}/${PROV_DATASET_NAME}"
+        local conflicting_ds
+        if conflicting_ds=$(check_dataset_in_use "$full_dataset_check" "$storage_name"); then
+            echo
+            printf "  ${c3}WARNING:${c0} Dataset '${full_dataset_check}' is already in use by storage '${conflicting_ds}'\n"
+            printf "  ${c3}Sharing datasets between storage entries can cause volume collisions.${c0}\n"
+            echo
+            read -rp "  Continue anyway? [y/N]: " confirm_ds
+            if [[ ! "$confirm_ds" =~ ^[Yy]$ ]]; then
+                continue
+            fi
+        fi
+
         break
     done
 
@@ -8613,29 +8719,47 @@ collect_provisioning_config() {
         local auto_nqn
         auto_nqn="nqn.$(date +%Y-%m).org.freenas.ctl:${storage_name}"
 
-        info "NVMe Subsystem Configuration:"
-        echo "  1) Use auto-generated NQN: $auto_nqn"
-        echo "  2) Enter custom NQN"
-        echo
+        while true; do
+            info "NVMe Subsystem Configuration:"
+            echo "  1) Use auto-generated NQN: $auto_nqn"
+            echo "  2) Enter custom NQN"
+            echo
 
-        local nqn_choice
-        read -rp "Select option [1-2] [1]: " nqn_choice
-        nqn_choice=${nqn_choice:-1}
+            local nqn_choice
+            read -rp "Select option [1-2] [1]: " nqn_choice
+            nqn_choice=${nqn_choice:-1}
 
-        case "$nqn_choice" in
-            1) PROV_NQN="$auto_nqn" ;;
-            2)
-                while true; do
-                    read -rp "Enter NQN: " PROV_NQN
-                    if [[ -z "$PROV_NQN" ]]; then
-                        error "NQN cannot be empty"
-                        continue
-                    fi
-                    break
-                done
-                ;;
-            *) PROV_NQN="$auto_nqn" ;;
-        esac
+            case "$nqn_choice" in
+                1) PROV_NQN="$auto_nqn" ;;
+                2)
+                    while true; do
+                        read -rp "Enter NQN: " PROV_NQN
+                        if [[ -z "$PROV_NQN" ]]; then
+                            error "NQN cannot be empty"
+                            continue
+                        fi
+                        break
+                    done
+                    ;;
+                *) PROV_NQN="$auto_nqn" ;;
+            esac
+
+            # Check if NQN is already in use by another storage entry
+            local conflicting_nqn
+            if conflicting_nqn=$(check_subsystem_in_use "$PROV_NQN" "$storage_name"); then
+                echo
+                printf "  ${c3}WARNING:${c0} Subsystem NQN is already in use by storage '${conflicting_nqn}'\n"
+                printf "  ${c3}Sharing subsystems between storage entries causes cross-visibility of all block devices.${c0}\n"
+                echo
+                read -rp "  Continue anyway? [y/N]: " confirm_nqn
+                if [[ ! "$confirm_nqn" =~ ^[Yy]$ ]]; then
+                    echo
+                    continue
+                fi
+            fi
+
+            break
+        done
 
         WIZARD_TARGET="$PROV_NQN"
 
@@ -8662,29 +8786,47 @@ collect_provisioning_config() {
         local auto_iqn
         auto_iqn="iqn.$(date +%Y-%m).org.freenas.ctl:${storage_name}"
 
-        info "iSCSI Target Configuration:"
-        echo "  1) Use auto-generated IQN: $auto_iqn"
-        echo "  2) Enter custom IQN"
-        echo
+        while true; do
+            info "iSCSI Target Configuration:"
+            echo "  1) Use auto-generated IQN: $auto_iqn"
+            echo "  2) Enter custom IQN"
+            echo
 
-        local iqn_choice
-        read -rp "Select option [1-2] [1]: " iqn_choice
-        iqn_choice=${iqn_choice:-1}
+            local iqn_choice
+            read -rp "Select option [1-2] [1]: " iqn_choice
+            iqn_choice=${iqn_choice:-1}
 
-        case "$iqn_choice" in
-            1) PROV_IQN="$auto_iqn" ;;
-            2)
-                while true; do
-                    read -rp "Enter IQN: " PROV_IQN
-                    if [[ -z "$PROV_IQN" ]]; then
-                        error "IQN cannot be empty"
-                        continue
-                    fi
-                    break
-                done
-                ;;
-            *) PROV_IQN="$auto_iqn" ;;
-        esac
+            case "$iqn_choice" in
+                1) PROV_IQN="$auto_iqn" ;;
+                2)
+                    while true; do
+                        read -rp "Enter IQN: " PROV_IQN
+                        if [[ -z "$PROV_IQN" ]]; then
+                            error "IQN cannot be empty"
+                            continue
+                        fi
+                        break
+                    done
+                    ;;
+                *) PROV_IQN="$auto_iqn" ;;
+            esac
+
+            # Check if IQN is already in use by another storage entry
+            local conflicting_iqn
+            if conflicting_iqn=$(check_target_in_use "$PROV_IQN" "$storage_name"); then
+                echo
+                printf "  ${c3}WARNING:${c0} Target IQN is already in use by storage '${conflicting_iqn}'\n"
+                printf "  ${c3}Sharing targets between storage entries causes cross-visibility of all block devices.${c0}\n"
+                echo
+                read -rp "  Continue anyway? [y/N]: " confirm_iqn
+                if [[ ! "$confirm_iqn" =~ ^[Yy]$ ]]; then
+                    echo
+                    continue
+                fi
+            fi
+
+            break
+        done
 
         WIZARD_TARGET="$PROV_IQN"
 
@@ -10854,13 +10996,26 @@ menu_configure_storage() {
             read -rp "Continue anyway? [y/N]: " continue_choice
             if [[ "$continue_choice" =~ ^[Yy] ]]; then
                 warning "Proceeding with unverified dataset '$dataset'"
-                break
             else
                 echo
                 info "Please enter a different dataset name"
                 continue
             fi
         fi
+
+        # Check if dataset is already in use by another storage entry
+        local conflicting_ds
+        if conflicting_ds=$(check_dataset_in_use "$dataset" "$storage_name"); then
+            echo
+            printf "  ${c3}WARNING:${c0} Dataset '${dataset}' is already in use by storage '${conflicting_ds}'\n"
+            printf "  ${c3}Sharing datasets between storage entries can cause volume collisions.${c0}\n"
+            echo
+            read -rp "  Continue anyway? [y/N]: " confirm_ds
+            if [[ ! "$confirm_ds" =~ ^[Yy]$ ]]; then
+                continue
+            fi
+        fi
+
         break
     done
 
@@ -10889,11 +11044,28 @@ menu_configure_storage() {
 
     if [[ "$transport_mode" == "iscsi" ]]; then
         # iSCSI Target
-        read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
-        if [[ -z "$target" ]]; then
-            error "iSCSI target cannot be empty"
-            return 1
-        fi
+        while true; do
+            read -rp "iSCSI target (e.g., iqn.2025-01.com.truenas:target0): " target
+            if [[ -z "$target" ]]; then
+                error "iSCSI target cannot be empty"
+                continue
+            fi
+
+            # Check if IQN is already in use by another storage entry
+            local conflicting_iqn
+            if conflicting_iqn=$(check_target_in_use "$target" "$storage_name"); then
+                echo
+                printf "  ${c3}WARNING:${c0} Target IQN is already in use by storage '${conflicting_iqn}'\n"
+                printf "  ${c3}Sharing targets between storage entries causes cross-visibility of all block devices.${c0}\n"
+                echo
+                read -rp "  Continue anyway? [y/N]: " confirm_iqn
+                if [[ ! "$confirm_iqn" =~ ^[Yy]$ ]]; then
+                    continue
+                fi
+            fi
+
+            break
+        done
     else
         # NVMe/TCP configuration
         # Check nvme-cli
@@ -10933,6 +11105,20 @@ menu_configure_storage() {
                 error "Invalid NQN format. Must start with nqn.YYYY-MM."
                 continue
             fi
+
+            # Check if NQN is already in use by another storage entry
+            local conflicting_nqn
+            if conflicting_nqn=$(check_subsystem_in_use "$subsystem_nqn" "$storage_name"); then
+                echo
+                printf "  ${c3}WARNING:${c0} Subsystem NQN is already in use by storage '${conflicting_nqn}'\n"
+                printf "  ${c3}Sharing subsystems between storage entries causes cross-visibility of all block devices.${c0}\n"
+                echo
+                read -rp "  Continue anyway? [y/N]: " confirm_nqn
+                if [[ ! "$confirm_nqn" =~ ^[Yy]$ ]]; then
+                    continue
+                fi
+            fi
+
             break
         done
 

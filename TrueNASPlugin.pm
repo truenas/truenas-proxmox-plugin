@@ -4,11 +4,13 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.2';
+our $VERSION = '2.0.3';
+# Highest Proxmox storage API version this plugin is validated against.
+our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
-use Digest::SHA qw(sha1);
+use Digest::SHA qw(sha1 sha1_hex);
 use IO::Socket::INET;
 use IO::Socket::SSL;
 use Time::HiRes qw(usleep);
@@ -251,7 +253,7 @@ sub _retry_with_backoff {
 # Storage API version - dynamically adapts to PVE version
 # Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 13)
 sub api {
-    my $tested_apiver = 13;  # Latest tested version (PVE 9.x)
+    my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
 
     # Get current system API version (safely, as PVE::Storage may not be loaded yet)
     my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
@@ -293,6 +295,10 @@ sub properties {
         },
         api_scheme => {
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
+            type => 'string', optional => 1,
+        },
+        api_transport => {
+            description => "Deprecated legacy transport selector. Ignored; WebSocket is always used.",
             type => 'string', optional => 1,
         },
         api_port => {
@@ -448,6 +454,7 @@ sub options {
         api_host      => { fixed => 1 },
         api_key       => { fixed => 1 },
         api_scheme    => { optional => 1, fixed => 1 },
+        api_transport => { optional => 1, fixed => 1 },
         api_port      => { optional => 1, fixed => 1 },
         api_insecure  => { optional => 1, fixed => 1 },
         prefer_ipv4   => { optional => 1 },
@@ -511,6 +518,33 @@ sub check_config {
 
     # Always set shared=1 since this is block-based shared storage (iSCSI or NVMe/TCP)
     $opts->{shared} = 1;
+
+    # Backward compatibility: accept legacy api_transport without breaking config parsing.
+    # TrueNAS SCALE API is WebSocket-only in current plugin versions.
+    if (defined $opts->{api_transport}) {
+        my $legacy_transport = lc($opts->{api_transport} // '');
+
+        if (!defined($opts->{api_scheme}) || $opts->{api_scheme} eq '') {
+            if ($legacy_transport eq 'ws' || $legacy_transport eq 'wss') {
+                $opts->{api_scheme} = $legacy_transport;
+            } else {
+                # Legacy values like 'rest'/'websocket' map to secure websocket behavior.
+                $opts->{api_scheme} = 'wss';
+            }
+        }
+
+        if ($legacy_transport eq 'rest') {
+            syslog('warning',
+                "[TrueNAS] Storage '$sectionId': api_transport=rest is deprecated and unsupported. " .
+                "Using WebSocket transport instead (api_scheme=$opts->{api_scheme})."
+            );
+        } else {
+            syslog('warning',
+                "[TrueNAS] Storage '$sectionId': api_transport is deprecated and ignored; " .
+                "use api_scheme/api_port if transport tuning is needed."
+            );
+        }
+    }
 
     # Validate retry configuration parameters
     if (defined $opts->{api_retry_max}) {
@@ -1906,9 +1940,42 @@ sub _tn_targets {
     return $list // [];
 }
 
-sub _tn_extent_create($scfg, $zname, $full) {
+# Generate a deterministic, globally unique iSCSI extent name.
+# Format: "<zname>-<8-char-sha1-hex>" derived from the full dataset path.
+# Weight volumes (pve-weight-*) are exempt and keep name == zname.
+# TrueNAS constraints: lowercase, [a-z0-9.\-:], max 64 chars.
+sub _generate_extent_name($scfg, $zname) {
+    # Weight volumes are exempt - keep name unchanged
+    return $zname if $zname =~ /^pve-weight-/;
+
+    my $full_path = $scfg->{dataset} . "/" . $zname;
+    my $hash8 = substr(sha1_hex($full_path), 0, 8);
+
+    # Enforce TrueNAS naming constraints
+    my $base = lc($zname);
+    $base =~ s/[^a-z0-9.\-:]//g;
+
+    # Max 64 chars total; suffix is "-" + 8 hex = 9 chars
+    my $max_base = 64 - 9;
+    if (length($base) > $max_base) {
+        $base = substr($base, 0, $max_base);
+    }
+
+    return "${base}-${hash8}";
+}
+
+# Resolve an iSCSI extent by its disk (zvol) path instead of by name.
+# Returns the first matching extent hashref, or undef if none found.
+sub _resolve_extent_by_disk($scfg, $zname) {
+    my $zvol_path = "zvol/" . $scfg->{dataset} . "/" . $zname;
+    my $extents = _tn_extents($scfg) // [];
+    my ($match) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
+    return $match;
+}
+
+sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     my $payload = {
-        name => $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
+        name => $extent_name // $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
     my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ]);
     # Invalidate cache since extents list has changed
@@ -1950,7 +2017,8 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
 }
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
-    my ($extent) = grep { ($_->{name} // '') eq $zname } @$extents;
+    my $zvol_path = "zvol/$scfg->{dataset}/$zname";
+    my ($extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
     return undef if !$extent || !defined $extent->{id};
     my $target_id = _resolve_target_id($scfg);
     my $maps = _tn_targetextents($scfg) // [];
@@ -2464,12 +2532,6 @@ sub _device_for_lun($scfg, $lun) {
         return $by; # fallback to by-path
     }
     return $by; # by-path preferred or fallback
-}
-
-sub _zvol_name($vmid, $name) {
-    $name //= 'disk-0';
-    $name =~ s/[^a-zA-Z0-9._\-]+/_/g;
-    return "vm-$vmid-$name";
 }
 
 # ======== NVMe/TCP Helper Functions ========
@@ -3259,8 +3321,9 @@ sub _alloc_image_iscsi {
 
     # Create an iSCSI extent for that zvol (device-backed)
     # TrueNAS expects a 'disk' like "zvol/<pool>/<zname>"
+    my $extent_name = _generate_extent_name($scfg, $zname);
     my $extent_payload = {
-        name => $zname,
+        name => $extent_name,
         type => 'DISK',
         disk => $zvol_path,
         insecure_tpc => JSON::PP::true, # typical default for modern OS initiators
@@ -3291,7 +3354,7 @@ sub _alloc_image_iscsi {
             "  4. Extent name conflict with existing extent\n" .
             "     -> Check: Shares > iSCSI > Extents for duplicate names\n\n" .
             "TrueNAS logs: /var/log/middlewared.log\n",
-            $zname, $full_ds, $zvol_path, $zname, $zname
+            $zname, $full_ds, $zvol_path, $extent_name, $zname
         );
     }
 
@@ -3543,7 +3606,8 @@ sub _free_image_iscsi {
     # Resolve target/extent/mapping on TrueNAS
     my $target_id = _resolve_target_id($scfg);
     my $extents = _tn_extents($scfg) // [];
-    my ($extent) = grep { ($_->{name}//'') eq $zname } @$extents;
+    my $zvol_path_match = "zvol/$scfg->{dataset}/$zname";
+    my ($extent) = grep { ($_->{disk}//'') eq $zvol_path_match } @$extents;
     my $maps = _tn_targetextents($scfg) // [];
     my ($tx) = ($extent && $target_id)
         ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
@@ -3626,9 +3690,9 @@ sub _free_image_iscsi {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete targetextent id=$id (may be in use by other cluster nodes)");
             }
         }
-        # Retry extent delete (re-query extent by name)
+        # Retry extent delete (re-query extent by disk path)
         $extents = _tn_extents($scfg) // [];
-        ($extent) = grep { ($_->{name}//'') eq $zname } @$extents;
+        ($extent) = grep { ($_->{disk}//'') eq $zvol_path_match } @$extents;
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
@@ -3976,11 +4040,14 @@ sub _list_images_iscsi {
         my $eid = $tx->{extent};
         my $e   = $extent_by_id{$eid} // next MAPPING;
 
-        # We name extents with the zvol name (e.g., vm-<vmid>-disk-<n>)
-        my $zname = $e->{name} // '';
-        next MAPPING if !$zname;
+        # Extract zvol name from extent's disk path (e.g., "zvol/tank/proxmox/vm-101-disk-0")
+        my $disk_path = $e->{disk} // '';
+        next MAPPING unless $disk_path =~ m{^zvol/(.+)$};
+        my $ds_full = $1;
 
-        my $ds_full = "$scfg->{dataset}/$zname";
+        # Extract zvol name from path, filtering by configured dataset
+        next MAPPING unless $ds_full =~ m{^\Q$scfg->{dataset}\E/(.+)$};
+        my $zname = $1;
 
         # Determine assigned LUN id
         my $lun = $tx->{lunid};
@@ -4566,29 +4633,16 @@ sub _clone_image_iscsi {
     # 2) Create iSCSI extent for the cloned zvol
     my $zvol_path = 'zvol/' . $target_full;
 
-    # Check if extent with target name already exists
+    # Check if extent for this zvol already exists (by disk path)
     my $extents = _tn_extents($scfg) // [];
-    my ($existing_extent) = grep { ($_->{name} // '') eq $target_zname } @$extents;
+    my ($existing_extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
 
-    my $extent_name = $target_zname;
+    my $extent_name = _generate_extent_name($scfg, $target_zname);
     my $extent_id;
 
     if ($existing_extent) {
-        # If extent exists and points to our zvol, reuse it
-        if (($existing_extent->{disk} // '') eq $zvol_path) {
-            $extent_id = $existing_extent->{id};
-        } else {
-            # Generate unique extent name with timestamp suffix
-            my $timestamp = time();
-            $extent_name = "$target_zname-$timestamp";
-
-            # Double-check the new name doesn't exist
-            my ($conflict) = grep { ($_->{name} // '') eq $extent_name } @$extents;
-            if ($conflict) {
-                # Add random suffix as fallback
-                $extent_name = "$target_zname-$timestamp-" . int(rand(1000));
-            }
-        }
+        # Extent already points to our zvol, reuse it
+        $extent_id = $existing_extent->{id};
     }
 
     # Create extent if we don't have one yet

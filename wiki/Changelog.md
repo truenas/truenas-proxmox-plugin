@@ -6,6 +6,19 @@
 - Official issue tracker: <https://github.com/truenas/truenas-proxmox-plugin/issues>
 - Historical changelog references to prior issue URLs may remain for archival context
 
+## Version 2.0.3 (February 8, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **Migration and test stability improvements**
+- **Improved migration diagnostics in dev test suite**: Live/offline migration failures now log command output instead of only generic failure messages
+- **Fixed performance regression phase arithmetic**: Performance baseline comparison now averages multi-sample timings correctly and avoids integer expression errors
+- **Added startup APIVER compatibility check**: Test suite now reports plugin/system storage API compatibility at startup before running phases
+
+### 🔧 **Compatibility Hardening**
+- **Added explicit tested API constant**: Plugin now declares `our $TESTED_APIVER = 13` near the version header for clear compatibility tracking
+- **Legacy config compatibility restored**: Deprecated `api_transport` is accepted and normalized to WebSocket behavior with warnings, preventing parser failures during migration/activation on stale configs
+
 ## Version 2.0.2 (February 4, 2026)
 
 ### 🐛 **Bug Fixes**

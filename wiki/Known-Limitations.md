@@ -720,3 +720,4 @@ zfs set quota=500G tank/proxmox
 - [Troubleshooting Guide](Troubleshooting.md) - Solutions to common issues
 - [Advanced Features](Advanced-Features.md) - Performance optimization
 - [Configuration Reference](Configuration.md) - All configuration options
+- [Multi-Tenancy](Multi-Tenancy.md) - Sharing a TrueNAS system across multiple clusters

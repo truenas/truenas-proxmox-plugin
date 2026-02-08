@@ -23,6 +23,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 
 ### Advanced Topics
 - **[Advanced Features](Advanced-Features.md)** - Performance tuning, cluster configuration, security hardening, and enterprise features
+- **[Multi-Tenancy / Shared TrueNAS](Multi-Tenancy.md)** - Safely sharing a single TrueNAS system across multiple Proxmox clusters
 - **[API Reference](API-Reference.md)** - Technical details on TrueNAS API integration, endpoints, and error handling
 
 ### Development
@@ -70,6 +71,11 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 - [Network Optimization](Advanced-Features.md#network-optimization)
 - [Multipath I/O](Advanced-Features.md#multipath-io-mpio)
 
+**Multi-Tenancy**:
+- [Dataset and Target Isolation](Multi-Tenancy.md#one-dataset-per-cluster)
+- [Extent Name Uniqueness](Multi-Tenancy.md#global-iscsi-extent-name-uniqueness)
+- [Separating Shared Deployments](Multi-Tenancy.md#separating-an-already-shared-deployment)
+
 **Security**:
 - [CHAP Authentication](Advanced-Features.md#chap-authentication)
 - [API Security](Advanced-Features.md#api-security)
@@ -86,6 +92,7 @@ wiki/
 ├── Tools.md                    # Tools and utilities (test suite, health check, diagnostics bundle, orphan cleanup, cluster deployment)
 ├── Troubleshooting.md          # Common issues and solutions
 ├── Advanced-Features.md        # Performance, clustering, security
+├── Multi-Tenancy.md            # Sharing TrueNAS across multiple clusters
 ├── API-Reference.md            # TrueNAS API technical details
 ├── Ideas.md                    # Feature ideas and development roadmap
 ├── Changelog.md                # Version history and release notes
@@ -156,6 +163,6 @@ For issues not covered in documentation:
 
 ## Version Information
 
-**Version**: 2.0.2
-**Last Updated**: February 4, 2026
+**Version**: 2.0.3
+**Last Updated**: February 8, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

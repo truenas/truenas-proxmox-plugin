@@ -898,3 +898,4 @@ pvesm list truenas-storage
 - [Installation Guide](Installation.md) - Initial setup instructions
 - [Advanced Features](Advanced-Features.md) - Performance tuning and clustering
 - [Troubleshooting](Troubleshooting.md) - Common configuration issues
+- [Multi-Tenancy](Multi-Tenancy.md) - Sharing a TrueNAS system across multiple clusters

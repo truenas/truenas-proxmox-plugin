@@ -402,8 +402,9 @@ check_apiver_mismatch() {
     # Get system APIVER
     system_apiver=$(perl -e 'require PVE::Storage; print PVE::Storage::APIVER()' 2>/dev/null || echo "unknown")
 
-    # Get plugin's tested APIVER from the plugin file
-    plugin_apiver=$(grep -oP 'my \$tested_apiver = \K\d+' /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm 2>/dev/null || echo "unknown")
+    # Get plugin tested APIVER (top-level constant in plugin)
+    plugin_apiver=$(perl -e 'use lib "/usr/share/perl5/PVE/Storage/Custom"; require TrueNASPlugin; print($PVE::Storage::Custom::TrueNASPlugin::TESTED_APIVER // "")' 2>/dev/null || true)
+    [[ -z "$plugin_apiver" ]] && plugin_apiver="unknown"
 
     if [[ "$system_apiver" != "unknown" && "$plugin_apiver" != "unknown" ]]; then
         if [[ "$system_apiver" -gt "$plugin_apiver" ]]; then
@@ -2245,8 +2246,10 @@ test_multidisk_advanced_operations() {
         # Live migrate to target node
         log_info "Live migrating VM from $NODE to $TARGET_NODE"
         local migrate_start=$(date +%s)
-        if ! qm migrate "$vmid" "$TARGET_NODE" --online >/dev/null 2>&1; then
+        local migrate_error
+        if ! migrate_error=$(qm migrate "$vmid" "$TARGET_NODE" --online 2>&1); then
             log_error "Failed to live migrate to $TARGET_NODE"
+            log_error "qm migrate output: ${migrate_error//$'\n'/ }"
             qm stop "$vmid" >/dev/null 2>&1 || true
             pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
             FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -2380,8 +2383,10 @@ test_live_migration() {
     # Migrate to target node
     log_info "Migrating VM from $NODE to $TARGET_NODE (live)"
     local migrate_start=$(date +%s)
-    if ! qm migrate "$vmid" "$TARGET_NODE" --online >/dev/null 2>&1; then
+    local migrate_error
+    if ! migrate_error=$(qm migrate "$vmid" "$TARGET_NODE" --online 2>&1); then
         log_error "Failed to migrate to $TARGET_NODE"
+        log_error "qm migrate output: ${migrate_error//$'\n'/ }"
         qm stop "$vmid" >/dev/null 2>&1 || true
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -2406,8 +2411,9 @@ test_live_migration() {
     # Migrate back to original node
     log_info "Migrating VM back from $TARGET_NODE to $NODE (live)"
     migrate_start=$(date +%s)
-    if ! pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/migrate" -target "$NODE" -online 1 >/dev/null 2>&1; then
+    if ! migrate_error=$(pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/migrate" -target "$NODE" -online 1 2>&1); then
         log_error "Failed to migrate back to $NODE"
+        log_error "pvesh migrate output: ${migrate_error//$'\n'/ }"
         pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/status/stop" >/dev/null 2>&1 || true
         pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -2482,8 +2488,10 @@ test_offline_migration() {
     # Migrate to target node (offline)
     log_info "Migrating VM from $NODE to $TARGET_NODE (offline)"
     local migrate_start=$(date +%s)
-    if ! qm migrate "$vmid" "$TARGET_NODE" >/dev/null 2>&1; then
+    local migrate_error
+    if ! migrate_error=$(qm migrate "$vmid" "$TARGET_NODE" 2>&1); then
         log_error "Failed to migrate to $TARGET_NODE"
+        log_error "qm migrate output: ${migrate_error//$'\n'/ }"
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - Migration to target failed")
@@ -2507,8 +2515,9 @@ test_offline_migration() {
     # Migrate back to original node
     log_info "Migrating VM back from $TARGET_NODE to $NODE (offline)"
     migrate_start=$(date +%s)
-    if ! pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/migrate" -target "$NODE" >/dev/null 2>&1; then
+    if ! migrate_error=$(pvesh create "/nodes/$TARGET_NODE/qemu/$vmid/migrate" -target "$NODE" 2>&1); then
         log_error "Failed to migrate back to $NODE"
+        log_error "pvesh migrate output: ${migrate_error//$'\n'/ }"
         pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - Migration back failed")
@@ -3949,7 +3958,23 @@ test_performance_regression_tracking() {
 
         # Compare each timing we have
         for key in "${!PERF_TIMINGS[@]}"; do
-            local current_time="${PERF_TIMINGS[$key]}"
+            local current_samples="${PERF_TIMINGS[$key]}"
+            local current_sum=0
+            local current_count=0
+            local sample
+
+            for sample in $current_samples; do
+                [[ "$sample" =~ ^[0-9]+$ ]] || continue
+                current_sum=$((current_sum + sample))
+                current_count=$((current_count + 1))
+            done
+
+            # Skip malformed or empty timing entries
+            if [[ $current_count -eq 0 ]]; then
+                continue
+            fi
+
+            local current_time=$((current_sum / current_count))
             local baseline_time
             # Extract numeric value for key from JSON baseline file using grep/sed
             baseline_time=$(grep -o "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]*" "$baseline_file" 2>/dev/null | \
@@ -4004,10 +4029,26 @@ test_performance_regression_tracking() {
     local json_data="{"
     local first=1
     for key in "${!PERF_TIMINGS[@]}"; do
+        local samples="${PERF_TIMINGS[$key]}"
+        local sum=0
+        local count=0
+        local sample
+
+        for sample in $samples; do
+            [[ "$sample" =~ ^[0-9]+$ ]] || continue
+            sum=$((sum + sample))
+            count=$((count + 1))
+        done
+
+        # Skip malformed or empty timing entries
+        [[ $count -eq 0 ]] && continue
+
+        local avg=$((sum / count))
+
         if [[ $first -eq 0 ]]; then
             json_data+=","
         fi
-        json_data+="\"$key\":${PERF_TIMINGS[$key]}"
+        json_data+="\"$key\":${avg}"
         first=0
     done
     json_data+="}"
@@ -4941,6 +4982,25 @@ main() {
     echo "╚════════════════════════════════════════════════════════════════════╝" | tee -a "$LOG_FILE"
     echo | tee -a "$LOG_FILE"
 
+    # Check APIVER compatibility at startup before running tests
+    local apiver_result
+    local apiver_status
+    local system_apiver
+    local plugin_apiver
+    apiver_result=$(check_apiver_mismatch)
+    apiver_status=$(echo "$apiver_result" | cut -d'|' -f1)
+    system_apiver=$(echo "$apiver_result" | cut -d'|' -f2)
+    plugin_apiver=$(echo "$apiver_result" | cut -d'|' -f3)
+
+    if [[ "$apiver_status" == "MISMATCH" ]]; then
+        log_warning "APIVER compatibility check: plugin may be out of date (System=$system_apiver, Plugin=$plugin_apiver)"
+    elif [[ "$apiver_status" == "OK" ]]; then
+        log_info "APIVER compatibility check: OK (System=$system_apiver, Plugin=$plugin_apiver)"
+    else
+        log_warning "APIVER compatibility check: Unable to determine (System=$system_apiver, Plugin=$plugin_apiver)"
+    fi
+    echo | tee -a "$LOG_FILE"
+
     log_info "Configuration:"
     log_info "  Storage ID:    $STORAGE_ID"
     log_info "  Node:          $NODE"
@@ -4958,11 +5018,7 @@ main() {
         log_info "  Backup Store:  NOT SET (backup tests will be skipped)"
     fi
 
-    # Check for APIVER mismatch
-    apiver_result=$(check_apiver_mismatch)
-    apiver_status=$(echo "$apiver_result" | cut -d'|' -f1)
-    system_apiver=$(echo "$apiver_result" | cut -d'|' -f2)
-    plugin_apiver=$(echo "$apiver_result" | cut -d'|' -f3)
+    # APIVER status was already checked at startup
 
     if [[ "$apiver_status" == "MISMATCH" ]]; then
         log_warning "  APIVER:        MISMATCH - System=$system_apiver, Plugin=$plugin_apiver"
