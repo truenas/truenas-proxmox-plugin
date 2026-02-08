@@ -6384,7 +6384,7 @@ verify_dataset() {
     start_spinner
 
     # Use pool.dataset.query with filter for specific dataset
-    local filter="[[\"id\", \"=\", \"${dataset}\"]]"
+    local filter="[[[\"id\", \"=\", \"${dataset}\"]]]"
     local response
     response=$(tn_api_call "$ip" "$apikey" "pool.dataset.query" "$filter" 2>/dev/null)
     local exit_code=$?
