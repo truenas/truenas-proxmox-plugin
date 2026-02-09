@@ -295,7 +295,6 @@ Portal numbers (or press Enter to skip): 1 2
 #   2) Create diagnostics bundle
 #   3) Cleanup orphaned resources
 #   4) Run plugin function test
-#   5) Run FIO storage benchmark
 #   0) Back to main menu
 
 # === Option 1: Health Check ===
