@@ -19,12 +19,12 @@ The TrueNAS plugin includes a comprehensive automated installer that handles ins
 Install the plugin with a single command:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 ```
 
 Or using curl:
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 ```
 
 The installer will:
@@ -124,13 +124,13 @@ For automation or CI/CD pipelines:
 
 ```bash
 # Download and install automatically
-wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash -s -- --non-interactive
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive
 ```
 
 Or download first:
 ```bash
 # Download installer
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
 chmod +x install.sh
 
 # Run in non-interactive mode
@@ -149,7 +149,7 @@ Non-interactive mode will:
 #### First-Time Installation
 ```bash
 # Run the one-liner
-wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 
 # Installer will:
 # 1. Download and install plugin v1.0.7 (latest)
@@ -266,15 +266,15 @@ For Proxmox clusters, install on each node:
 
 ```bash
 # On first node
-wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 
 # Installer will detect cluster and show:
 ⚠ Cluster Detected: 3 nodes in cluster
 ⚠ Remember to install on all cluster nodes!
 
 # On remaining nodes, run the same command:
-ssh root@node2 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
-ssh root@node3 "wget -qO- https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/install.sh | bash"
+ssh root@node2 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash"
+ssh root@node3 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash"
 
 # Or use the cluster update script (see Tools and Utilities guide)
 ```

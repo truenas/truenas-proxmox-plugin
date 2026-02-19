@@ -82,7 +82,7 @@ Perl compilation check returned errors
 ls -lh /tmp/TrueNASPlugin.pm.download
 
 # Try downloading manually to verify file integrity
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
 
 # Check syntax manually
 perl -c TrueNASPlugin.pm
@@ -247,7 +247,7 @@ GITHUB_TOKEN="ghp_yourTokenHere" ./install.sh
 **Option 3: Manual installation**
 ```bash
 # Download plugin manually
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
 
 # Install manually
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
