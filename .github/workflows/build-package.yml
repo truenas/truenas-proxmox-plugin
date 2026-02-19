@@ -138,10 +138,10 @@ jobs:
         with:
           name: truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all
 
-      - name: Install package
+      - name: Install package (force - dependencies not available on Ubuntu)
         run: |
-          sudo dpkg -i truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb || true
-          sudo apt-get install -f -y
+          # pve-manager is not available on Ubuntu runners, so force install
+          sudo dpkg --force-depends -i truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
 
       - name: Verify installation
         run: |
