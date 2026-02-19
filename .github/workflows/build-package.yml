@@ -68,7 +68,7 @@ jobs:
           for file in \
             "usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm" \
             "usr/share/doc/truenas-proxmox-plugin/copyright" \
-            "usr/share/doc/truenas-proxmox-plugin/changelog.Debian.gz"
+            "usr/share/doc/truenas-proxmox-plugin/changelog.gz"
           do
             if dpkg-deb --contents truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb | grep -q " ./$file$"; then
               echo "✓ $file"
