@@ -1,0 +1,35 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Extract version from changelog and inject into plugin
+	$(eval PKG_VERSION := $(shell dpkg-parsechangelog -S Version))
+	sed -i.bak "s/^our \$$VERSION = '.*';/our \$$VERSION = '$(PKG_VERSION)';/" TrueNASPlugin.pm
+	@echo "Injected version $(PKG_VERSION) into TrueNASPlugin.pm"
+
+override_dh_auto_install:
+	# Install plugin to Proxmox location
+	install -D -m 644 TrueNASPlugin.pm \
+		debian/truenas-proxmox-plugin/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+
+	# Install management script
+	install -D -m 755 install.sh \
+		debian/truenas-proxmox-plugin/usr/share/truenas-proxmox-plugin/install.sh
+
+	# Install test utilities
+	install -D -m 755 tools/dev-truenas-plugin-full-function-test.sh \
+		debian/truenas-proxmox-plugin/usr/share/truenas-proxmox-plugin/tools/dev-test.sh
+
+	# Create convenience symlink in /usr/bin (Debian packages must not use /usr/local)
+	mkdir -p debian/truenas-proxmox-plugin/usr/bin
+	ln -s ../share/truenas-proxmox-plugin/install.sh \
+		debian/truenas-proxmox-plugin/usr/bin/truenas-proxmox-manage
+
+override_dh_auto_clean:
+	dh_auto_clean
+	# Restore original plugin file if backup exists
+	[ -f TrueNASPlugin.pm.bak ] && mv TrueNASPlugin.pm.bak TrueNASPlugin.pm || true

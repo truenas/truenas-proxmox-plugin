@@ -1,0 +1,39 @@
+Source: truenas-proxmox-plugin
+Section: admin
+Priority: optional
+Maintainer: TrueNAS Contributors <noreply@truenas.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/truenas/truenas-proxmox-plugin
+Vcs-Browser: https://github.com/truenas/truenas-proxmox-plugin
+Vcs-Git: https://github.com/truenas/truenas-proxmox-plugin.git
+Rules-Requires-Root: no
+
+Package: truenas-proxmox-plugin
+Architecture: all
+Depends: ${misc:Depends},
+         pve-manager (>= 8.0.0),
+         open-iscsi,
+         perl (>= 5.32),
+         libjson-pp-perl,
+         liburi-perl,
+         libio-socket-ssl-perl
+Recommends: nvme-cli,
+            multipath-tools
+Suggests: fio
+Description: TrueNAS SCALE storage plugin for Proxmox VE
+ High-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE
+ via iSCSI or NVMe/TCP, featuring live snapshots, ZFS integration, and cluster
+ compatibility.
+ .
+ Features:
+  * Dual transport support (iSCSI and NVMe/TCP)
+  * ZFS snapshots and clones
+  * Live VM snapshots with RAM state (vmstate)
+  * Cluster-compatible shared storage
+  * Automatic volume management via TrueNAS API
+  * Thin provisioning and ZFS compression
+  * Multi-path I/O support
+  * CHAP authentication for iSCSI
+ .
+ This package includes the Proxmox storage plugin and management utilities.

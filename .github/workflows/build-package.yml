@@ -1,0 +1,188 @@
+name: Build Debian Package
+
+on:
+  push:
+    branches:
+      - main
+      - alpha
+      - 'release/**'
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
+      - alpha
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build and Test Package
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dpkg-dev \
+            lintian \
+            fakeroot
+
+      - name: Get package version
+        id: version
+        run: |
+          VERSION=$(dpkg-parsechangelog -S Version)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package version: $VERSION"
+
+      - name: Build debian package
+        run: |
+          dpkg-deb --build debian/truenas-proxmox-plugin
+          mv debian/truenas-proxmox-plugin.deb \
+             truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+
+      - name: Check package with lintian
+        run: |
+          lintian truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb || true
+
+      - name: Verify package contents
+        run: |
+          echo "=== Package Information ==="
+          dpkg-deb --info truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+
+          echo ""
+          echo "=== Package Contents ==="
+          dpkg-deb --contents truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+
+          echo ""
+          echo "=== Verifying Required Files ==="
+          MISSING=0
+
+          for file in \
+            "usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm" \
+            "usr/share/doc/truenas-proxmox-plugin/copyright" \
+            "usr/share/doc/truenas-proxmox-plugin/changelog.Debian.gz"
+          do
+            if dpkg-deb --contents truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb | grep -q " ./$file$"; then
+              echo "✓ $file"
+            else
+              echo "✗ $file - MISSING"
+              MISSING=1
+            fi
+          done
+
+          if [ $MISSING -eq 1 ]; then
+            echo "ERROR: Required files missing from package"
+            exit 1
+          fi
+
+      - name: Get package info for artifact naming
+        id: pkginfo
+        run: |
+          ARCH=$(dpkg-deb --field truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb Architecture)
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: truenas-proxmox-plugin_${{ steps.version.outputs.version }}_${{ steps.pkginfo.outputs.arch }}
+          path: truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+          retention-days: 30
+
+      - name: Create release checksums
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          sha256sum truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb > \
+            truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb.sha256
+          md5sum truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb > \
+            truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb.md5
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+            truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb.sha256
+            truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb.md5
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test-install:
+    runs-on: ubuntu-latest
+    name: Test Package Installation
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get package version
+        id: version
+        run: |
+          VERSION=$(dpkg-parsechangelog -S Version)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all
+
+      - name: Install package
+        run: |
+          sudo dpkg -i truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb || true
+          sudo apt-get install -f -y
+
+      - name: Verify installation
+        run: |
+          echo "=== Verifying Installation ==="
+
+          # Check plugin file exists
+          if [ -f /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm ]; then
+            echo "✓ Plugin file installed"
+          else
+            echo "✗ Plugin file NOT found"
+            exit 1
+          fi
+
+          # Check permissions
+          PERMS=$(stat -c "%a" /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm)
+          if [ "$PERMS" = "644" ]; then
+            echo "✓ Permissions correct (644)"
+          else
+            echo "✗ Incorrect permissions: $PERMS (expected 644)"
+            exit 1
+          fi
+
+          # Check documentation
+          if [ -d /usr/share/doc/truenas-proxmox-plugin ]; then
+            echo "✓ Documentation directory exists"
+          else
+            echo "✗ Documentation directory NOT found"
+            exit 1
+          fi
+
+          echo ""
+          echo "Installation verification successful"
+
+      - name: Test package removal
+        run: |
+          echo "=== Testing Package Removal ==="
+          sudo dpkg -r truenas-proxmox-plugin
+
+          if [ ! -f /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm ]; then
+            echo "✓ Plugin file removed"
+          else
+            echo "✗ Plugin file still exists after removal"
+            exit 1
+          fi
+
+          echo "Removal test successful"

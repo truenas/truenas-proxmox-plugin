@@ -53,9 +53,50 @@
 
 ### Installation
 
-**Recommended: Interactive Installer (One Command)**
+**Option 1: APT Repository (Recommended)**
 
-Download and run the installer interactively:
+Add the official repository and install:
+
+```bash
+# Add repository
+curl -fsSL https://truenas.github.io/truenas-proxmox-plugin/setup.sh | sudo bash
+
+# Install plugin
+apt-get update
+apt-get install truenas-proxmox-plugin
+
+# Restart Proxmox services
+systemctl restart pvedaemon pveproxy
+```
+
+Or use the setup script from this repository:
+
+```bash
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/tools/setup-apt-repo.sh
+chmod +x setup-apt-repo.sh
+sudo ./setup-apt-repo.sh
+sudo apt-get update
+sudo apt-get install truenas-proxmox-plugin
+```
+
+**Option 2: Debian Package**
+
+Download and install the .deb package directly:
+
+```bash
+# Download latest package
+wget https://github.com/truenas/truenas-proxmox-plugin/releases/latest/download/truenas-proxmox-plugin_2.0.3_all.deb
+
+# Install package
+dpkg -i truenas-proxmox-plugin_2.0.3_all.deb
+
+# Restart Proxmox services
+systemctl restart pvedaemon pveproxy
+```
+
+**Option 3: Interactive Installer**
+
+One-command interactive setup with guided configuration:
 
 ```bash
 bash <(curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh)

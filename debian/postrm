@@ -1,0 +1,46 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        # Restart Proxmox services to unload plugin
+        if systemctl is-active --quiet pvedaemon.service; then
+            systemctl restart pvedaemon.service || true
+        fi
+
+        if systemctl is-active --quiet pveproxy.service; then
+            systemctl restart pveproxy.service || true
+        fi
+
+        echo "TrueNAS Proxmox Plugin removed"
+        ;;
+
+    purge)
+        # On purge, remove any leftover files
+        rm -rf /usr/share/truenas-proxmox-plugin/ 2>/dev/null || true
+
+        # Restart services
+        if systemctl is-active --quiet pvedaemon.service; then
+            systemctl restart pvedaemon.service || true
+        fi
+
+        if systemctl is-active --quiet pveproxy.service; then
+            systemctl restart pveproxy.service || true
+        fi
+
+        echo "TrueNAS Proxmox Plugin purged"
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # Nothing to do
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

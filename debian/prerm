@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Check if storage configurations exist
+        if [ -f /etc/pve/storage.cfg ] && grep -q "^truenasplugin:" /etc/pve/storage.cfg 2>/dev/null; then
+            echo ""
+            echo "========================================" >&2
+            echo "WARNING: TrueNAS storage configurations still exist in /etc/pve/storage.cfg" >&2
+            echo ""
+            echo "The plugin will be removed, but your storage configurations will remain." >&2
+            echo "To completely remove TrueNAS storage:" >&2
+            echo "  1. Remove storage entries from Proxmox GUI or CLI" >&2
+            echo "  2. Run 'truenas-proxmox-manage' and use orphan cleanup (if needed)" >&2
+            echo "  3. Then purge the package: apt purge truenas-proxmox-plugin" >&2
+            echo "========================================" >&2
+            echo ""
+        fi
+        ;;
+
+    upgrade|failed-upgrade)
+        # Nothing to do on upgrade
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

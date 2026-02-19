@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Validate plugin syntax
+        if ! perl -c /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm >/dev/null 2>&1; then
+            echo "ERROR: Plugin syntax validation failed" >&2
+            exit 1
+        fi
+
+        # Restart Proxmox services to load plugin
+        if systemctl is-active --quiet pvedaemon.service; then
+            systemctl restart pvedaemon.service || true
+        fi
+
+        if systemctl is-active --quiet pveproxy.service; then
+            systemctl restart pveproxy.service || true
+        fi
+
+        echo ""
+        echo "TrueNAS Proxmox Plugin installed successfully (version $(dpkg-query -W -f='${Version}' truenas-proxmox-plugin))"
+        echo ""
+        echo "Configuration options:"
+        echo "  1. Run 'truenas-proxmox-manage' for interactive configuration wizard"
+        echo "  2. Manually edit /etc/pve/storage.cfg"
+        echo ""
+        echo "Documentation: https://github.com/truenas/truenas-proxmox-plugin/wiki"
+        echo ""
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        # Nothing to do
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

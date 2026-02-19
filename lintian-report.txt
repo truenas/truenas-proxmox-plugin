@@ -1,0 +1,8 @@
+W: truenas-proxmox-plugin: debian-changelog-has-wrong-day-of-week 2026-02-19 was a Thursday [usr/share/doc/truenas-proxmox-plugin/changelog.gz:1]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postinst:14]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postinst:18]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postrm:12]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postrm:24]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postrm:28]
+W: truenas-proxmox-plugin: maintainer-script-calls-systemctl [postrm:8]
+W: truenas-proxmox-plugin: no-manual-page [usr/bin/truenas-proxmox-manage]
