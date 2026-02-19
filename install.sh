@@ -12,7 +12,7 @@ set -euo pipefail
 # ============================================================================
 
 readonly INSTALLER_VERSION="1.0.2"
-readonly GITHUB_REPO="WarlockSyno/truenasplugin"
+readonly GITHUB_REPO="truenas/truenas-proxmox-plugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
 readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
