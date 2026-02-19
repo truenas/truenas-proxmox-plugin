@@ -29,6 +29,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            debhelper \
+            devscripts \
             dpkg-dev \
             lintian \
             fakeroot
@@ -42,9 +44,8 @@ jobs:
 
       - name: Build debian package
         run: |
-          dpkg-deb --build debian/truenas-proxmox-plugin
-          mv debian/truenas-proxmox-plugin.deb \
-             truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb
+          dpkg-buildpackage -us -uc -b
+          mv ../truenas-proxmox-plugin_${{ steps.version.outputs.version }}_all.deb .
 
       - name: Check package with lintian
         run: |
