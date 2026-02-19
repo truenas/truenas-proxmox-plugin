@@ -99,19 +99,19 @@ systemctl restart pvedaemon pveproxy
 One-command interactive setup with guided configuration:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh)
 ```
 
 Or download first, then run:
 ```bash
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh
 chmod +x install.sh
 ./install.sh
 ```
 
 **For Non-Interactive/Automated Installation:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/WarlockSyno/truenasplugin/alpha/install.sh | bash -s -- --non-interactive
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:
@@ -128,7 +128,7 @@ If you prefer manual installation:
 
 ```bash
 # Download the plugin
-wget https://raw.githubusercontent.com/WarlockSyno/truenasplugin/main/TrueNASPlugin.pm
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
 
 # Copy to plugin directory
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
