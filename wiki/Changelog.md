@@ -83,6 +83,7 @@ In-place migration is **not possible** due to:
   - **Issue**: EFI VMs require 528 KiB disks which don't align with common blocksizes (16K, 64K, 128K)
   - **Impact**: Users couldn't create UEFI/OVMF VMs when using custom `zvol_blocksize` configurations
   - **Affected operations**: Volume creation (`alloc_image`) for small disks like EFI variables
+  - **Related task**: `sessions/tasks/h-fix-efi-vm-blocksize-alignment.md`
 
 ### 🔧 **Technical Details**
 - Added `_parse_blocksize()` helper function (lines 91-105)
@@ -102,6 +103,7 @@ In-place migration is **not possible** due to:
 
 ### ✅ **Validation**
 Tested with multiple blocksize configurations:
+- 16K blocksize: 528 KiB → 544 KiB (aligned to 16K × 33)
 - 64K blocksize: 528 KiB → 576 KiB (aligned to 64K × 9)
 - 128K blocksize: 528 KiB → 640 KiB (aligned to 128K × 5)
 
