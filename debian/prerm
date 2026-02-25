@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -e
+
+STORAGE_CFG="/etc/pve/storage.cfg"
+
+case "$1" in
+    remove)
+        if [ -f "$STORAGE_CFG" ] && grep -Eq '^[[:space:]]*truenasplugin:' "$STORAGE_CFG"; then
+            echo "WARNING: TrueNAS plugin storage entries remain in $STORAGE_CFG (truenasplugin:)." >&2
+            echo "WARNING: They are not modified automatically during package removal." >&2
+        fi
+        ;;
+    upgrade|deconfigure|failed-upgrade)
+        ;;
+    *)
+        ;;
+esac
+
+exit 0

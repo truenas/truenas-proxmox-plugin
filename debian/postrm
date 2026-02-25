@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -e
+
+BACKUP_DIR="/var/lib/truenas-plugin-backups"
+LOG_FILE="/var/log/truenas-installer.log"
+
+case "$1" in
+    purge)
+        rm -rf "$BACKUP_DIR"
+        rm -f "$LOG_FILE"
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        ;;
+esac
+
+exit 0

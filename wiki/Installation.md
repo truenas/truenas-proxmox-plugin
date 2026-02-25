@@ -14,6 +14,60 @@ Complete installation instructions for the TrueNAS Proxmox VE Storage Plugin.
 
 The TrueNAS plugin includes a comprehensive automated installer that handles installation, updates, configuration, and management through an interactive menu system.
 
+### Install via Official APT Repository
+
+Use the APT repository if you want standard package install and upgrade workflows.
+
+#### Option 1: Installer bootstrap (recommended)
+
+Run the installer in non-interactive mode with APT setup and package install:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install
+```
+
+Optional suite override:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install --apt-suite trixie
+```
+
+Suite mapping:
+- Proxmox VE 8 -> `bookworm`
+- Proxmox VE 9 -> `trixie`
+
+#### Option 2: Manual deb822 repository setup
+
+Repository URL: `https://truenas.github.io/truenas-proxmox-plugin/apt/`
+Key URL: `https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg`
+
+```bash
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg -o /etc/apt/keyrings/truenas-proxmox-plugin.gpg
+
+cat >/etc/apt/sources.list.d/truenas-proxmox-plugin.sources <<'EOF'
+Types: deb
+URIs: https://truenas.github.io/truenas-proxmox-plugin/apt/
+Suites: bookworm
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/truenas-proxmox-plugin.gpg
+EOF
+```
+
+If you are on Proxmox VE 9, set `Suites: trixie` in the `.sources` file.
+
+Install and upgrade commands:
+
+```bash
+apt-get update
+apt-get install -y truenas-proxmox-plugin
+
+# Upgrade to newer plugin packages from the repository
+apt-get update
+apt-get install --only-upgrade -y truenas-proxmox-plugin
+```
+
 ### Quick Start - One-Line Installation
 
 Install the plugin with a single command:

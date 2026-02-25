@@ -28,6 +28,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 
 ### Development
 - **[Ideas and Feature Requests](Ideas.md)** - Proposed features, enhancements, and development roadmap
+- **[Packaging Guide](Packaging.md)** - Maintainer workflow for Debian packaging and APT publishing
 - **[Changelog](Changelog.md)** - Version history and release notes
 
 ### Important Information
@@ -41,6 +42,10 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 - [Single Node Setup](Installation.md#single-node-installation)
 - [Cluster Deployment](Installation.md#cluster-installation)
 - [TrueNAS Configuration](Installation.md#truenas-scale-setup)
+- [Official APT Repository Setup](Installation.md#install-via-official-apt-repository)
+
+**Development / Maintainers**:
+- [Packaging Guide](Packaging.md)
 
 **Testing**:
 - [Running Test Suite](Testing.md#basic-usage)

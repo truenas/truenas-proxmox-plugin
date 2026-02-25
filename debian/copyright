@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: TrueNAS Proxmox VE Storage Plugin
+Source: https://github.com/truenas/truenas-proxmox-plugin
+
+Files: *
+Copyright: Copyright (C) the project authors
+License: GPL-3.0-or-later
+
+License: GPL-3.0-or-later
+ This package is licensed under the GNU General Public License,
+ version 3 or, at your option, any later version.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.

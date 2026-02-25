@@ -52,24 +52,65 @@
 
 ### Installation
 
-**Recommended: Interactive Installer (One Command)**
+**Option 1 (Recommended): APT Repository**
+
+Install from the official APT repository with the installer:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install
+```
+
+Optional suite override (for scripted installs):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install --apt-suite trixie
+```
+
+Suite mapping:
+- Proxmox VE 8 -> `bookworm`
+- Proxmox VE 9 -> `trixie`
+
+Manual deb822 source setup:
+
+```bash
+cat >/etc/apt/sources.list.d/truenas-proxmox-plugin.sources <<'EOF'
+Types: deb
+URIs: https://truenas.github.io/truenas-proxmox-plugin/apt/
+Suites: <bookworm|trixie>
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/truenas-proxmox-plugin.gpg
+EOF
+
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg -o /etc/apt/keyrings/truenas-proxmox-plugin.gpg
+apt-get update
+apt-get install -y truenas-proxmox-plugin
+```
+
+**Option 2: Direct .deb Installation**
+
+Download a release package and install it directly:
+
+```bash
+wget https://github.com/truenas/truenas-proxmox-plugin/releases/download/v<RELEASE_TAG>/truenas-proxmox-plugin_<DEB_VERSION>_all.deb
+dpkg -i truenas-proxmox-plugin_<DEB_VERSION>_all.deb
+apt-get -f install -y
+```
+
+**Option 3: Interactive Installer (Existing Workflow)**
 
 Download and run the installer interactively:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh)
 ```
 
 Or download first, then run:
 ```bash
-wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
 chmod +x install.sh
 ./install.sh
-```
-
-**For Non-Interactive/Automated Installation:**
-```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 The installer provides:
@@ -81,9 +122,11 @@ The installer provides:
 - ✅ Backup and rollback support
 - ✅ Cluster-wide installation (install/update on all nodes simultaneously)
 
-**Alternative: Manual Installation**
+For expanded installation instructions, see the [Installation Guide](wiki/Installation.md).
 
-If you prefer manual installation:
+**Alternative: Manual Plugin File Installation**
+
+If you prefer manual plugin file installation:
 
 ```bash
 # Download the plugin
@@ -245,6 +288,7 @@ For detailed installation instructions and troubleshooting, see the [Installatio
 Comprehensive documentation is available in the [Wiki](wiki/):
 
 - **[Installation Guide](wiki/Installation.md)** - Detailed installation steps for both Proxmox and TrueNAS
+- **[Packaging Guide](wiki/Packaging.md)** - PACKAGING maintainer workflow for Debian builds, lintian, signing, and APT publishing
 - **[Configuration Reference](wiki/Configuration.md)** - Complete parameter reference and examples
 - **[Tools and Utilities](wiki/Tools.md)** - Test suite and cluster deployment scripts
 - **[Troubleshooting Guide](wiki/Troubleshooting.md)** - Common issues and solutions

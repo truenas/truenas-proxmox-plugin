@@ -18,6 +18,11 @@ readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
 readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
 readonly LOG_FILE="/var/log/truenas-installer.log"
+readonly APT_REPO_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/"
+readonly APT_KEY_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg"
+readonly APT_KEYRING_PATH="/etc/apt/keyrings/truenas-proxmox-plugin.gpg"
+readonly APT_SOURCES_PATH="/etc/apt/sources.list.d/truenas-proxmox-plugin.sources"
+readonly APT_PACKAGE_NAME="truenas-proxmox-plugin"
 
 # Exit codes
 readonly EXIT_SUCCESS=0
@@ -756,6 +761,8 @@ Usage: $0 [OPTIONS]
 OPTIONS:
     --version           Display installer version
     --non-interactive   Run in non-interactive mode with defaults
+    --apt-install       Install/upgrade via APT repository bootstrap
+    --apt-suite         APT suite override: bookworm or trixie
     --help              Show this help message
 
 EXAMPLES:
@@ -765,11 +772,14 @@ EXAMPLES:
     # Non-interactive installation
     $0 --non-interactive
 
+    # Non-interactive APT bootstrap install
+    $0 --non-interactive --apt-install --apt-suite trixie
+
     # One-liner installation from GitHub (auto-detects non-interactive)
-    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+    curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash
 
     # Or with wget
-    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash
+    wget -qO- https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash
 
 For more information, visit:
 https://github.com/${GITHUB_REPO}
@@ -780,6 +790,8 @@ EOF
 # Parse command line arguments
 parse_arguments() {
     NON_INTERACTIVE=false
+    APT_INSTALL=false
+    APT_SUITE=""
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -790,6 +802,26 @@ parse_arguments() {
             --non-interactive)
                 NON_INTERACTIVE=true
                 shift
+                ;;
+            --apt-install)
+                APT_INSTALL=true
+                shift
+                ;;
+            --apt-suite)
+                if [[ $# -lt 2 ]]; then
+                    error "--apt-suite requires a value: bookworm or trixie"
+                    exit $EXIT_ERROR
+                fi
+                case "$2" in
+                    bookworm|trixie)
+                        APT_SUITE="$2"
+                        ;;
+                    *)
+                        error "Invalid --apt-suite value: $2 (expected: bookworm or trixie)"
+                        exit $EXIT_ERROR
+                        ;;
+                esac
+                shift 2
                 ;;
             --help|-h)
                 show_help
@@ -803,6 +835,138 @@ parse_arguments() {
                 ;;
         esac
     done
+}
+
+detect_apt_suite() {
+    if [[ -n "${APT_SUITE:-}" ]]; then
+        echo "$APT_SUITE"
+        return 0
+    fi
+
+    local os_release_file
+    local version_codename=""
+
+    for os_release_file in /etc/os-release /usr/lib/os-release; do
+        if [[ -r "$os_release_file" ]]; then
+            version_codename=$( ( set +u; . "$os_release_file" 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}" ) )
+            case "$version_codename" in
+                bookworm|trixie)
+                    echo "$version_codename"
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+
+    local pve_major=""
+    local pve_line
+    while IFS= read -r pve_line; do
+        if [[ "$pve_line" =~ ^pve-manager/([0-9]+) ]]; then
+            pve_major="${BASH_REMATCH[1]}"
+            break
+        fi
+    done < <(pveversion 2>/dev/null || true)
+
+    case "$pve_major" in
+        8)
+            echo "bookworm"
+            return 0
+            ;;
+        9)
+            echo "trixie"
+            return 0
+            ;;
+    esac
+
+    error "Could not auto-detect APT suite. Please specify --apt-suite bookworm|trixie"
+    return 1
+}
+
+apt_bootstrap_install() {
+    local suite
+    if ! suite=$(detect_apt_suite); then
+        return 1
+    fi
+
+    printf "%-30s %s\n" "APT suite:" "$suite"
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        error "apt-get is required for --apt-install"
+        return 1
+    fi
+
+    printf "%-30s " "Creating keyring directory:"
+    install -d -m 0755 /etc/apt/keyrings
+    echo -e "${c2}OK${c0}"
+
+    printf "%-30s " "Downloading repo key:"
+    local key_tmp
+    key_tmp=$(mktemp)
+    if ! download_file "$APT_KEY_URL" "$key_tmp"; then
+        rm -f "$key_tmp"
+        echo -e "${c1}FAILED${c0}"
+        error "Failed to download APT key from $APT_KEY_URL"
+        return 1
+    fi
+    install -m 0644 "$key_tmp" "$APT_KEYRING_PATH"
+    rm -f "$key_tmp"
+    echo -e "${c2}OK${c0}"
+
+    printf "%-30s " "Writing APT source file:"
+    local sources_tmp
+    sources_tmp=$(mktemp)
+    cat > "$sources_tmp" << EOF
+Types: deb
+URIs: ${APT_REPO_URL}
+Suites: ${suite}
+Components: main
+Architectures: amd64
+Signed-By: ${APT_KEYRING_PATH}
+EOF
+    install -m 0644 "$sources_tmp" "$APT_SOURCES_PATH"
+    rm -f "$sources_tmp"
+    echo -e "${c2}OK${c0}"
+
+    printf "%-30s " "Running apt-get update:"
+    if ! apt-get update; then
+        echo -e "${c1}FAILED${c0}"
+        error "apt-get update failed"
+        return 1
+    fi
+    echo -e "${c2}OK${c0}"
+
+    if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        printf "%-30s " "Upgrading package:"
+        if ! apt-get install --only-upgrade -y "$APT_PACKAGE_NAME"; then
+            echo -e "${c1}FAILED${c0}"
+            error "Failed to upgrade $APT_PACKAGE_NAME"
+            return 1
+        fi
+    else
+        printf "%-30s " "Installing package:"
+        if ! apt-get install -y "$APT_PACKAGE_NAME"; then
+            echo -e "${c1}FAILED${c0}"
+            error "Failed to install $APT_PACKAGE_NAME"
+            return 1
+        fi
+    fi
+    echo -e "${c2}OK${c0}"
+
+    printf "%-30s " "Verifying package state:"
+    if ! dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        echo -e "${c1}FAILED${c0}"
+        error "dpkg -s verification failed for $APT_PACKAGE_NAME"
+        return 1
+    fi
+    if [[ ! -f "$PLUGIN_FILE" ]]; then
+        echo -e "${c1}FAILED${c0}"
+        error "Plugin file not found at $PLUGIN_FILE"
+        return 1
+    fi
+    echo -e "${c2}OK${c0}"
+
+    success "APT bootstrap installation complete"
+    return 0
 }
 
 # ============================================================================
@@ -916,10 +1080,35 @@ get_all_releases() {
     echo "$releases_data"
 }
 
+normalize_tag_version() {
+    local raw_tag="${1:-}"
+    local tag
+
+    [[ -n "$raw_tag" ]] || return 1
+
+    tag="${raw_tag#v}"
+
+    if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-deb[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
 # Extract version from release data
 get_release_version() {
     local release_data="$1"
-    echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' | sed 's/^v//'
+    local tag_name
+    local version
+
+    tag_name=$(echo "$release_data" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
+
+    if ! version=$(normalize_tag_version "$tag_name"); then
+        return 1
+    fi
+
+    echo "$version"
 }
 
 # Check if release is a pre-release
@@ -998,16 +1187,26 @@ check_for_updates() {
     local latest_release
     latest_release=$(get_latest_release) || return 1
 
+    local latest_tag_name
+    latest_tag_name=$(echo "$latest_release" | grep -Po '"tag_name":\s*"\K[^"]+' || true)
+
     local latest_version
-    latest_version=$(get_release_version "$latest_release")
+    latest_version=$(get_release_version "$latest_release") || {
+        log "ERROR" "Failed to parse latest release tag into semantic version"
+        return 1
+    }
 
     local is_prerelease
     is_prerelease=$(get_release_prerelease_status "$latest_release")
 
-    log "INFO" "Current version: $current_version, Latest version: $latest_version, Pre-release: $is_prerelease"
+    log "INFO" "Current version: $current_version, Latest release tag: ${latest_tag_name:-unknown}, Latest semver: $latest_version, Pre-release: $is_prerelease"
 
-    compare_versions "$current_version" "$latest_version"
-    local result=$?
+    local result=0
+    if compare_versions "$current_version" "$latest_version"; then
+        result=0
+    else
+        result=$?
+    fi
 
     if [[ $result -eq 2 ]]; then
         # Current version is older
@@ -1503,7 +1702,10 @@ perform_cluster_wide_installation() {
     fi
 
     local install_version
-    install_version=$(get_release_version "$release_data")
+    install_version=$(get_release_version "$release_data") || {
+        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        return 1
+    }
     info "Installing version: $install_version"
 
     # Check if this is a pre-release and warn user
@@ -1701,7 +1903,10 @@ perform_installation() {
     fi
 
     local install_version
-    install_version=$(get_release_version "$release_data")
+    install_version=$(get_release_version "$release_data") || {
+        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        return 1
+    }
     info "Installing version: $install_version"
 
     # Check if this is a pre-release and warn user
@@ -1841,15 +2046,15 @@ menu_not_installed() {
         fi
 
         # Build menu options dynamically
-        local menu_options=("Install latest version" "Install specific version" "View available versions")
-        local max_choice=3
+        local menu_options=("Install latest version" "Install via APT (Recommended)" "Install specific version" "View available versions")
+        local max_choice=4
 
         # Add cluster-wide option if in a cluster
         local cluster_option_position=0
         if is_cluster_node; then
             menu_options+=("Install latest version (all cluster nodes)")
-            max_choice=4
-            cluster_option_position=4
+            max_choice=5
+            cluster_option_position=5
         fi
 
         if [[ "$has_backups" = true ]]; then
@@ -1900,18 +2105,39 @@ menu_not_installed() {
                 fi
                 ;;
             2)
+                if apt_bootstrap_install; then
+                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                        echo
+                        read -rp "Would you like to configure storage now? [y/N]: " response
+                        if [[ "$response" =~ ^[Yy] ]]; then
+                            menu_configure_storage
+                            echo
+                            read -rp "Would you like to run a health check now? [y/N]: " hc_response
+                            if [[ "$hc_response" =~ ^[Yy] ]]; then
+                                echo
+                                menu_health_check
+                            fi
+                        fi
+                    fi
+                    read -rp "Press Enter to return to main menu..."
+                    return 0
+                else
+                    read -rp "Press Enter to return to main menu..."
+                fi
+                ;;
+            3)
                 if menu_install_specific_version; then
                     # After successful installation, break out to re-detect state
                     return 0
                 fi
                 read -rp "Press Enter to return to main menu..."
                 ;;
-            3)
+            4)
                 menu_view_versions
                 ;;
-            4)
+            5)
                 # Check if this is cluster-wide option or backup/manage option
-                if [[ "$cluster_option_position" -eq 4 ]]; then
+                if [[ "$cluster_option_position" -eq 5 ]]; then
                     # Cluster-wide installation
                     if perform_cluster_wide_installation "latest"; then
                         read -rp "Press Enter to return to main menu..."
@@ -1927,7 +2153,7 @@ menu_not_installed() {
                     error "Invalid choice"
                 fi
                 ;;
-            5)
+            6)
                 if [[ "$has_backups" = true ]]; then
                     menu_rollback
                 elif [[ "$should_manage_backups" = true ]]; then
@@ -1936,7 +2162,7 @@ menu_not_installed() {
                     error "Invalid choice"
                 fi
                 ;;
-            6)
+            7)
                 if [[ "$should_manage_backups" = true ]]; then
                     menu_manage_backups
                 else
@@ -10923,15 +11149,15 @@ main() {
                 echo
                 echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
                 echo "     ssh root@your-proxmox-host"
-                echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+                echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)"
                 echo
                 echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
-                echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+                echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh"
                 echo "     chmod +x install.sh"
                 echo "     ./install.sh"
                 echo
                 echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
-                echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+                echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash -s -- --non-interactive"
                 echo
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 echo
@@ -10951,15 +11177,15 @@ main() {
             echo
             echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
             echo "     ssh root@your-proxmox-host"
-            echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh)"
+            echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)"
             echo
             echo "  ${COLOR_GREEN}2. Download and Run${COLOR_RESET}"
-            echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh"
+            echo "     wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh"
             echo "     chmod +x install.sh"
             echo "     ./install.sh"
             echo
             echo "  ${COLOR_YELLOW}3. Non-Interactive (For Automation)${COLOR_RESET}"
-            echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/alpha/install.sh | bash -s -- --non-interactive"
+            echo "     curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | bash -s -- --non-interactive"
             echo
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo
@@ -10984,6 +11210,12 @@ main() {
     check_root
     check_dependencies
     success "System requirements satisfied"
+
+    if [[ "${APT_INSTALL:-false}" == "true" ]]; then
+        info "APT install mode enabled"
+        apt_bootstrap_install
+        exit $?
+    fi
 
     # Main menu loop - re-detect state after certain operations
     while true; do
@@ -11027,5 +11259,6 @@ main() {
     log "INFO" "Installer completed successfully"
 }
 
-# Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]-}" == "$0" ]]; then
+    main "$@"
+fi

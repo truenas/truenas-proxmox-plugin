@@ -1,0 +1,2 @@
+TrueNASPlugin.pm usr/share/perl5/PVE/Storage/Custom/
+install.sh usr/share/truenas-proxmox-plugin/

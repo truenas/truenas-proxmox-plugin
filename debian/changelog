@@ -1,0 +1,8 @@
+truenas-proxmox-plugin (2.0.3+deb1) unstable; urgency=medium
+
+  * Initial Debian packaging setup for APT repository publishing
+  * Configure debhelper-compat 13 and Standards-Version 4.6.2
+  * Add perl build dependencies for Proxmox VE plugin architecture
+  * Prepare for automated Debian package builds and releases
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 24 Feb 2026 16:00:00 +0000

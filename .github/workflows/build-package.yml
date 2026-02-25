@@ -1,0 +1,210 @@
+name: Build and Publish Debian Package
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            dpkg-dev \
+            debhelper \
+            dh-make-perl \
+            lintian
+
+      - name: Build package and run lintian
+        run: tools/build-deb.sh
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(dpkg-parsechangelog -S Source)"
+          deb_version="$(dpkg-parsechangelog -S Version)"
+          artifact_root="$(dirname "$GITHUB_WORKSPACE")"
+
+          mkdir -p dist
+          cp "${artifact_root}/${package_name}_${deb_version}"*.deb dist/
+          cp "${artifact_root}/${package_name}_${deb_version}"*.changes dist/
+          cp "${artifact_root}/${package_name}_${deb_version}"*.buildinfo dist/
+          cp "${artifact_root}/SHA256SUMS" dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+      APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout existing gh-pages content
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: ghpages
+          fetch-depth: 1
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: debian-package
+          path: artifacts
+
+      - name: Install publish dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            dpkg-dev \
+            gnupg \
+            reprepro
+
+      - name: Validate tag maps to debian/changelog version
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb_version="$(dpkg-parsechangelog -S Version)"
+          expected_tag="v${deb_version/+/-}"
+          actual_tag="${GITHUB_REF_NAME}"
+
+          if [[ "${actual_tag}" != "${expected_tag}" ]]; then
+            echo "Tag/changelog mismatch: expected ${expected_tag}, got ${actual_tag}" >&2
+            exit 1
+          fi
+
+      - name: Validate required publish secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${APT_GPG_PRIVATE_KEY:-}" ]] || missing+=("APT_GPG_PRIVATE_KEY")
+          [[ -n "${APT_GPG_KEY_ID:-}" ]] || missing+=("APT_GPG_KEY_ID")
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required secret(s): %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Build APT repository and sign metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "${GNUPGHOME}"
+
+          cleanup() {
+            rm -rf "${GNUPGHOME}"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+
+          mkdir -p apt
+          if [[ -d ghpages ]] && [[ -d ghpages/dists || -d ghpages/pool || -f ghpages/InRelease || -f ghpages/Release ]]; then
+            cp -a ghpages/. apt/
+          fi
+
+          mkdir -p apt/conf
+          sed "s/@APT_GPG_KEY_ID@/${APT_GPG_KEY_ID}/g" \
+            tools/apt-repo/conf/distributions.tmpl > apt/conf/distributions
+          cp tools/apt-repo/conf/options apt/conf/options
+
+          for suite in bookworm trixie; do
+            reprepro -Vb apt includedeb "${suite}" artifacts/*.deb
+          done
+
+          for suite in bookworm trixie; do
+            src_dir="apt/dists/${suite}/main/binary-amd64"
+            dst_dir="apt/dists/${suite}/main/binary-all"
+
+            if [[ -d "${src_dir}" ]]; then
+              mkdir -p "${dst_dir}"
+              for metadata in Packages Packages.gz Release; do
+                if [[ -f "${src_dir}/${metadata}" ]]; then
+                  cp -a "${src_dir}/${metadata}" "${dst_dir}/${metadata}"
+                fi
+              done
+            fi
+          done
+
+          gpg --batch --yes --output apt/pubkey.gpg --export "${APT_GPG_KEY_ID}"
+          gpg --batch --yes --armor --output apt/pubkey.asc --export "${APT_GPG_KEY_ID}"
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.deb
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+
+      - name: Stage GitHub Pages publish root
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d apt ]]; then
+            for entry in apt/*; do
+              name="$(basename "${entry}")"
+              case "${name}" in
+                dists|pool|pubkey.gpg|pubkey.asc|InRelease|Release|Release.gpg)
+                  ;;
+                *)
+                  rm -rf "${entry}"
+                  ;;
+              esac
+            done
+          fi
+
+          mkdir -p pages_root/apt
+          cp -a apt/. pages_root/apt/
+
+      - name: Publish APT repository to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: pages_root
+          keep_files: false

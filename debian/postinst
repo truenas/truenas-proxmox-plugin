@@ -1,0 +1,32 @@
+#!/bin/sh
+
+set -e
+
+PLUGIN_PATH="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+
+restart_proxmox_services() {
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl try-restart pvedaemon pveproxy || true
+    elif command -v invoke-rc.d >/dev/null 2>&1; then
+        invoke-rc.d pvedaemon restart || true
+        invoke-rc.d pveproxy restart || true
+    fi
+}
+
+case "$1" in
+    configure)
+        if [ ! -f "$PLUGIN_PATH" ]; then
+            echo "ERROR: Missing plugin file: $PLUGIN_PATH" >&2
+            exit 1
+        fi
+
+        perl -c "$PLUGIN_PATH" >/dev/null
+        restart_proxmox_services
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure|triggered)
+        ;;
+    *)
+        ;;
+esac
+
+exit 0
