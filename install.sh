@@ -2039,7 +2039,7 @@ menu_not_installed() {
 
         # Check if backups exist
         local backups
-        backups=$(list_backups 2>/dev/null | wc -l || echo "0")
+        backups=$( { list_backups 2>/dev/null || true; } | wc -l )
         local has_backups=false
         if [[ "$backups" -gt 0 ]]; then
             has_backups=true
@@ -5104,6 +5104,94 @@ run_health_check() {
         success "Status: HEALTHY"
         return 0
     fi
+}
+
+menu_view_versions() {
+    clear_screen
+    print_banner
+    echo
+
+    info "Fetching releases from GitHub..."
+    local releases
+    if ! releases=$(get_all_releases 2>/dev/null); then
+        error "Failed to fetch releases"
+        if [[ "${NON_INTERACTIVE:-}" != "true" ]]; then
+            read -rp "Press Enter to continue..."
+        fi
+        return 0
+    fi
+
+    local -a version_array=()
+    local -a prerelease_array=()
+
+    local release_count=0
+    local current_block=""
+    local tag_name=""
+    local is_prerelease=""
+    local version=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*\"url\":[[:space:]]*\"https://api.github.com ]]; then
+            if [[ -n "$current_block" ]] && [[ $release_count -lt 20 ]]; then
+                tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                if [[ -n "$tag_name" ]]; then
+                    version="${tag_name#v}"
+                    version_array+=("$version")
+                    prerelease_array+=("$is_prerelease")
+                    release_count=$((release_count + 1))
+                fi
+            fi
+
+            current_block="$line"
+        elif [[ -n "$current_block" ]]; then
+            current_block+=$'\n'"$line"
+
+            if [[ "$line" =~ \"published_at\" ]]; then
+                if [[ $release_count -lt 20 ]]; then
+                    tag_name=$(echo "$current_block" | grep -Po '"tag_name":[[:space:]]*"\K[^"]+' 2>/dev/null || echo "")
+                    is_prerelease=$(echo "$current_block" | grep -Po '"prerelease":[[:space:]]*\K(true|false)' 2>/dev/null || echo "false")
+
+                    if [[ -n "$tag_name" ]]; then
+                        version="${tag_name#v}"
+                        version_array+=("$version")
+                        prerelease_array+=("$is_prerelease")
+                        release_count=$((release_count + 1))
+                    fi
+                fi
+                current_block=""
+            fi
+        fi
+    done <<< "$releases"
+
+    if [[ ${#version_array[@]} -eq 0 ]]; then
+        error "No versions found"
+        if [[ "${NON_INTERACTIVE:-}" != "true" ]]; then
+            read -rp "Press Enter to continue..."
+        fi
+        return 0
+    fi
+
+    echo
+    info "Available versions:"
+    echo
+
+    local menu_indicator=""
+    local i
+    for i in "${!version_array[@]}"; do
+        menu_indicator=""
+        if [[ "${prerelease_array[$i]}" == "true" ]]; then
+            menu_indicator=" ${c3}(Pre-Release)${c0}"
+        fi
+        echo "  - v${version_array[$i]}${menu_indicator}"
+    done
+
+    echo
+    if [[ "${NON_INTERACTIVE:-}" != "true" ]]; then
+        read -rp "Press Enter to continue..."
+    fi
+    return 0
 }
 
 # Menu: Install specific version

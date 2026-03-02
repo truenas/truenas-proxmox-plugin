@@ -4543,8 +4543,11 @@ sub activate_volume {
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
         };
         if ($@) {
-            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $@");
-            die $@;
+            my $err = $@;
+            $err = 'Unknown error while locating iSCSI device' if !defined($err) || $err eq '';
+            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $err");
+            $err .= "\n" if $err !~ /\n\z/;
+            die $err;
         }
     } elsif ($mode eq 'nvme-tcp') {
         _nvme_connect($scfg);
@@ -4557,8 +4560,11 @@ sub activate_volume {
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
         };
         if ($@) {
-            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $@");
-            die $@;
+            my $err = $@;
+            $err = 'Unknown error while locating NVMe device' if !defined($err) || $err eq '';
+            _log($scfg, 0, 'err', "[TrueNAS] activate_volume: failed to locate device: $err");
+            $err .= "\n" if $err !~ /\n\z/;
+            die $err;
         }
     }
 
