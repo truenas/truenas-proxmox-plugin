@@ -525,10 +525,11 @@ sub check_config {
         my $legacy_transport = lc($opts->{api_transport} // '');
 
         if (!defined($opts->{api_scheme}) || $opts->{api_scheme} eq '') {
-            if ($legacy_transport eq 'ws' || $legacy_transport eq 'wss') {
-                $opts->{api_scheme} = $legacy_transport;
+            if ($legacy_transport eq 'wss') {
+                $opts->{api_scheme} = 'wss';
             } else {
-                # Legacy values like 'rest'/'websocket' map to secure websocket behavior.
+                # Legacy api_transport values are deprecated and should not force insecure WS.
+                # Default to secure websocket behavior for compatibility.
                 $opts->{api_scheme} = 'wss';
             }
         }
@@ -537,6 +538,11 @@ sub check_config {
             syslog('warning',
                 "[TrueNAS] Storage '$sectionId': api_transport=rest is deprecated and unsupported. " .
                 "Using WebSocket transport instead (api_scheme=$opts->{api_scheme})."
+            );
+        } elsif ($legacy_transport eq 'ws') {
+            syslog('warning',
+                "[TrueNAS] Storage '$sectionId': api_transport=ws is deprecated; " .
+                "using secure websocket transport instead (api_scheme=$opts->{api_scheme})."
             );
         } else {
             syslog('warning',
@@ -2923,28 +2929,56 @@ sub _nvme_device_for_uuid {
         usleep(DEVICE_READY_TIMEOUT_US);  # 100ms
     }
 
-    # Device didn't appear - provide detailed troubleshooting
+    # Device didn't appear - provide detailed troubleshooting.
+    # Include explicit API diagnosis so WebSocket/permission failures are not masked as
+    # generic "device did not appear" errors when multiple namespaces exist.
+    my ($namespaces, $api_err);
+    eval {
+        $namespaces = _api_call($scfg, 'nvmet.namespace.query', [
+            [["device_uuid", "=", $device_uuid]]
+        ]);
+        1;
+    } or do {
+        $api_err = $@;
+    };
+
+    my $namespace_detail;
+    if ($api_err) {
+        chomp($api_err);
+        $namespace_detail =
+            "TrueNAS API query for namespace metadata failed.\n" .
+            "  -> $api_err\n" .
+            "The plugin cannot safely disambiguate this UUID when multiple NVMe namespaces are present.";
+    } elsif (!$namespaces || !@$namespaces) {
+        $namespace_detail =
+            "Namespace UUID was not returned by TrueNAS API.\n" .
+            "Verify the namespace still exists and is mapped to subsystem '$nqn'.";
+    } else {
+        $namespace_detail =
+            "The namespace exists on TrueNAS but the matching Linux block device did not appear.\n" .
+            "Manual cleanup may be required.";
+    }
+
     my $err_msg = sprintf(
         "Could not locate NVMe device for TrueNAS UUID %s\n" .
         "  Subsystem NQN: %s\n\n" .
         "Troubleshooting steps:\n" .
         "  1. Verify NVMe subsystem connection:\n" .
-        "     -> Check: nvme list | grep '%s'\n" .
-        "  2. Check if namespace is visible:\n" .
         "     -> Check: nvme list-subsys | grep -A10 '%s'\n" .
+        "  2. Check if namespaces are visible as block devices:\n" .
+        "     -> Check: nvme list\n" .
         "  3. Verify TrueNAS NVMe-oF service is running\n" .
         "     -> TrueNAS: System Settings > Services > NVMe-oF Target\n" .
         "  4. Check network connectivity:\n" .
         "     -> Check: ping %s\n" .
         "  5. Review kernel logs for NVMe errors:\n" .
         "     -> Check: dmesg | tail -50 | grep nvme\n\n" .
-        "The namespace exists on TrueNAS but the device did not appear.\n" .
-        "Manual cleanup may be required.",
+        "%s",
         $device_uuid,
         $nqn,
         $nqn,
-        $nqn,
-        $scfg->{api_host}
+        $scfg->{api_host},
+        $namespace_detail,
     );
 
     die $err_msg;
