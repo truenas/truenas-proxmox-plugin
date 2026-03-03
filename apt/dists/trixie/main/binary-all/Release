@@ -1,0 +1,6 @@
+Archive: trixie
+Component: main
+Origin: TrueNAS Proxmox Plugin
+Label: TrueNAS Proxmox Plugin
+Architecture: amd64
+Description: TrueNAS Proxmox Plugin APT repository (trixie)

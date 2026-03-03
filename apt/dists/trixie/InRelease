@@ -1,0 +1,39 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: TrueNAS Proxmox Plugin
+Label: TrueNAS Proxmox Plugin
+Suite: trixie
+Codename: trixie
+Date: Tue, 03 Mar 2026 01:37:04 UTC
+Architectures: amd64
+Components: main
+Description: TrueNAS Proxmox Plugin APT repository (trixie)
+MD5Sum:
+ 5c894f928eea829bad672330c61ddb0c 919 main/binary-amd64/Packages
+ 2bdb3d09c32398329c53e7b752a9e1c2 578 main/binary-amd64/Packages.gz
+ 8bfa35b71784c004bfe73d60ac5c0af5 173 main/binary-amd64/Release
+SHA1:
+ 23353433d4cc966bc4dea874187abaac50c4b494 919 main/binary-amd64/Packages
+ 6dd3536bc6e3691874add75e36d2d292c289c183 578 main/binary-amd64/Packages.gz
+ 040cac17066721581c8f72bd25e716e1db9a4ffc 173 main/binary-amd64/Release
+SHA256:
+ 5b80a782b4ff5f43ab8a1b3a9b879dac3f17b01ecfaedb60721e36c2eac4b8bd 919 main/binary-amd64/Packages
+ d413180e33cc4da6dc2af321d265a0131a5bc9750d23ea102debb419cab3b17a 578 main/binary-amd64/Packages.gz
+ 6b03e33922db913500a68ebcfec689a61ddc300fe8e4cde30685d74d641a0398 173 main/binary-amd64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmmmO0AACgkQqX8sptOm
+79iJcw//UfISFIf25IGroTCctjL/Z5oCiJPBrt0J/tgy57qN53xzdGLQIiawQuIG
+oW0c57lQvpAsGntMsAUb/p1srZANTGG0f5SbPL/djBGpjumG9VEjmkaL35Fh3nFd
+LwCBv8VfP/wYe9Lzx3HuuQcPu5cYvBRJMmeBgbBNYJVQjGu0cwujgM1XoeiZs+iW
+E9hmOtob8RrRYY6hcHa2ZBbb8dP292LqJEy/R4Pd5zrkdl9lxhlPDct32c44XSyh
+whBYBvJt6fxeCIWu0wc5k2mDEuovbS79GQh46l4bfFy1joX/4jzHWiebqr2OCKRS
+5FRzm2AFVSd4cpjj++ql1sahHFmGA/vtrudadiCPMddOY+QFDe+DsH+7bfmoiB0u
+N+BKSttskUXvkb0Svv6k2xmJT9lA5V6M9RbjzdB+UKSz9TePqKpBZdsOONwHuIiU
+xyBjJSbi3KiMwZJIfAJ+aKhXcnK/Po0TdojCaS4oMrRe8uZNLlthXHqrcR1jv8CB
+s3X8RUDhEpcLsmr6gigR3XCBx77qYajySUtDJg4AdjcJIHobxfIfidNUd0lHUvEG
+IqmgFC9BPEM2kOL1V2gY8GRdVtmtRWB02PdU1gTLHDeB9YCiKBAbc0zqtKaSN/nN
+kXyyskhhb7h/Iuw/dcP219mGEAUBhoDbI9DlsUeG9aUIUi2prlg=
+=rZ6Y
+-----END PGP SIGNATURE-----
