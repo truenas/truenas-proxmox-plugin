@@ -1,10 +1,18 @@
 # TrueNAS Plugin Changelog
 
-## Repository Migration Note (February 6, 2026)
+## Version 2.0.4 (March 2, 2026)
 
-- Official repository home moved to <https://github.com/truenas/truenas-proxmox-plugin>
-- Official issue tracker: <https://github.com/truenas/truenas-proxmox-plugin/issues>
-- Historical changelog references to prior issue URLs may remain for archival context
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale connection recovery**
+- **Auto-reconnect on stale NVMe subsystem**: When the TrueNAS NVMe-oF target stops publishing namespaces over an existing connection (subsystem shows connected but zero block devices appear), the plugin now automatically disconnects and reconnects the subsystem to force re-enumeration. This resolves "Could not locate NVMe device" errors on VM start without manual intervention ([#10](https://github.com/truenas/truenas-proxmox-plugin/issues/10))
+- **Safety-guarded reconnect**: Reconnect only triggers when zero block devices have been seen across all discovery iterations AND the subsystem reports as connected, ensuring running VMs are never disrupted
+
+#### **Syslog priority fix**
+- **Fixed invalid syslog `error` priority**: The `_log()` helper now normalizes `'error'` to `'err'` (valid syslog level), preventing silent failures in error logging paths that could mask device matching diagnostics
+
+### 🔧 **Internal Improvements**
+- **Enhanced device discovery return values**: `_nvme_find_device_by_subsystem` now returns device count alongside the matched device path, enabling callers to distinguish between "zero devices" (stale connection) and "devices exist but no UUID match" (different issue)
 
 ## Version 2.0.3 (February 8, 2026)
 

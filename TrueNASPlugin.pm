@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.3';
+our $VERSION = '2.0.4';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -152,6 +152,7 @@ sub _log {
 
     # Normalize syslog priority aliases
     $priority = 'warning' if defined($priority) && $priority eq 'warn';
+    $priority = 'err' if defined($priority) && $priority eq 'error';
 
     # Level 0 messages (errors) are always logged
     return syslog($priority, $message) if $level == 0;
@@ -2692,14 +2693,15 @@ sub _nvme_disconnect {
 }
 
 # Find NVMe device by matching subsystem NQN and TrueNAS namespace UUID
-# Returns device path like /dev/nvme0n1 or undef if not found
+# Returns hashref { device => $path_or_undef, device_count => $count }
+# device_count reflects how many block devices exist for the subsystem
 sub _nvme_find_device_by_subsystem {
     my ($scfg, $device_uuid) = @_;
 
     my $nqn = $scfg->{subsystem_nqn};
 
     # Find subsystem matching our NQN
-    opendir(my $dh, "/sys/class/nvme-subsystem") or return undef;
+    opendir(my $dh, "/sys/class/nvme-subsystem") or return { device => undef, device_count => 0 };
     while (my $subsys = readdir($dh)) {
         next unless $subsys =~ /^(nvme-subsys\d+)$/;
         $subsys = $1;  # Untaint via capture
@@ -2782,7 +2784,8 @@ sub _nvme_find_device_by_subsystem {
         }
         closedir($bdh);
 
-        _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found " . scalar(@devices) . " device(s) for subsystem $nqn");
+        my $device_count = scalar(@devices);
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: found $device_count device(s) for subsystem $nqn");
 
         # TIER 1: Try NGUID matching (most reliable, unambiguous)
         # Query TrueNAS once for namespace info
@@ -2802,7 +2805,7 @@ sub _nvme_find_device_by_subsystem {
                     if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
                         closedir($dh);
                         _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NGUID (NSID: $dev->{nsid}, type: $dev->{type})");
-                        return $dev->{path};
+                        return { device => $dev->{path}, device_count => $device_count };
                     }
                 }
 
@@ -2826,7 +2829,7 @@ sub _nvme_find_device_by_subsystem {
                 if (defined $dev->{nsid} && $dev->{nsid} eq $target_nsid) {
                     closedir($dh);
                     _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NSID (NSID: $dev->{nsid}, type: $dev->{type})");
-                    return $dev->{path};
+                    return { device => $dev->{path}, device_count => $device_count };
                 }
             }
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NSID matching failed - no device matched NSID $target_nsid");
@@ -2841,18 +2844,18 @@ sub _nvme_find_device_by_subsystem {
         if (@devices == 1) {
             closedir($dh);
             _log($scfg, 1, 'info', "[TrueNAS] nvme_find_device: using single device $devices[0]->{path} (NSID: $devices[0]->{nsid}, type: $devices[0]->{type})");
-            return $devices[0]->{path};
+            return { device => $devices[0]->{path}, device_count => $device_count };
         }
 
         # No reliable matching available - cannot safely select a device
         closedir($dh);
         my $dev_list = join(', ', map { "$_->{name} (NSID: $_->{nsid})" } @devices);
-        _log($scfg, 0, 'error', "[TrueNAS] nvme_find_device: multiple devices found but no reliable matching available. Devices: $dev_list");
-        return undef;
+        _log($scfg, 0, 'err', "[TrueNAS] nvme_find_device: multiple devices found but no reliable matching available. Devices: $dev_list");
+        return { device => undef, device_count => $device_count };
     }
     closedir($dh);
 
-    return undef;
+    return { device => undef, device_count => 0 };
 }
 
 # Get namespace info from TrueNAS by device UUID
@@ -2879,9 +2882,17 @@ sub _nvme_device_for_uuid {
     _log($scfg, 2, 'debug', "[TrueNAS] nvme_device_for_uuid: searching for namespace with UUID $device_uuid in subsystem $nqn");
 
     # Wait for device to appear with progressive backoff (up to 5 seconds)
+    my $ever_saw_devices = 0;  # Track if any block devices were ever seen (safety guard for reconnect)
+    my $reconnect_attempted = 0;
+
     for (my $i = 0; $i < 50; $i++) {
         # Search for device by subsystem NQN
-        my $device = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
+        my $result = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
+        my $device = $result ? $result->{device} : undef;
+        my $device_count = $result ? $result->{device_count} : 0;
+
+        $ever_saw_devices = 1 if $device_count > 0;
+
         if ($device && -b $device) {
             _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: device ready at $device");
             return $device;
@@ -2920,6 +2931,17 @@ sub _nvme_device_for_uuid {
                 }
                 closedir($dh);
             };
+        } elsif ($i == 25 && !$reconnect_attempted && !$ever_saw_devices && _nvme_is_connected($scfg)) {
+            # Stale connection recovery: subsystem shows connected but zero block devices
+            # have appeared across all iterations. The TrueNAS target has likely stopped
+            # publishing namespaces over this connection. Reconnecting forces re-enumeration.
+            # Safe because zero devices means no VMs are using this subsystem.
+            $reconnect_attempted = 1;
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_device_for_uuid: stale NVMe connection detected - subsystem connected but 0 devices after 2.5s, reconnecting");
+            eval { _nvme_disconnect($scfg) };
+            usleep(500_000);  # 500ms for disconnect to settle
+            eval { _nvme_connect($scfg) };
+            _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: reconnect completed, resuming device discovery");
         } elsif ($i == 30) {
             # Another settle with trigger
             eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };
