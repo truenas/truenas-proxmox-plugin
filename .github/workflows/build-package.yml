@@ -94,8 +94,8 @@ jobs:
 
       - name: Install publish dependencies
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             ca-certificates \
             dpkg-dev \
             gnupg \
