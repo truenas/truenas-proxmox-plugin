@@ -58,13 +58,13 @@
 Install from the official APT repository with the installer:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install
 ```
 
 Optional suite override (for scripted installs):
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install --apt-suite trixie
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install --apt-suite trixie
 ```
 
 Suite mapping:

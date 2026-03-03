@@ -23,13 +23,13 @@ Use the APT repository if you want standard package install and upgrade workflow
 Run the installer in non-interactive mode with APT setup and package install:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install
 ```
 
 Optional suite override:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive --apt-install --apt-suite trixie
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install --apt-suite trixie
 ```
 
 Suite mapping:
