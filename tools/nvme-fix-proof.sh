@@ -101,12 +101,19 @@ print "TRANSPORT_MODE=",($scfg->{transport_mode}//"iscsi"),"\n";
 print "SUBSYSTEM_NQN=",($scfg->{subsystem_nqn}//""),"\n";
 print "DISCOVERY_PORTAL=",($scfg->{discovery_portal}//""),"\n";
 print "API_HOST=",($scfg->{api_host}//""),"\n";
+print "API_SCHEME=",($scfg->{api_scheme}//"wss"),"\n";
+print "API_PORT=",($scfg->{api_port}//""),"\n";
+print "API_INSECURE=",($scfg->{api_insecure}//"0"),"\n";
 ' "$STORAGE_ID")"
 
 echo "$CFG_OUT"
 
 TRANSPORT_MODE="$(echo "$CFG_OUT" | awk -F= '/^TRANSPORT_MODE=/{print $2}')"
 SUBSYSTEM_NQN="$(echo "$CFG_OUT" | awk -F= '/^SUBSYSTEM_NQN=/{print $2}')"
+API_HOST="$(echo "$CFG_OUT" | awk -F= '/^API_HOST=/{print $2}')"
+API_SCHEME="$(echo "$CFG_OUT" | awk -F= '/^API_SCHEME=/{print $2}')"
+API_PORT="$(echo "$CFG_OUT" | awk -F= '/^API_PORT=/{print $2}')"
+API_INSECURE="$(echo "$CFG_OUT" | awk -F= '/^API_INSECURE=/{print $2}')"
 
 if [[ "$TRANSPORT_MODE" != "nvme-tcp" ]]; then
   echo "ERROR: storage '$STORAGE_ID' is not nvme-tcp (got '$TRANSPORT_MODE')."
@@ -174,8 +181,111 @@ API_NGUID="$(echo "$API_OUT" | awk -F= '/^API_NGUID=/{print $2}' | tail -n 1)"
 API_ERROR="$(echo "$API_OUT" | awk -F= '/^API_ERROR=/{print $2}' | tail -n 1)"
 
 if [[ "${API_ERROR:-0}" == "1" ]]; then
+  API_ERROR_MSG="$(echo "$API_OUT" | awk -F= '/^API_ERROR_MSG=/{print substr($0, index($0,"=")+1)}' | tail -n 1)"
   echo
-  echo "RESULT: API query failed; cannot prove UUID matching until API path is stable."
+  echo "API query failed: $API_ERROR_MSG"
+  echo
+  echo "== 3a) WebSocket connectivity diagnostic =="
+
+  # Determine connection parameters
+  WS_SCHEME="${API_SCHEME:-wss}"
+  if [[ "$WS_SCHEME" == "wss" ]]; then
+    WS_PORT="${API_PORT:-443}"
+  else
+    WS_PORT="${API_PORT:-80}"
+  fi
+  CURL_FLAGS=("-s" "-S" "-o" "/dev/null" "-w" "%{http_code}" "--max-time" "10")
+  if [[ "${API_INSECURE:-0}" == "1" ]]; then
+    CURL_FLAGS+=("-k")
+  fi
+
+  echo "Target: ${WS_SCHEME}://${API_HOST}:${WS_PORT}/api/current"
+  echo "Insecure mode: ${API_INSECURE:-0}"
+  echo
+
+  # Test 1: Basic HTTPS connectivity (does the port respond at all?)
+  echo "-- Test 1: HTTPS connectivity to ${API_HOST}:${WS_PORT}"
+  HTTP_PROTO="https"
+  [[ "$WS_SCHEME" == "ws" ]] && HTTP_PROTO="http"
+  HTTP_CODE="$(curl "${CURL_FLAGS[@]}" "${HTTP_PROTO}://${API_HOST}:${WS_PORT}/" 2>&1)" || true
+  echo "   HTTP status for /: ${HTTP_CODE:-connection failed}"
+
+  # Test 2: WebSocket upgrade handshake (must use HTTP/1.1; HTTP/2 rejects Upgrade)
+  # Note: curl cannot complete a real WebSocket handshake, so a 400 with
+  # "Handshake error" in the body actually means the endpoint IS reachable
+  # and processing WebSocket requests. A truly broken connection would show
+  # 000 (connection refused), 404, 302, or an HTML page.
+  echo "-- Test 2: WebSocket upgrade handshake to /api/current"
+  WS_BODY_FILE="$(mktemp)"
+  WS_RESP="$(curl -s -S --max-time 10 --http1.1 \
+    ${API_INSECURE:+-k} \
+    -H "Upgrade: websocket" \
+    -H "Connection: Upgrade" \
+    -H "Sec-WebSocket-Key: dGVzdGtleQ==" \
+    -H "Sec-WebSocket-Version: 13" \
+    -D - -o "$WS_BODY_FILE" \
+    "${HTTP_PROTO}://${API_HOST}:${WS_PORT}/api/current" 2>&1)" || true
+  WS_STATUS="$(echo "$WS_RESP" | head -1 | tr -d '\r')"
+  WS_BODY="$(head -c 256 "$WS_BODY_FILE" 2>/dev/null || true)"
+  echo "   Response: $WS_STATUS"
+  echo "$WS_RESP" | grep -iE '^(upgrade|connection|location|server|www-authenticate|content-type):' | while IFS= read -r hdr; do
+    echo "   ${hdr}"
+  done || true
+  if [[ -n "$WS_BODY" ]]; then
+    echo "   Body: $WS_BODY"
+  fi
+  # Interpret the result
+  WS_CODE=""
+  if [[ "$WS_STATUS" == HTTP/* ]]; then
+    WS_CODE="$(echo "$WS_STATUS" | awk '{print $2}')"
+  fi
+  if [[ "$WS_CODE" == "400" && "$WS_BODY" == *"Handshake error"* ]]; then
+    echo "   -> HEALTHY: WebSocket endpoint is reachable and processing requests."
+    echo "      (400 is expected from curl; the plugin uses raw sockets for the real handshake.)"
+  elif [[ "$WS_CODE" == "101" ]]; then
+    echo "   -> HEALTHY: WebSocket upgrade accepted."
+  elif [[ "$WS_CODE" == "301" || "$WS_CODE" == "302" || "$WS_CODE" == "307" ]]; then
+    echo "   -> REDIRECT: Server is redirecting WebSocket requests. Check for a reverse proxy."
+  elif [[ "$WS_CODE" == "404" ]]; then
+    echo "   -> MISSING: /api/current endpoint not found. Check TrueNAS version (requires 25.10+)."
+  elif [[ "$WS_CODE" == "403" ]]; then
+    echo "   -> FORBIDDEN: Request blocked. Check firewall, ACL, or reverse proxy rules."
+  elif [[ -z "$WS_CODE" || "$WS_CODE" == "000" ]]; then
+    echo "   -> UNREACHABLE: Cannot connect to ${API_HOST}:${WS_PORT}. Check network/firewall."
+  else
+    echo "   -> UNEXPECTED: HTTP $WS_CODE - investigate the response above."
+  fi
+  rm -f "$WS_BODY_FILE"
+
+  # Test 3: Check if /websocket endpoint exists (some TrueNAS versions)
+  echo "-- Test 3: WebSocket upgrade handshake to /websocket"
+  WS_ALT="$(curl -s -S --max-time 10 --http1.1 \
+    ${API_INSECURE:+-k} \
+    -H "Upgrade: websocket" \
+    -H "Connection: Upgrade" \
+    -H "Sec-WebSocket-Key: dGVzdGtleQ==" \
+    -H "Sec-WebSocket-Version: 13" \
+    -D - -o /dev/null \
+    "${HTTP_PROTO}://${API_HOST}:${WS_PORT}/websocket" 2>&1)" || true
+  WS_ALT_STATUS="$(echo "$WS_ALT" | head -1 | tr -d '\r')"
+  echo "   Response: $WS_ALT_STATUS"
+
+  # Test 4: Try common alternate ports if using default
+  if [[ "$WS_PORT" == "443" ]]; then
+    for ALT_PORT in 80 6000; do
+      echo "-- Test 4: Trying alternate port ${ALT_PORT}"
+      ALT_PROTO="https"
+      [[ "$ALT_PORT" == "80" ]] && ALT_PROTO="http"
+      ALT_CODE="$(curl -s -S -o /dev/null -w "%{http_code}" --max-time 5 \
+        ${API_INSECURE:+-k} \
+        "${ALT_PROTO}://${API_HOST}:${ALT_PORT}/" 2>&1)" || true
+      echo "   HTTP status for /: ${ALT_CODE:-connection failed}"
+    done
+  fi
+
+  echo
+  echo "RESULT: API query failed; cannot prove UUID matching until WebSocket connectivity is resolved."
+  echo "Share the output above to help diagnose the connection issue."
   exit 2
 fi
 
