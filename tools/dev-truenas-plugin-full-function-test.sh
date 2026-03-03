@@ -343,8 +343,8 @@ tn_api_call() {
     perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
@@ -373,8 +373,8 @@ tn_api_call_write() {
     perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
@@ -403,7 +403,7 @@ check_apiver_mismatch() {
     system_apiver=$(perl -e 'require PVE::Storage; print PVE::Storage::APIVER()' 2>/dev/null || echo "unknown")
 
     # Get plugin tested APIVER (top-level constant in plugin)
-    plugin_apiver=$(perl -e 'use lib "/usr/share/perl5/PVE/Storage/Custom"; require TrueNASPlugin; print($PVE::Storage::Custom::TrueNASPlugin::TESTED_APIVER // "")' 2>/dev/null || true)
+    plugin_apiver=$(perl -e 'use lib "/usr/share/perl5"; require PVE::Storage::Custom::TrueNASPlugin; print($PVE::Storage::Custom::TrueNASPlugin::TESTED_APIVER // "")' 2>/dev/null || true)
     [[ -z "$plugin_apiver" ]] && plugin_apiver="unknown"
 
     if [[ "$system_apiver" != "unknown" && "$plugin_apiver" != "unknown" ]]; then

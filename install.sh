@@ -6455,8 +6455,8 @@ tn_api_call() {
     result=$(perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json) = @ARGV;
@@ -6516,8 +6516,8 @@ tn_api_call_write() {
     result=$(perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json) = @ARGV;
@@ -8513,8 +8513,8 @@ execute_provisioning() {
         start_spinner
         local weight_result
         weight_result=$(perl -e '
-            use lib "/usr/share/perl5/PVE/Storage/Custom";
-            use TrueNASPlugin;
+            use lib "/usr/share/perl5";
+            use PVE::Storage::Custom::TrueNASPlugin ();
 
             my $scfg = {
                 api_host => $ARGV[0],
