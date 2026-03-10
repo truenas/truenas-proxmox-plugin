@@ -2692,6 +2692,38 @@ sub _nvme_disconnect {
     }
 }
 
+# Rescan NVMe controllers belonging to our subsystem to discover new namespaces
+sub _nvme_rescan_subsystem_controllers {
+    my ($scfg) = @_;
+
+    my $nqn = $scfg->{subsystem_nqn};
+
+    opendir(my $dh, "/sys/class/nvme-subsystem") or return;
+    while (my $subsys = readdir($dh)) {
+        next unless $subsys =~ /^(nvme-subsys\d+)$/;
+        $subsys = $1;  # Untaint via capture
+        my $subsys_nqn = eval {
+            open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+            my $val = <$fh>;
+            close $fh;
+            chomp($val);
+            $val;
+        };
+        next unless $subsys_nqn && $subsys_nqn eq $nqn;
+
+        # Rescan all controllers in our subsystem
+        opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
+        while (my $entry = readdir($sdh)) {
+            next unless $entry =~ /^(nvme(\d+))$/;
+            my $ctrl_dev = "/dev/nvme$2";
+            eval { run_command(['nvme', 'ns-rescan', $ctrl_dev], outfunc => sub {}, errfunc => sub {}) };
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_rescan: rescanned $ctrl_dev");
+        }
+        closedir($sdh);
+    }
+    closedir($dh);
+}
+
 # Find NVMe device by matching subsystem NQN and TrueNAS namespace UUID
 # Returns hashref { device => $path_or_undef, device_count => $count }
 # device_count reflects how many block devices exist for the subsystem
@@ -2905,32 +2937,7 @@ sub _nvme_device_for_uuid {
         } elsif ($i == 15) {
             # Trigger udev and rescan NVMe controllers for our subsystem
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
-            eval {
-                opendir(my $dh, "/sys/class/nvme-subsystem") or die;
-                while (my $subsys = readdir($dh)) {
-                    next unless $subsys =~ /^(nvme-subsys\d+)$/;
-                    $subsys = $1;  # Untaint via capture
-                    my $subsys_nqn = eval {
-                        open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
-                        my $val = <$fh>;
-                        close $fh;
-                        chomp($val);
-                        $val;
-                    };
-                    next unless $subsys_nqn && $subsys_nqn eq $nqn;
-
-                    # Rescan controllers in this subsystem
-                    opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
-                    while (my $entry = readdir($sdh)) {
-                        next unless $entry =~ /^(nvme(\d+))$/;
-                        $entry = $1;  # Untaint via capture
-                        my $ctrl_dev = "/dev/nvme$2";
-                        eval { run_command(['nvme', 'ns-rescan', $ctrl_dev], outfunc => sub {}, errfunc => sub {}) };
-                    }
-                    closedir($sdh);
-                }
-                closedir($dh);
-            };
+            eval { _nvme_rescan_subsystem_controllers($scfg) };
         } elsif ($i == 25 && !$reconnect_attempted && !$ever_saw_devices && _nvme_is_connected($scfg)) {
             # Stale connection recovery: subsystem shows connected but zero block devices
             # have appeared across all iterations. The TrueNAS target has likely stopped
@@ -2941,7 +2948,11 @@ sub _nvme_device_for_uuid {
             eval { _nvme_disconnect($scfg) };
             usleep(500_000);  # 500ms for disconnect to settle
             eval { _nvme_connect($scfg) };
-            _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: reconnect completed, resuming device discovery");
+            if ($@) {
+                _log($scfg, 0, 'err', "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+            } else {
+                _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: reconnect completed, resuming device discovery");
+            }
         } elsif ($i == 30) {
             # Another settle with trigger
             eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };
@@ -3961,7 +3972,7 @@ sub _free_image_nvme {
             # Try to find the device path - it should not exist after disconnect
             my $dev_path = eval { _nvme_find_device_by_subsystem($scfg, $device_uuid) };
             if ($dev_path && ref($dev_path) eq 'HASH') {
-                push @nvme_device_paths, $dev_path->{path};
+                push @nvme_device_paths, $dev_path->{device};
             } elsif ($dev_path) {
                 push @nvme_device_paths, $dev_path;
             }
@@ -4864,7 +4875,7 @@ sub _clone_image_nvme {
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
     my $ns = eval {
-        _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+        _api_call_write($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
     };
     if ($@) {
         # Cleanup: delete the zvol clone if namespace creation failed
@@ -4874,10 +4885,57 @@ sub _clone_image_nvme {
 
     my $device_uuid = $ns->{device_uuid} // die "No device_uuid returned from namespace creation\n";
 
-    # 3) Wait for device to appear
+    # 3) Wait for device to appear with initial settle/rescan
+    # Fresh namespaces need time for kernel to create block device
+    _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace created with UUID $device_uuid, settling...");
+
+    # Give kernel time to discover the new namespace
+    usleep(200_000);  # 200ms initial settle
+
+    # Trigger udev to pick up the new device and rescan controllers
+    eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+    eval { _nvme_rescan_subsystem_controllers($scfg) };
+
+    # 4) Find the device (will retry internally)
     my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
     if (!$dev) {
-        # Cleanup on failure
+        # Cleanup on failure - with detailed instrumentation
+        _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: FAILED to locate device for UUID $device_uuid after settle/rescan");
+
+        # Query current state for diagnostics
+        my $subsys_state = eval {
+            my $nqn_match = $scfg->{subsystem_nqn};
+            my @all_lines;
+            run_command(['nvme', 'list-subsys'],
+                outfunc => sub { push @all_lines, shift },
+                errfunc => sub {}
+            );
+            # Extract lines around our NQN (up to 20 lines after match)
+            my @matched;
+            my $remaining = 0;
+            for my $line (@all_lines) {
+                if ($line =~ /\Q$nqn_match\E/) {
+                    $remaining = 20;
+                    push @matched, $line;
+                } elsif ($remaining > 0) {
+                    push @matched, $line;
+                    $remaining--;
+                }
+            }
+            join("\n", @matched);
+        } || "(could not query subsystem state)";
+        _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: subsystem state:\n$subsys_state");
+
+        # Check if namespace exists in API
+        my $ns_check = eval {
+            _api_call($scfg, 'nvmet.namespace.query', [[["device_uuid", "=", $device_uuid]]]);
+        };
+        if ($ns_check && @$ns_check) {
+            _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: namespace exists in API (NSID: $ns_check->[0]->{nsid}) but no block device visible");
+        } else {
+            _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: namespace not found in API");
+        }
+
         eval {
             _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ]);
         };
@@ -4885,14 +4943,13 @@ sub _clone_image_nvme {
         die "Device did not appear for cloned namespace (UUID: $device_uuid)\n";
     }
 
-    # 4) Return clone volume name
+    # 5) Return clone volume name
     my $clone_volname = "vol-$target_zname-ns$device_uuid";
     return $clone_volname;
 }
 
 sub copy_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
-
 
     # For our TrueNAS plugin, copy_image uses the same ZFS clone functionality as clone_image
     # This provides efficient space-efficient copying via ZFS clone technology
