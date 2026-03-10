@@ -30,6 +30,27 @@ norm_guid() {
   echo "$s"
 }
 
+read_sysfs_value() {
+  local p="${1:-}"
+  if [[ -r "$p" ]]; then
+    tr -d '\n' < "$p"
+  else
+    printf ''
+  fi
+}
+
+read_sysfs_first() {
+  local p
+  for p in "$@"; do
+    if [[ -r "$p" ]]; then
+      tr -d '\n' < "$p"
+      return 0
+    fi
+  done
+  printf ''
+  return 0
+}
+
 is_all_zero_guid() {
   local n
   n="$(norm_guid "${1:-}")"
@@ -317,16 +338,18 @@ for ((t=0; t<=WAIT_SECONDS; t++)); do
       [[ -e "$p" ]] || continue
       d="$(basename "$p")"
 
+      [[ "$d" =~ ^nvme[0-9]+(c[0-9]+)?n[0-9]+$ ]] || continue
+
       dev_nqn=""
       if [[ -r "/sys/block/$d/device/subsysnqn" ]]; then
-        dev_nqn="$(tr -d '\n' < "/sys/block/$d/device/subsysnqn" || true)"
+        dev_nqn="$(read_sysfs_value "/sys/block/$d/device/subsysnqn")"
       elif [[ -r "/sys/block/$d/device/../subsysnqn" ]]; then
-        dev_nqn="$(tr -d '\n' < "/sys/block/$d/device/../subsysnqn" || true)"
+        dev_nqn="$(read_sysfs_value "/sys/block/$d/device/../subsysnqn")"
       fi
       [[ "$dev_nqn" == "$SUBSYSTEM_NQN" ]] || continue
 
-      nsid="$(tr -d '\n' < "/sys/block/$d/nsid" 2>/dev/null || true)"
-      nguid="$(tr -d '\n' < "/sys/block/$d/nguid" 2>/dev/null || true)"
+      nsid="$(read_sysfs_first "/sys/class/block/$d/device/nsid" "/sys/block/$d/device/nsid" "/sys/block/$d/nsid")"
+      nguid="$(read_sysfs_first "/sys/class/block/$d/device/nguid" "/sys/block/$d/device/nguid" "/sys/block/$d/nguid")"
       echo "$d|$nsid|$nguid"
     done
   )

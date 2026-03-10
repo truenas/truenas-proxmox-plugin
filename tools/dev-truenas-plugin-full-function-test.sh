@@ -4666,10 +4666,7 @@ test_multi_pool_operations() {
 
     sleep $ALLOCATION_WAIT
 
-    pvesm alloc "$pool_a" "$vmid_a" "vm-$vmid_a-disk-0" 8G >/dev/null 2>&1
-    local alloc_a_rc=$?
-
-    if [[ $alloc_a_rc -ne 0 ]]; then
+    if ! pvesm alloc "$pool_a" "$vmid_a" "vm-$vmid_a-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk on pool A"
         pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -4688,10 +4685,7 @@ test_multi_pool_operations() {
 
     sleep $ALLOCATION_WAIT
 
-    pvesm alloc "$pool_b" "$vmid_b" "vm-$vmid_b-disk-0" 8G >/dev/null 2>&1
-    local alloc_b_rc=$?
-
-    if [[ $alloc_b_rc -ne 0 ]]; then
+    if ! pvesm alloc "$pool_b" "$vmid_b" "vm-$vmid_b-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk on pool B"
         pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
         pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
@@ -4869,10 +4863,7 @@ test_dataset_property_inheritance() {
 
     # Allocate disk (creates zvol)
     log_verbose "Allocating disk (creates zvol)" "INFO" "$CURRENT_OP_ID"
-    pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1
-    local alloc_rc=$?
-
-    if [[ $alloc_rc -ne 0 ]]; then
+    if ! pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk"
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
