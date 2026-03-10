@@ -11,8 +11,8 @@ Vcs-Browser: https://github.com/truenas/truenas-proxmox-plugin
 
 Package: truenas-proxmox-plugin
 Architecture: all
-Depends: pve-manager (>= 8.0.0), open-iscsi, perl, libio-socket-ssl-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
-Recommends: nvme-cli, multipath-tools
+Depends: pve-manager (>= 8.0.0), open-iscsi, multipath-tools, perl, libio-socket-ssl-perl, liburi-perl, ${misc:Depends}, ${perl:Depends}
+Recommends: nvme-cli
 Description: TrueNAS SCALE storage plugin for Proxmox VE
  This package provides the TrueNAS Proxmox storage plugin for shared VM disk
  storage over iSCSI and NVMe/TCP. It integrates with TrueNAS SCALE via

@@ -1,5 +1,30 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.5 (March 10, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale NGUID recovery**
+- **Auto-reconnect on stale NGUID data**: When the TrueNAS NVMe-oF service is restarted while Proxmox has an active connection, the kernel's cached NGUID values become stale, causing UUID-based device matching to fail. The plugin now detects this condition (devices exist but NGUID never matches across 35 iterations) and automatically disconnects/reconnects the subsystem to refresh kernel metadata. This complements the existing zero-device recovery (i=25) with a new stale-data recovery path (i=35)
+- **Safety-gated reconnect with fuser check**: The stale NGUID reconnect only triggers when `allow_reconnect` is set (via `activate_volume`) AND `fuser` confirms no running process has any subsystem device open, preventing disruption to running VMs
+
+#### **NVMe clone reliability**
+- **Pre-settle and rescan after namespace creation**: `_clone_image_nvme` now performs a 200ms settle, udev settle, and controller rescan before entering the device discovery loop, improving reliability for freshly created namespaces
+- **Enhanced clone failure diagnostics**: When a cloned namespace device fails to appear, the plugin now logs subsystem state (`nvme list-subsys`) and checks whether the namespace exists in the TrueNAS API, providing actionable diagnostics instead of a generic failure message
+
+#### **NVMe namespace clone uses ephemeral connection**
+- **Fixed `_clone_image_nvme` write operation**: Namespace creation (`nvmet.namespace.create`) now routes through `_api_call_write` (ephemeral WebSocket connection) instead of `_api_call` (persistent connection), preventing response interleaving during concurrent clone operations
+
+#### **NVMe free_image device path fix**
+- **Fixed incorrect hash key in `_free_image_nvme`**: Device path extraction after `_nvme_find_device_by_subsystem` now uses the correct `device` key instead of non-existent `path` key
+
+### 🔧 **Internal Improvements**
+- **Extracted `_nvme_rescan_subsystem_controllers` helper**: Controller rescan logic extracted from inline code in `_nvme_device_for_uuid` into a reusable function, used by both device discovery (i=15) and clone settle paths
+- **New `_nvme_get_subsystem_device_paths` helper**: Collects all `/dev/nvmeXnY` block device paths belonging to the configured subsystem NQN via `/sys/block` enumeration
+- **New `_nvme_check_devices_in_use` helper**: Uses `fuser` to verify whether any subsystem devices are held open by running processes, providing safety gating for reconnect operations
+- **Match tier tracking**: `_nvme_find_device_by_subsystem` now returns a `match_tier` field (`nguid`, `nsid`, or `single`) enabling callers to detect stale NGUID conditions
+- **`_nvme_device_for_uuid` accepts `allow_reconnect` option**: New keyword argument gates the stale NGUID reconnect path; passed by `activate_volume` and `_nvme_create_namespace` but not by `path()`, ensuring read-only lookups never trigger reconnects
+
 ## Version 2.0.4 (March 2, 2026)
 
 ### 🐛 **Bug Fixes**
