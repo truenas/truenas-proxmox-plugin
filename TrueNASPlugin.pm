@@ -2837,7 +2837,7 @@ sub _nvme_find_device_by_subsystem {
                     if ($dev->{nguid} && $dev->{nguid} eq $target_nguid) {
                         closedir($dh);
                         _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NGUID (NSID: $dev->{nsid}, type: $dev->{type})");
-                        return { device => $dev->{path}, device_count => $device_count };
+                        return { device => $dev->{path}, device_count => $device_count, match_tier => 'nguid' };
                     }
                 }
 
@@ -2861,7 +2861,7 @@ sub _nvme_find_device_by_subsystem {
                 if (defined $dev->{nsid} && $dev->{nsid} eq $target_nsid) {
                     closedir($dh);
                     _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NSID (NSID: $dev->{nsid}, type: $dev->{type})");
-                    return { device => $dev->{path}, device_count => $device_count };
+                    return { device => $dev->{path}, device_count => $device_count, match_tier => 'nsid' };
                 }
             }
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NSID matching failed - no device matched NSID $target_nsid");
@@ -2876,18 +2876,18 @@ sub _nvme_find_device_by_subsystem {
         if (@devices == 1) {
             closedir($dh);
             _log($scfg, 1, 'info', "[TrueNAS] nvme_find_device: using single device $devices[0]->{path} (NSID: $devices[0]->{nsid}, type: $devices[0]->{type})");
-            return { device => $devices[0]->{path}, device_count => $device_count };
+            return { device => $devices[0]->{path}, device_count => $device_count, match_tier => 'single' };
         }
 
         # No reliable matching available - cannot safely select a device
         closedir($dh);
         my $dev_list = join(', ', map { "$_->{name} (NSID: $_->{nsid})" } @devices);
         _log($scfg, 0, 'err', "[TrueNAS] nvme_find_device: multiple devices found but no reliable matching available. Devices: $dev_list");
-        return { device => undef, device_count => $device_count };
+        return { device => undef, device_count => $device_count, match_tier => undef };
     }
     closedir($dh);
 
-    return { device => undef, device_count => 0 };
+    return { device => undef, device_count => 0, match_tier => undef };
 }
 
 # Get namespace info from TrueNAS by device UUID
@@ -2905,9 +2905,64 @@ sub _nvme_get_namespace_info {
     return $namespaces->[0];
 }
 
+# Collect /dev/nvmeXnY paths for all block devices belonging to our subsystem NQN
+sub _nvme_get_subsystem_device_paths {
+    my ($scfg) = @_;
+
+    my $nqn = $scfg->{subsystem_nqn};
+    my @paths;
+
+    opendir(my $bdh, "/sys/block") or return @paths;
+    while (my $entry = readdir($bdh)) {
+        next unless $entry =~ /^(nvme\d+(?:c\d+)?n\d+)$/;
+        $entry = $1;  # Untaint
+
+        my $dev_nqn = eval {
+            # Standard devices have subsysnqn under device/, controller devices under device/../
+            my $nqn_path = -e "/sys/block/$entry/device/subsysnqn"
+                ? "/sys/block/$entry/device/subsysnqn"
+                : "/sys/block/$entry/device/../subsysnqn";
+            open my $fh, '<', $nqn_path or return undef;
+            my $val = <$fh>;
+            close $fh;
+            chomp($val);
+            return $val;
+        };
+
+        push @paths, "/dev/$entry" if $dev_nqn && $dev_nqn eq $nqn;
+    }
+    closedir($bdh);
+
+    return @paths;
+}
+
+# Check if any of the given device paths are in use by a running process.
+# Returns: 1 if any device is in use (unsafe to disconnect), 0 if all clear.
+sub _nvme_check_devices_in_use {
+    my ($scfg, @device_paths) = @_;
+    return 0 unless @device_paths;
+
+    # Fail safe: if fuser not available, assume in use
+    if (! -x '/usr/bin/fuser' && ! -x '/bin/fuser') {
+        _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety");
+        return 1;
+    }
+
+    # fuser -s: exit 0 = at least one device has active process
+    #           exit 1 = none accessed (run_command dies on non-zero)
+    eval {
+        run_command(['fuser', '-s', @device_paths],
+            outfunc => sub {},
+            errfunc => sub {},
+        );
+    };
+    return $@ ? 0 : 1;  # $@ set = no processes = not in use
+}
+
 # Get device path for namespace by matching subsystem NQN and namespace properties
 sub _nvme_device_for_uuid {
-    my ($scfg, $device_uuid) = @_;
+    my ($scfg, $device_uuid, %opts) = @_;
+    my $allow_reconnect = $opts{allow_reconnect} // 0;
 
     my $nqn = $scfg->{subsystem_nqn};
 
@@ -2915,6 +2970,7 @@ sub _nvme_device_for_uuid {
 
     # Wait for device to appear with progressive backoff (up to 5 seconds)
     my $ever_saw_devices = 0;  # Track if any block devices were ever seen (safety guard for reconnect)
+    my $nguid_ever_matched = 0;  # Track if NGUID matching ever succeeded (stale detection)
     my $reconnect_attempted = 0;
 
     for (my $i = 0; $i < 50; $i++) {
@@ -2925,8 +2981,11 @@ sub _nvme_device_for_uuid {
 
         $ever_saw_devices = 1 if $device_count > 0;
 
+        my $match_tier = $result ? $result->{match_tier} : undef;
+        $nguid_ever_matched = 1 if $match_tier && $match_tier eq 'nguid';
+
         if ($device && -b $device) {
-            _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: device ready at $device");
+            _log($scfg, 1, 'info', "[TrueNAS] nvme_device_for_uuid: device ready at $device (match: " . ($match_tier // 'unknown') . ")");
             return $device;
         }
 
@@ -2939,6 +2998,7 @@ sub _nvme_device_for_uuid {
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
             eval { _nvme_rescan_subsystem_controllers($scfg) };
         } elsif ($i == 25 && !$reconnect_attempted && !$ever_saw_devices && _nvme_is_connected($scfg)) {
+            # No $allow_reconnect check needed: zero devices means no VMs are affected.
             # Stale connection recovery: subsystem shows connected but zero block devices
             # have appeared across all iterations. The TrueNAS target has likely stopped
             # publishing namespaces over this connection. Reconnecting forces re-enumeration.
@@ -2957,6 +3017,38 @@ sub _nvme_device_for_uuid {
             # Another settle with trigger
             eval { run_command(['udevadm', 'trigger'], outfunc => sub {}, errfunc => sub {}) };
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        } elsif ($i == 35 && !$reconnect_attempted && $allow_reconnect
+                 && $ever_saw_devices && !$nguid_ever_matched
+                 && _nvme_is_connected($scfg)) {
+            # Stale NGUID recovery: subsystem connected, devices exist, but NGUID
+            # has never matched across 35 iterations (~3.5s). The kernel's cached
+            # NGUID data is likely stale from a previous TrueNAS service state.
+            # Only safe if no running process (QEMU) has any subsystem device open.
+            # Note: inherent TOCTOU window between fuser check and disconnect.
+            # CFS lock prevents concurrent plugin operations; manual VM starts
+            # during this ~1ms window are the residual (very low) risk.
+            my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
+            if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected but "
+                    . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
+            } else {
+                $reconnect_attempted = 1;
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: stale NGUID connection detected "
+                    . "- " . scalar(@dev_paths) . " devices, none in use, reconnecting");
+                eval { _nvme_disconnect($scfg) };
+                usleep(500_000);
+                eval { _nvme_connect($scfg) };
+                if ($@) {
+                    _log($scfg, 0, 'err',
+                        "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+                } else {
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] nvme_device_for_uuid: reconnect completed, "
+                        . "resuming device discovery");
+                }
+            }
         }
 
         usleep(DEVICE_READY_TIMEOUT_US);  # 100ms
@@ -3106,7 +3198,7 @@ sub _nvme_create_namespace {
     _nvme_connect($scfg);
 
     # Wait for device to appear
-    my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+    my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: device ready at $dev");
 
     return $device_uuid;
@@ -4623,7 +4715,7 @@ sub activate_volume {
         my $device_uuid = $metadata;
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
         eval {
-            my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+            my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
         };
         if ($@) {
@@ -4897,7 +4989,7 @@ sub _clone_image_nvme {
     eval { _nvme_rescan_subsystem_controllers($scfg) };
 
     # 4) Find the device (will retry internally)
-    my $dev = _nvme_device_for_uuid($scfg, $device_uuid);
+    my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
     if (!$dev) {
         # Cleanup on failure - with detailed instrumentation
         _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: FAILED to locate device for UUID $device_uuid after settle/rescan");

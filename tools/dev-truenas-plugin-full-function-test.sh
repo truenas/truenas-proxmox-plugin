@@ -20,6 +20,8 @@
 #  14. Offline Backup - Test backup of stopped VM (requires --backup-store)
 #  15. Cross-Node Clone (Online) - Test cloning running VM to different node (cluster only)
 #  16. Cross-Node Clone (Offline) - Test cloning stopped VM to different node (cluster only)
+#  ...
+#  30. NVMe Stale Recovery - Test stale NVMe connection detection and automatic reconnect
 #
 # Performance Summary:
 #   After all tests complete, a summary table displays average, min, and max times
@@ -68,7 +70,7 @@ if [[ $# -lt 2 ]]; then
     echo ""
     echo "Options:"
     echo "  --backup-store STORAGE - Backup storage ID for backup tests (optional)"
-    echo "  --phase PHASE_NUM      - Start from specific phase number (optional)"
+    echo "  --phase PHASE_NUM      - Run only the specified phase number (optional)"
     echo ""
     echo "Examples:"
     echo "  $0 tnscale 9001"
@@ -83,6 +85,7 @@ STORAGE_ID="$1"
 VMID_START="$2"
 BACKUP_STORE=""
 START_PHASE=1
+STOP_PHASE=""  # When set, stop after this phase (for --phase single-phase execution)
 
 # Validate VMID_START is a number
 if ! [[ "$VMID_START" =~ ^[0-9]+$ ]]; then
@@ -101,6 +104,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --phase)
             START_PHASE="$2"
+            STOP_PHASE="$2"  # When --phase is specified, stop after this phase
             shift 2
             ;;
         *)
@@ -311,6 +315,15 @@ log_success() {
 
 log_error() {
     log_both "$*" "ERROR"
+}
+
+# Check if we should stop after the current phase (for --phase single-phase execution)
+check_stop_phase() {
+    local completed_phase="$1"
+    if [[ -n "$STOP_PHASE" && "$completed_phase" -ge "$STOP_PHASE" ]]; then
+        log_info "Phase $STOP_PHASE completed. Exiting as requested (--phase $STOP_PHASE)."
+        exit 0
+    fi
 }
 
 log_warning() {
@@ -4927,6 +4940,218 @@ test_dataset_property_inheritance() {
 }
 
 # ============================================================================
+# Phase 30: NVMe Stale Connection Recovery Test
+# ============================================================================
+
+test_nvme_stale_recovery() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="NVMe Stale Connection Recovery"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 30 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Skip if not NVMe-TCP transport mode
+    log_verbose "Checking transport mode" "INFO" "$CURRENT_OP_ID"
+    local storage_cfg="/etc/pve/storage.cfg"
+    local transport_mode=""
+    local subsystem_nqn=""
+    local in_storage_block=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:[[:space:]]+$STORAGE_ID$ ]]; then
+            in_storage_block=1
+            continue
+        fi
+
+        if [[ $in_storage_block -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^truenasplugin: ]]; then
+                break
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]*transport_mode[[:space:]]+(.+)$ ]]; then
+                transport_mode="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*subsystem_nqn[[:space:]]+(.+)$ ]]; then
+                subsystem_nqn="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$storage_cfg"
+
+    if [[ "$transport_mode" != "nvme-tcp" ]] && [[ -z "$subsystem_nqn" ]]; then
+        log_success "Skipped - not NVMe-TCP transport mode"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("SKIP: $test_name - Not NVMe-TCP transport")
+        return 0
+    fi
+
+    # Get API credentials
+    log_verbose "Reading TrueNAS API configuration" "INFO" "$CURRENT_OP_ID"
+    local config_str
+    config_str=$(get_storage_config "$STORAGE_ID")
+    local api_host api_key dataset api_insecure
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config_str"
+
+    if [[ -z "$api_host" ]] || [[ -z "$api_key" ]]; then
+        log_error "Could not extract API configuration from storage.cfg"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Configuration extraction failed")
+        return 1
+    fi
+
+    log_verbose "API Host: $api_host, Dataset: $dataset" "INFO" "$CURRENT_OP_ID"
+
+    # Pre-flight: verify NVMe-oF service is running
+    log_verbose "Verifying NVMe-oF service is running" "INFO" "$CURRENT_OP_ID"
+    local nvmet_status
+    if ! nvmet_status=$(tn_api_call "$api_host" "$api_key" "service.query" \
+        '[[["service","=","nvmet"]]]' "$api_insecure" 2>/dev/null); then
+        log_error "Failed to query NVMe-oF service status"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Cannot query nvmet service")
+        return 1
+    fi
+
+    if ! echo "$nvmet_status" | grep -q '"state":"RUNNING"'; then
+        log_error "NVMe-oF service is not running - cannot test stale recovery"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - nvmet service not running")
+        return 1
+    fi
+
+    log_verbose "NVMe-oF service confirmed running" "INFO" "$CURRENT_OP_ID"
+
+    # Record syslog marker for later inspection
+    local syslog_marker
+    syslog_marker=$(date +"%Y-%m-%dT%H:%M:%S")
+
+    # Create VM + allocate NVMe disk
+    log_verbose "Creating test VM $vmid with NVMe disk" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-nvme-stale" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    log_verbose "Allocating 1GB disk" "INFO" "$CURRENT_OP_ID"
+    local volid
+    volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-0" \
+        -size "1G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
+        log_error "Failed to allocate disk: $volid"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated volume: $volid" "INFO" "$CURRENT_OP_ID"
+
+    # Attach disk and boot VM (baseline - confirm everything works before staling)
+    log_verbose "Attaching disk and starting VM (baseline check)" "INFO" "$CURRENT_OP_ID"
+    if ! qm set "$vmid" -scsi0 "$volid" -scsihw virtio-scsi-single -boot "order=scsi0" >/dev/null 2>&1; then
+        log_error "Failed to attach disk to VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk attach failed")
+        return 1
+    fi
+
+    if ! timeout 120 qm start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start VM for baseline check"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline VM start failed")
+        return 1
+    fi
+
+    log_verbose "Baseline VM start succeeded, stopping VM" "INFO" "$CURRENT_OP_ID"
+    sleep 2
+    qm stop "$vmid" --timeout 30 >/dev/null 2>&1
+    sleep 2
+
+    # Restart TrueNAS NVMe-oF service to create stale state
+    log_verbose "Restarting TrueNAS NVMe-oF service to create stale connections" "WARN" "$CURRENT_OP_ID"
+    if ! tn_api_call_write "$api_host" "$api_key" "service.restart" '["nvmet"]' "$api_insecure" >/dev/null 2>&1; then
+        log_error "Failed to restart NVMe-oF service"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - nvmet restart failed")
+        return 1
+    fi
+
+    # Wait for service to fully restart and republish namespaces
+    log_verbose "Waiting 5s for NVMe-oF service to republish namespaces" "INFO" "$CURRENT_OP_ID"
+    sleep 5
+
+    # Trigger activate_volume via qm start - this exercises the stale NGUID recovery path
+    # activate_volume passes allow_reconnect => 1, enabling i=35 stale NGUID detection
+    log_verbose "Starting VM after NVMe-oF restart (triggers stale recovery)" "INFO" "$CURRENT_OP_ID"
+    if ! timeout 120 qm start "$vmid" >/dev/null 2>&1; then
+        log_error "VM failed to start after NVMe-oF restart - stale recovery may have failed"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM start failed after nvmet restart")
+        return 1
+    fi
+
+    log_success "VM started successfully after NVMe-oF restart - stale recovery worked"
+
+    # Verify via syslog (informational, not pass/fail)
+    log_verbose "Checking syslog for reconnect messages" "INFO" "$CURRENT_OP_ID"
+    local syslog_output
+    syslog_output=$(journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null \
+        | grep -E "stale (NGUID|NVMe) connection detected|NVMe.*reconnect|zero block devices" || true)
+
+    if [[ -n "$syslog_output" ]]; then
+        log_verbose "Recovery messages found in syslog:" "INFO" "$CURRENT_OP_ID"
+        while IFS= read -r logline; do
+            log_verbose "  $logline" "INFO" "$CURRENT_OP_ID"
+        done <<< "$syslog_output"
+    else
+        log_verbose "No explicit stale recovery messages in syslog (recovery may have been transparent)" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Cleanup
+    log_verbose "Cleaning up test VM" "INFO" "$CURRENT_OP_ID"
+    qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+    sleep 2
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    # Post-flight: verify NVMe-oF service is still running
+    log_verbose "Verifying NVMe-oF service still running after test" "INFO" "$CURRENT_OP_ID"
+    local post_status
+    if post_status=$(tn_api_call "$api_host" "$api_key" "service.query" \
+        '[[["service","=","nvmet"]]]' "$api_insecure" 2>/dev/null); then
+        if ! echo "$post_status" | grep -q '"state":"RUNNING"'; then
+            log_warning "NVMe-oF service not running after test - restarting"
+            tn_api_call_write "$api_host" "$api_key" "service.start" '["nvmet"]' "$api_insecure" >/dev/null 2>&1 || true
+            sleep 3
+        fi
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "NVMe stale connection recovery test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "nvme_stale_recovery" "$duration"
+    return 0
+}
+
+# ============================================================================
 # Performance Summary Table
 # ============================================================================
 
@@ -5060,6 +5285,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 2
 
     # Phase 3: TrueNAS Size Verification
     if [[ $START_PHASE -gt 3 ]]; then
@@ -5078,6 +5304,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 3
 
     # Phase 4: Disk Deletion
     if [[ $START_PHASE -gt 4 ]]; then
@@ -5096,6 +5323,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 4
 
     # Phase 5: Clone and Snapshot Tests
     if [[ $START_PHASE -gt 5 ]]; then
@@ -5136,6 +5364,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 5
 
     # Phase 6: Disk Resize
     if [[ $START_PHASE -gt 6 ]]; then
@@ -5151,6 +5380,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 6
 
     # Phase 7: Concurrent Operations
     if [[ $START_PHASE -gt 7 ]]; then
@@ -5166,6 +5396,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 7
 
     # Phase 8: Performance
     if [[ $START_PHASE -gt 8 ]]; then
@@ -5181,6 +5412,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 8
 
     # Phase 9: Multiple Disks
     if [[ $START_PHASE -gt 9 ]]; then
@@ -5196,6 +5428,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 9
 
     # Phase 10: EFI VM Creation
     if [[ $START_PHASE -gt 10 ]]; then
@@ -5211,6 +5444,8 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+
+    check_stop_phase 10
 
     # Phase 11: Multi-Disk Advanced Operations
     if [[ $START_PHASE -gt 11 ]]; then
@@ -5231,7 +5466,9 @@ main() {
     else
         test_num=$((test_num + 3))
     fi
+
     fi
+    check_stop_phase 11
 
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
@@ -5300,6 +5537,7 @@ main() {
         log_info "Skipping cluster-based tests (Phases 12-15) - not in a cluster or no target node available"
         echo | tee -a "$LOG_FILE"
     fi
+    check_stop_phase 15
 
     # Phase 18: Rapid Creation/Deletion Stress Test
     if [[ $START_PHASE -gt 18 ]]; then
@@ -5315,6 +5553,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 18
 
     # Phase 19: Storage Quota/Space Exhaustion Test
     if [[ $START_PHASE -gt 19 ]]; then
@@ -5330,6 +5569,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 19
 
     # Phase 20: Invalid/Malformed API Requests Test
     if [[ $START_PHASE -gt 20 ]]; then
@@ -5345,6 +5585,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 20
 
     # Phase 21: Interrupted Operations Test
     if [[ $START_PHASE -gt 21 ]]; then
@@ -5360,6 +5601,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 21
 
     # Phase 22: Large Disk Operations Test
     if [[ $START_PHASE -gt 22 ]]; then
@@ -5375,6 +5617,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 22
 
     # Backup tests (only if backup storage specified)
     if [[ -n "$BACKUP_STORE" ]]; then
@@ -5411,6 +5654,7 @@ main() {
         log_info "Skipping backup tests (Phases 16, 17) - no backup storage specified (use --backup-store)"
         echo | tee -a "$LOG_FILE"
     fi
+    check_stop_phase 17
 
     # Phase 23: Transport Mode Verification
     if [[ $START_PHASE -gt 23 ]]; then
@@ -5426,6 +5670,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 23
 
     # Phase 24: Snapshot Reversion
     if [[ $START_PHASE -gt 24 ]]; then
@@ -5441,6 +5686,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 24
 
     # Phase 25: Disk Hotswap
     if [[ $START_PHASE -gt 25 ]]; then
@@ -5456,6 +5702,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 25
 
     # Phase 26: API Rate Limiting
     if [[ $START_PHASE -gt 26 ]]; then
@@ -5470,6 +5717,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 26
 
     # Phase 27: Multi-Pool Operations
     if [[ $START_PHASE -gt 27 ]]; then
@@ -5484,6 +5732,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 27
 
     # Phase 28: Performance Regression Tracking
     if [[ $START_PHASE -gt 28 ]]; then
@@ -5498,6 +5747,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 28
 
     # Phase 29: Dataset Property Inheritance
     if [[ $START_PHASE -gt 29 ]]; then
@@ -5513,6 +5763,23 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 29
+
+    # Phase 30: NVMe Stale Connection Recovery
+    if [[ $START_PHASE -gt 30 ]]; then
+        log_info "Skipping Phase 30 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 30: NVMe Stale Connection Recovery" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 33))
+    test_nvme_stale_recovery "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 30
 
     # Performance Summary
     print_performance_summary
