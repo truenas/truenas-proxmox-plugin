@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.5';
+our $VERSION = '2.0.6';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -854,18 +854,48 @@ sub _ws_recv_text {
 }
 sub _ws_rpc {
     my ($conn, $obj) = @_;
+    my $request_id = $obj->{id};
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
-    my $resp = _ws_recv_text($conn->{sock});
-    my $decoded = eval { decode_json($resp) };
-    if ($@ || !$decoded) {
-        my $len = length($resp // '');
-        my $preview = substr($resp // '', 0, 200);
-        _log(undef, 0, 'err', "[TrueNAS] JSON decode failed (len=$len): $@ Preview: $preview");
-        die "JSON-RPC decode failed: $@";
+
+    # Read frames until we get a response matching our request ID.
+    # TrueNAS may send unsolicited messages (event notifications, subscription
+    # events) that desynchronize a naive send-then-read-next-frame approach.
+    # JSON-RPC 2.0 uses the id field to match responses to requests.
+    my $max_skip = 10;
+    for (my $skipped = 0; $skipped <= $max_skip; $skipped++) {
+        my $resp = _ws_recv_text($conn->{sock});
+        my $decoded = eval { decode_json($resp) };
+        if ($@ || !$decoded) {
+            my $len = length($resp // '');
+            my $preview = substr($resp // '', 0, 200);
+            _log(undef, 0, 'err', "[TrueNAS] JSON decode failed (len=$len): $@ Preview: $preview");
+            die "JSON-RPC decode failed: $@";
+        }
+
+        # Match response to our request by id
+        if (defined($request_id) && ref($decoded) eq 'HASH'
+            && defined($decoded->{id}) && "$decoded->{id}" eq "$request_id") {
+            die "JSON-RPC error: ".encode_json($decoded->{error}) if exists $decoded->{error};
+            return $decoded->{result};
+        }
+
+        # No id in request (shouldn't happen) — accept the first response
+        if (!defined($request_id)) {
+            die "JSON-RPC error: ".encode_json($decoded->{error})
+                if ref($decoded) eq 'HASH' && exists $decoded->{error};
+            return ref($decoded) eq 'HASH' ? $decoded->{result} : $decoded;
+        }
+
+        # Non-matching frame — log and continue reading
+        my $got_id = ref($decoded) eq 'HASH' ? ($decoded->{id} // 'undef') : 'non-object';
+        _log(undef, 1, 'warning',
+            "[TrueNAS] _ws_rpc: skipping non-matching frame "
+            . "(expected id=$request_id, got id=$got_id)");
     }
-    die "JSON-RPC error: ".encode_json($decoded->{error}) if exists $decoded->{error};
-    return $decoded->{result};
+
+    die "JSON-RPC: no matching response after skipping $max_skip frames "
+        . "(request id=$request_id, method=$obj->{method})";
 }
 
 # ======== Persistent WebSocket Connection Management ========
@@ -2804,6 +2834,7 @@ sub _nvme_selector_result {
         match_tier => $args{match_tier},
         selector_outcome => $args{selector_outcome},
         mismatch_reason => $args{mismatch_reason},
+        nguid_contradicted => $args{nguid_contradicted} // 0,
     };
 }
 
@@ -2955,6 +2986,7 @@ sub _nvme_select_namespace_device {
     my $ns_info = $namespace_meta->{namespace};
     my $usable_nguid = 0;
     my $usable_nsid = 0;
+    my $nguid_contradicted = 0;
 
     if ($ns_info && defined $ns_info->{device_nguid}) {
         my $target_nguid = $ns_info->{device_nguid};
@@ -2976,6 +3008,12 @@ sub _nvme_select_namespace_device {
                         selector_outcome => 'exact_match',
                     );
                 }
+                # Track devices with real (non-zero) NGUIDs that don't match — indicates
+                # a stale subsystem connection where kernel NGUID data is outdated
+                if (!$nguid_contradicted && defined($dev->{nguid}) && $dev->{nguid} ne '') {
+                    (my $stripped = $dev->{nguid}) =~ s/[-:]//g;
+                    $nguid_contradicted = 1 if $stripped =~ /[1-9a-fA-F]/;
+                }
             }
 
             my $device_nguids = join(', ', map {
@@ -2990,10 +3028,24 @@ sub _nvme_select_namespace_device {
     if ($ns_info && defined $ns_info->{nsid}) {
         my $target_nsid = $ns_info->{nsid};
         $usable_nsid = 1;
+        my $nsid_rejected_by_nguid = 0;
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: attempting NSID match for NSID $target_nsid");
 
         for my $dev (@$devices) {
             if (defined $dev->{nsid} && $dev->{nsid} eq $target_nsid) {
+                # Cross-validate: if the API provided a valid NGUID and this device
+                # has a real (non-zero) NGUID that didn't match, this device belongs
+                # to a different namespace — it is stale and must be skipped.
+                if ($nguid_contradicted && defined($dev->{nguid}) && $dev->{nguid} ne '') {
+                    (my $stripped = $dev->{nguid}) =~ s/[-:]//g;
+                    if ($stripped =~ /[1-9a-fA-F]/) {
+                        $nsid_rejected_by_nguid = 1;
+                        _log($scfg, 1, 'warning',
+                            "[TrueNAS] nvme_find_device: NSID $target_nsid matched $dev->{path} "
+                            . "but device NGUID $dev->{nguid} contradicts API — skipping stale device");
+                        next;
+                    }
+                }
                 _log($scfg, 2, 'debug', "[TrueNAS] nvme_find_device: matched device $dev->{path} by NSID (NSID: $dev->{nsid}, type: $dev->{type})");
                 return _nvme_selector_result(
                     selected_device_path => $dev->{path},
@@ -3005,7 +3057,11 @@ sub _nvme_select_namespace_device {
             }
         }
 
-        _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NSID matching failed - no device matched NSID $target_nsid");
+        if ($nsid_rejected_by_nguid) {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: all NSID-matching devices rejected due to NGUID contradiction — stale subsystem connection");
+        } else {
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: NSID matching failed - no device matched NSID $target_nsid");
+        }
     }
 
     if ($namespace_meta->{metadata_state} ne 'ok') {
@@ -3039,6 +3095,7 @@ sub _nvme_select_namespace_device {
             api_namespace_count => $api_namespace_count,
             selector_outcome => 'publication_mismatch',
             mismatch_reason => $mismatch_reason,
+            nguid_contradicted => $nguid_contradicted,
         );
     }
 
@@ -3066,6 +3123,7 @@ sub _nvme_select_namespace_device {
         api_namespace_count => $api_namespace_count,
         selector_outcome => 'publication_mismatch',
         mismatch_reason => $mismatch_reason,
+        nguid_contradicted => $nguid_contradicted,
     );
 }
 
@@ -3268,6 +3326,36 @@ sub _nvme_device_for_uuid {
         if ($i == 5) {
             # Early settle
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        } elsif ($i == 10 && !$reconnect_attempted && $allow_reconnect
+                 && $ever_saw_devices && !$nguid_ever_matched
+                 && $last_result && $last_result->{nguid_contradicted}
+                 && _nvme_is_connected($scfg)) {
+            # Early stale NGUID recovery: devices exist with real NGUIDs that contradict
+            # the TrueNAS API within the first 1s. An NGUID contradiction is definitive —
+            # the kernel's cached namespace data belongs to a previous TrueNAS state and
+            # will never self-resolve without a disconnect/reconnect cycle.
+            my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
+            if (_nvme_check_devices_in_use($scfg, @dev_paths)) {
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: stale NGUIDs detected (early) but "
+                    . scalar(@dev_paths) . " device(s) are in use, skipping reconnect");
+            } else {
+                $reconnect_attempted = 1;
+                _log($scfg, 1, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: stale NGUID contradiction detected (early) "
+                    . "- " . scalar(@dev_paths) . " devices, none in use, reconnecting");
+                eval { _nvme_disconnect($scfg) };
+                usleep(500_000);
+                eval { _nvme_connect($scfg) };
+                if ($@) {
+                    _log($scfg, 0, 'err',
+                        "[TrueNAS] nvme_device_for_uuid: reconnect failed: $@");
+                } else {
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] nvme_device_for_uuid: reconnect completed, "
+                        . "resuming device discovery");
+                }
+            }
         } elsif ($i == 15) {
             # Trigger udev and rescan NVMe controllers for our subsystem
             eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };

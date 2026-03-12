@@ -1,5 +1,32 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.6 (March 12, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale device NSID false-positive matching**
+- **NGUID cross-validation on NSID matches**: When the NGUID tier fails to match any device, the NSID tier now cross-validates candidates against the API-provided NGUID. If a device has a real (non-zero) NGUID that contradicts the API, it is rejected as stale rather than returned as an exact match. This prevents the plugin from selecting a wrong device when a stale subsystem connection has a device with a coincidentally matching NSID but a different NGUID
+- **Early stale NGUID reconnect (i=10)**: A new early detection trigger at iteration 10 (~1 second) fires when NGUID contradiction is detected, reducing stale connection recovery time from ~3.5 seconds to ~1.5 seconds. Uses the same safety gates as the existing i=35 trigger (fuser check, `allow_reconnect` flag)
+
+#### **NVMe namespace selector refactor**
+- **Structured selector results**: `_nvme_find_device_by_subsystem` now returns structured `_nvme_selector_result` objects with explicit outcome classification (`exact_match`, `legacy_single_namespace_fallback`, `publication_mismatch`, `metadata_failure`), linux/API namespace counts, and mismatch reason codes for better diagnostics
+- **Tighter legacy single-device fallback**: The single-device fallback now requires both `linux_device_count == 1` AND `api_namespace_count == 1`, and is blocked entirely when NGUID or NSID metadata was usable but failed to match, preventing wrong-device selection when metadata proves the device is stale
+- **Separated metadata queries**: Namespace metadata is now fetched through `_nvme_get_namespace_selector_metadata` which cross-references both the target UUID and the subsystem namespace count, enabling publication mismatch detection
+
+#### **NVMe error message improvements**
+- **Structured failure diagnostics**: When device discovery fails, the error message now includes linux-visible device count, API namespace count, selector mismatch reason, and a human-readable explanation instead of generic failure messages
+- **Detailed selector failure labels**: Mismatch reasons like `api_namespace_not_visible_in_linux`, `namespace_metadata_did_not_match_visible_devices`, and `subsystem_not_visible` provide actionable context for troubleshooting
+
+#### **WebSocket response desynchronization fix**
+- **JSON-RPC request ID matching in `_ws_rpc`**: The WebSocket RPC function now matches response frames to requests by JSON-RPC `id` field. Previously, unsolicited TrueNAS messages (event notifications) could desynchronize the send/receive pairing, causing a `core.ping` "pong" response to be returned as the result of a subsequent API call (e.g., `pool.dataset.get_instance`), leading to `Can't use string ("pong") as a HASH ref` crashes in `status()`. Non-matching frames are now logged and skipped (up to 10)
+
+### 🔒 **Security**
+
+#### **NVMe CLI input untainting**
+- **Untaint all values passed to NVMe CLI commands**: Portal hosts, ports, NQNs, and DH-HMAC-CHAP secrets are now validated and untainted through dedicated helpers (`_nvme_untaint_cli_host`, `_nvme_untaint_cli_port`, `_nvme_untaint_cli_nqn`, `_nvme_untaint_cli_secret`) before being passed to `nvme connect`/`nvme disconnect` commands, preventing potential command injection from storage.cfg values
+
+---
+
 ## Version 2.0.5 (March 10, 2026)
 
 ### 🐛 **Bug Fixes**
