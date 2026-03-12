@@ -1,5 +1,5 @@
 Package: truenas-proxmox-plugin
-Version: 2.0.6+deb1
+Version: 2.0.6+deb2
 Architecture: all
 Maintainer: TrueNAS Proxmox Plugin Maintainers <noreply@github.com>
 Installed-Size: 607
@@ -8,11 +8,11 @@ Recommends: nvme-cli
 Homepage: https://github.com/truenas/truenas-proxmox-plugin
 Priority: optional
 Section: admin
-Filename: pool/main/t/truenas-proxmox-plugin/truenas-proxmox-plugin_2.0.6+deb1_all.deb
-Size: 104896
-SHA256: 23b0e4eb99b1531154818569fb946ff4d3b837d239552dd69eacf9708f56d809
-SHA1: 9d3f0a4e0ef40d27e01aaf1876c5eaa945f5c27d
-MD5sum: 76655faf0620ec3b78b67e11ae115870
+Filename: pool/main/t/truenas-proxmox-plugin/truenas-proxmox-plugin_2.0.6+deb2_all.deb
+Size: 104932
+SHA256: cceb015242760f93648ede05e90524b2b4b8728c8ba28f3ed3c31b3cd558e001
+SHA1: 6ffb45e54f65ccae833c008fa7576ee5aedee847
+MD5sum: 1540cf441a417e4053a6a09a672cb516
 Description: TrueNAS SCALE storage plugin for Proxmox VE
  This package provides the TrueNAS Proxmox storage plugin for shared VM disk
  storage over iSCSI and NVMe/TCP. It integrates with TrueNAS SCALE via
