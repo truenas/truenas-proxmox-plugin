@@ -170,6 +170,17 @@ jobs:
             fi
           done
 
+          changelogs_uri="Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog"
+          for suite in bookworm trixie; do
+            release="apt/dists/${suite}/Release"
+            if [[ -f "${release}" ]] && ! grep -q '^Changelogs:' "${release}"; then
+              sed -i "/^Description:/i ${changelogs_uri}" "${release}"
+            fi
+            rm -f "apt/dists/${suite}/Release.gpg" "apt/dists/${suite}/InRelease"
+            gpg --batch --yes -abs -o "apt/dists/${suite}/Release.gpg" "${release}"
+            gpg --batch --yes --clearsign -o "apt/dists/${suite}/InRelease" "${release}"
+          done
+
           gpg --batch --yes --output apt/pubkey.gpg --export "${APT_GPG_KEY_ID}"
           gpg --batch --yes --armor --output apt/pubkey.asc --export "${APT_GPG_KEY_ID}"
 
@@ -180,7 +191,7 @@ jobs:
           pkg_name="$(dpkg-parsechangelog -S Source)"
           deb_version="$(dpkg-parsechangelog -S Version)"
           prefix="$(echo "${pkg_name}" | head -c1)"
-          changelog_dir="apt/changelogs/pool/main/${prefix}/${pkg_name}"
+          changelog_dir="apt/changelogs/main/${prefix}/${pkg_name}"
           changelog_path="${changelog_dir}/${pkg_name}_${deb_version}_changelog"
 
           mkdir -p "${changelog_dir}"
