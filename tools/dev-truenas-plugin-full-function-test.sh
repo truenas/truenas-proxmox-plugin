@@ -5100,6 +5100,33 @@ test_nvme_stale_recovery() {
 
     log_success "VM started successfully after NVMe-oF restart - stale recovery worked"
 
+    # Issue-12 regression detection: check for aliasing fallback or taint errors
+    log_verbose "Checking for issue-12 regression signatures" "INFO" "$CURRENT_OP_ID"
+    local issue12_failures=""
+
+    # Check for 'using single device' (aliasing fallback signature)
+    if journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null | grep -q "using single device"; then
+        issue12_failures="${issue12_failures}aliasing_fallback "
+        log_error "ISSUE-12 REGRESSION: 'using single device' detected (aliasing fallback)"
+    fi
+
+    # Check for 'Insecure dependency in exec' (taint regression signature)
+    if journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null | grep -q "Insecure dependency in exec"; then
+        issue12_failures="${issue12_failures}taint_regression "
+        log_error "ISSUE-12 REGRESSION: 'Insecure dependency in exec' detected (taint regression)"
+    fi
+
+    # Fail the test if any issue-12 signatures were found
+    if [[ -n "$issue12_failures" ]]; then
+        log_error "Issue-12 regression signatures detected: $issue12_failures"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Issue-12 regression: $issue12_failures")
+        return 1
+    fi
+
     # Verify via syslog (informational, not pass/fail)
     log_verbose "Checking syslog for reconnect messages" "INFO" "$CURRENT_OP_ID"
     local syslog_output
