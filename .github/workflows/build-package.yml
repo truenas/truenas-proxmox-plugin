@@ -173,6 +173,19 @@ jobs:
           gpg --batch --yes --output apt/pubkey.gpg --export "${APT_GPG_KEY_ID}"
           gpg --batch --yes --armor --output apt/pubkey.asc --export "${APT_GPG_KEY_ID}"
 
+      - name: Generate changelog for APT
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_name="$(dpkg-parsechangelog -S Source)"
+          deb_version="$(dpkg-parsechangelog -S Version)"
+          prefix="$(echo "${pkg_name}" | head -c1)"
+          changelog_dir="apt/changelogs/pool/main/${prefix}/${pkg_name}"
+          changelog_path="${changelog_dir}/${pkg_name}_${deb_version}_changelog"
+
+          mkdir -p "${changelog_dir}"
+          cp debian/changelog "${changelog_path}"
+
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -189,7 +202,7 @@ jobs:
             for entry in apt/*; do
               name="$(basename "${entry}")"
               case "${name}" in
-                dists|pool|pubkey.gpg|pubkey.asc|InRelease|Release|Release.gpg)
+                dists|pool|changelogs|pubkey.gpg|pubkey.asc|InRelease|Release|Release.gpg)
                   ;;
                 *)
                   rm -rf "${entry}"
