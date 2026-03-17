@@ -291,7 +291,7 @@ test_T3_06() {
 
     local check_file
     if [[ "$config" == "F" ]]; then
-        check_file=/etc/nvme/hostnqn
+        check_file=/etc/nvme/discovery.conf
     else
         check_file=/etc/multipath.conf
     fi
