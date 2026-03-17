@@ -14,6 +14,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
+# Ensure iptables rules are cleaned up even if the harness is interrupted
+trap 'iptables_cleanup_all' EXIT INT TERM
+
 # Global state
 PASS_COUNT=0
 FAIL_COUNT=0

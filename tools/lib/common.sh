@@ -69,16 +69,34 @@ retry_window_seconds() {
     echo $(( (15 * max) + (delay * max) + 30 ))
 }
 
+# Track active iptables blocks so they can be cleaned up on exit
+_IPTABLES_BLOCKS=()
+
 # Block outbound TCP to host:port using iptables OUTPUT chain.
 # Usage: iptables_block <host> <port>
 iptables_block() {
     iptables -A OUTPUT -p tcp --destination "$1" --dport "$2" -j DROP
+    _IPTABLES_BLOCKS+=("$1:$2")
 }
 
 # Remove the OUTPUT chain block for host:port.
 # Usage: iptables_unblock <host> <port>
 iptables_unblock() {
     iptables -D OUTPUT -p tcp --destination "$1" --dport "$2" -j DROP 2>/dev/null || true
+    local new_blocks=()
+    for b in "${_IPTABLES_BLOCKS[@]:-}"; do
+        [[ "$b" != "$1:$2" ]] && new_blocks+=("$b")
+    done
+    _IPTABLES_BLOCKS=("${new_blocks[@]:-}")
+}
+
+# Remove all tracked iptables blocks. Called by EXIT trap in run-tests.sh.
+iptables_cleanup_all() {
+    for b in "${_IPTABLES_BLOCKS[@]:-}"; do
+        local host="${b%:*}" port="${b##*:}"
+        iptables -D OUTPUT -p tcp --destination "$host" --dport "$port" -j DROP 2>/dev/null || true
+    done
+    _IPTABLES_BLOCKS=()
 }
 
 # Run a command on a remote cluster node as root via SSH.

@@ -141,7 +141,7 @@ test_T2_04() {
 test_T2_05() {
     local storage="$1"
     local portal1_ip
-    portal1_ip=$(read_storage_cfg "$storage" "portal" | cut -d',' -f1)
+    portal1_ip=$(read_storage_cfg "$storage" "portals" | cut -d',' -f1)
 
     log_info "T2-05: Path failure — I/O continues"
 

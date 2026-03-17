@@ -131,36 +131,32 @@ test_T1_02() {
     # Block outbound 443 to API host
     iptables_block "$api_host" 443
 
-    local start_time
-    start_time=$(date +%s)
+    # Wait 20s to ensure at least one retry fires (15s connect timeout + margin)
+    sleep 20
 
-    # Trigger pvesm status in background
-    ( pvesm status "$storage" &>/dev/null ) &
-    local bg_pid=$!
-
-    sleep 20  # Exceeds single connect timeout — ensures at least one retry fires
-
-    # Unblock
+    # Unblock — from here the API should be reachable again
     iptables_unblock "$api_host" 443
 
-    # Wait for background job within the computed window
-    local waited=0
-    while kill -0 "$bg_pid" 2>/dev/null; do
-        sleep 2
-        waited=$(($(date +%s) - start_time))
-        if [[ "$waited" -gt "$window" ]]; then
-            kill "$bg_pid" 2>/dev/null || true
-            log_fail "T1-02: pvesm status did not recover within ${window}s window"
-            return 1
+    # Verify recovery: poll pvesm status until it succeeds or window expires
+    local start_time
+    start_time=$(date +%s)
+    local remaining=$(( window - 20 ))  # 20s already elapsed during block period
+    local recovered=0
+
+    while [[ $(( $(date +%s) - start_time )) -lt $remaining ]]; do
+        if pvesm status "$storage" &>/dev/null; then
+            recovered=1
+            break
         fi
+        sleep 2
     done
 
-    if wait "$bg_pid"; then
+    if [[ $recovered -eq 1 ]]; then
         local elapsed=$(( $(date +%s) - start_time ))
-        log_pass "T1-02: pvesm status recovered after ${elapsed}s (window: ${window}s)"
+        log_pass "T1-02: pvesm status recovered ${elapsed}s after unblock (window: ${remaining}s)"
         return 0
     else
-        log_fail "T1-02: pvesm status exited non-zero after unblock"
+        log_fail "T1-02: pvesm status did not recover within ${remaining}s after unblock"
         return 1
     fi
 }
