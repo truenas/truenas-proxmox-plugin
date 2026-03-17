@@ -47,7 +47,7 @@ cat >"$TMP" <<'EOF'
 : initial_pool_config_file
 : 0
 
-truenas-iscsi: TrueNASPlugin
+truenasplugin: truenas-iscsi
 	nodes localhost
 	api_host 192.168.1.10
 	api_insecure 1

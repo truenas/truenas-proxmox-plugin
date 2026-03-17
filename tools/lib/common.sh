@@ -44,8 +44,8 @@ log_info() {
 read_storage_cfg_file() {
     local cfg_file="$1" storage="$2" key="$3" default="${4:-}"
     local found=""
-    found=$(awk -v storage="$storage:" -v key="$key" -v dflt="$default" '
-        /^[^ \t]/ { in_section = ($1 == storage) }
+    found=$(awk -v storage="$storage" -v key="$key" -v dflt="$default" '
+        /^[^ \t]/ { in_section = ($2 == storage) }
         in_section && /^[ \t]/ {
             split($0, parts, /[ \t]+/)
             if (parts[2] == key) { print parts[3]; found=1; exit }
