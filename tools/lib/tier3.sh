@@ -35,10 +35,10 @@ tier3_preflight() {
 
     # Plugin file checksum identical on all nodes
     local local_sum
-    local_sum=$(md5sum /usr/share/perl5/PVE/Storage/TrueNASPlugin.pm 2>/dev/null | awk '{print $1}')
+    local_sum=$(md5sum /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm 2>/dev/null | awk '{print $1}')
     while IFS= read -r peer; do
         local remote_sum
-        remote_sum=$(ssh_run "$peer" md5sum /usr/share/perl5/PVE/Storage/TrueNASPlugin.pm 2>/dev/null | awk '{print $1}')
+        remote_sum=$(ssh_run "$peer" md5sum /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm 2>/dev/null | awk '{print $1}')
         if [[ "$local_sum" != "$remote_sum" ]]; then
             log_warn "Tier 3 pre-flight: plugin checksum mismatch on $peer — update plugin on all nodes before running Tier 3"
             return 1
@@ -422,7 +422,7 @@ test_T3_09() {
 
     log_info "T3-09: Plugin version consistency"
 
-    local plugin_file=/usr/share/perl5/PVE/Storage/TrueNASPlugin.pm
+    local plugin_file=/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
     local local_sum
     local_sum=$(md5sum "$plugin_file" 2>/dev/null | awk '{print $1}')
     local all_match=1

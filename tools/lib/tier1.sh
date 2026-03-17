@@ -22,7 +22,7 @@ tier1_preflight() {
     fi
 
     # Plugin file present and passes perl -c
-    local plugin_file="/usr/share/perl5/PVE/Storage/TrueNASPlugin.pm"
+    local plugin_file="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
     if [[ ! -f "$plugin_file" ]]; then
         log_fail "Pre-flight: plugin file not found at $plugin_file"
         ok=1
