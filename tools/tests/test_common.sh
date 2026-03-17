@@ -1,5 +1,5 @@
-# tools/tests/test_common.sh
 #!/usr/bin/env bash
+# tools/tests/test_common.sh
 # Standalone unit tests for tools/lib/common.sh — no external dependencies.
 set -uo pipefail
 PASS=0; FAIL=0
