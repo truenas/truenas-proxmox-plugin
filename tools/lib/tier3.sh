@@ -80,7 +80,7 @@ test_T3_01() {
     log_info "T3-01: Shared storage visibility"
 
     local vmid=9720
-    pvesh post /nodes/localhost/storage/"$storage"/content \
+    pvesh create /nodes/localhost/storage/"$storage"/content \
         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null || {
         log_skip "T3-01: could not create volume"
         return 0
@@ -126,13 +126,13 @@ test_T3_02() {
 
     # Launch simultaneously
     ssh_run "${peers[0]}" \
-        pvesh post /nodes/"${peers[0]}"/qemu \
+        pvesh create /nodes/"${peers[0]}"/qemu \
         -vmid "$vmid1" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null &
     local pid1=$!
 
     ssh_run "${peers[1]}" \
-        pvesh post /nodes/"${peers[1]}"/qemu \
+        pvesh create /nodes/"${peers[1]}"/qemu \
         -vmid "$vmid2" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null &
     local pid2=$!
@@ -179,7 +179,7 @@ test_T3_03() {
     fi
 
     local vmid=9723
-    pvesh post /nodes/localhost/qemu \
+    pvesh create /nodes/localhost/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null
     qm start "$vmid" &>/dev/null
@@ -223,7 +223,7 @@ test_T3_04() {
     fi
 
     local vmid=9724
-    pvesh post /nodes/localhost/qemu \
+    pvesh create /nodes/localhost/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null
     qm start "$vmid" &>/dev/null
@@ -338,12 +338,12 @@ test_T3_07() {
 
     # Trigger concurrent creates via SSH
     ssh_run "${peers[0]}" \
-        pvesh post /nodes/"${peers[0]}"/storage/"$storage"/content \
+        pvesh create /nodes/"${peers[0]}"/storage/"$storage"/content \
         -vmid "$vmid1" -filename "vm-${vmid1}-disk-0" -size 1G &>/dev/null &
     local pid1=$!
 
     ssh_run "${peers[1]}" \
-        pvesh post /nodes/"${peers[1]}"/storage/"$storage"/content \
+        pvesh create /nodes/"${peers[1]}"/storage/"$storage"/content \
         -vmid "$vmid2" -filename "vm-${vmid2}-disk-0" -size 1G &>/dev/null &
     local pid2=$!
 

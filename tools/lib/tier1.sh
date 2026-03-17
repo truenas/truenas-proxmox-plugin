@@ -173,7 +173,7 @@ test_T1_03() {
     local volid="${storage}:vm-${vmid}-disk-0"
 
     # Create a test volume (1G)
-    if ! pvesh post /nodes/localhost/storage/"$storage"/content \
+    if ! pvesh create /nodes/localhost/storage/"$storage"/content \
          -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null; then
         log_skip "T1-03: could not create test volume on storage '$storage'"
         return 0
@@ -241,7 +241,7 @@ test_T1_04() {
 
     local vmid=9702
     # Create a minimal VM config with a disk
-    pvesh post /nodes/localhost/qemu \
+    pvesh create /nodes/localhost/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null || {
         log_skip "T1-04: could not create test VM $vmid"
@@ -277,7 +277,7 @@ test_T1_05() {
     fi
 
     local vmid=9703
-    pvesh post /nodes/localhost/qemu \
+    pvesh create /nodes/localhost/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null || {
         log_skip "T1-05: could not create test VM $vmid"
@@ -352,7 +352,7 @@ test_T1_07() {
 
     for i in $(seq 1 5); do
         local volid
-        if volid=$(pvesh post /nodes/localhost/storage/"$storage"/content \
+        if volid=$(pvesh create /nodes/localhost/storage/"$storage"/content \
                    -vmid "$vmid" -filename "vm-${vmid}-disk-$((i-1))" \
                    -size 1G 2>&1); then
             created+=("${storage}:vm-${vmid}-disk-$((i-1))")
