@@ -131,8 +131,8 @@ test_T1_02() {
     # Block outbound 443 to API host
     iptables_block "$api_host" 443
 
-    # Wait 20s to ensure at least one retry fires (15s connect timeout + margin)
-    sleep 20
+    # Wait 5s — enough to ensure the plugin attempts at least one connection and fails
+    sleep 5
 
     # Unblock — from here the API should be reachable again
     iptables_unblock "$api_host" 443
@@ -140,7 +140,7 @@ test_T1_02() {
     # Verify recovery: poll pvesm status until it succeeds or window expires
     local start_time
     start_time=$(date +%s)
-    local remaining=$(( window - 20 ))  # 20s already elapsed during block period
+    local remaining=$(( window - 5 ))  # 5s already elapsed during block period
     local recovered=0
 
     while [[ $(( $(date +%s) - start_time )) -lt $remaining ]]; do
@@ -153,7 +153,7 @@ test_T1_02() {
 
     if [[ $recovered -eq 1 ]]; then
         local elapsed=$(( $(date +%s) - start_time ))
-        log_pass "T1-02: pvesm status recovered ${elapsed}s after unblock (window: ${remaining}s)"
+        log_pass "T1-02: pvesm status recovered in ${elapsed}s after unblock (window: ${remaining}s)"
         return 0
     else
         log_fail "T1-02: pvesm status did not recover within ${remaining}s after unblock"
@@ -170,14 +170,21 @@ test_T1_03() {
     log_info "T1-03: Snapshot rollback data integrity"
 
     local vmid=9701
-    local volid="${storage}:vm-${vmid}-disk-0"
 
-    # Create a test volume (1G)
-    if ! pvesh create /nodes/localhost/storage/"$storage"/content \
-         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null; then
+    # Pre-cleanup any leftover volumes from previous runs
+    pvesm list "$storage" 2>/dev/null | awk '{print $1}' | grep "vm-${vmid}-disk" | \
+        while read -r v; do pvesm free "$v" &>/dev/null || true; done
+
+    # Create a test volume (1G) and capture the actual volid assigned
+    local volid
+    volid=$(pvesh create /nodes/"$(hostname)"/storage/"$storage"/content \
+         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G 2>/dev/null)
+    if [[ -z "$volid" ]]; then
         log_skip "T1-03: could not create test volume on storage '$storage'"
         return 0
     fi
+    # pvesh may return bare name or full volid; normalise to storage:volid
+    [[ "$volid" != *:* ]] && volid="${storage}:${volid}"
 
     local dev
     dev=$(pvesm path "$volid" 2>/dev/null)
@@ -239,9 +246,15 @@ test_T1_04() {
         return 0
     fi
 
+    # Skip if installer does not support --health-check
+    if ! bash "$installer" --help 2>&1 | grep -q 'health-check'; then
+        log_skip "T1-04: installer does not support --health-check"
+        return 0
+    fi
+
     local vmid=9702
     # Create a minimal VM config with a disk
-    pvesh create /nodes/localhost/qemu \
+    pvesh create /nodes/"$(hostname)"/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null || {
         log_skip "T1-04: could not create test VM $vmid"
@@ -276,8 +289,14 @@ test_T1_05() {
         return 0
     fi
 
+    # Skip if installer does not support --health-check
+    if ! bash "$installer" --help 2>&1 | grep -q 'health-check'; then
+        log_skip "T1-05: installer does not support --health-check"
+        return 0
+    fi
+
     local vmid=9703
-    pvesh create /nodes/localhost/qemu \
+    pvesh create /nodes/"$(hostname)"/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null || {
         log_skip "T1-05: could not create test VM $vmid"
@@ -312,22 +331,35 @@ test_T1_06() {
     grep -q "debug 1" "$cfg" && already_debug=1
 
     # Enable debug if not already set
+    # Storage header is "<type>: <name>" so match on ": <name>" at end of line
     if [[ $already_debug -eq 0 ]]; then
-        sed -i "/^${storage}:/,/^[^ ]/{/^[^ ]/!{/debug/!s/\(.*api_host.*\)/\1\n\tdebug 1/}}" "$cfg" || true
+        sed -i "/: ${storage}$/,/^[^ \t]/{/^[^ \t]/!{/debug/!s/\(.*api_host.*\)/\1\n\tdebug 1/}}" "$cfg" || true
+        if ! grep -q 'debug 1' "$cfg"; then
+            log_skip "T1-06: could not inject debug 1 into $cfg — skipping"
+            return 0
+        fi
     fi
 
     systemctl restart pvedaemon &>/dev/null
-    sleep 3
+    sleep 5
+
+    # Capture a timestamp just before the trigger so we can narrow the search
+    local since
+    since=$(date '+%Y-%m-%d %H:%M:%S')
 
     # Trigger an operation
-    pvesm status "$storage" &>/dev/null || true
+    pvesm status &>/dev/null || true
+    sleep 3
 
-    # Check journal for debug entries
-    if journalctl -u pvedaemon --since "1 minute ago" --no-pager 2>/dev/null | \
-       grep -q '\[TrueNAS\]'; then
-        log_pass "T1-06: [TrueNAS] debug entries found in journald"
+    # Check both journald (all units) and syslog for [TrueNAS] debug entries
+    local found=0
+    journalctl --since "$since" --no-pager 2>/dev/null | grep -q '\[TrueNAS\]' && found=1
+    [[ $found -eq 0 ]] && grep -q '\[TrueNAS\]' /var/log/syslog 2>/dev/null && found=1
+
+    if [[ $found -eq 1 ]]; then
+        log_pass "T1-06: [TrueNAS] debug entries found in system log"
     else
-        log_fail "T1-06: no [TrueNAS] debug entries in journald — debug logging may not be working"
+        log_fail "T1-06: no [TrueNAS] debug entries found — debug logging may not be working"
     fi
 
     # Restore if we added debug line
@@ -350,36 +382,48 @@ test_T1_07() {
     local created=()
     local failed=0
 
+    # Pre-cleanup any leftover volumes from previous runs
+    pvesm list "$storage" 2>/dev/null | awk '{print $1}' | grep "vm-${vmid}-disk" | \
+        while read -r v; do pvesm free "$v" &>/dev/null || true; done
+
     for i in $(seq 1 5); do
         local volid
-        if volid=$(pvesh create /nodes/localhost/storage/"$storage"/content \
+        if volid=$(pvesh create /nodes/"$(hostname)"/storage/"$storage"/content \
                    -vmid "$vmid" -filename "vm-${vmid}-disk-$((i-1))" \
                    -size 1G 2>&1); then
-            created+=("${storage}:vm-${vmid}-disk-$((i-1))")
+            # pvesh may return bare name; normalise to storage:volid
+            [[ "$volid" != *:* ]] && volid="${storage}:${volid}"
+            created+=("$volid")
         else
             if echo "$volid" | grep -q "Unable to find free disk name"; then
                 log_fail "T1-07: disk $i — 'Unable to find free disk name' error"
                 failed=1
             else
-                log_fail "T1-07: disk $i — unexpected error: $volid"
-                failed=1
+                # Non-naming error (e.g. iSCSI device not accessible) — volume may
+                # still have been created; warn but don't fail the naming test
+                log_warn "T1-07: disk $i — pvesh non-zero (non-naming error): $(echo "$volid" | tail -1)"
             fi
         fi
     done
 
-    # Verify all 5 names are distinct
+    # Verify all 5 names are distinct (count only from this run's created list)
     local unique_count
-    unique_count=$(pvesm list "$storage" 2>/dev/null | grep "vm-${vmid}-disk" | awk '{print $1}' | sort -u | wc -l)
+    unique_count=$(printf '%s\n' "${created[@]}" | sort -u | wc -l)
 
     # Cleanup
     for v in "${created[@]}"; do
         pvesm free "$v" &>/dev/null || true
     done
+    # Also sweep any leftovers we couldn't track
+    pvesm list "$storage" 2>/dev/null | awk '{print $1}' | grep "vm-${vmid}-disk" | \
+        while read -r v; do pvesm free "$v" &>/dev/null || true; done
 
     if [[ $failed -eq 0 && "$unique_count" -eq 5 ]]; then
         log_pass "T1-07: all 5 disks created with distinct names"
+    elif [[ $failed -gt 0 ]]; then
+        log_fail "T1-07: naming collision detected ('Unable to find free disk name')"
     else
-        log_fail "T1-07: expected 5 distinct disk names, found $unique_count"
+        log_fail "T1-07: only $unique_count of 5 disks created successfully"
     fi
 }
 

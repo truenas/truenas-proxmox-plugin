@@ -55,7 +55,7 @@ test_T2_01() {
     log_info "T2-01: dm-multipath map creation"
 
     local vmid=9710
-    pvesh create /nodes/localhost/storage/"$storage"/content \
+    pvesh create /nodes/"$(hostname)"/storage/"$storage"/content \
         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null || {
         log_skip "T2-01: could not create volume"
         return 0
@@ -262,7 +262,7 @@ test_T2_08() {
     log_info "T2-08: Silent fallback detection when dm map removed"
 
     local vmid=9712
-    pvesh create /nodes/localhost/storage/"$storage"/content \
+    pvesh create /nodes/"$(hostname)"/storage/"$storage"/content \
         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null || {
         log_skip "T2-08: could not create volume"
         return 0

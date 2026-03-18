@@ -340,7 +340,7 @@ tn_api_call() {
     local params="${4:-[]}";
     local api_insecure="${5:-0}"
 
-    perl -e '
+    timeout 60 perl -e '
         use strict;
         use warnings;
         use lib "/usr/share/perl5/PVE/Storage/Custom";
@@ -370,7 +370,7 @@ tn_api_call_write() {
     local params="${4:-[]}";
     local api_insecure="${5:-0}"
 
-    perl -e '
+    timeout 60 perl -e '
         use strict;
         use warnings;
         use lib "/usr/share/perl5/PVE/Storage/Custom";
