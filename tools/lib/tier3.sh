@@ -80,7 +80,7 @@ test_T3_01() {
     log_info "T3-01: Shared storage visibility"
 
     local vmid=9720
-    pvesh create /nodes/localhost/storage/"$storage"/content \
+    pvesh create /nodes/"$(hostname)"/storage/"$storage"/content \
         -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size 1G &>/dev/null || {
         log_skip "T3-01: could not create volume"
         return 0
@@ -179,7 +179,7 @@ test_T3_03() {
     fi
 
     local vmid=9723
-    pvesh create /nodes/localhost/qemu \
+    pvesh create /nodes/"$(hostname)"/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null
     qm start "$vmid" &>/dev/null
@@ -223,7 +223,7 @@ test_T3_04() {
     fi
 
     local vmid=9724
-    pvesh create /nodes/localhost/qemu \
+    pvesh create /nodes/"$(hostname)"/qemu \
         -vmid "$vmid" -memory 128 -cores 1 \
         -scsi0 "${storage}:8,format=raw" &>/dev/null
     qm start "$vmid" &>/dev/null
