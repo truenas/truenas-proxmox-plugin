@@ -13,6 +13,7 @@ use MIME::Base64 qw(encode_base64);
 use Digest::SHA qw(sha1 sha1_hex);
 use IO::Socket::INET;
 use IO::Socket::SSL;
+use IO::Select;
 use Time::HiRes qw(usleep);
 use POSIX ();
 use Socket qw(inet_ntoa);
@@ -792,7 +793,11 @@ sub _ws_read_exact {
     my ($sock, $ref, $want) = @_;
     $$ref = '' if !defined $$ref;
     my $got = 0;
+    my $sel = IO::Select->new($sock);
     while ($got < $want) {
+        unless ($sock->pending() || $sel->can_read(30)) {
+            return undef;  # socket not readable within 30s — connection stale
+        }
         my $r = $sock->sysread($$ref, $want - $got, $got);
         return undef if !defined $r || $r == 0;
         $got += $r;
