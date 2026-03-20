@@ -144,7 +144,7 @@ test_T1_02() {
     local recovered=0
 
     while [[ $(( $(date +%s) - start_time )) -lt $remaining ]]; do
-        if pvesm status "$storage" &>/dev/null; then
+        if pvesm list "$storage" &>/dev/null; then
             recovered=1
             break
         fi
