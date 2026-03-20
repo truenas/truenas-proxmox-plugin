@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.6';
+our $VERSION = '2.0.7';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -2772,12 +2772,36 @@ sub _nvme_connect {
 }
 
 # Disconnect from NVMe/TCP subsystem
+# Tries controller-specific disconnect first to avoid disrupting other storages
+# sharing the same subsystem NQN. Falls back to NQN-wide disconnect if needed.
 sub _nvme_disconnect {
     my ($scfg) = @_;
     my $nqn = _nvme_untaint_cli_nqn($scfg->{subsystem_nqn}, 'NVMe subsystem NQN');
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_disconnect: disconnecting from subsystem $nqn");
 
+    # Try controller-specific disconnect first
+    my @controllers = _nvme_find_controllers_for_subsystem($scfg);
+    if (@controllers) {
+        my $all_ok = 1;
+        for my $ctrl (@controllers) {
+            _log($scfg, 1, 'info', "[TrueNAS] nvme_disconnect: disconnecting controller $ctrl");
+            eval {
+                run_command(['nvme', 'disconnect', '-d', $ctrl],
+                    outfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] nvme disconnect $ctrl: " . shift); },
+                    errfunc => sub {}
+                );
+            };
+            if ($@) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_disconnect: failed to disconnect $ctrl: $@");
+                $all_ok = 0;
+            }
+        }
+        return if $all_ok;
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_disconnect: some controller disconnects failed, falling back to NQN-wide");
+    }
+
+    # Fallback: NQN-wide disconnect
     eval {
         run_command(['nvme', 'disconnect', '-n', $nqn],
             outfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] nvme disconnect: " . shift); },
@@ -2819,6 +2843,77 @@ sub _nvme_rescan_subsystem_controllers {
         closedir($sdh);
     }
     closedir($dh);
+}
+
+# Find NVMe controllers belonging to our subsystem that match our configured portals.
+# Returns list of controller device paths (e.g., /dev/nvme0, /dev/nvme1).
+sub _nvme_find_controllers_for_subsystem {
+    my ($scfg) = @_;
+
+    my $nqn = $scfg->{subsystem_nqn};
+    my @controllers;
+
+    # Build set of portals to match against
+    my %portal_set;
+    for my $portal_str ($scfg->{discovery_portal}, $scfg->{portals} ? split(/\s*,\s*/, $scfg->{portals}) : ()) {
+        next unless $portal_str;
+        my ($host, $port) = _nvme_parse_portal($portal_str);
+        $portal_set{"$host:$port"} = 1;
+    }
+
+    opendir(my $dh, "/sys/class/nvme-subsystem") or return @controllers;
+    while (my $subsys = readdir($dh)) {
+        next unless $subsys =~ /^(nvme-subsys\d+)$/;
+        $subsys = $1;  # Untaint
+        my $subsys_nqn = eval {
+            open my $fh, '<', "/sys/class/nvme-subsystem/$subsys/subsysnqn" or die;
+            my $val = <$fh>;
+            close $fh;
+            chomp($val);
+            $val;
+        };
+        next unless $subsys_nqn && $subsys_nqn eq $nqn;
+
+        # Find controllers in this subsystem
+        opendir(my $sdh, "/sys/class/nvme-subsystem/$subsys") or next;
+        while (my $entry = readdir($sdh)) {
+            next unless $entry =~ /^(nvme(\d+))$/;
+            my $ctrl_name = $1;
+            my $ctrl_num = $2;
+
+            # Read controller address to match against our portals
+            my $address = eval {
+                open my $fh, '<', "/sys/class/nvme/$ctrl_name/address" or die;
+                my $val = <$fh>;
+                close $fh;
+                chomp($val);
+                $val;
+            };
+            next unless $address;
+
+            # Parse traddr=X.X.X.X,trsvcid=YYYY from address string
+            my ($ctrl_host, $ctrl_port);
+            if ($address =~ /traddr=([^,\s]+)/) {
+                $ctrl_host = $1;
+            }
+            if ($address =~ /trsvcid=(\d+)/) {
+                $ctrl_port = $1;
+            }
+            next unless $ctrl_host;
+            $ctrl_port //= 4420;
+
+            # If we have portals configured, only include controllers matching them
+            if (%portal_set) {
+                next unless $portal_set{"$ctrl_host:$ctrl_port"};
+            }
+
+            push @controllers, "/dev/nvme$ctrl_num";
+        }
+        closedir($sdh);
+    }
+    closedir($dh);
+
+    return @controllers;
 }
 
 # Find NVMe device by matching subsystem NQN and TrueNAS namespace UUID.
@@ -3502,7 +3597,7 @@ sub _nvme_ensure_subsystem {
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
     # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
-    my $subsys = _api_call($scfg, 'nvmet.subsys.create', [{
+    my $subsys = _api_call_write($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
@@ -3521,7 +3616,7 @@ sub _nvme_ensure_subsystem {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: creating port for $host:$port");
 
         eval {
-            _api_call($scfg, 'nvmet.port.create', [{
+            _api_call_write($scfg, 'nvmet.port.create', [{
                 subsys_id => $subsys_id,
                 trtype => 'TCP',
                 traddr => $host,
@@ -3548,7 +3643,7 @@ sub _nvme_create_namespace {
 
     # Create namespace
     # Note: zvol creation job is now waited on in alloc_image() before calling this function
-    my $ns = _api_call($scfg, 'nvmet.namespace.create', [{
+    my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [{
         device_type => 'ZVOL',
         device_path => $zvol_path,  # Already has 'zvol/' prefix
         subsys_id => $subsys_id,

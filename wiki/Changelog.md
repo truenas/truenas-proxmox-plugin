@@ -1,5 +1,15 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.7 (March 20, 2026)
+
+### Bug Fixes
+
+#### NVMe write operations use ephemeral WebSocket connections
+- **Subsystem, port, and namespace creation now use ephemeral connections**: `_nvme_ensure_subsystem()` and `_nvme_create_namespace()` previously used persistent WebSocket connections for write operations (`nvmet.subsys.create`, `nvmet.port.create`, `nvmet.namespace.create`), risking response desynchronization under concurrent operations. These now use `_api_call_write()` (ephemeral connections) matching the clone path which already used the correct pattern
+
+#### Controller-specific NVMe disconnect
+- **Targeted controller disconnect**: `_nvme_disconnect()` now disconnects individual controllers by device path (`nvme disconnect -d /dev/nvmeX`) instead of disconnecting all controllers for the entire subsystem NQN. This prevents recovery logic in `_nvme_device_for_uuid()` from disrupting other storages or multipath connections sharing the same subsystem. Falls back to NQN-wide disconnect if controller-specific disconnect is unavailable
+
 ## Version 2.0.6 (March 12, 2026)
 
 ### 🐛 **Bug Fixes**

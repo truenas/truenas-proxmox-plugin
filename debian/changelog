@@ -1,3 +1,10 @@
+truenas-proxmox-plugin (2.0.7+deb1) unstable; urgency=medium
+
+  * NVMe write operations (subsystem/port/namespace create) use ephemeral WebSocket connections
+  * Controller-specific NVMe disconnect with NQN-wide fallback
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.6+deb2) unstable; urgency=medium
 
   * Restart pvestatd on install/upgrade for fresh plugin code loading
