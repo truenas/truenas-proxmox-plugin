@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.10 (March 21, 2026)
+
+### NVMe Improvements
+
+- **Add ns-rescan to NVMe alloc deferred path**: `_alloc_image_nvme` now calls `_nvme_rescan_subsystem_controllers()` after connect and before device discovery, matching the existing clone path behavior. This explicitly asks the kernel to re-enumerate namespaces rather than relying solely on TrueNAS AEN (Asynchronous Event Notification). Improves namespace discovery reliability in environments where AEN may not fire, reducing discovery latency by ~1.5s in affected setups (ref: GitHub issue #12)
+
+---
+
 ## Version 2.0.9 (March 20, 2026)
 
 ### Bug Fixes

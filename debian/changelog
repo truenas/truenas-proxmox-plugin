@@ -1,3 +1,10 @@
+truenas-proxmox-plugin (2.0.10+deb1) unstable; urgency=medium
+
+  * Add ns-rescan to NVMe alloc deferred path (mirrors clone path)
+  * Improves namespace discovery when TrueNAS AEN is unavailable
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 21 Mar 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (2.0.9+deb1) unstable; urgency=medium
 
   * Fix stale NVMe subsystem entry preventing connection (_nvme_is_connected

@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.9';
+our $VERSION = '2.0.10';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -4178,6 +4178,10 @@ sub _alloc_image_nvme {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: NVMe connect failed (activate_volume will retry): $@");
             return;
         }
+        # Settle + rescan to detect new namespace (mirrors clone_image_nvme deferred path)
+        usleep(200_000);  # 200ms initial settle
+        eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
         my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
         if ($dev) {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
