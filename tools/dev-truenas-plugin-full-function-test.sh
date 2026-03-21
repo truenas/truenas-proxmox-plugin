@@ -22,6 +22,12 @@
 #  16. Cross-Node Clone (Offline) - Test cloning stopped VM to different node (cluster only)
 #  ...
 #  30. NVMe Stale Recovery - Test stale NVMe connection detection and automatic reconnect
+#  31. Concurrent Alloc+Free Contention - Measure lock contention between simultaneous alloc and free
+#  32. Multi-Disk Sequential Timing - Measure per-disk times to show preflight/cache speedup
+#  33. Mixed Concurrent Operations - Run alloc, clone, and free simultaneously
+#  34. Concurrent Clone Operations - Two full clones from different sources simultaneously
+#  35. Cross-Node Concurrent Alloc - Allocate disks on two nodes simultaneously (cluster only)
+#  36. Concurrent Migration + Alloc - Migrate VM while allocating disk simultaneously (cluster only)
 #
 # Performance Summary:
 #   After all tests complete, a summary table displays average, min, and max times
@@ -5170,6 +5176,1123 @@ test_nvme_stale_recovery() {
 }
 
 # ============================================================================
+# Phase 31: Concurrent Alloc+Free Lock Contention
+# ============================================================================
+
+test_concurrent_alloc_free_contention() {
+    local test_num=$1
+    local test_name="Concurrent Alloc+Free Lock Contention"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_free=$((VMID_START + 34))
+    local vmid_alloc=$((VMID_START + 35))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create VM with a disk (the free target)
+    log_info "Setting up: creating VM $vmid_free with disk (free target)"
+    if ! qm create "$vmid_free" -name "test-contention-free" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create free-target VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    local free_volid
+    free_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_free" \
+        -filename "vm-${vmid_free}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
+        log_error "Failed to allocate free-target disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    # Setup: Create empty VM (the alloc target)
+    log_info "Setting up: creating empty VM $vmid_alloc (alloc target)"
+    if ! qm create "$vmid_alloc" -name "test-contention-alloc" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc-target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc
+    log_info "Baseline: timing single disk allocation"
+    local baseline_start=$(date +%s%3N)
+    local baseline_volid
+    baseline_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    if [[ -z "$baseline_volid" || "$baseline_volid" == *"error"* ]]; then
+        log_error "Baseline allocation failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_ms}ms"
+    track_timing "contention_baseline_alloc" "$baseline_ms"
+
+    # Remove baseline disk so we can allocate again
+    pvesm free "$baseline_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Launch alloc and free simultaneously
+    log_info "Concurrent: launching alloc + free simultaneously"
+    local error_dir="/tmp/contention-test-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Free operation
+    (
+        local op_start=$(date +%s%3N)
+        pvesm free "$free_volid" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/free.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/free.result"
+        fi
+    ) &
+    local free_pid=$!
+
+    # Wait for both
+    wait "$alloc_pid" 2>/dev/null || true
+    wait "$free_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local alloc_result="FAIL:0"
+    local free_result="FAIL:0"
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    [[ -f "$error_dir/free.result" ]] && free_result=$(cat "$error_dir/free.result")
+    rm -rf "$error_dir"
+
+    local alloc_status="${alloc_result%%:*}"
+    local alloc_ms="${alloc_result##*:}"
+    local free_status="${free_result%%:*}"
+    local free_ms="${free_result##*:}"
+
+    log_info "Concurrent alloc: ${alloc_ms}ms (${alloc_status})"
+    log_info "Concurrent free:  ${free_ms}ms (${free_status})"
+    log_info "Wall time:        ${wall_ms}ms"
+    local sequential_sum=$((alloc_ms + free_ms))
+    log_info "Sequential sum:   ${sequential_sum}ms"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel, 100% = fully serial)"
+    fi
+
+    track_timing "contention_concurrent_alloc" "$alloc_ms"
+    track_timing "contention_concurrent_free" "$free_ms"
+    track_timing "contention_wall_time" "$wall_ms"
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_free" "$vmid_alloc" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$alloc_status" == "OK" && "$free_status" == "OK" ]]; then
+        log_success "Concurrent alloc+free contention test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ "$alloc_status" == "OK" || "$free_status" == "OK" ]]; then
+        log_warning "Partial success: alloc=$alloc_status, free=$free_status (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (partial - alloc=$alloc_status, free=$free_status)")
+    else
+        log_error "Both operations failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Both operations failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 32: Multi-Disk Sequential Timing
+# ============================================================================
+
+test_multi_disk_sequential_timing() {
+    local test_num=$1
+    local test_name="Multi-Disk Sequential Timing (4 disks)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid=$((VMID_START + 36))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Create VM
+    log_info "Creating VM $vmid for multi-disk test"
+    if ! qm create "$vmid" -name "test-multidisk-seq" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    # Allocate 4 disks sequentially with timing
+    local disk_times=()
+    local total_start=$(date +%s%3N)
+    local all_ok=true
+
+    for i in 0 1 2 3; do
+        log_info "Allocating disk $i..."
+        local disk_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid" \
+            -filename "vm-${vmid}-disk-${i}" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local disk_end=$(date +%s%3N)
+        local disk_ms=$((disk_end - disk_start))
+        disk_times+=("$disk_ms")
+
+        if [[ -z "$volid" || "$volid" == *"error"* ]]; then
+            log_error "Failed to allocate disk $i"
+            all_ok=false
+            break
+        fi
+
+        # Attach disk
+        local bus_idx=$i
+        if ! qm set "$vmid" -scsi${bus_idx} "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk $i"
+            all_ok=false
+            break
+        fi
+
+        log_info "Disk $i: ${disk_ms}ms"
+        track_timing "multidisk_seq_disk${i}" "$disk_ms"
+    done
+
+    local total_end=$(date +%s%3N)
+    local total_ms=$((total_end - total_start))
+    track_timing "multidisk_seq_total" "$total_ms"
+
+    if [[ "$all_ok" == "true" && ${#disk_times[@]} -eq 4 ]]; then
+        local first_disk=${disk_times[0]}
+        local subsequent_sum=$(( ${disk_times[1]} + ${disk_times[2]} + ${disk_times[3]} ))
+        local subsequent_avg=$((subsequent_sum / 3))
+
+        log_info "First disk (cold cache):  ${first_disk}ms"
+        log_info "Subsequent avg (warm):    ${subsequent_avg}ms"
+        track_timing "multidisk_seq_first_disk" "$first_disk"
+        track_timing "multidisk_seq_subsequent_avg" "$subsequent_avg"
+
+        if [[ $first_disk -gt 0 ]]; then
+            local speedup_pct=$(( (first_disk - subsequent_avg) * 100 / first_disk ))
+            log_info "Speedup: ${speedup_pct}% faster with warm cache"
+        fi
+
+        # Verify all 4 disks in VM config
+        local disk_count
+        disk_count=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | wc -l)
+        if [[ $disk_count -eq 4 ]]; then
+            log_success "All 4 disks verified in storage"
+        else
+            log_warning "Expected 4 disks, found $disk_count"
+        fi
+    fi
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$all_ok" == "true" && ${#disk_times[@]} -eq 4 ]]; then
+        log_success "Multi-disk sequential timing test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Multi-disk sequential timing test failed - only ${#disk_times[@]}/4 disks created"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - ${#disk_times[@]}/4 disks created")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 33: Mixed Concurrent Operations
+# ============================================================================
+
+test_mixed_concurrent_operations() {
+    local test_num=$1
+    local test_name="Mixed Concurrent Operations (alloc+clone+free)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_clone_src=$((VMID_START + 37))
+    local vmid_alloc=$((VMID_START + 38))
+    local vmid_clone_dst=$((VMID_START + 39))
+
+    # Cleanup
+    for v in $vmid_clone_src $vmid_alloc $vmid_clone_dst; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create source VM with disk (for clone)
+    log_info "Setting up: creating clone source VM $vmid_clone_src with disk"
+    if ! qm create "$vmid_clone_src" -name "test-mixed-clone-src" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create clone source VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone source VM creation failed")
+        return 1
+    fi
+
+    local src_volid
+    src_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_clone_src" \
+        -filename "vm-${vmid_clone_src}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$src_volid" || "$src_volid" == *"error"* ]]; then
+        log_error "Failed to allocate clone source disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Source disk alloc failed")
+        return 1
+    fi
+
+    if ! qm set "$vmid_clone_src" -scsi0 "$src_volid" >/dev/null 2>&1; then
+        log_error "Failed to attach source disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Source disk attach failed")
+        return 1
+    fi
+
+    # Setup: Create empty VM (for alloc) and a detached disk (for free)
+    log_info "Setting up: creating alloc target VM $vmid_alloc with detached free-target disk"
+    if ! qm create "$vmid_alloc" -name "test-mixed-alloc" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Alloc target VM creation failed")
+        return 1
+    fi
+
+    # Create a detached disk on the alloc VM to be freed
+    local free_volid
+    free_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
+        log_error "Failed to create free-target disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Free-target disk creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Launch alloc, clone, and free simultaneously
+    log_info "Concurrent: launching alloc + clone + free simultaneously"
+    local error_dir="/tmp/mixed-concurrent-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-1" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Clone operation
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_clone_src" "$vmid_clone_dst" --name "test-mixed-clone-dst" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone.result"
+        fi
+    ) &
+    local clone_pid=$!
+
+    # Free operation
+    (
+        local op_start=$(date +%s%3N)
+        pvesm free "$free_volid" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/free.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/free.result"
+        fi
+    ) &
+    local free_pid=$!
+
+    # Wait for all
+    wait "$alloc_pid" 2>/dev/null || true
+    wait "$clone_pid" 2>/dev/null || true
+    wait "$free_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local alloc_result="FAIL:0" clone_result="FAIL:0" free_result="FAIL:0"
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    [[ -f "$error_dir/clone.result" ]] && clone_result=$(cat "$error_dir/clone.result")
+    [[ -f "$error_dir/free.result" ]] && free_result=$(cat "$error_dir/free.result")
+    rm -rf "$error_dir"
+
+    local alloc_status="${alloc_result%%:*}" alloc_ms="${alloc_result##*:}"
+    local clone_status="${clone_result%%:*}" clone_ms="${clone_result##*:}"
+    local free_status="${free_result%%:*}" free_ms="${free_result##*:}"
+
+    log_info "Concurrent alloc: ${alloc_ms}ms (${alloc_status})"
+    log_info "Concurrent clone: ${clone_ms}ms (${clone_status})"
+    log_info "Concurrent free:  ${free_ms}ms (${free_status})"
+    log_info "Wall time:        ${wall_ms}ms"
+    local sequential_sum=$((alloc_ms + clone_ms + free_ms))
+    log_info "Sequential sum:   ${sequential_sum}ms"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel)"
+    fi
+
+    track_timing "mixed_concurrent_alloc" "$alloc_ms"
+    track_timing "mixed_concurrent_clone" "$clone_ms"
+    track_timing "mixed_concurrent_free" "$free_ms"
+    track_timing "mixed_concurrent_wall" "$wall_ms"
+
+    # Count successes
+    local success_count=0
+    [[ "$alloc_status" == "OK" ]] && success_count=$((success_count + 1))
+    [[ "$clone_status" == "OK" ]] && success_count=$((success_count + 1))
+    [[ "$free_status" == "OK" ]] && success_count=$((success_count + 1))
+
+    # Cleanup
+    for v in $vmid_clone_dst $vmid_alloc $vmid_clone_src; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    wait_for_vm_deletion "$vmid_clone_src" "$vmid_clone_dst" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ $success_count -eq 3 ]]; then
+        log_success "Mixed concurrent operations test passed - all 3 ops succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ $success_count -ge 1 ]]; then
+        log_warning "Mixed concurrent operations: ${success_count}/3 succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (${success_count}/3 ops succeeded)")
+    else
+        log_error "All mixed concurrent operations failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - All operations failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 34: Concurrent Clone Operations
+# ============================================================================
+
+test_concurrent_clone_operations() {
+    local test_num=$1
+    local test_name="Concurrent Clone Operations (2 simultaneous clones)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_src_a=$((VMID_START + 40))
+    local vmid_src_b=$((VMID_START + 41))
+    local vmid_dst_a=$((VMID_START + 42))
+    local vmid_dst_b=$((VMID_START + 43))
+
+    # Cleanup
+    for v in $vmid_src_a $vmid_src_b $vmid_dst_a $vmid_dst_b; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create two source VMs with disks
+    log_info "Setting up: creating source VMs with disks"
+    for pair in "$vmid_src_a:test-clone-src-a" "$vmid_src_b:test-clone-src-b"; do
+        local vid="${pair%%:*}"
+        local vname="${pair##*:}"
+
+        if ! qm create "$vid" -name "$vname" -memory 512 >/dev/null 2>&1; then
+            log_error "Failed to create source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source VM creation failed")
+            return 1
+        fi
+
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vid" \
+            -filename "vm-${vid}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+        if [[ -z "$volid" || "$volid" == *"error"* ]]; then
+            log_error "Failed to allocate disk for source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source disk allocation failed")
+            return 1
+        fi
+
+        if ! qm set "$vid" -scsi0 "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk to source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source disk attach failed")
+            return 1
+        fi
+    done
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single clone
+    log_info "Baseline: timing single clone (src_a → dst_a)"
+    local baseline_start=$(date +%s%3N)
+    if ! qm clone "$vmid_src_a" "$vmid_dst_a" --name "test-clone-dst-a-baseline" --full --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Baseline clone failed"
+        for v in $vmid_src_a $vmid_src_b; do
+            pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+        done
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline clone failed")
+        return 1
+    fi
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    log_info "Baseline clone: ${baseline_ms}ms"
+    track_timing "concurrent_clone_baseline" "$baseline_ms"
+
+    # Delete baseline clone
+    pvesh delete "/nodes/$NODE/qemu/$vmid_dst_a" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_dst_a" "$vmid_dst_a" 5
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Clone both simultaneously
+    log_info "Concurrent: cloning src_a → dst_a and src_b → dst_b simultaneously"
+    local error_dir="/tmp/concurrent-clone-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Clone A
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_src_a" "$vmid_dst_a" --name "test-clone-dst-a" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone_a.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone_a.result"
+        fi
+    ) &
+    local clone_a_pid=$!
+
+    # Clone B
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_src_b" "$vmid_dst_b" --name "test-clone-dst-b" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone_b.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone_b.result"
+        fi
+    ) &
+    local clone_b_pid=$!
+
+    # Wait for both
+    wait "$clone_a_pid" 2>/dev/null || true
+    wait "$clone_b_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local clone_a_result="FAIL:0" clone_b_result="FAIL:0"
+    [[ -f "$error_dir/clone_a.result" ]] && clone_a_result=$(cat "$error_dir/clone_a.result")
+    [[ -f "$error_dir/clone_b.result" ]] && clone_b_result=$(cat "$error_dir/clone_b.result")
+    rm -rf "$error_dir"
+
+    local clone_a_status="${clone_a_result%%:*}" clone_a_ms="${clone_a_result##*:}"
+    local clone_b_status="${clone_b_result%%:*}" clone_b_ms="${clone_b_result##*:}"
+
+    log_info "Clone A: ${clone_a_ms}ms (${clone_a_status})"
+    log_info "Clone B: ${clone_b_ms}ms (${clone_b_status})"
+    log_info "Wall time: ${wall_ms}ms"
+    log_info "2x baseline: $((baseline_ms * 2))ms"
+    if [[ $baseline_ms -gt 0 ]]; then
+        local serialization_pct=$((wall_ms * 100 / (baseline_ms * 2)))
+        log_info "Serialization ratio: ${serialization_pct}% (50% = fully parallel, 100% = fully serial)"
+        track_timing "concurrent_clone_serialization_pct" "$serialization_pct"
+    fi
+
+    track_timing "concurrent_clone_a" "$clone_a_ms"
+    track_timing "concurrent_clone_b" "$clone_b_ms"
+    track_timing "concurrent_clone_wall" "$wall_ms"
+
+    # Verify destination VMs exist with disks
+    local success_count=0
+    if [[ "$clone_a_status" == "OK" ]]; then
+        if pvesh get "/nodes/$NODE/qemu/$vmid_dst_a/config" >/dev/null 2>&1; then
+            success_count=$((success_count + 1))
+        else
+            log_warning "Clone A reported OK but VM not found"
+        fi
+    fi
+    if [[ "$clone_b_status" == "OK" ]]; then
+        if pvesh get "/nodes/$NODE/qemu/$vmid_dst_b/config" >/dev/null 2>&1; then
+            success_count=$((success_count + 1))
+        else
+            log_warning "Clone B reported OK but VM not found"
+        fi
+    fi
+
+    # Cleanup
+    for v in $vmid_dst_a $vmid_dst_b $vmid_src_a $vmid_src_b; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    wait_for_vm_deletion "$vmid_src_a" "$vmid_dst_b" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ $success_count -eq 2 ]]; then
+        log_success "Concurrent clone test passed - both clones succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ $success_count -ge 1 ]]; then
+        log_warning "Concurrent clone: ${success_count}/2 succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (${success_count}/2 clones succeeded)")
+    else
+        log_error "Both concurrent clones failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Both clones failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 35: Cross-Node Concurrent Allocations (Cluster Only)
+# ============================================================================
+
+test_cross_node_concurrent_alloc() {
+    local test_num=$1
+    local test_name="Cross-Node Concurrent Allocations"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_local=$((VMID_START + 44))
+    local vmid_remote=$((VMID_START + 45))
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create empty VMs on each node
+    log_info "Creating VM $vmid_local on local node ($NODE)"
+    if ! qm create "$vmid_local" -name "test-xnode-alloc-local" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create local VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Local VM creation failed")
+        return 1
+    fi
+
+    log_info "Creating VM $vmid_remote on remote node ($TARGET_NODE)"
+    if ! pvesh create "/nodes/$TARGET_NODE/qemu" -vmid "$vmid_remote" -name "test-xnode-alloc-remote" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create remote VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Remote VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc on local node
+    log_info "Baseline: timing single alloc on local node"
+    local baseline_start=$(date +%s%3N)
+    local baseline_volid
+    baseline_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_local" \
+        -filename "vm-${vmid_local}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    if [[ -z "$baseline_volid" || "$baseline_volid" == *"error"* ]]; then
+        log_error "Baseline allocation failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_ms}ms"
+    track_timing "xnode_alloc_baseline" "$baseline_ms"
+
+    # Remove baseline disk
+    pvesm free "$baseline_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Alloc on both nodes simultaneously
+    log_info "Concurrent: allocating on $NODE and $TARGET_NODE simultaneously"
+    local error_dir="/tmp/xnode-alloc-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Local alloc
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_local" \
+            -filename "vm-${vmid_local}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/local.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/local.result"
+        fi
+    ) &
+    local local_pid=$!
+
+    # Remote alloc
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$TARGET_NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_remote" \
+            -filename "vm-${vmid_remote}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/remote.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/remote.result"
+        fi
+    ) &
+    local remote_pid=$!
+
+    # Wait for both
+    wait "$local_pid" 2>/dev/null || true
+    wait "$remote_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local local_result="FAIL:0" remote_result="FAIL:0"
+    [[ -f "$error_dir/local.result" ]] && local_result=$(cat "$error_dir/local.result")
+    [[ -f "$error_dir/remote.result" ]] && remote_result=$(cat "$error_dir/remote.result")
+    rm -rf "$error_dir"
+
+    local local_status="${local_result%%:*}" local_ms="${local_result##*:}"
+    local remote_status="${remote_result%%:*}" remote_ms="${remote_result##*:}"
+
+    log_info "Local alloc:  ${local_ms}ms (${local_status})"
+    log_info "Remote alloc: ${remote_ms}ms (${remote_status})"
+    log_info "Wall time:    ${wall_ms}ms"
+    log_info "2x baseline:  $((baseline_ms * 2))ms"
+    if [[ $baseline_ms -gt 0 ]]; then
+        local serialization_pct=$((wall_ms * 100 / (baseline_ms * 2)))
+        log_info "Serialization ratio: ${serialization_pct}% (50% = fully parallel, 100% = fully serial)"
+        track_timing "xnode_alloc_serialization_pct" "$serialization_pct"
+    fi
+
+    track_timing "xnode_alloc_local" "$local_ms"
+    track_timing "xnode_alloc_remote" "$remote_ms"
+    track_timing "xnode_alloc_wall" "$wall_ms"
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_local" "$vmid_local" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$local_status" == "OK" && "$remote_status" == "OK" ]]; then
+        log_success "Cross-node concurrent alloc test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Cross-node concurrent alloc failed (local=$local_status, remote=$remote_status)"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - local=$local_status, remote=$remote_status")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 36: Concurrent Migration + Allocation (Cluster Only)
+# ============================================================================
+
+test_concurrent_migration_alloc() {
+    local test_num=$1
+    local test_name="Concurrent Migration + Allocation"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_migrate=$((VMID_START + 46))
+    local vmid_alloc=$((VMID_START + 47))
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create VM A with disk (migration source)
+    log_info "Creating migration source VM $vmid_migrate with disk"
+    if ! qm create "$vmid_migrate" -name "test-migrate-alloc-src" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create migration VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration VM creation failed")
+        return 1
+    fi
+
+    local migrate_volid
+    migrate_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_migrate" \
+        -filename "vm-${vmid_migrate}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [[ -z "$migrate_volid" || "$migrate_volid" == *"error"* ]]; then
+        log_error "Failed to allocate migration disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration disk alloc failed")
+        return 1
+    fi
+
+    if ! qm set "$vmid_migrate" -scsi0 "$migrate_volid" >/dev/null 2>&1; then
+        log_error "Failed to attach migration disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration disk attach failed")
+        return 1
+    fi
+
+    # Setup: Create VM B (alloc target)
+    log_info "Creating alloc target VM $vmid_alloc"
+    if ! qm create "$vmid_alloc" -name "test-migrate-alloc-target" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Alloc target VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single offline migration
+    log_info "Baseline: timing offline migration ($NODE → $TARGET_NODE)"
+    local baseline_migrate_start=$(date +%s%3N)
+    local migrate_error
+    if ! migrate_error=$(qm migrate "$vmid_migrate" "$TARGET_NODE" 2>&1); then
+        log_error "Baseline migration failed"
+        log_error "qm migrate output: ${migrate_error//$'\n'/ }"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline migration failed")
+        return 1
+    fi
+    local baseline_migrate_end=$(date +%s%3N)
+    local baseline_migrate_ms=$((baseline_migrate_end - baseline_migrate_start))
+
+    log_info "Baseline migration: ${baseline_migrate_ms}ms"
+    track_timing "migrate_alloc_baseline_migrate" "$baseline_migrate_ms"
+
+    # Migrate back for the concurrent test
+    log_info "Migrating VM back to $NODE for concurrent test"
+    if ! migrate_error=$(pvesh create "/nodes/$TARGET_NODE/qemu/$vmid_migrate/migrate" -target "$NODE" 2>&1); then
+        log_error "Failed to migrate back to $NODE"
+        log_error "pvesh migrate output: ${migrate_error//$'\n'/ }"
+        pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration back failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc
+    log_info "Baseline: timing single alloc"
+    local baseline_alloc_start=$(date +%s%3N)
+    local baseline_alloc_volid
+    baseline_alloc_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    local baseline_alloc_end=$(date +%s%3N)
+    local baseline_alloc_ms=$((baseline_alloc_end - baseline_alloc_start))
+
+    if [[ -z "$baseline_alloc_volid" || "$baseline_alloc_volid" == *"error"* ]]; then
+        log_error "Baseline alloc failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_alloc_ms}ms"
+    track_timing "migrate_alloc_baseline_alloc" "$baseline_alloc_ms"
+
+    # Remove baseline alloc disk
+    pvesm free "$baseline_alloc_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Migration + alloc simultaneously
+    log_info "Concurrent: migrating VM $vmid_migrate to $TARGET_NODE + allocating disk for VM $vmid_alloc"
+    local error_dir="/tmp/migrate-alloc-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Migration operation
+    (
+        local op_start=$(date +%s%3N)
+        qm migrate "$vmid_migrate" "$TARGET_NODE" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/migrate.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/migrate.result"
+        fi
+    ) &
+    local migrate_pid=$!
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Wait for both
+    wait "$migrate_pid" 2>/dev/null || true
+    wait "$alloc_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local migrate_result="FAIL:0" alloc_result="FAIL:0"
+    [[ -f "$error_dir/migrate.result" ]] && migrate_result=$(cat "$error_dir/migrate.result")
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    rm -rf "$error_dir"
+
+    local migrate_status="${migrate_result%%:*}" migrate_ms="${migrate_result##*:}"
+    local alloc_status="${alloc_result%%:*}" alloc_ms="${alloc_result##*:}"
+
+    log_info "Migration:      ${migrate_ms}ms (${migrate_status})"
+    log_info "Allocation:     ${alloc_ms}ms (${alloc_status})"
+    log_info "Wall time:      ${wall_ms}ms"
+    local sequential_sum=$((baseline_migrate_ms + baseline_alloc_ms))
+    log_info "Sequential sum: ${sequential_sum}ms (baseline migrate + baseline alloc)"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel)"
+    fi
+
+    track_timing "migrate_alloc_concurrent_migrate" "$migrate_ms"
+    track_timing "migrate_alloc_concurrent_alloc" "$alloc_ms"
+    track_timing "migrate_alloc_wall" "$wall_ms"
+
+    # Verify: VM A should be on TARGET_NODE
+    if [[ "$migrate_status" == "OK" ]]; then
+        if pvesh get "/nodes/$TARGET_NODE/qemu/$vmid_migrate/config" >/dev/null 2>&1; then
+            log_success "VM $vmid_migrate verified on $TARGET_NODE"
+        else
+            log_warning "Migration reported OK but VM not found on $TARGET_NODE"
+        fi
+    fi
+
+    # Verify: VM B should have a disk
+    if [[ "$alloc_status" == "OK" ]]; then
+        local disk_count
+        disk_count=$(pvesm list "$STORAGE_ID" --vmid "$vmid_alloc" 2>/dev/null | tail -n +2 | wc -l)
+        if [[ $disk_count -ge 1 ]]; then
+            log_success "VM $vmid_alloc has $disk_count disk(s)"
+        else
+            log_warning "Alloc reported OK but no disks found for VM $vmid_alloc"
+        fi
+    fi
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_migrate" "$vmid_alloc" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$migrate_status" == "OK" && "$alloc_status" == "OK" ]]; then
+        log_success "Concurrent migration+alloc test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Concurrent migration+alloc failed (migrate=$migrate_status, alloc=$alloc_status)"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - migrate=$migrate_status, alloc=$alloc_status")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
 # Performance Summary Table
 # ============================================================================
 
@@ -5798,6 +6921,101 @@ main() {
     test_num=$((test_num + 1))
     fi
     check_stop_phase 30
+
+    # Phase 31: Concurrent Alloc+Free Lock Contention
+    if [[ $START_PHASE -gt 31 ]]; then
+        log_info "Skipping Phase 31 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 31: Concurrent Alloc+Free Lock Contention" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_concurrent_alloc_free_contention "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 31
+
+    # Phase 32: Multi-Disk Sequential Timing
+    if [[ $START_PHASE -gt 32 ]]; then
+        log_info "Skipping Phase 32 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 32: Multi-Disk Sequential Timing" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_multi_disk_sequential_timing "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 32
+
+    # Phase 33: Mixed Concurrent Operations
+    if [[ $START_PHASE -gt 33 ]]; then
+        log_info "Skipping Phase 33 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 33: Mixed Concurrent Operations" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_mixed_concurrent_operations "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 33
+
+    # Phase 34: Concurrent Clone Operations
+    if [[ $START_PHASE -gt 34 ]]; then
+        log_info "Skipping Phase 34 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 34: Concurrent Clone Operations" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_concurrent_clone_operations "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 34
+
+    # Cluster-based concurrent tests (only if cluster detected)
+    if [[ $IS_CLUSTER -eq 1 ]]; then
+        # Phase 35: Cross-Node Concurrent Allocations
+        if [[ $START_PHASE -gt 35 ]]; then
+            log_info "Skipping Phase 35 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 35: Cross-Node Concurrent Allocations" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_cross_node_concurrent_alloc "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+
+        # Phase 36: Concurrent Migration + Allocation
+        if [[ $START_PHASE -gt 36 ]]; then
+            log_info "Skipping Phase 36 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 36: Concurrent Migration + Allocation" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_concurrent_migration_alloc "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+    else
+        log_info "Skipping cluster-based concurrent tests (Phases 35-36) - not in a cluster or no target node available"
+        echo | tee -a "$LOG_FILE"
+    fi
+    check_stop_phase 36
 
     # Performance Summary
     print_performance_summary

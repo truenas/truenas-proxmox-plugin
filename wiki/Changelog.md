@@ -1,5 +1,39 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.8 (March 20, 2026)
+
+### Concurrency Improvements
+
+#### Deferred I/O after CFS lock release
+- **`cluster_lock_storage` now runs local I/O after lock release**: Storage operations (alloc, clone, free) previously held the Proxmox Cluster File System (CFS) lock while performing local I/O — iSCSI session login, SCSI rescan, device discovery polling, and `udevadm settle`. These operations now execute *after* the lock is released via a new `_defer_after_lock()` mechanism, allowing other nodes and processes to acquire the lock sooner. `activate_volume` still handles device discovery as a safety net if the deferred work doesn't complete in time
+- **Re-entrancy safe**: Deferred work queues are localized per lock invocation, so nested `cluster_lock_storage` calls (e.g., from bulk provisioning) each get their own independent queue
+
+#### Batch disk name finding
+- **Single-query disk name resolution**: `_find_free_disk_name()` replaces the previous loop that called `_tn_dataset_get()` per candidate name (vm-VMID-disk-0, disk-1, ...) with a single `pool.dataset.query` call using a regex filter, then checks candidates against the result set in memory. For VMs with existing disks, this eliminates N sequential API round-trips
+
+#### Target ID caching
+- **`_resolve_target_id` results cached per-process**: The iSCSI target ID lookup (which queries `iscsi.target.query`) is now cached in `%_target_id_cache`, avoiding redundant API calls when the same target is resolved multiple times within a single operation (e.g., preflight check + allocation both need the target ID). Cache is cleared alongside the main API cache via `_clear_cache()`
+
+#### LUN extraction from create response
+- **LUN ID extracted directly from `iscsi.targetextent.create` response**: Previously, after creating a target-extent mapping, the plugin re-fetched the full target-extent list to find the LUN ID. The create response already contains the assigned LUN, so it is now extracted directly, saving one API round-trip per allocation
+
+#### Preflight check caching
+- **30-second preflight cache**: `_preflight_check_alloc()` results are cached for 30 seconds. When creating multiple disks for the same VM in rapid succession (e.g., a 4-disk VM), only the first allocation runs the full 7-step preflight validation; subsequent allocations within the window skip it entirely
+
+### Concurrency Test Results
+
+Tested on Proxmox 3-node cluster with TrueNAS SCALE 25.10.0. Parallelism ratio = wall time / sequential sum (lower = more parallel, 50% = fully parallel, 100% = fully serial).
+
+| Test | iSCSI | NVMe/TCP |
+|------|:-----:|:--------:|
+| **Alloc + Free simultaneously** | **53%** parallelism (11.8s wall vs 22.1s sequential) | **60%** (8.5s vs 14.1s) |
+| **Alloc + Clone + Free simultaneously** | **46%** (23.5s vs 50.3s) | **53%** (27.3s vs 51.2s) |
+| **Two concurrent clones** | **65%** serialization (28.3s wall vs 2x21.7s baseline) | **73%** (17.0s vs 2x11.6s) |
+| **Cross-node concurrent alloc** | **70%** serialization (11.5s vs 2x8.1s) | **88%** (9.9s vs 2x5.6s) |
+| **Migration + alloc simultaneously** | **77%** parallelism (8.8s vs 11.3s sequential) | **66%** (5.5s vs 8.2s) |
+
+---
+
 ## Version 2.0.7 (March 20, 2026)
 
 ### Bug Fixes
@@ -9,6 +43,8 @@
 
 #### Controller-specific NVMe disconnect
 - **Targeted controller disconnect**: `_nvme_disconnect()` now disconnects individual controllers by device path (`nvme disconnect -d /dev/nvmeX`) instead of disconnecting all controllers for the entire subsystem NQN. This prevents recovery logic in `_nvme_device_for_uuid()` from disrupting other storages or multipath connections sharing the same subsystem. Falls back to NQN-wide disconnect if controller-specific disconnect is unavailable
+
+---
 
 ## Version 2.0.6 (March 12, 2026)
 

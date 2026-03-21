@@ -1,3 +1,13 @@
+truenas-proxmox-plugin (2.0.8+deb1) unstable; urgency=medium
+
+  * Deferred I/O after CFS lock release for improved concurrent operation throughput
+  * Batch disk name finding via single pool.dataset.query call
+  * Target ID caching to avoid redundant iscsi.target.query API calls
+  * LUN ID extraction from iscsi.targetextent.create response (saves API round-trip)
+  * 30-second preflight check caching for multi-disk VM creation
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (2.0.7+deb1) unstable; urgency=medium
 
   * NVMe write operations (subsystem/port/namespace create) use ephemeral WebSocket connections
