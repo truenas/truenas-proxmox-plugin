@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.9 (March 20, 2026)
+
+### Bug Fixes
+
+- **Fix stale NVMe subsystem entry preventing connection**: `_nvme_is_connected()` now verifies a live TCP controller exists, not just the NQN string in `nvme list-subsys` output. A stale kernel subsystem entry (NQN present but no active TCP transport) previously caused `_nvme_connect()` to skip connection, leaving VMs unable to start with no visible block devices
+- **Handle "already connected" during NVMe reconnect**: When NVMe controllers are in connecting/resetting state (e.g., after NVMe-oF service restart), `nvme connect` returns "already connected". This is now treated as success instead of failure, allowing the plugin to proceed with device discovery
+- **Include stderr in NVMe connect failure logs**: Connection failure log messages now include the raw stderr output from `nvme connect` for easier production debugging
+
 ## Version 2.0.8 (March 20, 2026)
 
 ### Concurrency Improvements

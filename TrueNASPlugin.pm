@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.8';
+our $VERSION = '2.0.9';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -2756,12 +2756,19 @@ sub _nvme_is_connected {
     my ($scfg) = @_;
     my $nqn = $scfg->{subsystem_nqn};
 
+    my $in_our_subsys = 0;
     my $connected = 0;
     eval {
         run_command(['nvme', 'list-subsys'],
             outfunc => sub {
                 my $line = shift;
-                $connected = 1 if $line =~ /\Q$nqn\E/;
+                if ($line =~ /NQN=/) {
+                    # New subsystem section — check if it's ours
+                    $in_our_subsys = ($line =~ /\Q$nqn\E/) ? 1 : 0;
+                } elsif ($in_our_subsys && $line =~ /tcp\s.*\blive\b/) {
+                    # Found a live TCP transport controller for our subsystem
+                    $connected = 1;
+                }
             },
             errfunc => sub {}
         );
@@ -2817,16 +2824,23 @@ sub _nvme_connect {
             push @cmd, '--dhchap-ctrl-secret', $dhchap_ctrl_secret;
         }
 
+        my $connect_stderr = '';
         eval {
             run_command(\@cmd,
                 outfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] nvme connect: " . shift); },
-                errfunc => sub { _log($scfg, 1, 'warning', "[TrueNAS] nvme connect error: " . shift); }
+                errfunc => sub { $connect_stderr .= shift; }
             );
             $connected_count++;
         };
         if ($@) {
-            # Log warning but continue - may already be connected or portal unreachable
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $@");
+            if ($connect_stderr =~ /already connected/i) {
+                # Controller exists but may be reconnecting — treat as success
+                _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: portal $portal already connected (controller may be recovering)");
+                $connected_count++;
+            } else {
+                my $detail = $connect_stderr ? " (stderr: $connect_stderr)" : '';
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $@$detail");
+            }
         }
     }
 
