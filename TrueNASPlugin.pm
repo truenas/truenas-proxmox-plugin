@@ -41,6 +41,12 @@ package PVE::Storage::Custom::TrueNASPlugin;
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # 60 seconds
 
+# Per-process cache for _resolve_target_id results (avoids redundant API calls)
+my %_target_id_cache;
+
+# Per-process cache for preflight check results (time-based, 30s validity)
+my $_preflight_last_ok = 0;
+
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
@@ -106,6 +112,8 @@ sub _clear_cache {
         # Clear all cache
         %API_CACHE = ();
     }
+    # Also clear the target ID cache
+    %_target_id_cache = ();
 }
 
 # ======== Helper functions ========
@@ -1977,6 +1985,48 @@ sub _tn_targets {
     return $list // [];
 }
 
+# Find the first free disk name for a VM using a single batch query.
+# Replaces the naive loop that called _tn_dataset_get per candidate name.
+sub _find_free_disk_name {
+    my ($scfg, $vmid) = @_;
+    my $dataset = $scfg->{dataset};
+    my $prefix = "vm-$vmid-disk-";
+
+    # Single query: fetch all children of the parent dataset matching our VM's prefix
+    # Escape regex special chars in dataset path (TrueNAS uses Python regex)
+    (my $dataset_escaped = $dataset) =~ s/([.+*?^()\[\]{}|\\])/\\$1/g;
+    my $children = eval {
+        _api_call($scfg, 'pool.dataset.query', [
+            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/${prefix}"]]
+        ]);
+    };
+    my %existing;
+    if ($children && ref($children) eq 'ARRAY') {
+        %existing = map { $_->{id} => 1 } @$children;
+    }
+
+    for (my $n = 0; $n < 1000; $n++) {
+        my $candidate = "${prefix}$n";
+        if (!$existing{"$dataset/$candidate"}) {
+            return $candidate;
+        }
+    }
+
+    die sprintf(
+        "Unable to find free disk name after 1000 attempts (VM %d)\n\n" .
+        "This usually indicates:\n" .
+        "  1. Too many disks already exist for this VM (max: 1000)\n" .
+        "  2. Naming conflicts with existing volumes\n\n" .
+        "Dataset: %s\n" .
+        "Pattern attempted: vm-%d-disk-0 through vm-%d-disk-999\n\n" .
+        "Troubleshooting:\n" .
+        "  - Check TrueNAS dataset '%s' for orphaned volumes\n" .
+        "  - Verify API connectivity and permissions\n" .
+        "  - Check TrueNAS logs: /var/log/middlewared.log\n",
+        $vmid, $dataset, $vmid, $vmid, $dataset
+    );
+}
+
 # Generate a deterministic, globally unique iSCSI extent name.
 # Format: "<zname>-<8-char-sha1-hex>" derived from the full dataset path.
 # Weight volumes (pve-weight-*) are exempt and keep name == zname.
@@ -2068,8 +2118,15 @@ sub _current_lun_for_zname($scfg, $zname) {
 
 # Pre-flight validation checks before volume allocation
 # Returns arrayref of error messages (empty if all checks pass)
+# Results are cached for 30 seconds to avoid redundant checks during multi-disk creation.
 sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
+
+    # Skip redundant preflight checks when allocating multiple disks rapidly
+    if (time() - $_preflight_last_ok < 30) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok) . "s ago)");
+        return [];
+    }
 
     my @errors;
     my $mode = $scfg->{transport_mode} // 'iscsi';
@@ -2203,13 +2260,23 @@ sub _preflight_check_alloc {
         push @errors, "Cannot verify parent dataset: $@";
     }
 
+    # Cache successful result for 30s to speed up multi-disk creation
+    $_preflight_last_ok = time() if !@errors;
+
     return \@errors;
 }
 
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
+# Result is cached per IQN to avoid redundant API calls within the same process.
 sub _resolve_target_id {
     my ($scfg) = @_;
     my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
+
+    # Return cached result if available
+    if (exists $_target_id_cache{$want}) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _resolve_target_id: using cached target_id=$_target_id_cache{$want} for $want");
+        return $_target_id_cache{$want};
+    }
 
     # 1) Get targets; if empty, surface a clear diagnostic
     my $targets = _tn_targets($scfg) // [];
@@ -2278,6 +2345,7 @@ sub _resolve_target_id {
             $want
         );
     }
+    $_target_id_cache{$want} = $found->{id};
     return $found->{id};
 }
 
@@ -3819,29 +3887,7 @@ sub alloc_image {
     # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
     my $zname = $name;
     if (!$zname) {
-        # naive free name finder: vm-<vmid>-disk-0...999
-        for (my $n = 0; $n < 1000; $n++) {
-            my $candidate = "vm-$vmid-disk-$n";
-            my $full = $scfg->{dataset} . '/' . $candidate;
-            my $exists = eval { _tn_dataset_get($scfg, $full) };
-            if ($@ || !$exists) { $zname = $candidate; last; }
-        }
-        if (!$zname) {
-            die sprintf(
-                "Unable to find free disk name after 1000 attempts (VM %d)\n\n" .
-                "This usually indicates:\n" .
-                "  1. Too many disks already exist for this VM (max: 1000)\n" .
-                "  2. TrueNAS dataset query failures preventing name verification\n" .
-                "  3. Naming conflicts with existing volumes\n\n" .
-                "Dataset: %s\n" .
-                "Pattern attempted: vm-%d-disk-0 through vm-%d-disk-999\n\n" .
-                "Troubleshooting:\n" .
-                "  - Check TrueNAS dataset '%s' for orphaned volumes\n" .
-                "  - Verify API connectivity and permissions\n" .
-                "  - Check TrueNAS logs: /var/log/middlewared.log\n",
-                $vmid, $scfg->{dataset}, $vmid, $vmid, $scfg->{dataset}
-            );
-        }
+        $zname = _find_free_disk_name($scfg, $vmid);
     }
 
     my $full_ds = $scfg->{dataset} . '/' . $zname;
@@ -3987,6 +4033,7 @@ sub _alloc_image_iscsi {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
 
+    my $lun;
     if (!$existing_map) {
         # Mapping doesn't exist, create it
         _log($scfg, 2, 'debug', "[TrueNAS] alloc_image: creating target-extent mapping for extent_id=$extent_id to target_id=$target_id");
@@ -3997,20 +4044,24 @@ sub _alloc_image_iscsi {
             [ $tx_payload ],
         );
 
-        # Invalidate cache after creating new mapping to ensure we get fresh data
+        # Extract LUN directly from create response (avoids a re-fetch query)
+        $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
+
+        # Invalidate cache after creating new mapping
         _clear_cache($scfg->{storeid} || 'unknown');
 
-        # Re-fetch mappings to get the newly created one
-        $maps = _tn_targetextents($scfg) // [];
-        ($existing_map) = grep {
-            (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-        } @$maps;
+        # Fallback: re-fetch if create response didn't include lunid
+        if (!defined $lun) {
+            $maps = _tn_targetextents($scfg) // [];
+            ($existing_map) = grep {
+                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+            } @$maps;
+            $lun = $existing_map->{lunid} if $existing_map;
+        }
     } else {
         _log($scfg, 1, 'info', "[TrueNAS] alloc_image: target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
+        $lun = $existing_map->{lunid};
     }
-
-    # 4) Find the lunid that TrueNAS assigned for this (target, extent)
-    my $lun = $existing_map ? $existing_map->{lunid} : undef;
     if (!defined $lun) {
         die sprintf(
             "Could not determine assigned LUN for disk '%s'\n\n" .
@@ -4031,94 +4082,96 @@ sub _alloc_image_iscsi {
         );
     }
 
-    # 5) Ensure iSCSI login, then refresh initiator view on this node
-    if (!_target_sessions_active($scfg)) {
-        # No sessions exist yet - login first
-        _log($scfg, 1, 'info', "[TrueNAS] alloc_image: no active iSCSI sessions detected - attempting login to target $scfg->{target_iqn}");
-        eval { _iscsi_login_all($scfg); };
-        if ($@) {
-            _log($scfg, 0, 'warning', "[TrueNAS] alloc_image: iSCSI login failed: $@");
-            die "Failed to establish iSCSI session: $@\n";
-        }
-    }
-    # Now rescan to detect the new LUN
-    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-    if ($scfg->{use_multipath}) {
-        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
-    }
-    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
-
-    # 6) Verify device is accessible before returning success
-    my $device_ready = 0;
-    # Progressive backoff: 0ms, 100ms, 250ms, 250ms, 250ms... (up to 5 seconds total)
-    my @retry_delays = (0, 100_000, 250_000);  # First 3 attempts: immediate, 100ms, 250ms
-    for my $attempt (1..20) { # Wait up to 5 seconds for device to appear
-        eval {
-            my $dev = _device_for_lun($scfg, $lun);
-            if ($dev && -e $dev && -b $dev) {
-                _log($scfg, 2, 'debug', "[TrueNAS] alloc_image: device $dev is ready for LUN $lun (attempt $attempt)");
-                $device_ready = 1;
-            }
-        };
-        last if $device_ready;
-
-        if ($attempt % 4 == 0) {
-            # Extra discovery/rescan every second (every 4th attempt after initial burst)
-            eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
-            if ($scfg->{use_multipath}) {
-                eval { _try_run(['multipath','-r'], "multipath reload"); };
-            }
-            eval { run_command(['udevadm','settle'], outfunc => sub {}); };
-        }
-
-        # Progressive backoff: first few attempts faster, then 250ms thereafter
-        my $delay = $retry_delays[$attempt - 1] // 250_000;
-        usleep($delay) if $delay > 0;
-    }
-
-    if (!$device_ready) {
-        die sprintf(
-            "Volume created but device not accessible after 5 seconds\n\n" .
-            "LUN: %d\n" .
-            "Target IQN: %s\n" .
-            "Dataset: %s\n" .
-            "Disk name: %s\n\n" .
-            "The zvol and iSCSI configuration were created successfully,\n" .
-            "but the Linux block device did not appear on this node.\n\n" .
-            "Common causes:\n" .
-            "  1. iSCSI session not logged in or stale\n" .
-            "     -> Check: iscsiadm -m session\n" .
-            "     -> Fix: iscsiadm -m node -T %s -p %s --login\n" .
-            "  2. udev rules preventing device creation\n" .
-            "     -> Check: ls -la /dev/disk/by-path/ | grep %s\n" .
-            "  3. Multipath misconfiguration (if enabled)\n" .
-            "     -> Check: multipath -ll\n" .
-            "  4. Firewall blocking iSCSI traffic (port 3260)\n" .
-            "     -> Check: iptables -L | grep 3260\n\n" .
-            "The volume exists on TrueNAS but needs manual cleanup or\n" .
-            "re-login to iSCSI target to become accessible.\n",
-            $lun, $scfg->{target_iqn}, $full_ds, $zname,
-            $scfg->{target_iqn}, $scfg->{discovery_portal},
-            $scfg->{target_iqn}
-        );
-    }
-
-    # 7) Return our encoded volname so Proxmox can store it in the VM config
+    # 5) Return volname immediately — device discovery is deferred after lock release.
+    # activate_volume handles authoritative device discovery before any VM uses the disk.
     my $volname = "vol-$zname-lun$lun";
+
+    # Defer local I/O operations (iSCSI login, rescan, device polling) to run after CFS lock release
+    my $deferred_scfg = $scfg;  # capture for closure
+    my $deferred_lun = $lun;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: starting iSCSI device discovery for LUN $deferred_lun");
+
+        # Ensure iSCSI login
+        if (!_target_sessions_active($deferred_scfg)) {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
+            eval { _iscsi_login_all($deferred_scfg); };
+            if ($@) {
+                _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
+                return;
+            }
+        }
+
+        # Rescan to detect the new LUN
+        eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+        if ($deferred_scfg->{use_multipath}) {
+            eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+        }
+        eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+
+        # Best-effort device verification with reduced retries
+        my $device_ready = 0;
+        for my $attempt (1..8) {
+            eval {
+                my $dev = _device_for_lun($deferred_scfg, $deferred_lun);
+                if ($dev && -e $dev && -b $dev) {
+                    _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: device $dev ready for LUN $deferred_lun (attempt $attempt)");
+                    $device_ready = 1;
+                }
+            };
+            last if $device_ready;
+            usleep(250_000);  # 250ms between attempts
+            if ($attempt % 4 == 0) {
+                eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan"); };
+                eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+            }
+        }
+        if (!$device_ready) {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: device not yet visible for LUN $deferred_lun (activate_volume will handle)");
+        }
+    });
+
     return $volname;
 }
 
-# NVMe-specific allocation (create namespace, wait for device)
+# NVMe-specific allocation (create namespace, defer device discovery)
 sub _alloc_image_nvme {
     my ($class, $scfg, $zname, $full_ds, $zvol_path) = @_;
 
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: creating NVMe namespace for $zname");
 
-    # Create namespace and get device_uuid
-    my $device_uuid = _nvme_create_namespace($scfg, $zname, $full_ds, $zvol_path);
+    # Create namespace on TrueNAS (locked section — API calls only)
+    my $subsys_id = _nvme_ensure_subsystem($scfg);
+    my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [{
+        device_type => 'ZVOL',
+        device_path => $zvol_path,
+        subsys_id => $subsys_id,
+        enabled => JSON::PP::true,
+    }]);
+    my $device_uuid = $ns->{device_uuid};
+    die "Failed to get device_uuid from namespace creation\n" unless $device_uuid;
+    _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
-    # Return encoded volname
+    # Return volname immediately — defer connect + device discovery
     my $volname = "vol-$zname-ns$device_uuid";
+
+    my $deferred_scfg = $scfg;
+    my $deferred_uuid = $device_uuid;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image_nvme deferred: connecting and discovering device for UUID $deferred_uuid");
+        eval { _nvme_connect($deferred_scfg); };
+        if ($@) {
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: NVMe connect failed (activate_volume will retry): $@");
+            return;
+        }
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        if ($dev) {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
+        } else {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device not yet visible (activate_volume will handle)");
+        }
+    });
+
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: volume created successfully: $volname");
     return $volname;
 }
@@ -4390,46 +4443,45 @@ sub _free_image_iscsi {
         warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
-    # 6) Skip re-login after volume deletion - the device is gone, no need to reconnect
-    if ($need_force_logout) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: skipping re-login after volume deletion (device is gone)");
+    # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
+    my $deferred_scfg = $scfg;
+    my $deferred_need_force_logout = $need_force_logout;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_iscsi deferred: post-deletion cleanup");
 
-        # Just clean up any stale multipath mappings without reconnecting
-        if ($scfg->{use_multipath}) {
-            eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
-        }
-        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
-    } else {
-        eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
-        if ($scfg->{use_multipath}) {
-            eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
-        }
-        eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
-    }
-
-    # Self-healing: Verify weight volume exists after deletion
-    # This prevents target undiscoverability when all VM volumes are deleted
-    # IMPORTANT: Must run BEFORE logout_on_free to avoid race condition where
-    # we logout before creating the weight volume, leaving it unmapped
-    eval {
-        _log($scfg, 2, 'debug', "[TrueNAS] free_image: self-healing: verifying weight volume after deletion");
-        _ensure_target_visible($scfg);
-    };
-    if ($@) {
-        # Non-fatal warning - weight verification failed but volume deletion succeeded
-        _log($scfg, 0, 'warning', "[TrueNAS] free_image: self-healing: weight volume verification failed: $@");
-    }
-
-    # Optional: logout if no LUNs remain for this target on this node
-    # Runs AFTER self-healing so weight volume is created before we check LUN count
-    if ($scfg->{logout_on_free}) {
-        eval {
-            if (_session_has_no_luns($scfg)) {
-                _logout_target_all_portals($scfg);
+        if ($deferred_need_force_logout) {
+            # Just clean up stale multipath mappings without reconnecting
+            if ($deferred_scfg->{use_multipath}) {
+                eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
             }
+            eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+        } else {
+            eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
+            if ($deferred_scfg->{use_multipath}) {
+                eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
+            }
+            eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+        }
+
+        # Self-healing: Verify weight volume exists after deletion
+        eval {
+            _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image deferred: self-healing: verifying weight volume");
+            _ensure_target_visible($deferred_scfg);
         };
-        warn "warning: logout_on_free check failed: $@" if $@;
-    }
+        if ($@) {
+            _log($deferred_scfg, 0, 'warning', "[TrueNAS] free_image deferred: self-healing: weight volume verification failed: $@");
+        }
+
+        # Optional: logout if no LUNs remain for this target on this node
+        if ($deferred_scfg->{logout_on_free}) {
+            eval {
+                if (_session_has_no_luns($deferred_scfg)) {
+                    _logout_target_all_portals($deferred_scfg);
+                }
+            };
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] free_image deferred: logout_on_free check failed: $@") if $@;
+        }
+    });
 
     return undef;
 }
@@ -4563,8 +4615,12 @@ sub _free_image_nvme {
         warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
     }
 
-    # 4) Clean up udev
-    eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+    # 4) Defer udev cleanup after lock release
+    my $deferred_scfg = $scfg;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_nvme deferred: udev settle");
+        eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+    });
 
     return undef;
 }
@@ -5170,6 +5226,7 @@ sub activate_volume {
             $err .= "\n" if $err !~ /\n\z/;
             die $err;
         }
+
     } elsif ($mode eq 'nvme-tcp') {
         _nvme_connect($scfg);
 
@@ -5229,17 +5286,7 @@ sub _clone_image_iscsi {
     # Determine target dataset name
     my $target_zname = $name;
     if (!$target_zname) {
-        # Generate automatic name: vm-<vmid>-disk-<n>
-        for (my $n = 0; $n < 1000; $n++) {
-            my $candidate = "vm-$vmid-disk-$n";
-            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
-            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
-            if ($@ || !$exists) {
-                $target_zname = $candidate;
-                last;
-            }
-        }
-        die "unable to find free clone name\n" if !$target_zname;
+        $target_zname = _find_free_disk_name($scfg, $vmid);
     }
 
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
@@ -5307,6 +5354,7 @@ sub _clone_image_iscsi {
         (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
     } @$maps;
 
+    my $lun;
     if (!$existing_map) {
         # Mapping doesn't exist, create it
         _log($scfg, 2, 'debug', "[TrueNAS] _clone_image_iscsi: creating target-extent mapping for extent_id=$extent_id to target_id=$target_id");
@@ -5327,31 +5375,40 @@ sub _clone_image_iscsi {
             die "Failed to create target-extent mapping for clone: $@\n";
         }
 
+        # Extract LUN directly from create response (avoids a re-fetch query)
+        $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
+
         # Invalidate cache after creating new mapping
         _clear_cache($scfg->{storeid} || 'unknown');
 
-        # Re-fetch mappings to get the newly created one
-        $maps = _tn_targetextents($scfg) // [];
-        ($existing_map) = grep {
-            (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-        } @$maps;
+        # Fallback: re-fetch if create response didn't include lunid
+        if (!defined $lun) {
+            $maps = _tn_targetextents($scfg) // [];
+            ($existing_map) = grep {
+                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+            } @$maps;
+            $lun = $existing_map->{lunid} if $existing_map;
+        }
     } else {
         _log($scfg, 1, 'info', "[TrueNAS] _clone_image_iscsi: target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
+        $lun = $existing_map->{lunid};
     }
 
-    # 4) Find assigned LUN
-    my $lun = $existing_map ? $existing_map->{lunid} : undef;
     die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
 
-    # 5) Refresh initiator view
-    eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-    if ($scfg->{use_multipath}) {
-        eval { _try_run(['multipath','-r'], "multipath reload failed"); };
-    }
-    eval { run_command(['udevadm','settle'], outfunc => sub {}); };
-
-    # 6) Return clone volume name
+    # 5) Return clone volume name — defer initiator rescan after lock release
     my $clone_volname = "vol-$target_zname-lun$lun";
+
+    my $deferred_scfg = $scfg;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_iscsi deferred: refreshing initiator view");
+        eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+        if ($deferred_scfg->{use_multipath}) {
+            eval { _try_run(['multipath','-r'], "multipath reload failed"); };
+        }
+        eval { run_command(['udevadm','settle'], outfunc => sub {}); };
+    });
+
     return $clone_volname;
 }
 
@@ -5369,17 +5426,7 @@ sub _clone_image_nvme {
     # Determine target dataset name
     my $target_zname = $name;
     if (!$target_zname) {
-        # Generate automatic name: vm-<vmid>-disk-<n>
-        for (my $n = 0; $n < 1000; $n++) {
-            my $candidate = "vm-$vmid-disk-$n";
-            my $candidate_full = $scfg->{dataset} . '/' . $candidate;
-            my $exists = eval { _tn_dataset_get($scfg, $candidate_full) };
-            if ($@ || !$exists) {
-                $target_zname = $candidate;
-                last;
-            }
-        }
-        die "unable to find free clone name\n" if !$target_zname;
+        $target_zname = _find_free_disk_name($scfg, $vmid);
     }
 
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
@@ -5439,66 +5486,26 @@ sub _clone_image_nvme {
 
     my $device_uuid = $ns->{device_uuid} // die "No device_uuid returned from namespace creation\n";
 
-    # 3) Wait for device to appear with initial settle/rescan
-    # Fresh namespaces need time for kernel to create block device
-    _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace created with UUID $device_uuid, settling...");
-
-    # Give kernel time to discover the new namespace
-    usleep(200_000);  # 200ms initial settle
-
-    # Trigger udev to pick up the new device and rescan controllers
-    eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
-    eval { _nvme_rescan_subsystem_controllers($scfg) };
-
-    # 4) Find the device (will retry internally)
-    my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
-    if (!$dev) {
-        # Cleanup on failure - with detailed instrumentation
-        _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: FAILED to locate device for UUID $device_uuid after settle/rescan");
-
-        # Query current state for diagnostics
-        my $subsys_state = eval {
-            my $nqn_match = $scfg->{subsystem_nqn};
-            my @all_lines;
-            run_command(['nvme', 'list-subsys'],
-                outfunc => sub { push @all_lines, shift },
-                errfunc => sub {}
-            );
-            # Extract lines around our NQN (up to 20 lines after match)
-            my @matched;
-            my $remaining = 0;
-            for my $line (@all_lines) {
-                if ($line =~ /\Q$nqn_match\E/) {
-                    $remaining = 20;
-                    push @matched, $line;
-                } elsif ($remaining > 0) {
-                    push @matched, $line;
-                    $remaining--;
-                }
-            }
-            join("\n", @matched);
-        } || "(could not query subsystem state)";
-        _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: subsystem state:\n$subsys_state");
-
-        # Check if namespace exists in API
-        my $ns_check = eval {
-            _api_call($scfg, 'nvmet.namespace.query', [[["device_uuid", "=", $device_uuid]]]);
-        };
-        if ($ns_check && @$ns_check) {
-            _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: namespace exists in API (NSID: $ns_check->[0]->{nsid}) but no block device visible");
-        } else {
-            _log($scfg, 0, 'err', "[TrueNAS] _clone_image_nvme: namespace not found in API");
-        }
-
-        eval {
-            _api_call($scfg, 'nvmet.namespace.delete', [ $ns->{id} ]);
-        };
-        eval { _tn_dataset_delete($scfg, $target_full) };
-        die "Device did not appear for cloned namespace (UUID: $device_uuid)\n";
-    }
-
-    # 5) Return clone volume name
+    # 3) Return clone volume name — defer device discovery after lock release.
+    # The namespace and dataset are created successfully at this point.
+    # activate_volume handles authoritative device discovery before any VM uses the disk.
     my $clone_volname = "vol-$target_zname-ns$device_uuid";
+
+    my $deferred_scfg = $scfg;
+    my $deferred_uuid = $device_uuid;
+    _defer_after_lock(sub {
+        _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_nvme deferred: discovering device for UUID $deferred_uuid");
+        usleep(200_000);  # 200ms initial settle
+        eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        if ($dev) {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device ready at $dev");
+        } else {
+            _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device not yet visible (activate_volume will handle)");
+        }
+    });
+
     return $clone_volname;
 }
 
@@ -5514,20 +5521,29 @@ sub copy_image {
 
 sub create_base { die "base images not supported"; }
 
-# ======== Extended Cluster Lock Timeout ========
-# Override cluster_lock_storage to use a longer timeout for TrueNAS operations.
+# ======== Deferred Work & Extended Lock Timeout ========
+# Override cluster_lock_storage to:
+#   1) Use a longer timeout for TrueNAS operations (default 120s vs Proxmox's 10s)
+#   2) Execute deferred work AFTER the CFS lock is released
 #
-# The default Proxmox CFS lock timeout is 10 seconds, which is too short for
-# concurrent storage operations on TrueNAS. Each disk allocation takes ~12-15
-# seconds (zvol creation + iSCSI extent + device discovery), so parallel
-# allocations (e.g., bulk VM provisioning) can queue up and timeout.
+# The deferred work pattern allows plugin methods to push local I/O operations
+# (iSCSI login, device discovery polling, udev settle) to a queue that runs
+# outside the cluster-wide lock. This dramatically reduces lock hold time for
+# concurrent operations like bulk VM provisioning.
 #
-# This override increases the timeout to 120 seconds (configurable via
-# storage_lock_timeout option), allowing more concurrent operations to succeed.
-# The lock is still cluster-wide, so operations are serialized - this just
-# prevents timeouts during the queue wait.
+# Safety: activate_volume is the authoritative device discovery point — Proxmox
+# always calls it before a VM uses a disk, so deferred discovery is best-effort.
 
 use constant DEFAULT_LOCK_TIMEOUT => 120;  # 2 minutes default, vs Proxmox's 10 seconds
+
+our @_deferred_work;
+
+# Queue a code block to execute after the current CFS lock is released.
+# Deferred work is best-effort: failures are logged but never fatal.
+sub _defer_after_lock {
+    my ($code) = @_;
+    push @_deferred_work, $code;
+}
 
 sub cluster_lock_storage {
     my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
@@ -5540,8 +5556,24 @@ sub cluster_lock_storage {
     # Override the timeout if not explicitly provided or if it's the Proxmox default
     $timeout = $lock_timeout if !defined($timeout) || $timeout < $lock_timeout;
 
-    # Call parent implementation with extended timeout
-    return $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $func, @param);
+    # Localize @_deferred_work for re-entrancy safety (nested lock calls get their own queue)
+    local @_deferred_work = ();
+
+    # Run the locked callback via parent implementation
+    my $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $func, @param);
+
+    # Execute deferred work outside the lock (best-effort, never die)
+    if (@_deferred_work) {
+        _log($scfg, 2, 'debug', "[TrueNAS] cluster_lock_storage: executing " . scalar(@_deferred_work) . " deferred operation(s) after lock release");
+        for my $work (@_deferred_work) {
+            eval { $work->() };
+            if ($@) {
+                _log($scfg, 1, 'warning', "[TrueNAS] cluster_lock_storage: deferred work failed (non-fatal): $@");
+            }
+        }
+    }
+
+    return $result;
 }
 
 1;
