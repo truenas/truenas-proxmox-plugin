@@ -1,10 +1,80 @@
 # TrueNAS Plugin Changelog
 
-## Repository Migration Note (February 6, 2026)
+## Version 2.0.7 (March 20, 2026)
 
-- Official repository home moved to <https://github.com/truenas/truenas-proxmox-plugin>
-- Official issue tracker: <https://github.com/truenas/truenas-proxmox-plugin/issues>
-- Historical changelog references to prior issue URLs may remain for archival context
+### Bug Fixes
+
+#### NVMe write operations use ephemeral WebSocket connections
+- **Subsystem, port, and namespace creation now use ephemeral connections**: `_nvme_ensure_subsystem()` and `_nvme_create_namespace()` previously used persistent WebSocket connections for write operations (`nvmet.subsys.create`, `nvmet.port.create`, `nvmet.namespace.create`), risking response desynchronization under concurrent operations. These now use `_api_call_write()` (ephemeral connections) matching the clone path which already used the correct pattern
+
+#### Controller-specific NVMe disconnect
+- **Targeted controller disconnect**: `_nvme_disconnect()` now disconnects individual controllers by device path (`nvme disconnect -d /dev/nvmeX`) instead of disconnecting all controllers for the entire subsystem NQN. This prevents recovery logic in `_nvme_device_for_uuid()` from disrupting other storages or multipath connections sharing the same subsystem. Falls back to NQN-wide disconnect if controller-specific disconnect is unavailable
+
+## Version 2.0.6 (March 12, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale device NSID false-positive matching**
+- **NGUID cross-validation on NSID matches**: When the NGUID tier fails to match any device, the NSID tier now cross-validates candidates against the API-provided NGUID. If a device has a real (non-zero) NGUID that contradicts the API, it is rejected as stale rather than returned as an exact match. This prevents the plugin from selecting a wrong device when a stale subsystem connection has a device with a coincidentally matching NSID but a different NGUID
+- **Early stale NGUID reconnect (i=10)**: A new early detection trigger at iteration 10 (~1 second) fires when NGUID contradiction is detected, reducing stale connection recovery time from ~3.5 seconds to ~1.5 seconds. Uses the same safety gates as the existing i=35 trigger (fuser check, `allow_reconnect` flag)
+
+#### **NVMe namespace selector refactor**
+- **Structured selector results**: `_nvme_find_device_by_subsystem` now returns structured `_nvme_selector_result` objects with explicit outcome classification (`exact_match`, `legacy_single_namespace_fallback`, `publication_mismatch`, `metadata_failure`), linux/API namespace counts, and mismatch reason codes for better diagnostics
+- **Tighter legacy single-device fallback**: The single-device fallback now requires both `linux_device_count == 1` AND `api_namespace_count == 1`, and is blocked entirely when NGUID or NSID metadata was usable but failed to match, preventing wrong-device selection when metadata proves the device is stale
+- **Separated metadata queries**: Namespace metadata is now fetched through `_nvme_get_namespace_selector_metadata` which cross-references both the target UUID and the subsystem namespace count, enabling publication mismatch detection
+
+#### **NVMe error message improvements**
+- **Structured failure diagnostics**: When device discovery fails, the error message now includes linux-visible device count, API namespace count, selector mismatch reason, and a human-readable explanation instead of generic failure messages
+- **Detailed selector failure labels**: Mismatch reasons like `api_namespace_not_visible_in_linux`, `namespace_metadata_did_not_match_visible_devices`, and `subsystem_not_visible` provide actionable context for troubleshooting
+
+#### **WebSocket response desynchronization fix**
+- **JSON-RPC request ID matching in `_ws_rpc`**: The WebSocket RPC function now matches response frames to requests by JSON-RPC `id` field. Previously, unsolicited TrueNAS messages (event notifications) could desynchronize the send/receive pairing, causing a `core.ping` "pong" response to be returned as the result of a subsequent API call (e.g., `pool.dataset.get_instance`), leading to `Can't use string ("pong") as a HASH ref` crashes in `status()`. Non-matching frames are now logged and skipped (up to 10)
+
+### 🔒 **Security**
+
+#### **NVMe CLI input untainting**
+- **Untaint all values passed to NVMe CLI commands**: Portal hosts, ports, NQNs, and DH-HMAC-CHAP secrets are now validated and untainted through dedicated helpers (`_nvme_untaint_cli_host`, `_nvme_untaint_cli_port`, `_nvme_untaint_cli_nqn`, `_nvme_untaint_cli_secret`) before being passed to `nvme connect`/`nvme disconnect` commands, preventing potential command injection from storage.cfg values
+
+---
+
+## Version 2.0.5 (March 10, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale NGUID recovery**
+- **Auto-reconnect on stale NGUID data**: When the TrueNAS NVMe-oF service is restarted while Proxmox has an active connection, the kernel's cached NGUID values become stale, causing UUID-based device matching to fail. The plugin now detects this condition (devices exist but NGUID never matches across 35 iterations) and automatically disconnects/reconnects the subsystem to refresh kernel metadata. This complements the existing zero-device recovery (i=25) with a new stale-data recovery path (i=35)
+- **Safety-gated reconnect with fuser check**: The stale NGUID reconnect only triggers when `allow_reconnect` is set (via `activate_volume`) AND `fuser` confirms no running process has any subsystem device open, preventing disruption to running VMs
+
+#### **NVMe clone reliability**
+- **Pre-settle and rescan after namespace creation**: `_clone_image_nvme` now performs a 200ms settle, udev settle, and controller rescan before entering the device discovery loop, improving reliability for freshly created namespaces
+- **Enhanced clone failure diagnostics**: When a cloned namespace device fails to appear, the plugin now logs subsystem state (`nvme list-subsys`) and checks whether the namespace exists in the TrueNAS API, providing actionable diagnostics instead of a generic failure message
+
+#### **NVMe namespace clone uses ephemeral connection**
+- **Fixed `_clone_image_nvme` write operation**: Namespace creation (`nvmet.namespace.create`) now routes through `_api_call_write` (ephemeral WebSocket connection) instead of `_api_call` (persistent connection), preventing response interleaving during concurrent clone operations
+
+#### **NVMe free_image device path fix**
+- **Fixed incorrect hash key in `_free_image_nvme`**: Device path extraction after `_nvme_find_device_by_subsystem` now uses the correct `device` key instead of non-existent `path` key
+
+### 🔧 **Internal Improvements**
+- **Extracted `_nvme_rescan_subsystem_controllers` helper**: Controller rescan logic extracted from inline code in `_nvme_device_for_uuid` into a reusable function, used by both device discovery (i=15) and clone settle paths
+- **New `_nvme_get_subsystem_device_paths` helper**: Collects all `/dev/nvmeXnY` block device paths belonging to the configured subsystem NQN via `/sys/block` enumeration
+- **New `_nvme_check_devices_in_use` helper**: Uses `fuser` to verify whether any subsystem devices are held open by running processes, providing safety gating for reconnect operations
+- **Match tier tracking**: `_nvme_find_device_by_subsystem` now returns a `match_tier` field (`nguid`, `nsid`, or `single`) enabling callers to detect stale NGUID conditions
+- **`_nvme_device_for_uuid` accepts `allow_reconnect` option**: New keyword argument gates the stale NGUID reconnect path; passed by `activate_volume` and `_nvme_create_namespace` but not by `path()`, ensuring read-only lookups never trigger reconnects
+
+## Version 2.0.4 (March 2, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale connection recovery**
+- **Auto-reconnect on stale NVMe subsystem**: When the TrueNAS NVMe-oF target stops publishing namespaces over an existing connection (subsystem shows connected but zero block devices appear), the plugin now automatically disconnects and reconnects the subsystem to force re-enumeration. This resolves "Could not locate NVMe device" errors on VM start without manual intervention ([#10](https://github.com/truenas/truenas-proxmox-plugin/issues/10))
+- **Safety-guarded reconnect**: Reconnect only triggers when zero block devices have been seen across all discovery iterations AND the subsystem reports as connected, ensuring running VMs are never disrupted
+
+#### **Syslog priority fix**
+- **Fixed invalid syslog `error` priority**: The `_log()` helper now normalizes `'error'` to `'err'` (valid syslog level), preventing silent failures in error logging paths that could mask device matching diagnostics
+
+### 🔧 **Internal Improvements**
+- **Enhanced device discovery return values**: `_nvme_find_device_by_subsystem` now returns device count alongside the matched device path, enabling callers to distinguish between "zero devices" (stale connection) and "devices exist but no UUID match" (different issue)
 
 ## Version 2.0.3 (February 8, 2026)
 

@@ -6,7 +6,7 @@ PLUGIN_PATH="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 
 restart_proxmox_services() {
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-        systemctl try-restart pvedaemon pveproxy || true
+        systemctl try-restart pvedaemon pveproxy pvestatd || true
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
         invoke-rc.d pveproxy restart || true

@@ -94,8 +94,8 @@ jobs:
 
       - name: Install publish dependencies
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             ca-certificates \
             dpkg-dev \
             gnupg \
@@ -170,8 +170,32 @@ jobs:
             fi
           done
 
+          changelogs_uri="Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog"
+          for suite in bookworm trixie; do
+            release="apt/dists/${suite}/Release"
+            if [[ -f "${release}" ]] && ! grep -q '^Changelogs:' "${release}"; then
+              sed -i "/^Description:/i ${changelogs_uri}" "${release}"
+            fi
+            rm -f "apt/dists/${suite}/Release.gpg" "apt/dists/${suite}/InRelease"
+            gpg --batch --yes -abs -o "apt/dists/${suite}/Release.gpg" "${release}"
+            gpg --batch --yes --clearsign -o "apt/dists/${suite}/InRelease" "${release}"
+          done
+
           gpg --batch --yes --output apt/pubkey.gpg --export "${APT_GPG_KEY_ID}"
           gpg --batch --yes --armor --output apt/pubkey.asc --export "${APT_GPG_KEY_ID}"
+
+      - name: Generate changelog for APT
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_name="$(dpkg-parsechangelog -S Source)"
+          deb_version="$(dpkg-parsechangelog -S Version)"
+          prefix="$(echo "${pkg_name}" | head -c1)"
+          changelog_dir="apt/changelogs/main/${prefix}/${pkg_name}"
+          changelog_path="${changelog_dir}/${pkg_name}_${deb_version}_changelog"
+
+          mkdir -p "${changelog_dir}"
+          cp debian/changelog "${changelog_path}"
 
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
@@ -189,7 +213,7 @@ jobs:
             for entry in apt/*; do
               name="$(basename "${entry}")"
               case "${name}" in
-                dists|pool|pubkey.gpg|pubkey.asc|InRelease|Release|Release.gpg)
+                dists|pool|changelogs|pubkey.gpg|pubkey.asc|InRelease|Release|Release.gpg)
                   ;;
                 *)
                   rm -rf "${entry}"
