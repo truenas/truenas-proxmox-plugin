@@ -5531,11 +5531,15 @@ validate_ip() {
     return 1
 }
 
-# Validate storage name format
+# Validate storage name format (must match Proxmox PVE::JSONSchema::parse_id rules)
 validate_storage_name() {
     local name="$1"
-    # Storage name should be alphanumeric with hyphens/underscores, no spaces
-    if [[ $name =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    # Must start with a letter, contain only letters/numbers/hyphens/underscores/dots,
+    # end with a letter or number, and be at least 2 characters
+    if [[ ${#name} -lt 2 ]]; then
+        return 1
+    fi
+    if [[ $name =~ ^[a-zA-Z][a-zA-Z0-9_.-]*[a-zA-Z0-9]$ ]]; then
         return 0
     fi
     return 1
@@ -9802,7 +9806,7 @@ wizard_add_storage() {
             continue
         fi
         if ! validate_storage_name "$WIZARD_STORAGE_NAME"; then
-            error "Invalid storage name. Use only letters, numbers, hyphens, and underscores"
+            error "Invalid storage name. Must start with a letter, end with a letter or number, and contain only letters, numbers, hyphens, underscores, or dots (min 2 characters)"
             continue
         fi
         if storage_name_exists "$WIZARD_STORAGE_NAME"; then
