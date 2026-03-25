@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.11 (March 25, 2026)
+
+### Bug Fixes
+
+- **Force NVMe subsystem configfs sync after namespace creation**: After creating an NVMe namespace, the plugin now calls `nvmet.subsys.update` to force TrueNAS to reapply the subsystem configuration to the kernel configfs. This works around a TrueNAS middleware bug (NAS-140266) where namespace creation succeeds at the API level but the namespace is not published to `/sys/kernel/config/nvmet/`, causing device discovery to fail and VMs to error with "stopped: unexpected status". Applied to all three namespace creation paths: `_alloc_image_nvme` (deferred), `_clone_image_nvme` (deferred), and `_nvme_create_namespace` (inline). The reapply is non-fatal — failure is logged as a warning but does not block the operation (ref: GitHub issues #7, #12)
+
+---
+
 ## Version 2.0.10 (March 21, 2026)
 
 ### NVMe Improvements
