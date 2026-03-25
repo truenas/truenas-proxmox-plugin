@@ -14,6 +14,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 - [Content Type](#content-type)
   - [content](#content)
   - [shared](#shared)
+  - [nodes](#nodes)
  - [API Configuration](#api-configuration)
   - [api_scheme](#api_scheme)
   - [api_port](#api_port)
@@ -159,6 +160,20 @@ Set to `1` for cluster configurations to enable VM migration and HA.
 
 ```ini
 shared 1
+```
+
+### `nodes`
+**Description**: Restrict storage visibility to specific cluster nodes
+**Type**: String (comma-separated node hostnames)
+**Default**: Empty (all nodes can access the storage)
+
+When set, only the listed nodes will see and be able to use this storage. Omit this parameter or leave it empty to allow all cluster nodes to access the storage. Node names must match the Proxmox hostnames exactly (as shown in `/etc/pve/nodes/`).
+
+```ini
+# Restrict to two specific nodes
+nodes pve01,pve02
+
+# Allow all nodes (default - omit the line entirely)
 ```
 
 ## API Configuration

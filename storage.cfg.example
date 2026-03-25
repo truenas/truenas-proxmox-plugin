@@ -45,6 +45,8 @@ truenasplugin: truenas-cluster
     portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
+    # Node restriction (optional - omit for all nodes)
+    # nodes pve01,pve02,pve03
     # Performance optimizations
     zvol_blocksize 128K
     tn_sparse 1
@@ -265,6 +267,7 @@ truenasplugin: truenas-soho
 #
 # Cluster:
 # - Set shared=1 for cluster configurations
+# - Use 'nodes' to restrict storage to specific cluster nodes
 # - Ensure all nodes have identical configurations
 # - Test failover scenarios regularly
 # - NVMe/TCP and iSCSI cannot be mixed on same storage ID
