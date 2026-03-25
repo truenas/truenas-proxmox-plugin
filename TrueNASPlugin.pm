@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.10';
+our $VERSION = '2.0.11';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -3743,6 +3743,12 @@ sub _nvme_create_namespace {
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: created namespace with UUID $device_uuid");
 
+    # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
+    eval { _api_call_write($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+    if ($@) {
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_create_namespace: subsystem reapply failed (non-fatal): $@");
+    }
+
     # Connect to subsystem if not already connected
     _nvme_connect($scfg);
 
@@ -4177,7 +4183,14 @@ sub _alloc_image_nvme {
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
+    my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
+        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
+        eval { _api_call_write($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        if ($@) {
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
+        }
+
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image_nvme deferred: connecting and discovering device for UUID $deferred_uuid");
         eval { _nvme_connect($deferred_scfg); };
         if ($@) {
@@ -5523,7 +5536,14 @@ sub _clone_image_nvme {
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
+    my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
+        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
+        eval { _api_call_write($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        if ($@) {
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] clone_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
+        }
+
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_nvme deferred: discovering device for UUID $deferred_uuid");
         usleep(200_000);  # 200ms initial settle
         eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
