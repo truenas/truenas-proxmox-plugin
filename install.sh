@@ -9182,6 +9182,87 @@ backup_storage_cfg() {
     return 0
 }
 
+# Prompt user to select which cluster nodes can access this storage.
+# Sets the variable named by $1 (default: "nodes") to a comma-separated list
+# of node names, or empty string for all nodes.
+# Args: $1 = variable name to set (optional, default "nodes")
+#       $2 = current nodes value for edit mode (optional)
+prompt_node_selection() {
+    local _var_name="${1:-nodes}"
+    local _current="${2:-}"
+
+    # Detect cluster nodes
+    local -a cluster_entries=()
+    local -a node_names=()
+    mapfile -t cluster_entries < <(get_cluster_nodes 2>/dev/null)
+    if [[ ${#cluster_entries[@]} -gt 1 ]]; then
+        for entry in "${cluster_entries[@]}"; do
+            node_names+=("${entry%%:*}")
+        done
+    else
+        # Single node or no cluster - skip selection
+        eval "$_var_name=''"
+        return 0
+    fi
+
+    echo
+    info "Node Restriction (limit which cluster nodes can access this storage):"
+    if [[ -n "$_current" ]]; then
+        echo "  Current: $_current"
+    fi
+    echo
+    echo "  0) All nodes (no restriction) [default]"
+    local i=1
+    for name in "${node_names[@]}"; do
+        local marker=""
+        if [[ -n "$_current" ]] && [[ ",$_current," == *",$name,"* ]]; then
+            marker=" ${c2}(currently selected)${c0}"
+        fi
+        echo -e "  $i) $name$marker"
+        ((i++))
+    done
+    echo
+    info "Enter node numbers separated by spaces (e.g., 1 3) or 0 for all:"
+
+    local selection
+    while true; do
+        read -rp "Nodes [0]: " selection
+        selection="${selection:-0}"
+
+        if [[ "$selection" == "0" ]]; then
+            eval "$_var_name=''"
+            return 0
+        fi
+
+        # Parse space-separated numbers
+        local -a selected_names=()
+        local valid=true
+        read -ra nums <<< "$selection"
+        for num in "${nums[@]}"; do
+            if [[ ! "$num" =~ ^[0-9]+$ ]] || [[ "$num" -lt 1 ]] || [[ "$num" -gt ${#node_names[@]} ]]; then
+                error "Invalid selection: $num (must be 0-${#node_names[@]})"
+                valid=false
+                break
+            fi
+            selected_names+=("${node_names[$((num-1))]}")
+        done
+
+        if [[ "$valid" == "true" ]] && [[ ${#selected_names[@]} -gt 0 ]]; then
+            # Join with commas
+            local result=""
+            for name in "${selected_names[@]}"; do
+                if [[ -n "$result" ]]; then
+                    result="${result},${name}"
+                else
+                    result="$name"
+                fi
+            done
+            eval "$_var_name='$result'"
+            return 0
+        fi
+    done
+}
+
 # Generate storage configuration block
 generate_storage_config() {
     local name="$1"
@@ -9196,6 +9277,7 @@ generate_storage_config() {
     local portals="${10:-}"
     local transport_mode="${11:-iscsi}"  # Default to iscsi for backward compatibility
     local hostnqn="${12:-}"
+    local nodes="${13:-}"
 
     local api_port="${TN_API_PORT:-443}"
 
@@ -9246,6 +9328,11 @@ EOF
     # Add hostnqn for NVMe if provided
     if [[ -n "$hostnqn" ]] && [[ "$transport_mode" == "nvme-tcp" ]]; then
         echo "	hostnqn ${hostnqn}"
+    fi
+
+    # Add node restriction if specified (omit for all nodes)
+    if [[ -n "$nodes" ]]; then
+        echo "	nodes ${nodes}"
     fi
 
     # Always add content type
@@ -9479,6 +9566,11 @@ menu_edit_storage() {
         fi
     fi
 
+    # Node restriction
+    local current_nodes="${config_values[nodes]:-}"
+    local nodes=""
+    prompt_node_selection nodes "$current_nodes"
+
     # Generate updated configuration
     echo
     info "Updated Configuration Summary:"
@@ -9486,10 +9578,10 @@ menu_edit_storage() {
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         local subsystem_nqn="${config_values[subsystem_nqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
     else
         local target_iqn="${config_values[target_iqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
     fi
     echo "$config"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -9546,6 +9638,7 @@ WIZARD_USE_MULTIPATH=""      # "1" if multipath enabled
 WIZARD_BLOCKSIZE=""          # Block size (e.g., 16K)
 WIZARD_SPARSE=""             # Sparse volume (0 or 1)
 WIZARD_HOSTNQN=""            # Host NQN for NVMe/TCP
+WIZARD_NODES=""              # Comma-separated node names (empty = all nodes)
 
 # Display wizard progress summary with validated inputs
 # Shows checkmarks for validated items
@@ -9722,6 +9815,11 @@ show_wizard_summary() {
                 echo -e "    Host NQN:            ${c6}(pending)${c0}"
             fi
         fi
+
+        # Node Restriction (only shown when explicitly set)
+        if [[ -n "$WIZARD_NODES" ]]; then
+            echo -e "  ${c2}✓${c0} Node Restriction:    $WIZARD_NODES"
+        fi
     fi
 
     echo
@@ -9749,6 +9847,7 @@ reset_wizard_state() {
     WIZARD_BLOCKSIZE=""
     WIZARD_SPARSE=""
     WIZARD_HOSTNQN=""
+    WIZARD_NODES=""
 }
 
 # Progressive wizard for adding new storage
@@ -10195,6 +10294,7 @@ menu_configure_storage() {
     TN_API_PORT="$WIZARD_API_PORT"
     local provisioning_mode="$WIZARD_CONFIG_MODE"
     local transport_mode="$WIZARD_TRANSPORT_MODE"
+    local nodes="$WIZARD_NODES"
 
     # Handle automated provisioning mode
     if [[ "$provisioning_mode" == "create" ]]; then
@@ -10228,12 +10328,15 @@ menu_configure_storage() {
                 portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
             fi
 
+            # Node restriction (cluster only)
+            prompt_node_selection nodes
+
             # Generate configuration using wizard-collected values
             local config
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
-                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
             else
-                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
             fi
 
             # Show final configuration summary
@@ -10707,12 +10810,15 @@ menu_configure_storage() {
         use_multipath="0"
     fi
 
+    # Node restriction (cluster only)
+    prompt_node_selection nodes
+
     # Generate configuration
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
     else
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
     fi
 
     # Display summary with validation status
@@ -10758,6 +10864,10 @@ menu_configure_storage() {
     # Additional portals if configured
     if [[ -n "$portals" ]]; then
         printf "  ${c2}✓${c0} %-20s %s\n" "Additional Portals:" "$portals"
+    fi
+    # Node restriction if configured
+    if [[ -n "$nodes" ]]; then
+        printf "  ${c2}✓${c0} %-20s %s\n" "Node Restriction:" "$nodes"
     fi
     echo
     echo "  ${c2}✓${c0} = Validated    ${c4}○${c0} = User provided (not validated)"
