@@ -1720,7 +1720,13 @@ sub volume_resize {
     _log($scfg, 1, 'info', "[TrueNAS] volume_resize: volname=$volname, target_size=$new_size_bytes");
 
     # Fetch current zvol info from TrueNAS
-    my $ds = _tn_dataset_get($scfg, $full) // {};
+    my $ds = eval { _tn_dataset_get($scfg, $full) };
+    if (my $err = $@) {
+        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            die "volume '$full' does not exist on TrueNAS\n";
+        }
+        die $err;
+    }
     my $cur_bytes = _normalize_value($ds->{volsize});
     my $bs_bytes  = _normalize_value($ds->{volblocksize}); # may be 0/undef
 
@@ -1741,7 +1747,7 @@ sub volume_resize {
     my $delta = $req_bytes - $cur_bytes;
 
     # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
-    my $pds = _tn_dataset_get($scfg, $scfg->{dataset}) // {};
+    my $pds = eval { _tn_dataset_get($scfg, $scfg->{dataset}) } // {};
     my $avail_bytes = _normalize_value($pds->{available}); # parent dataset/pool available
     my $max_grow    = $avail_bytes ? int($avail_bytes * 0.80) : 0;
     if ($avail_bytes && $delta > $max_grow) {
@@ -4201,7 +4207,13 @@ sub volume_size_info {
         $class->parse_volname($volname);
     $fmt //= 'raw';
     my $full = $scfg->{dataset} . '/' . $zname;
-    my $ds = _tn_dataset_get($scfg, $full) // {};
+    my $ds = eval { _tn_dataset_get($scfg, $full) } // {};
+    if (my $err = $@) {
+        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            die "volume '$full' does not exist on TrueNAS\n";
+        }
+        die $err;
+    }
     my $bytes = _normalize_value($ds->{volsize});
     die "volume_size_info: missing volsize for $full\n" if !$bytes;
     return wantarray ? ($bytes, $fmt) : $bytes;
