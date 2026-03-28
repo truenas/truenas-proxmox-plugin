@@ -1,3 +1,11 @@
+truenas-proxmox-plugin (2.0.12+deb1) unstable; urgency=medium
+
+  * Sync NVMe portals when subsystem already exists (Issue #20)
+  * Port bindings are now created for portals added to storage.cfg
+    after initial NVMe/TCP storage setup
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 27 Mar 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.11+deb1) unstable; urgency=medium
 
   * Force NVMe subsystem configfs sync after namespace creation

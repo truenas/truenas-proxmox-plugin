@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.11';
+our $VERSION = '2.0.12';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -3733,6 +3733,90 @@ sub _nvme_device_for_uuid {
     die $err_msg;
 }
 
+# Sync NVMe portals: ensure all configured portals have port bindings on TrueNAS.
+# Handles portals added to storage.cfg after initial subsystem setup (Issue #20).
+sub _nvme_sync_portals {
+    my ($scfg, $subsys_id) = @_;
+
+    # Collect desired portals from storage config
+    my @desired_portals = ();
+    push @desired_portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
+    push @desired_portals, split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+    return unless @desired_portals;
+
+    # Query existing port-subsystem bindings
+    # TrueNAS 25.10+ uses separate port and port_subsys entities
+    my $existing_bindings = eval {
+        _api_call($scfg, 'nvmet.port_subsys.query', []);
+    } // [];
+
+    # Build lookup of existing "addr:port" for this subsystem
+    my %existing_set;
+    for my $binding (@{$existing_bindings // []}) {
+        next unless $binding->{subsys} && $binding->{subsys}{id} == $subsys_id;
+        my $port = $binding->{port};
+        next unless $port;
+        my $key = lc("$port->{addr_traddr}:$port->{addr_trsvcid}");
+        $existing_set{$key} = 1;
+    }
+
+    # Create missing ports (TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association)
+    for my $portal (@desired_portals) {
+        my ($host, $port) = _nvme_parse_portal($portal);
+        my $lookup_key = lc("$host:$port");
+        next if $existing_set{$lookup_key};
+
+        _log($scfg, 1, 'info', "[TrueNAS] nvme_sync_portals: creating missing port for $host:$port (subsys_id=$subsys_id)");
+
+        my $port_id;
+        eval {
+            # Step 1: Create the port
+            my $port_result = _api_call_write($scfg, 'nvmet.port.create', [{
+                addr_trtype => 'TCP',
+                addr_traddr => $host,
+                addr_trsvcid => int($port),
+            }]);
+            $port_id = ref($port_result) eq 'HASH' ? $port_result->{id} : $port_result;
+        };
+        if ($@) {
+            my $create_err = $@;
+            # Port may already exist (shared across subsystems) — find and reuse it
+            if ($create_err =~ /already.*port.*same transport and address/i) {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: port $host:$port already exists, reusing");
+                eval {
+                    my $all_ports = _api_call($scfg, 'nvmet.port.query', []);
+                    for my $p (@{$all_ports // []}) {
+                        if (lc($p->{addr_traddr}) eq lc($host) && "$p->{addr_trsvcid}" eq "$port") {
+                            $port_id = $p->{id};
+                            last;
+                        }
+                    }
+                };
+            }
+            if (!$port_id) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to create or find port for $portal: $create_err");
+                next;
+            }
+        }
+
+        # Step 2: Associate port with subsystem
+        eval {
+            _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+                port_id   => int($port_id),
+                subsys_id => int($subsys_id),
+            }]);
+        };
+        if ($@) {
+            # Association may already exist — not an error
+            if ($@ =~ /already exists/i) {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: port_subsys association already exists for port_id=$port_id");
+            } else {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to associate port for $portal: $@");
+            }
+        }
+    }
+}
+
 # Ensure NVMe subsystem exists on TrueNAS
 sub _nvme_ensure_subsystem {
     my ($scfg) = @_;
@@ -3747,8 +3831,12 @@ sub _nvme_ensure_subsystem {
 
     if ($subsystems && @$subsystems) {
         my $subsys = $subsystems->[0];
-        _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys->{id}");
-        return $subsys->{id};
+        my $subsys_id = $subsys->{id};
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys_id, syncing portals");
+
+        _nvme_sync_portals($scfg, $subsys_id);
+
+        return $subsys_id;
     }
 
     # Create subsystem if it doesn't exist
@@ -3779,12 +3867,44 @@ sub _nvme_ensure_subsystem {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: creating port for $host:$port");
 
         eval {
-            _api_call_write($scfg, 'nvmet.port.create', [{
-                subsys_id => $subsys_id,
-                trtype => 'TCP',
-                traddr => $host,
-                trsvcid => "$port",  # Must be string
-            }]);
+            # TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association
+            my $port_id;
+            my $port_result = eval {
+                _api_call_write($scfg, 'nvmet.port.create', [{
+                    addr_trtype => 'TCP',
+                    addr_traddr => $host,
+                    addr_trsvcid => int($port),
+                }]);
+            };
+            if ($@ && $@ =~ /already.*port.*same transport and address/i) {
+                # Port exists (may be shared with another subsystem) — find and reuse it
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: port $host:$port already exists, reusing");
+                my $all_ports = _api_call($scfg, 'nvmet.port.query', []);
+                for my $p (@{$all_ports // []}) {
+                    if (lc($p->{addr_traddr}) eq lc($host) && "$p->{addr_trsvcid}" eq "$port") {
+                        $port_id = $p->{id};
+                        last;
+                    }
+                }
+            } elsif ($@) {
+                die $@;
+            } else {
+                $port_id = ref($port_result) eq 'HASH' ? $port_result->{id} : $port_result;
+            }
+
+            if (defined $port_id) {
+                eval {
+                    _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+                        port_id   => int($port_id),
+                        subsys_id => int($subsys_id),
+                    }]);
+                };
+                if ($@ && $@ =~ /already exists/i) {
+                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: port_subsys association already exists");
+                } elsif ($@) {
+                    die $@;
+                }
+            }
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_ensure_subsystem: failed to create port for $portal: $@");
