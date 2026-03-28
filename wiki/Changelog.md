@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.12 (March 27, 2026)
+
+### Bug Fixes
+
+- **Sync NVMe portals when subsystem already exists**: When `portals` are added to an existing NVMe/TCP storage configuration, the plugin now creates missing port bindings on TrueNAS during subsystem activation. Previously, portals added after initial storage setup were never registered on the TrueNAS side, causing `nvme connect` to silently fail for new paths and preventing multipath from activating (GitHub issue #20)
+
+---
+
 ## Version 2.0.11 (March 25, 2026)
 
 ### Bug Fixes
