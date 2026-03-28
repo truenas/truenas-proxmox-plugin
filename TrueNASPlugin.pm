@@ -48,6 +48,9 @@ my %_target_id_cache;
 # Per-process cache for preflight check results (time-based, 30s validity)
 my $_preflight_last_ok = 0;
 
+# Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
+my %_portal_sync_last_ok;
+
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
@@ -113,8 +116,9 @@ sub _clear_cache {
         # Clear all cache
         %API_CACHE = ();
     }
-    # Also clear the target ID cache
+    # Also clear the target ID and portal sync caches
     %_target_id_cache = ();
+    %_portal_sync_last_ok = ();
 }
 
 # ======== Helper functions ========
@@ -3738,6 +3742,13 @@ sub _nvme_device_for_uuid {
 sub _nvme_sync_portals {
     my ($scfg, $subsys_id) = @_;
 
+    my $sid = $scfg->{storeid} // 'unknown';
+    if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
+            . (time() - $_portal_sync_last_ok{$sid}) . "s ago)");
+        return;
+    }
+
     # Collect desired portals from storage config
     my @desired_portals = ();
     push @desired_portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
@@ -3815,6 +3826,8 @@ sub _nvme_sync_portals {
             }
         }
     }
+
+    $_portal_sync_last_ok{$sid} = time();
 }
 
 # Ensure NVMe subsystem exists on TrueNAS

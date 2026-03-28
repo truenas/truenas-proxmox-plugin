@@ -6,6 +6,10 @@
 
 - **Sync NVMe portals when subsystem already exists**: When `portals` are added to an existing NVMe/TCP storage configuration, the plugin now creates missing port bindings on TrueNAS during subsystem activation. Previously, portals added after initial storage setup were never registered on the TrueNAS side, causing `nvme connect` to silently fail for new paths and preventing multipath from activating (GitHub issue #20)
 
+### Performance
+
+- **Cache NVMe portal sync results**: Portal sync now caches its result per-storage for 60 seconds, avoiding a redundant `port_subsys.query` API call on every disk allocation when portals are already correctly bound
+
 ---
 
 ## Version 2.0.11 (March 25, 2026)
