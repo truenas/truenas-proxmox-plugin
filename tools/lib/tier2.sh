@@ -35,9 +35,13 @@ tier2_preflight() {
     # Both portals reachable
     local portals
     portals=$(read_storage_cfg "$storage" "portals")
-    for portal_ip in $(echo "$portals" | tr ',' ' '); do
-        if ! nc -zv "$portal_ip" 3260 &>/dev/null; then
-            log_warn "Tier 2 pre-flight: portal $portal_ip:3260 unreachable — skipping Tier 2"
+    for portal_entry in $(echo "$portals" | tr ',' ' '); do
+        local portal_ip="${portal_entry%%:*}"
+        local portal_port="${portal_entry##*:}"
+        # If no port was specified, default to 3260
+        [[ "$portal_port" == "$portal_ip" ]] && portal_port=3260
+        if ! nc -zv "$portal_ip" "$portal_port" &>/dev/null; then
+            log_warn "Tier 2 pre-flight: portal ${portal_ip}:${portal_port} unreachable — skipping Tier 2"
             return 1
         fi
     done
@@ -140,8 +144,11 @@ test_T2_04() {
 # ============================================================
 test_T2_05() {
     local storage="$1"
-    local portal1_ip
-    portal1_ip=$(read_storage_cfg "$storage" "portals" | cut -d',' -f1)
+    local portal1_entry portal1_ip portal1_port
+    portal1_entry=$(read_storage_cfg "$storage" "portals" | cut -d',' -f1)
+    portal1_ip="${portal1_entry%%:*}"
+    portal1_port="${portal1_entry##*:}"
+    [[ "$portal1_port" == "$portal1_ip" ]] && portal1_port=3260
 
     log_info "T2-05: Path failure — I/O continues"
 
@@ -161,7 +168,7 @@ test_T2_05() {
     fi
 
     # Block primary portal
-    iptables_block "$portal1_ip" 3260
+    iptables_block "$portal1_ip" "$portal1_port"
     sleep 30
 
     local vm_status
@@ -171,18 +178,19 @@ test_T2_05() {
         log_pass "T2-05: VM remains running after primary portal blocked for 30s"
     else
         log_fail "T2-05: VM not running (status: $vm_status) — failover did not work"
-        iptables_unblock "$portal1_ip" 3260
+        iptables_unblock "$portal1_ip" "$portal1_port"
         return 1
     fi
 
     if dmesg | tail -50 | grep -qi 'disk.*error\|blk_update_request.*I/O error'; then
         log_fail "T2-05: I/O errors found in dmesg during path failure"
-        iptables_unblock "$portal1_ip" 3260
+        iptables_unblock "$portal1_ip" "$portal1_port"
         return 1
     fi
 
     # Leave portal blocked for T2-06
     T2_BLOCKED_PORTAL="$portal1_ip"
+    T2_BLOCKED_PORT="$portal1_port"
 }
 
 # ============================================================
@@ -191,6 +199,7 @@ test_T2_05() {
 test_T2_06() {
     local storage="$1"
     local portal_ip="${T2_BLOCKED_PORTAL:-}"
+    local portal_port="${T2_BLOCKED_PORT:-3260}"
 
     log_info "T2-06: Failback to optimized path"
 
@@ -199,7 +208,7 @@ test_T2_06() {
         return 0
     fi
 
-    iptables_unblock "$portal_ip" 3260
+    iptables_unblock "$portal_ip" "$portal_port"
 
     local recovered=0
     for i in $(seq 1 12); do
