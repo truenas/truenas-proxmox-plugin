@@ -22,6 +22,7 @@ PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 HARD_GATE_FAILED=0
+TIER4_AVAILABLE=0
 LOG_FILE="/tmp/truenas-test-$(date '+%Y%m%d-%H%M%S').log"
 
 # Argument defaults
@@ -54,21 +55,23 @@ parse_args() {
 # ============================================================
 config_required_tiers() {
     case "$1" in
-        A)   echo "1"     ;;
-        D)   echo "1 2"   ;;
-        F)   echo "1 3"   ;;
-        all) echo "1 2 3" ;;
-        *)   echo "1"     ;;
+        A)   echo "1"       ;;
+        D)   echo "1 2"     ;;
+        F)   echo "1 3"     ;;
+        H)   echo "1 4"     ;;
+        all) echo "1 2 3 4" ;;
+        *)   echo "1"       ;;
     esac
 }
 
 config_hard_gates() {
     case "$1" in
-        A)   echo "T1-01"             ;;
-        D)   echo "T1-01 T2-03"       ;;
-        F)   echo "T1-01 T3-04"       ;;
-        all) echo "T1-01 T2-03 T3-04" ;;
-        *)   echo "T1-01"             ;;
+        A)   echo "T1-01"                   ;;
+        D)   echo "T1-01 T2-03"             ;;
+        F)   echo "T1-01 T3-04"             ;;
+        H)   echo "T1-01 T4-04"             ;;
+        all) echo "T1-01 T2-03 T3-04 T4-04" ;;
+        *)   echo "T1-01"                   ;;
     esac
 }
 
@@ -126,13 +129,28 @@ log_info "Log: $LOG_FILE"
 log_info "Config: $ARG_CONFIG  Tier: $ARG_TIER  Storage: ${ARG_STORAGE:-<auto>}"
 
 MAX_TIER=$(detect_max_tier)
+
+# Tier 4 detection runs separately since detect_max_tier runs in a subshell
+# and cannot set globals in the parent.
+if [[ $MAX_TIER -ge 1 ]] && [[ -n "$ARG_STORAGE" ]]; then
+    _ha_licensed=$(tn_api_call "$ARG_STORAGE" "failover.licensed" 2>/dev/null || true)
+    if [[ "$_ha_licensed" == "true" ]]; then
+        TIER4_AVAILABLE=1
+    fi
+fi
+
 log_info "Detected max hardware tier: $MAX_TIER"
 
 # Validate hardware against --config requirements
 if [[ "$ARG_CONFIG" != "all" ]]; then
     required_tiers=$(config_required_tiers "$ARG_CONFIG")
     for t in $required_tiers; do
-        if [[ "$t" -gt "$MAX_TIER" ]]; then
+        if [[ "$t" -eq 4 ]]; then
+            if [[ "${TIER4_AVAILABLE:-0}" -ne 1 ]]; then
+                log_fail "Hardware insufficient for Config $ARG_CONFIG: Tier 4 (HA TrueNAS) required but not detected"
+                exit 2
+            fi
+        elif [[ "$t" -gt "$MAX_TIER" ]]; then
             log_fail "Hardware insufficient for Config $ARG_CONFIG: Tier $t required but max detected is $MAX_TIER"
             exit 2
         fi
@@ -154,6 +172,7 @@ fi
 source "$SCRIPT_DIR/lib/tier1.sh"
 source "$SCRIPT_DIR/lib/tier2.sh"
 source "$SCRIPT_DIR/lib/tier3.sh"
+source "$SCRIPT_DIR/lib/tier4.sh"
 
 START_TIME=$(date +%s)
 
@@ -163,7 +182,12 @@ run_tier() {
         log_info "Tier $tier skipped by --tier flag"
         return 0
     fi
-    if [[ "$tier" -gt "$MAX_TIER" ]]; then
+    if [[ "$tier" -eq 4 ]]; then
+        if [[ "${TIER4_AVAILABLE:-0}" -ne 1 ]]; then
+            log_skip "Tier 4 — HA TrueNAS not detected"
+            return 0
+        fi
+    elif [[ "$tier" -gt "$MAX_TIER" ]]; then
         log_skip "Tier $tier — requires hardware not detected"
         return 0
     fi
@@ -171,12 +195,14 @@ run_tier() {
         1) run_tier1 "$ARG_STORAGE" "$ARG_CONFIG" ;;
         2) run_tier2 "$ARG_STORAGE" "$ARG_CONFIG" ;;
         3) run_tier3 "$ARG_STORAGE" "$ARG_CONFIG" ;;
+        4) run_tier4 "$ARG_STORAGE" "$ARG_CONFIG" ;;
     esac
 }
 
 run_tier 1
 run_tier 2
 run_tier 3
+run_tier 4
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))

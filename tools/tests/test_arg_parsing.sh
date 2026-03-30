@@ -34,13 +34,20 @@ assert_eq "defaults --yes"    "0"   "$ARG_YES"
 assert_eq "config A tiers" "1"     "$(config_required_tiers A)"
 assert_eq "config D tiers" "1 2"   "$(config_required_tiers D)"
 assert_eq "config F tiers" "1 3"   "$(config_required_tiers F)"
-assert_eq "config all tiers" "1 2 3" "$(config_required_tiers all)"
+assert_eq "config all tiers" "1 2 3 4" "$(config_required_tiers all)"
+
+# --- Config H ---
+parse_args --storage mystore --config H --yes
+assert_eq "parse --config H"  "H" "$ARG_CONFIG"
+
+assert_eq "config H tiers" "1 4"       "$(config_required_tiers H)"
+assert_eq "config H gates" "T1-01 T4-04" "$(config_hard_gates H)"
 
 # --- config_hard_gates ---
 assert_eq "config A gates" "T1-01"         "$(config_hard_gates A)"
 assert_eq "config D gates" "T1-01 T2-03"   "$(config_hard_gates D)"
 assert_eq "config F gates" "T1-01 T3-04"   "$(config_hard_gates F)"
-assert_eq "config all gates" "T1-01 T2-03 T3-04" "$(config_hard_gates all)"
+assert_eq "config all gates" "T1-01 T2-03 T3-04 T4-04" "$(config_hard_gates all)"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
