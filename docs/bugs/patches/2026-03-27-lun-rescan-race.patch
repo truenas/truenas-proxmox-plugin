@@ -1,0 +1,18 @@
+--- a/TrueNASPlugin.pm
++++ b/TrueNASPlugin.pm
+@@ -2599,13 +2599,15 @@ sub _device_for_lun($scfg, $lun) {
+     # Wait briefly for by-path to appear if needed
+     my $by;
+     my $max_retries = $scfg->{device_ready_retries} // 200; # up to ~20s with 100ms sleep
++    # Rescan schedule: aggressive early rescans for freshly-mapped LUNs (e.g. during
++    # multi-disk migration), then progressively less frequent for slower edge cases.
++    my %rescan_at = map { $_ => 1 } (3, 6, 10, 15, 20, 35, 60, 100, 150);
+     for (my $i = 1; $i <= $max_retries; $i++) {
+         $by = _find_by_path_for_lun($scfg, $lun);
+         last if $by && -e $by;
+         run_command(['udevadm','settle'], outfunc => sub {});
+-        if ($i == 10 || $i == 20 || $i == 35 || $i == 60 || $i == 100 || $i == 150) {
++        if ($rescan_at{$i}) {
+             _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
+             run_command(['udevadm','settle'], outfunc => sub {});
+         }
