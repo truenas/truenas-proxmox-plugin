@@ -80,6 +80,11 @@ assert_eq "retry_window_seconds 3 1" "78" "$val"
 val=$(retry_window_seconds 5 2)
 assert_eq "retry_window_seconds 5 2" "115" "$val"
 
+# --- tn_api_call argument validation ---
+# tn_api_call requires at least 2 args: storage and method
+out=$(tn_api_call 2>&1) || true
+assert_match "tn_api_call no args" 'Usage:' "$out"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

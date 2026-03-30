@@ -113,3 +113,49 @@ ssh_reachable() {
     ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
         "root@$1" true 2>/dev/null
 }
+
+# Call a TrueNAS WebSocket API method via the plugin's Perl code path.
+# Usage: tn_api_call <storage_name> <method> [json_params]
+# Returns: JSON result on stdout, exits non-zero on failure.
+# Requires: PVE::Storage::Custom::TrueNASPlugin installed, storage configured in storage.cfg.
+tn_api_call() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: tn_api_call <storage_name> <method> [json_params]" >&2
+        return 1
+    fi
+    local storage="$1" method="$2" params="${3:-[]}"
+
+    local api_host api_key api_insecure
+    api_host=$(read_storage_cfg "$storage" "api_host")
+    api_key=$(read_storage_cfg "$storage" "api_key")
+    api_insecure=$(read_storage_cfg "$storage" "api_insecure" "0")
+
+    if [[ -z "$api_host" || -z "$api_key" ]]; then
+        echo "tn_api_call: could not read api_host/api_key for storage '$storage'" >&2
+        return 1
+    fi
+
+    perl -e '
+        use strict; use warnings;
+        use JSON::PP;
+        # Minimal scfg hash — only what _ws_open and _api_call need
+        my $scfg = {
+            api_host     => $ARGV[0],
+            api_key      => $ARGV[1],
+            api_insecure => int($ARGV[2]),
+            prefer_ipv4  => 1,
+        };
+        my $method = $ARGV[3];
+        my $params = decode_json($ARGV[4]);
+
+        require PVE::Storage::Custom::TrueNASPlugin;
+        my $conn = PVE::Storage::Custom::TrueNASPlugin::_ws_open($scfg);
+        my $result = PVE::Storage::Custom::TrueNASPlugin::_ws_rpc($conn, {
+            jsonrpc => "2.0",
+            id      => 1,
+            method  => $method,
+            params  => $params,
+        });
+        print encode_json($result) . "\n" if defined $result;
+    ' "$api_host" "$api_key" "$api_insecure" "$method" "$params"
+}
