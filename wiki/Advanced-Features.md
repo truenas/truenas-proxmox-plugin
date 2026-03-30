@@ -1052,6 +1052,41 @@ truenasplugin: ha-storage
 - Set `logout_on_free 0` to maintain persistent connections
 - Increase retry limits for HA failover tolerance
 
+**iSCSI Initiator Tuning for HA Failover**
+
+TrueNAS Enterprise HA failback (returning to the original active controller) can cause two separate iSCSI session disruptions: the initial drop when the VIP moves, and a second ping timeout after reconnection while the new active controller is still stabilizing. The default iSCSI initiator timeouts are too aggressive for this scenario and can cause QEMU to stop VMs even when the storage recovers within a reasonable window.
+
+Apply these settings in `/etc/iscsi/iscsid.conf` on every Proxmox node:
+
+```ini
+# How long the SCSI layer waits for a dropped session to recover before
+# returning I/O errors. Must exceed the worst-case failback time.
+# Observed failback times: 3-108s. Default: 120.
+node.session.timeo.replacement_timeout = 280
+
+# How often the initiator pings the target. A longer interval gives the
+# target more time to stabilize after failback before being pinged.
+# Default: 5.
+node.conn[0].timeo.noop_out_interval = 15
+
+# How long to wait for a ping response before declaring the connection
+# dead. The default 5s causes a second session drop after failback
+# because the target reconnects but isn't immediately ready for pings.
+# Default: 5.
+node.conn[0].timeo.noop_out_timeout = 30
+```
+
+Changes to `iscsid.conf` only affect new sessions. Apply to existing sessions:
+
+```bash
+TARGET_IQN="iqn.2005-10.org.freenas.ctl:your-target"
+iscsiadm -m node -T $TARGET_IQN -o update -n node.session.timeo.replacement_timeout -v 280
+iscsiadm -m node -T $TARGET_IQN -o update -n node.conn[0].timeo.noop_out_interval -v 15
+iscsiadm -m node -T $TARGET_IQN -o update -n node.conn[0].timeo.noop_out_timeout -v 30
+```
+
+> **Note:** These values trade off faster detection of genuinely dead connections for better tolerance of HA failover events. For multipath setups without HA, the defaults (5s/5s/120s) are preferred — fast failover to the other path is more important than tolerating long outages.
+
 ### Cluster Testing
 
 Verify cluster functionality:
