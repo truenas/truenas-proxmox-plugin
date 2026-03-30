@@ -344,14 +344,19 @@ test_T4_03() {
         return 1
     fi
 
-    # Write marker to the dedicated volume
+    # Write marker to the dedicated volume and force to stable storage
     T4_MARKER="truenas-ha-test-marker-$$"
     echo "$T4_MARKER" | dd of="$marker_dev" bs=512 count=1 conv=notrunc oflag=direct &>/dev/null || {
         log_fail "T4-03: failed to write marker to $marker_dev"
         return 1
     }
+    # Ensure data reaches stable storage on TrueNAS before failover
+    sync
+    blockdev --flushbufs "$marker_dev" 2>/dev/null || true
+    sleep 1
 
-    # Verify readback
+    # Verify readback (drop caches to confirm it's on disk, not in memory)
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     local readback
     readback=$(dd if="$marker_dev" bs=512 count=1 iflag=direct 2>/dev/null | tr -d '\0')
     if ! echo "$readback" | grep -q "$T4_MARKER"; then
@@ -630,6 +635,17 @@ test_T4_09() {
 
     if [[ "$current_node" == "$T4_ORIGINAL_NODE" ]]; then
         log_pass "T4-09: failback complete — controller $current_node is MASTER again (${T4_RECOVERY_ELAPSED}s)"
+
+        # Warn if failback time is close to the iSCSI replacement_timeout —
+        # VMs and data integrity checks are likely to fail when the outage
+        # approaches or exceeds this threshold.
+        local repl_timeout
+        repl_timeout=$(grep -m1 'node.session.timeo.replacement_timeout' /etc/iscsi/iscsid.conf 2>/dev/null | awk '{print $3}')
+        repl_timeout="${repl_timeout:-120}"
+        local threshold=$(( repl_timeout * 75 / 100 ))  # warn at 75% of timeout
+        if [[ "$T4_RECOVERY_ELAPSED" -gt "$threshold" ]]; then
+            log_warn "T4-09: failback took ${T4_RECOVERY_ELAPSED}s — close to iSCSI replacement_timeout (${repl_timeout}s). VM survival and data integrity tests may fail. Consider increasing node.session.timeo.replacement_timeout in /etc/iscsi/iscsid.conf."
+        fi
     else
         log_warn "T4-09: controller $current_node is MASTER, expected original controller $T4_ORIGINAL_NODE"
         log_warn "T4-09: system is in a valid HA state, just not the original topology"
