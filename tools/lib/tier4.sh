@@ -16,6 +16,7 @@ T4_RECOVERY_ELAPSED=0
 T4_IO_PID=""                # PID of background I/O workload
 T4_IO_LOG=""                # Log file for I/O workload output
 T4_STANDBY_TIMEOUT=300      # seconds to wait for standby to come back
+T4_FAILBACK_TIMESTAMP=""    # dmesg reference timestamp for failback diagnostics
 
 # ============================================================
 # Pre-flight checks for Tier 4
@@ -612,6 +613,9 @@ test_T4_09() {
 
     log_info "T4-09: Trigger HA failback"
 
+    # Capture dmesg timestamp before failback so T4-11 can extract relevant messages
+    T4_FAILBACK_TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
     log_info "T4-09: calling failover.become_passive to return to original controller..."
     tn_api_call "$storage" "failover.become_passive" &>/dev/null || true
 
@@ -706,6 +710,18 @@ test_T4_11() {
 
     if [[ "$vm_status" != "running" ]]; then
         log_fail "T4-11: VM $T4_TEST_VMID status is '$vm_status' after failback (expected running)"
+        # Dump relevant dmesg/SCSI errors to help diagnose why the VM stopped
+        if [[ -n "${T4_FAILBACK_TIMESTAMP:-}" ]]; then
+            local scsi_errors
+            scsi_errors=$(dmesg --time-format iso 2>/dev/null | awk -v after="$T4_FAILBACK_TIMESTAMP" '$1 >= after' | \
+                grep -iE 'scsi|iscsi|session|I/O error|abort|reset|target' | tail -20)
+            if [[ -n "$scsi_errors" ]]; then
+                log_info "T4-11: SCSI/iSCSI dmesg during failback:"
+                while IFS= read -r line; do
+                    log_info "T4-11:   $line"
+                done <<< "$scsi_errors"
+            fi
+        fi
         return 1
     fi
 
