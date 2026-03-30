@@ -2596,20 +2596,88 @@ sub _login_target_all_portals {
     }
 }
 
-sub _device_for_lun($scfg, $lun) {
-    # Wait briefly for by-path to appear if needed
-    my $by;
-    my $max_retries = $scfg->{device_ready_retries} // 200; # up to ~20s with 100ms sleep
-    for (my $i = 1; $i <= $max_retries; $i++) {
-        $by = _find_by_path_for_lun($scfg, $lun);
-        last if $by && -e $by;
-        run_command(['udevadm','settle'], outfunc => sub {});
-        if ($i == 10 || $i == 20 || $i == 35 || $i == 60 || $i == 100 || $i == 150) {
-            _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
-            run_command(['udevadm','settle'], outfunc => sub {});
+# Find scsi_host numbers for sessions connected to our target IQN.
+# Reads /sys/class/iscsi_session/sessionN/targetname and resolves the
+# session symlink to extract the hostN number.
+# Returns: list of host numbers (e.g., (5, 7)) or empty list on failure.
+sub _scsi_hosts_for_target($scfg) {
+    my $iqn = $scfg->{target_iqn} // return ();
+    my $sys = '/sys/class/iscsi_session';
+    opendir(my $dh, $sys) or return ();
+    my @hosts;
+    while (my $entry = readdir($dh)) {
+        next unless $entry =~ /^session\d+$/;
+        my $tgt_file = "$sys/$entry/targetname";
+        next unless -r $tgt_file;
+        open(my $fh, '<', $tgt_file) or next;
+        chomp(my $tgt = <$fh> // '');
+        close $fh;
+        next unless $tgt eq $iqn;
+        # Resolve symlink to find host number:
+        # /sys/class/iscsi_session/sessionN -> /sys/devices/.../hostN/.../iscsi_session/sessionN
+        my $real = readlink("$sys/$entry") // '';
+        if ($real =~ m{/host(\d+)/}) {
+            push @hosts, $1;
         }
-        usleep(DEVICE_READY_TIMEOUT_US);
     }
+    closedir($dh);
+    return @hosts;
+}
+
+# Issue a targeted SCSI scan for a specific LUN on the given host numbers.
+# Writes "- - <lun>" to /sys/class/scsi_host/hostN/scan.
+# Returns: number of hosts successfully scanned.
+sub _scan_lun_on_hosts($lun, @hosts) {
+    my $scanned = 0;
+    for my $host (@hosts) {
+        my $scan_file = "/sys/class/scsi_host/host${host}/scan";
+        next unless -w $scan_file;
+        if (open(my $fh, '>', $scan_file)) {
+            print $fh "- - $lun\n";
+            close $fh;
+            $scanned++;
+        }
+    }
+    return $scanned;
+}
+
+sub _device_for_lun($scfg, $lun) {
+    my $by;
+
+    # --- Phase 1: targeted scan via sysfs (fast path) ---
+    # Find scsi_host(s) for our iSCSI target and ask the kernel to discover
+    # this specific LUN. This is O(1) vs the O(sessions*LUNs) global rescan.
+    my @hosts = _scsi_hosts_for_target($scfg);
+    if (@hosts) {
+        my $scanned = _scan_lun_on_hosts($lun, @hosts);
+        if ($scanned) {
+            run_command(['udevadm','settle'], outfunc => sub {});
+            # Short wait for by-path symlink to appear (udev propagation)
+            for (my $i = 1; $i <= 30; $i++) {  # up to ~3s
+                $by = _find_by_path_for_lun($scfg, $lun);
+                last if $by && -e $by;
+                usleep(DEVICE_READY_TIMEOUT_US);
+            }
+        }
+    }
+
+    # --- Phase 2: fallback to global rescan (original behavior) ---
+    # If targeted scan didn't work (sysfs unavailable, permissions, or LUN
+    # not yet mapped on target), fall back to the original retry loop.
+    if (!$by || !-e $by) {
+        my $max_retries = $scfg->{device_ready_retries} // 200;
+        for (my $i = 1; $i <= $max_retries; $i++) {
+            $by = _find_by_path_for_lun($scfg, $lun);
+            last if $by && -e $by;
+            run_command(['udevadm','settle'], outfunc => sub {});
+            if ($i == 10 || $i == 20 || $i == 35 || $i == 60 || $i == 100 || $i == 150) {
+                _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
+                run_command(['udevadm','settle'], outfunc => sub {});
+            }
+            usleep(DEVICE_READY_TIMEOUT_US);
+        }
+    }
+
     if (!$by || !-e $by) {
         my $iqn = $scfg->{target_iqn} // '';
         my @sessions = _run_lines(['iscsiadm','-m','session']);
@@ -2627,7 +2695,9 @@ sub _device_for_lun($scfg, $lun) {
         };
         my $paths_text = @paths ? join(', ', @paths) : 'none';
 
-        die "Could not locate by-path device for LUN $lun (IQN $iqn, retries $max_retries). Sessions: $session_text. by-path: $paths_text\n";
+        my $hosts_text = @hosts ? join(', ', map { "host$_" } @hosts) : 'none found';
+        die "Could not locate by-path device for LUN $lun (IQN $iqn). " .
+            "Targeted scan hosts: $hosts_text. Sessions: $session_text. by-path: $paths_text\n";
     }
 
     # Multipath preference
