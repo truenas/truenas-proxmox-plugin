@@ -343,6 +343,67 @@ apt-get install multipath-tools
 ```
 
 **2. Configure Multipath** (`/etc/multipath.conf`):
+
+There are two configurations depending on whether you're using TrueNAS Enterprise HA with ALUA or a non-HA setup.
+
+**For TrueNAS Enterprise HA (ALUA):**
+
+ALUA (Asymmetric Logical Unit Access) is required for HA setups with dual portals — one portal per controller. Each LUN has an Active Optimized path through the active controller and an Active Non-Optimized path through the standby. Multipath must be configured with the ALUA hardware handler so it routes I/O through the correct path and handles failover transitions.
+
+```conf
+defaults {
+    user_friendly_names yes
+    find_multipaths no
+    failback immediate
+    no_path_retry queue
+    fast_io_fail_tmo 280
+}
+
+blacklist {
+    devnode "^(ram|raw|loop|fd|md|dm-|sr|scd|st)[0-9]*"
+    devnode "^hd[a-z]"
+    devnode "^sda"  # Exclude OS disk (adjust if needed)
+}
+
+devices {
+    device {
+        vendor "TrueNAS"
+        product "iSCSI Disk"
+        hardware_handler "1 alua"
+        prio alua
+        path_grouping_policy group_by_prio
+        failback immediate
+    }
+}
+```
+
+Key differences from non-ALUA:
+- `hardware_handler "1 alua"` — tells the kernel to use ALUA for path state management
+- `prio alua` — prioritizes paths based on ALUA target port group state
+- `path_grouping_policy group_by_prio` — groups paths by priority (Active Optimized vs Non-Optimized)
+- `fast_io_fail_tmo 280` — required for HA failback tolerance (see [iSCSI Timeout Tuning](#iscsi-timeout-tuning-for-ha-failover) below)
+
+Verify ALUA is working after configuration:
+
+```bash
+systemctl restart multipathd
+multipath -ll
+```
+
+Expected output for each device:
+```
+mpath0 (3600...) dm-X TrueNAS,iSCSI Disk
+size=100G features='0' hwhandler='1 alua' wp=rw
+|-+- policy='service-time 0' prio=50 status=active
+| `- H:C:T:L sdX M:N active ready running       <- Active Optimized (active controller)
+`-+- policy='service-time 0' prio=10 status=enabled
+  `- H:C:T:L sdY M:N active ready running       <- Active Non-Optimized (standby controller)
+```
+
+If `hwhandler='0'` appears, ALUA is not active — check the devices block in `multipath.conf`.
+
+**For non-HA setups (round-robin load balancing):**
+
 ```conf
 defaults {
     user_friendly_names yes
@@ -360,7 +421,6 @@ blacklist {
     devnode "^sda"  # Exclude OS disk (adjust if needed)
 }
 
-# Optional: Specific device configuration for TrueNAS
 devices {
     device {
         vendor "TrueNAS"
@@ -1031,12 +1091,12 @@ Configure for HA environments:
 
 ```ini
 truenasplugin: ha-storage
-    api_host truenas-vip.company.com  # Use VIP for TrueNAS HA
+    api_host truenas-vip.example.com   # VIP — always points to the active controller
     api_key 1-your-api-key
     target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
     dataset tank/ha/proxmox
-    discovery_portal 192.168.100.10:3260
-    portals 192.168.100.11:3260,192.168.100.12:3260
+    discovery_portal 192.168.100.10:3260         # VIP for iSCSI discovery
+    portals 192.168.100.11:3260,192.168.100.12:3260  # Real controller IPs (not VIP)
     shared 1
     use_multipath 1
     force_delete_on_inuse 1
@@ -1045,46 +1105,116 @@ truenasplugin: ha-storage
 ```
 
 **HA Considerations**:
-- Use TrueNAS virtual IP (VIP) for `api_host`
-- Configure multiple portals on different TrueNAS controllers
-- Enable `force_delete_on_inuse` for HA VM failover
-- Set `logout_on_free 0` to maintain persistent connections
-- Increase retry limits for HA failover tolerance
+- `api_host` — the TrueNAS VIP (virtual IP), which floats between controllers
+- `discovery_portal` — the VIP for initial iSCSI target discovery
+- `portals` — the real IP addresses of each controller (NOT the VIP). These are the iSCSI data paths that multipath uses for dual-path ALUA. Each controller has its own IP that persists regardless of which controller is active.
+- `use_multipath 1` — required for ALUA dual-path I/O
+- `force_delete_on_inuse 1` — allows volume deletion when iSCSI sessions are active (needed during HA VM failover)
+- `logout_on_free 0` — maintain persistent iSCSI connections
+- `api_retry_max 5` — increase retry tolerance for API calls during failover
 
-**iSCSI Initiator Tuning for HA Failover**
+**iSCSI Session Setup**:
 
-TrueNAS Enterprise HA failback (returning to the original active controller) can cause two separate iSCSI session disruptions: the initial drop when the VIP moves, and a second ping timeout after reconnection while the new active controller is still stabilizing. The default iSCSI initiator timeouts are too aggressive for this scenario and can cause QEMU to stop VMs even when the storage recovers within a reasonable window.
+After configuring `storage.cfg`, establish iSCSI sessions to both controller portals:
 
-Apply these settings in `/etc/iscsi/iscsid.conf` on every Proxmox node:
+```bash
+# Discover targets on both controllers (use your real controller IPs)
+iscsiadm -m discovery -t sendtargets -p 192.168.100.11:3260
+iscsiadm -m discovery -t sendtargets -p 192.168.100.12:3260
+
+# Login to all discovered portals
+iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:ha-cluster --login
+
+# Verify two sessions (one per controller)
+iscsiadm -m session
+# Expected: two sessions to the two controller IPs
+
+# Verify multipath sees both paths with ALUA
+multipath -ll | head -6
+# Expected: hwhandler='1 alua', prio=50 (active), prio=10 (enabled)
+```
+
+**iSCSI Timeout Tuning for HA Failover**
+
+TrueNAS Enterprise HA failback (returning to the original active controller) can cause two separate iSCSI session disruptions: the initial drop when the VIP moves, and a second ping timeout after reconnection while the new active controller is still stabilizing. The default timeouts are too aggressive for this scenario and can cause QEMU to stop VMs even when the storage recovers within a reasonable window.
+
+**With multipath (ALUA + HA):**
+
+When `multipathd` is active, it overrides the iSCSI `replacement_timeout` with its own `fast_io_fail_tmo` value every time it reloads — regardless of what `iscsid.conf` or `iscsiadm` node records say. The default `fast_io_fail_tmo` is 5 seconds, which is far too short for HA failback. Settings in `iscsid.conf` for `replacement_timeout` have no effect when multipath is managing the devices.
+
+Add to `/etc/multipath.conf` on every Proxmox node:
+
+```
+defaults {
+    find_multipaths no
+    fast_io_fail_tmo 280
+}
+```
+
+Then restart multipathd:
+
+```bash
+systemctl restart multipathd
+```
+
+Verify the kernel is using the correct value:
+
+```bash
+cat /sys/class/iscsi_session/session*/recovery_tmo
+# All sessions should show 280
+```
+
+**Without multipath (single-path HA):**
+
+When multipath is not active, the iSCSI `replacement_timeout` controls session recovery directly. Apply these settings in `/etc/iscsi/iscsid.conf` on every Proxmox node:
 
 ```ini
 # How long the SCSI layer waits for a dropped session to recover before
 # returning I/O errors. Must exceed the worst-case failback time.
 # Observed failback times: 3-108s. Default: 120.
 node.session.timeo.replacement_timeout = 280
+```
 
-# How often the initiator pings the target. A longer interval gives the
-# target more time to stabilize after failback before being pinged.
-# Default: 5.
+Changes to `iscsid.conf` only affect newly created sessions. Logout and re-login for the new value to take effect, or restart `iscsid` with no active sessions:
+
+```bash
+iscsiadm -m node -T $TARGET_IQN --logoutall=all
+systemctl restart iscsid
+iscsiadm -m node -T $TARGET_IQN --login
+```
+
+**Ping timeout tuning (both configurations):**
+
+After a failover, the reconnected session may not be immediately ready to handle pings. The default 5s `noop_out_timeout` can trigger a second session drop. Apply in `/etc/iscsi/iscsid.conf` **before** establishing any iSCSI sessions:
+
+```ini
+# How often the initiator pings the target. Default: 5.
 node.conn[0].timeo.noop_out_interval = 15
 
-# How long to wait for a ping response before declaring the connection
-# dead. The default 5s causes a second session drop after failback
-# because the target reconnects but isn't immediately ready for pings.
-# Default: 5.
+# How long to wait for a ping response. Default: 5.
 node.conn[0].timeo.noop_out_timeout = 30
 ```
 
-Changes to `iscsid.conf` only affect new sessions. Apply to existing sessions:
+These values are baked into iSCSI sessions at creation time. If sessions already exist, they must be logged out and re-established for the new values to take effect:
 
 ```bash
-TARGET_IQN="iqn.2005-10.org.freenas.ctl:your-target"
-iscsiadm -m node -T $TARGET_IQN -o update -n node.session.timeo.replacement_timeout -v 280
-iscsiadm -m node -T $TARGET_IQN -o update -n node.conn[0].timeo.noop_out_interval -v 15
-iscsiadm -m node -T $TARGET_IQN -o update -n node.conn[0].timeo.noop_out_timeout -v 30
+# Logout all sessions, restart iscsid, re-login
+iscsiadm -m node -T $TARGET_IQN --logoutall=all
+systemctl restart iscsid
+sleep 2
+iscsiadm -m node -T $TARGET_IQN --login
+
+# Verify all sessions have the correct values
+iscsiadm -m session -P 3 | grep 'Recovery Timeout'
+# All sessions should show 280 (or your configured value)
+
+cat /sys/class/iscsi_session/session*/recovery_tmo
+# Kernel-level confirmation — all should match
 ```
 
-> **Note:** These values trade off faster detection of genuinely dead connections for better tolerance of HA failover events. For multipath setups without HA, the defaults (5s/5s/120s) are preferred — fast failover to the other path is more important than tolerating long outages.
+> **Note:** These values trade off faster detection of genuinely dead connections for better tolerance of HA failover events. For multipath setups without HA, the defaults are preferred — fast failover to the other path is more important than tolerating long outages.
+>
+> **Reference:** [Red Hat: iSCSI and DM Multipath overrides](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/dm_multipath/iscsi-and-dm-multipath-overrides) documents the `fast_io_fail_tmo` override behavior.
 
 ### Cluster Testing
 

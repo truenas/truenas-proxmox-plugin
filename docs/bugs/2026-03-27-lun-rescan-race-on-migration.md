@@ -12,7 +12,7 @@ Live migration of a VM with 3 disks fails on the destination node:
 
 ```
 Could not locate by-path device for LUN 12 (IQN iqn.2005-10.org.freenas.ctl:truenas-main, retries 200).
-Sessions: tcp: [1] 10.220.13.138:3260,1 iqn.2005-10.org.freenas.ctl:truenas-main (non-flash).
+Sessions: tcp: [1] 192.168.100.10:3260,1 iqn.2005-10.org.freenas.ctl:truenas-main (non-flash).
 by-path: ...-lun-11, ...-lun-9, ...-lun-8, ...-lun-7, ...-lun-5, ...-lun-6, ...-lun-4,
          ...-lun-1, ...-lun-3, ...-lun-2, ...-lun-0
 ```
