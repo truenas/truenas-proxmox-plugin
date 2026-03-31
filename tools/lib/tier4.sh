@@ -9,13 +9,9 @@ T4_TEST_VMID=9740
 T4_TEST_VOLID=""
 T4_MARKER_VOLID=""          # Separate volume for data integrity marker (not attached to VM)
 T4_VM_CREATED=0
-T4_FAILOVER_TIMEOUT=180     # seconds
-T4_POLL_INTERVAL=5          # seconds
 T4_MARKER=""
-T4_RECOVERY_ELAPSED=0
 T4_IO_PID=""                # PID of background I/O workload
 T4_IO_LOG=""                # Log file for I/O workload output
-T4_STANDBY_TIMEOUT=300      # seconds to wait for standby to come back
 T4_FAILBACK_TIMESTAMP=""    # dmesg reference timestamp for failback diagnostics
 
 # ============================================================
@@ -114,29 +110,6 @@ tier4_cleanup() {
 }
 
 # ============================================================
-# Helper: poll VIP until API responds or timeout
-# Returns 0 on recovery, 1 on timeout. Sets T4_RECOVERY_ELAPSED.
-# ============================================================
-tier4_wait_for_api() {
-    local storage="$1"
-    local timeout="${2:-$T4_FAILOVER_TIMEOUT}"
-    local start_time
-    start_time=$(date +%s)
-    T4_RECOVERY_ELAPSED=0
-
-    while [[ $(( $(date +%s) - start_time )) -lt $timeout ]]; do
-        if tn_api_call "$storage" "failover.status" &>/dev/null; then
-            T4_RECOVERY_ELAPSED=$(( $(date +%s) - start_time ))
-            return 0
-        fi
-        sleep "$T4_POLL_INTERVAL"
-    done
-
-    T4_RECOVERY_ELAPSED=$timeout
-    return 1
-}
-
-# ============================================================
 # Helper: start continuous I/O on a block device in the background.
 # Writes sequential 4K blocks with a counter, logs errors.
 # Usage: tier4_start_io <device>
@@ -196,35 +169,6 @@ tier4_stop_io() {
 
     T4_IO_PID=""
     return "$( [[ "$errors" -eq 0 ]] && echo 0 || echo 1 )"
-}
-
-# ============================================================
-# Helper: wait for standby controller to become reachable.
-# Polls failover.call_remote core.ping until it succeeds.
-# Returns 0 on success, 1 on timeout.
-# ============================================================
-tier4_wait_for_standby() {
-    local storage="$1"
-    local timeout="${2:-$T4_STANDBY_TIMEOUT}"
-    local start_time
-    start_time=$(date +%s)
-
-    log_info "Waiting for standby controller to become ready (timeout: ${timeout}s)..."
-
-    while [[ $(( $(date +%s) - start_time )) -lt $timeout ]]; do
-        # failover.call_remote pings the other controller
-        local result
-        result=$(tn_api_call "$storage" "failover.call_remote" '["core.ping"]' 2>/dev/null || true)
-        if [[ "$result" == *"pong"* ]]; then
-            local elapsed=$(( $(date +%s) - start_time ))
-            log_info "Standby controller ready in ${elapsed}s"
-            return 0
-        fi
-        sleep "$T4_POLL_INTERVAL"
-    done
-
-    log_warn "Standby controller not ready within ${timeout}s"
-    return 1
 }
 
 # ============================================================
@@ -391,15 +335,15 @@ test_T4_04() {
     # The API call may fail/hang as the controller goes down — that's expected
 
     # Poll VIP until the API responds on the new active controller
-    log_info "T4-04: waiting for API recovery on VIP (timeout: ${T4_FAILOVER_TIMEOUT}s)..."
+    log_info "T4-04: waiting for API recovery on VIP (timeout: ${HA_FAILOVER_TIMEOUT}s)..."
 
-    if ! tier4_wait_for_api "$storage" "$T4_FAILOVER_TIMEOUT"; then
-        log_fail "T4-04: HARD GATE — API did not recover within ${T4_FAILOVER_TIMEOUT}s after failover"
+    if ! ha_wait_for_api "$storage" "$HA_FAILOVER_TIMEOUT"; then
+        log_fail "T4-04: HARD GATE — API did not recover within ${HA_FAILOVER_TIMEOUT}s after failover"
         HARD_GATE_FAILED=1
         return 2
     fi
 
-    log_info "T4-04: API responded after ${T4_RECOVERY_ELAPSED}s"
+    log_info "T4-04: API responded after ${HA_RECOVERY_ELAPSED}s"
 
     # Confirm the controller has actually changed by checking failover.node
     local new_node
@@ -411,7 +355,7 @@ test_T4_04() {
     new_node=$(echo "$new_node" | tr -d '"')
 
     if [[ "$new_node" != "$T4_ORIGINAL_NODE" ]]; then
-        log_pass "T4-04: failover complete — was controller $T4_ORIGINAL_NODE, now $new_node (${T4_RECOVERY_ELAPSED}s)"
+        log_pass "T4-04: failover complete — was controller $T4_ORIGINAL_NODE, now $new_node (${HA_RECOVERY_ELAPSED}s)"
     else
         log_fail "T4-04: HARD GATE — still on controller $new_node after failover (expected different controller)"
         HARD_GATE_FAILED=1
@@ -619,15 +563,15 @@ test_T4_09() {
     log_info "T4-09: calling failover.become_passive to return to original controller..."
     tn_api_call "$storage" "failover.become_passive" &>/dev/null || true
 
-    log_info "T4-09: waiting for API recovery on VIP (timeout: ${T4_FAILOVER_TIMEOUT}s)..."
+    log_info "T4-09: waiting for API recovery on VIP (timeout: ${HA_FAILOVER_TIMEOUT}s)..."
 
-    if ! tier4_wait_for_api "$storage" "$T4_FAILOVER_TIMEOUT"; then
-        log_warn "T4-09: API did not recover within ${T4_FAILOVER_TIMEOUT}s after failback"
+    if ! ha_wait_for_api "$storage" "$HA_FAILOVER_TIMEOUT"; then
+        log_warn "T4-09: API did not recover within ${HA_FAILOVER_TIMEOUT}s after failback"
         log_warn "T4-09: original controller may not be MASTER — system is still in a valid HA state"
         return 1
     fi
 
-    log_info "T4-09: API responded after ${T4_RECOVERY_ELAPSED}s"
+    log_info "T4-09: API responded after ${HA_RECOVERY_ELAPSED}s"
 
     # Verify the original controller is back
     local current_node
@@ -638,7 +582,7 @@ test_T4_09() {
     current_node=$(echo "$current_node" | tr -d '"')
 
     if [[ "$current_node" == "$T4_ORIGINAL_NODE" ]]; then
-        log_pass "T4-09: failback complete — controller $current_node is MASTER again (${T4_RECOVERY_ELAPSED}s)"
+        log_pass "T4-09: failback complete — controller $current_node is MASTER again (${HA_RECOVERY_ELAPSED}s)"
 
         # Warn if failback time is close to the iSCSI replacement_timeout —
         # VMs and data integrity checks are likely to fail when the outage
@@ -647,8 +591,8 @@ test_T4_09() {
         repl_timeout=$(grep -m1 'node.session.timeo.replacement_timeout' /etc/iscsi/iscsid.conf 2>/dev/null | awk '{print $3}')
         repl_timeout="${repl_timeout:-120}"
         local threshold=$(( repl_timeout * 75 / 100 ))  # warn at 75% of timeout
-        if [[ "$T4_RECOVERY_ELAPSED" -gt "$threshold" ]]; then
-            log_warn "T4-09: failback took ${T4_RECOVERY_ELAPSED}s — close to iSCSI replacement_timeout (${repl_timeout}s). VM survival and data integrity tests may fail. Consider increasing node.session.timeo.replacement_timeout in /etc/iscsi/iscsid.conf."
+        if [[ "$HA_RECOVERY_ELAPSED" -gt "$threshold" ]]; then
+            log_warn "T4-09: failback took ${HA_RECOVERY_ELAPSED}s — close to iSCSI replacement_timeout (${repl_timeout}s). VM survival and data integrity tests may fail. Consider increasing node.session.timeo.replacement_timeout in /etc/iscsi/iscsid.conf."
         fi
     else
         log_warn "T4-09: controller $current_node is MASTER, expected original controller $T4_ORIGINAL_NODE"
@@ -859,7 +803,7 @@ run_tier4() {
     # --- Wait for standby before failback ---
     # The former active controller needs time to reboot and rejoin as standby.
     # Without this, failback will fail because there's no standby to fail over to.
-    tier4_wait_for_standby "$storage" || {
+    ha_wait_for_standby "$storage" || {
         log_warn "Tier 4: standby controller not ready — failback tests may fail"
     }
 

@@ -85,6 +85,24 @@ assert_eq "retry_window_seconds 5 2" "115" "$val"
 out=$(tn_api_call 2>&1) || true
 assert_match "tn_api_call no args" 'Usage:' "$out"
 
+# --- parse_multipath_ll ---
+SAMPLE_MP='mpathb (36589cfc000000abc) dm-4 TrueNAS,iSCSI Disk
+size=100G features='"'"'1 queue_if_no_path'"'"' hwhandler='"'"'1 alua'"'"' wp=rw
+|-+- policy='"'"'service-time 0'"'"' prio=50 status=active
+| `- 3:0:0:1 sdc 8:32 active ready running
+`-+- policy='"'"'service-time 0'"'"' prio=10 status=enabled
+  `- 4:0:0:1 sdd 8:48 active ready running'
+
+eval "$(echo "$SAMPLE_MP" | parse_multipath_ll)"
+assert_eq "mp dm_device"    "dm-4"      "$MP_DM_DEVICE"
+assert_eq "mp hwhandler"    "1 alua"    "$MP_HWHANDLER"
+assert_eq "mp prio_high"    "50"        "$MP_PRIO_HIGH"
+assert_eq "mp prio_low"     "10"        "$MP_PRIO_LOW"
+assert_eq "mp path_high"    "sdc"       "$MP_PATH_HIGH"
+assert_eq "mp path_low"     "sdd"       "$MP_PATH_LOW"
+assert_eq "mp path_active"  "sdc"       "$MP_PATH_ACTIVE"
+assert_eq "mp path_enabled" "sdd"       "$MP_PATH_ENABLED"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

@@ -159,3 +159,137 @@ tn_api_call() {
         print encode_json($result) . "\n" if defined $result;
     ' "$api_host" "$api_key" "$api_insecure" "$method" "$params"
 }
+
+# Parse multipath -ll output for one device and emit shell variable assignments.
+# Usage: eval "$(multipath -ll <dm_device> | parse_multipath_ll)"
+# Sets: MP_DM_DEVICE, MP_HWHANDLER, MP_PRIO_HIGH, MP_PRIO_LOW,
+#        MP_PATH_HIGH, MP_PATH_LOW, MP_STATUS_HIGH, MP_STATUS_LOW,
+#        MP_SCSI_HIGH, MP_SCSI_LOW
+# Reads from stdin. Parses the first device stanza only.
+parse_multipath_ll() {
+    local dm_device="" hwhandler=""
+    local prio_high=0 prio_low=999 path_high="" path_low=""
+    local status_high="" status_low="" scsi_high="" scsi_low=""
+    local path_active="" prio_active=0 scsi_active=""
+    local path_enabled="" prio_enabled=0 scsi_enabled=""
+    local current_prio=0 current_status=""
+
+    while IFS= read -r line; do
+        # First line: mpathX (wwid) dm-N vendor,product
+        if [[ -z "$dm_device" ]] && [[ "$line" =~ (dm-[0-9]+) ]]; then
+            dm_device="${BASH_REMATCH[1]}"
+        fi
+        # hwhandler line
+        if [[ "$line" =~ hwhandler=\'([^\']*)\' ]]; then
+            hwhandler="${BASH_REMATCH[1]}"
+        fi
+        # Path group line: prio=NN status=XXX
+        if [[ "$line" =~ prio=([0-9]+) ]]; then
+            current_prio="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$line" =~ status=([a-z]+) ]]; then
+            current_status="${BASH_REMATCH[1]}"
+        fi
+        # Path line: H:C:T:L sdX M:m state1 state2 state3
+        if [[ "$line" =~ ([0-9]+:[0-9]+:[0-9]+:[0-9]+)[[:space:]]+(sd[a-z]+) ]]; then
+            local scsi_addr="${BASH_REMATCH[1]}"
+            local sd_dev="${BASH_REMATCH[2]}"
+            if [[ "$current_prio" -gt "$prio_high" ]]; then
+                prio_high="$current_prio"
+                path_high="$sd_dev"
+                status_high="$current_status"
+                scsi_high="$scsi_addr"
+            fi
+            if [[ "$current_prio" -lt "$prio_low" ]]; then
+                prio_low="$current_prio"
+                path_low="$sd_dev"
+                status_low="$current_status"
+                scsi_low="$scsi_addr"
+            fi
+            # Track path group by status (active = carrying I/O)
+            if [[ "$current_status" == "active" ]]; then
+                path_active="$sd_dev"
+                prio_active="$current_prio"
+                scsi_active="$scsi_addr"
+            elif [[ "$current_status" == "enabled" ]]; then
+                path_enabled="$sd_dev"
+                prio_enabled="$current_prio"
+                scsi_enabled="$scsi_addr"
+            fi
+        fi
+    done
+
+    echo "MP_DM_DEVICE='$dm_device'"
+    echo "MP_HWHANDLER='$hwhandler'"
+    echo "MP_PRIO_HIGH='$prio_high'"
+    echo "MP_PRIO_LOW='$prio_low'"
+    echo "MP_PATH_HIGH='$path_high'"
+    echo "MP_PATH_LOW='$path_low'"
+    echo "MP_STATUS_HIGH='$status_high'"
+    echo "MP_STATUS_LOW='$status_low'"
+    echo "MP_SCSI_HIGH='$scsi_high'"
+    echo "MP_SCSI_LOW='$scsi_low'"
+    echo "MP_PATH_ACTIVE='$path_active'"
+    echo "MP_PRIO_ACTIVE='$prio_active'"
+    echo "MP_SCSI_ACTIVE='$scsi_active'"
+    echo "MP_PATH_ENABLED='$path_enabled'"
+    echo "MP_PRIO_ENABLED='$prio_enabled'"
+    echo "MP_SCSI_ENABLED='$scsi_enabled'"
+}
+
+# ============================================================
+# Shared HA failover helpers — used by Tier 4 and Tier 5
+# ============================================================
+HA_FAILOVER_TIMEOUT=180     # seconds to wait for VIP API recovery
+HA_POLL_INTERVAL=5          # seconds between poll attempts
+HA_STANDBY_TIMEOUT=300      # seconds to wait for standby controller
+HA_RECOVERY_ELAPSED=0       # set by ha_wait_for_api after successful recovery
+
+# Poll TrueNAS VIP until the API responds or timeout expires.
+# Usage: ha_wait_for_api <storage_name> [timeout]
+# Returns 0 on recovery, 1 on timeout. Sets HA_RECOVERY_ELAPSED.
+ha_wait_for_api() {
+    local storage="$1"
+    local timeout="${2:-$HA_FAILOVER_TIMEOUT}"
+    local start_time
+    start_time=$(date +%s)
+    HA_RECOVERY_ELAPSED=0
+
+    while [[ $(( $(date +%s) - start_time )) -lt $timeout ]]; do
+        if tn_api_call "$storage" "failover.status" &>/dev/null; then
+            HA_RECOVERY_ELAPSED=$(( $(date +%s) - start_time ))
+            return 0
+        fi
+        sleep "$HA_POLL_INTERVAL"
+    done
+
+    HA_RECOVERY_ELAPSED=$timeout
+    return 1
+}
+
+# Wait for the standby controller to become reachable.
+# Polls failover.call_remote core.ping until success or timeout.
+# Usage: ha_wait_for_standby <storage_name> [timeout]
+# Returns 0 on success, 1 on timeout.
+ha_wait_for_standby() {
+    local storage="$1"
+    local timeout="${2:-$HA_STANDBY_TIMEOUT}"
+    local start_time
+    start_time=$(date +%s)
+
+    log_info "Waiting for standby controller to become ready (timeout: ${timeout}s)..."
+
+    while [[ $(( $(date +%s) - start_time )) -lt $timeout ]]; do
+        local result
+        result=$(tn_api_call "$storage" "failover.call_remote" '["core.ping"]' 2>/dev/null || true)
+        if [[ "$result" == *"pong"* ]]; then
+            local elapsed=$(( $(date +%s) - start_time ))
+            log_info "Standby controller ready in ${elapsed}s"
+            return 0
+        fi
+        sleep "$HA_POLL_INTERVAL"
+    done
+
+    log_warn "Standby controller not ready within ${timeout}s"
+    return 1
+}
