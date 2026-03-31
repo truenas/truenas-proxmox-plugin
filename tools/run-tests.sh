@@ -23,6 +23,7 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 HARD_GATE_FAILED=0
 TIER4_AVAILABLE=0
+TIER5_AVAILABLE=0
 LOG_FILE="/tmp/truenas-test-$(date '+%Y%m%d-%H%M%S').log"
 
 # Argument defaults
@@ -55,23 +56,25 @@ parse_args() {
 # ============================================================
 config_required_tiers() {
     case "$1" in
-        A)   echo "1"       ;;
-        D)   echo "1 2"     ;;
-        F)   echo "1 3"     ;;
-        H)   echo "1 4"     ;;
-        all) echo "1 2 3 4" ;;
-        *)   echo "1"       ;;
+        A)   echo "1"         ;;
+        D)   echo "1 2"       ;;
+        F)   echo "1 3"       ;;
+        H)   echo "1 4"       ;;
+        G)   echo "1 5"       ;;
+        all) echo "1 2 3 4 5" ;;
+        *)   echo "1"         ;;
     esac
 }
 
 config_hard_gates() {
     case "$1" in
-        A)   echo "T1-01"                   ;;
-        D)   echo "T1-01 T2-03"             ;;
-        F)   echo "T1-01 T3-04"             ;;
-        H)   echo "T1-01 T4-04"             ;;
-        all) echo "T1-01 T2-03 T3-04 T4-04" ;;
-        *)   echo "T1-01"                   ;;
+        A)   echo "T1-01"                         ;;
+        D)   echo "T1-01 T2-03"                   ;;
+        F)   echo "T1-01 T3-04"                   ;;
+        H)   echo "T1-01 T4-04"                   ;;
+        G)   echo "T1-01 T5-04"                   ;;
+        all) echo "T1-01 T2-03 T3-04 T4-04 T5-04" ;;
+        *)   echo "T1-01"                         ;;
     esac
 }
 
@@ -139,6 +142,15 @@ if [[ $MAX_TIER -ge 1 ]] && [[ -n "$ARG_STORAGE" ]]; then
     fi
 fi
 
+# Tier 5 detection: HA + multipath + dual portals
+if [[ "${TIER4_AVAILABLE:-0}" -eq 1 ]] && \
+   grep -q 'use_multipath 1' /etc/pve/storage.cfg 2>/dev/null; then
+    _portal_count=$(read_storage_cfg "$ARG_STORAGE" "portals" | tr ',' '\n' | grep -c '.' || true)
+    if [[ "${_portal_count:-0}" -ge 2 ]]; then
+        TIER5_AVAILABLE=1
+    fi
+fi
+
 log_info "Detected max hardware tier: $MAX_TIER"
 
 # Validate hardware against --config requirements
@@ -148,6 +160,11 @@ if [[ "$ARG_CONFIG" != "all" ]]; then
         if [[ "$t" -eq 4 ]]; then
             if [[ "${TIER4_AVAILABLE:-0}" -ne 1 ]]; then
                 log_fail "Hardware insufficient for Config $ARG_CONFIG: Tier 4 (HA TrueNAS) required but not detected"
+                exit 2
+            fi
+        elif [[ "$t" -eq 5 ]]; then
+            if [[ "${TIER5_AVAILABLE:-0}" -ne 1 ]]; then
+                log_fail "Hardware insufficient for Config $ARG_CONFIG: Tier 5 (ALUA + HA) required but not detected"
                 exit 2
             fi
         elif [[ "$t" -gt "$MAX_TIER" ]]; then
@@ -173,6 +190,7 @@ source "$SCRIPT_DIR/lib/tier1.sh"
 source "$SCRIPT_DIR/lib/tier2.sh"
 source "$SCRIPT_DIR/lib/tier3.sh"
 source "$SCRIPT_DIR/lib/tier4.sh"
+source "$SCRIPT_DIR/lib/tier5.sh"
 
 START_TIME=$(date +%s)
 
@@ -187,6 +205,11 @@ run_tier() {
             log_skip "Tier 4 — HA TrueNAS not detected"
             return 0
         fi
+    elif [[ "$tier" -eq 5 ]]; then
+        if [[ "${TIER5_AVAILABLE:-0}" -ne 1 ]]; then
+            log_skip "Tier 5 — ALUA + HA not detected"
+            return 0
+        fi
     elif [[ "$tier" -gt "$MAX_TIER" ]]; then
         log_skip "Tier $tier — requires hardware not detected"
         return 0
@@ -196,6 +219,7 @@ run_tier() {
         2) run_tier2 "$ARG_STORAGE" "$ARG_CONFIG" ;;
         3) run_tier3 "$ARG_STORAGE" "$ARG_CONFIG" ;;
         4) run_tier4 "$ARG_STORAGE" "$ARG_CONFIG" ;;
+        5) run_tier5 "$ARG_STORAGE" "$ARG_CONFIG" ;;
     esac
 }
 
@@ -203,6 +227,7 @@ run_tier 1
 run_tier 2
 run_tier 3
 run_tier 4
+run_tier 5
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
