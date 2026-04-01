@@ -441,12 +441,9 @@ show_cluster_warning() {
         echo
         warning "⚠️  Proxmox Cluster Detected (${node_count} nodes)"
         echo
-        info "This installer only updates the current node."
-        info "To update all cluster nodes, use the cluster update script:"
-        echo
-        echo "  wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/tools/update-cluster.sh"
-        echo "  chmod +x update-cluster.sh"
-        echo "  ./update-cluster.sh node1 node2 node3"
+        info "Installation was performed on this node only."
+        info "To update all cluster nodes, re-run this installer and select:"
+        info "  'Update plugin' → 'Update all cluster nodes'"
         echo
         return 0
     fi

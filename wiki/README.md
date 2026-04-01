@@ -57,8 +57,8 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 - [Health Check Tool](Tools.md#health-check-tool)
 - [Diagnostics Bundle](Tools.md#diagnostics-bundle)
 - [Orphan Cleanup Tool](Tools.md#orphan-cleanup-tool)
-- [Cluster Update Script](Tools.md#cluster-update-script)
-- [Version Check Script](Tools.md#version-check-script)
+- [Cluster Update](Tools.md#cluster-update-script)
+- [Version Check](Tools.md#version-check-script)
 - [Deployment Automation](Tools.md#integration-with-cicd)
 
 **Configuration**:
