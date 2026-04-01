@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.12';
+our $VERSION = '2.0.13';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -4256,17 +4256,24 @@ sub _alloc_image_iscsi {
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: starting iSCSI device discovery for LUN $deferred_lun");
 
-        # Ensure iSCSI login
-        if (!_target_sessions_active($deferred_scfg)) {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
-            eval { _iscsi_login_all($deferred_scfg); };
-            if ($@) {
-                _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
-                return;
-            }
+        # When sessions are already active, skip the disruptive session rescan and multipath
+        # reload — these affect ALL iSCSI sessions/devices system-wide and can cause I/O errors
+        # on other active multipath devices (Issue #15). activate_volume handles authoritative
+        # device discovery with built-in rescans at safe intervals.
+        if (_target_sessions_active($deferred_scfg)) {
+            _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: sessions already active, skipping rescan (activate_volume will handle device discovery)");
+            return;
         }
 
-        # Rescan to detect the new LUN
+        # No active sessions — perform login and device discovery
+        _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
+        eval { _iscsi_login_all($deferred_scfg); };
+        if ($@) {
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
+            return;
+        }
+
+        # Rescan to detect the new LUN (safe here — we just logged in, no existing I/O)
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
         if ($deferred_scfg->{use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
@@ -4511,6 +4518,9 @@ sub _free_image_iscsi {
     # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, check if safe to logout
     # Don't logout if there are other active LUNs - this breaks multi-disk operations
     if ($need_force_logout) {
+        # Invalidate cache to get fresh targetextent data — a destination LUN may have been
+        # created since the cache was last populated (e.g., during a disk move operation)
+        _clear_cache($scfg->{storeid} || 'unknown');
         # Check how many LUNs are currently mapped to this target
         my $active_luns = 0;
         eval {
