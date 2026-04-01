@@ -592,14 +592,22 @@ force_delete_truenas_zvol() {
 if pvesh get /cluster/status --output-format=json 2>/dev/null | grep -q '"type":"cluster"'; then
     IS_CLUSTER=1
 
-    # Get list of online nodes (excluding current node)
+    # Get list of ONLINE nodes only (excluding current node)
     mapfile -t CLUSTER_NODES < <(pvesh get /nodes --output-format=json 2>/dev/null | \
-        grep -o '"node":"[^"]*"' | cut -d'"' -f4 | grep -v "^$NODE$" || echo "")
+        NODE="$NODE" perl -0777 -MJSON::PP -ne '
+            my $nodes = decode_json($_);
+            for my $n (@$nodes) {
+                next if $n->{node} eq $ENV{NODE};
+                print "$n->{node}\n" if ($n->{status} // "") eq "online";
+            }
+        ' || echo "")
 
-    if [[ ${#CLUSTER_NODES[@]} -gt 0 ]]; then
+    if [[ ${#CLUSTER_NODES[@]} -gt 0 && -n "${CLUSTER_NODES[0]}" ]]; then
         TARGET_NODE="${CLUSTER_NODES[0]}"
+        log_info "Cluster detected — using online node '$TARGET_NODE' for multi-node tests (${#CLUSTER_NODES[@]} peer(s) available)"
     else
         IS_CLUSTER=0
+        log_info "Cluster detected but no online peer nodes found — multi-node tests will be skipped"
     fi
 fi
 

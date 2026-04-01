@@ -1,5 +1,15 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.13 (March 31, 2026)
+
+### Bug Fixes
+
+- **Skip disruptive iSCSI rescan during allocation when sessions already active**: When iSCSI sessions are already established, `alloc_image` now skips the system-wide session rescan and multipath reload. These operations affect all active iSCSI devices and can cause I/O errors on unrelated disks during concurrent operations (GitHub issue #15)
+
+- **Invalidate targetextent cache in free_image**: The cache is now explicitly cleared before querying active LUNs during disk free operations, ensuring accurate counts when a destination LUN was created during a disk move (GitHub issue #15)
+
+---
+
 ## Version 2.0.12 (March 27, 2026)
 
 ### Bug Fixes
