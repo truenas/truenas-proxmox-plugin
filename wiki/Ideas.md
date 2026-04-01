@@ -215,8 +215,7 @@ Overall Score      GOOD        BEST        FAIR
 **Tool Enhancement**:
 ```bash
 # Show what would be deployed without actually deploying
-cd tools/
-./update-cluster.sh --dry-run pve1 pve2 pve3
+./install.sh --dry-run  # (proposed feature)
 
 # Output:
 # Would copy TrueNASPlugin.pm to:

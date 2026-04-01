@@ -424,8 +424,8 @@ tail -f /var/log/middlewared.log | grep rate
 # Keep plugin source in safe location
 cp TrueNASPlugin.pm /root/truenas-plugin-backup/
 
-# Use cluster deployment script for easy reinstall
-./update-cluster.sh node1 node2 node3
+# Use installer for easy cluster-wide reinstall
+./install.sh  # Select "Install latest version (all cluster nodes)"
 ```
 
 ## Network Limitations

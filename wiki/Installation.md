@@ -754,15 +754,14 @@ Follow the single node installation steps above on your first cluster node.
 
 #### 2. Deploy to Cluster Nodes
 
-Use the included deployment script:
+Use the installer's cluster-wide deployment feature:
 
 ```bash
-# Make the script executable
-chmod +x update-cluster.sh
+# Run the installer on any cluster node
+./install.sh
 
-# Deploy to all nodes
-cd tools/
-./update-cluster.sh node1 node2 node3
+# Select "Install latest version (all cluster nodes)"
+# The installer will automatically discover and deploy to all nodes
 ```
 
 Or manually on each node:
@@ -1086,9 +1085,8 @@ systemctl restart pvedaemon pveproxy
 
 ### Cluster Update
 ```bash
-# Use the deployment script
-cd tools/
-./update-cluster.sh node1 node2 node3
+# Run the installer and select "Update plugin" → "Update all cluster nodes"
+./install.sh
 
 # Or manually on each node
 for node in node1 node2 node3; do
