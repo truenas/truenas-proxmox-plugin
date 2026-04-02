@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.13';
+our $VERSION = '2.0.14';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -4442,29 +4442,7 @@ sub _free_image_iscsi {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: captured " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) for cleanup") if @scsi_devices_to_cleanup;
     }
 
-    # Best-effort: flush local multipath path of this WWID (ignore "not a multipath device")
-    if ($scfg->{use_multipath}) {
-        eval {
-            my ($dev) = $class->path($scfg, $volname, $storeid, undef);
-            if ($dev) {
-                my $leaf = Cwd::abs_path($dev);
-                my $wwid = '';
-                eval {
-                    PVE::Tools::run_command(
-                        ['/lib/udev/scsi_id','-g','-u','-d',$leaf],
-                        outfunc => sub { $wwid .= $_[0]; }, errfunc => sub {}
-                    );
-                };
-                chomp($wwid) if $wwid;
-                if ($wwid) {
-                    eval { PVE::Tools::run_command(['multipath','-f',$wwid], outfunc=>sub{}, errfunc=>sub{}) };
-                }
-            }
-        };
-        # ignore any multipath flush errors here
-    }
-
-    # Resolve target/extent/mapping on TrueNAS
+    # Resolve target/extent/mapping on TrueNAS (moved up: needed for WWID validation below)
     my $target_id = _resolve_target_id($scfg);
     my $extents = _tn_extents($scfg) // [];
     my $zvol_path_match = "zvol/$scfg->{dataset}/$zname";
@@ -4474,14 +4452,59 @@ sub _free_image_iscsi {
         ? grep { (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id}) } @$maps
         : ();
 
+    # Best-effort: flush the local multipath map for this LUN's WWID.
+    # Derive WWID directly from the TrueNAS extent NAA (already fetched above) rather than
+    # calling path() + scsi_id — scsi_id does not work reliably on DM devices (/dev/mapper/mpathX),
+    # and calling path() here would re-enter the login path on a volume being deleted.
+    # TrueNAS NAA format: "0x6589cfc..." → multipath WWID: "36589cfc..." (0x prefix → NAA-6 type byte 3)
+    if ($scfg->{use_multipath}) {
+        eval {
+            if ($extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
+                (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
+                _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: flushing multipath map $flush_wwid");
+                eval { PVE::Tools::run_command(['multipath','-f',$flush_wwid], outfunc=>sub{}, errfunc=>sub{}) };
+            }
+            # If no extent or NAA missing/malformed: skip flush (cannot determine WWID safely)
+        };
+        # ignore any multipath flush errors here
+    }
+
     my $in_use = sub { my ($e)=@_; return ($e && $e =~ /in use/i) ? 1 : 0; };
     my $need_force_logout = 0;
+    my $did_session_logout = 0;
+    my $scsi_teardown_done = 0;
+
+    # Pre-teardown: remove this LUN's SCSI block device from the kernel before TrueNAS API calls.
+    # The iSCSI TCP session stays open (needed for other LUNs), but the kernel device is released.
+    # After teardown succeeds, we pass force=true to TrueNAS delete calls to bypass the
+    # persistent-session check — the session no longer has any active I/O against this LUN.
+    if (@scsi_devices_to_cleanup) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: pre-teardown of " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) before API calls");
+        my @device_paths;
+        for my $dev (@scsi_devices_to_cleanup) {
+            my $delete_path = "/sys/block/$dev/device/delete";
+            push @device_paths, $delete_path if -e $delete_path;
+            if (-e $delete_path && -w $delete_path) {
+                eval {
+                    _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev");
+                    if (open my $fh, '>', $delete_path) { print $fh "1"; close $fh; }
+                };
+            }
+        }
+        my $verified = _verify_devices_disconnected($scfg, \@device_paths);
+        eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+        sleep(DEVICE_SETTLE_DELAY_S);
+        @scsi_devices_to_cleanup = ();
+        # Only set flag when kernel confirms devices gone — gates force=true on API calls below
+        $scsi_teardown_done = $verified ? 1 : 0;
+    }
 
     # 1) Delete targetextent mapping
+    # Pass force=true when SCSI teardown confirmed no active I/O against this LUN.
     if ($tx && defined $tx->{id}) {
         my $id = $tx->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.targetextent.delete',[ $id ]);
+            _api_call($scfg,'iscsi.targetextent.delete',[ $id, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
             1;
         };
         if (!$ok) {
@@ -4497,10 +4520,11 @@ sub _free_image_iscsi {
     }
 
     # 2) Delete extent (may still be mapped if step 1 failed)
+    # Pass force=true when SCSI teardown confirmed no active I/O against this LUN.
     if ($extent && defined $extent->{id}) {
         my $eid = $extent->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.extent.delete',[ $eid ]);
+            _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
             1;
         };
         if (!$ok) {
@@ -4529,24 +4553,26 @@ sub _free_image_iscsi {
             $active_luns = scalar(@target_maps);
         };
 
-        # Only logout if this is the last LUN, or if we can't determine LUN count
-        # This prevents breaking multi-disk restore/creation operations
+        # Only logout if this is the last LUN (or unknown count) — full logout during a
+        # disk move would tear down the destination LUN's session mid-copy.
         if ($active_luns <= 1 || $@) {
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: logging out to retry extent deletion (active LUNs: $active_luns)");
             _logout_target_all_portals($scfg);
-            # Wait for iSCSI session to fully disconnect before retrying deletion
             _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: waiting for iSCSI session to disconnect");
-            sleep(DEVICE_SETTLE_DELAY_S);  # Reduced from 2s to 1s - modern systems settle faster
+            sleep(DEVICE_SETTLE_DELAY_S);
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+            $did_session_logout = 1;
         } else {
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: skipping logout - $active_luns other LUNs active");
-            $need_force_logout = 0;  # Skip retry since we're not logging out
+            # Other LUNs active — do NOT logout entire target.
+            # Early per-LUN SCSI teardown should have released this LUN's reference.
+            # $need_force_logout stays 1 to trigger the retry block below without a session logout.
+            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: $active_luns LUNs active — retrying deletes without logout");
         }
         # Retry mapping delete
         if ($tx && defined $tx->{id}) {
             my $id = $tx->{id};
             eval {
-                _api_call($scfg,'iscsi.targetextent.delete',[ $id ]);
+                _api_call($scfg,'iscsi.targetextent.delete',[ $id, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
             };
             if ($@) {
                 # In cluster environments, other nodes may have active sessions causing "in use" errors
@@ -4560,7 +4586,7 @@ sub _free_image_iscsi {
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
-                _api_call($scfg,'iscsi.extent.delete',[ $eid ]);
+                _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
             };
             if ($@) {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete extent id=$eid (may be in use by other cluster nodes)");
@@ -4568,44 +4594,14 @@ sub _free_image_iscsi {
         }
     }
 
-    # 4) CRITICAL: Ensure devices are fully disconnected BEFORE dataset deletion
-    # This fixes the race condition where dataset deletion fails with "busy" errors
-    # because the kernel still has active device references
-    if ($need_force_logout || @scsi_devices_to_cleanup) {
-        # Logout to disconnect iSCSI sessions
-        if ($need_force_logout) {
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: logging out before dataset deletion to prevent race condition");
-            _logout_target_all_portals($scfg);
+    # 4) Allow devices to settle before dataset deletion
+    if ($need_force_logout) {
+        if ($did_session_logout) {
+            # Session was disconnected in step 3 — give it a moment before dataset deletion
             sleep(DEVICE_SETTLE_DELAY_S);
         }
-
-        # Clean up orphaned SCSI device entries from kernel
-        # This must happen BEFORE dataset deletion to prevent "busy" errors
-        if (@scsi_devices_to_cleanup) {
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: cleaning up " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) before dataset deletion");
-            my @device_paths;
-            for my $dev (@scsi_devices_to_cleanup) {
-                my $delete_path = "/sys/block/$dev/device/delete";
-                push @device_paths, $delete_path if -e $delete_path;
-                if (-e $delete_path && -w $delete_path) {
-                    eval {
-                        _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev for LUN $lun");
-                        if (open my $fh, '>', $delete_path) {
-                            print $fh "1";
-                            close $fh;
-                        }
-                    };
-                    # Ignore errors - device may already be gone
-                }
-            }
-
-            # Verify devices are disconnected before proceeding
-            _verify_devices_disconnected($scfg, \@device_paths);
-        }
-
-        # Run udevadm settle to ensure kernel has processed all changes
         eval { run_command(['udevadm','settle'], outfunc => sub {}) };
-        $need_force_logout = 1;  # Mark that we need to handle reconnection later
+        $need_force_logout = 1;  # signal deferred cleanup: skip session rescan
     }
 
     # 5) Delete the zvol dataset using retry logic with exponential backoff
@@ -5401,7 +5397,11 @@ sub activate_volume {
 
     if ($mode eq 'iscsi') {
         _iscsi_login_all($scfg);
-        if ($scfg->{use_multipath}) { run_command(['multipath','-r'], outfunc => sub {}); }
+        if ($scfg->{use_multipath}) {
+            run_command(['multipath','-r'], outfunc => sub {});
+            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+            usleep(UDEV_SETTLE_TIMEOUT_US);
+        }
 
         # Wait for the specific LUN device to appear (up to ~20s, configurable)
         my $lun = $metadata;

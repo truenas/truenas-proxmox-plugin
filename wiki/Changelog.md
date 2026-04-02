@@ -1,5 +1,19 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.14 (April 2, 2026)
+
+### Bug Fixes
+
+- **Fix disk move with multipath — orphaned iSCSI extents on TrueNAS (GitHub issue #15)**: When moving a stopped VM's disk between storages with `use_multipath=1`, the plugin now tears down the source LUN's SCSI block device before calling TrueNAS delete APIs, and passes `force=true` to `iscsi.targetextent.delete` and `iscsi.extent.delete` once the kernel confirms no active I/O against that LUN. Previously, persistent iSCSI sessions caused TrueNAS to refuse deletion ("target is in use"), leaving orphaned extent/targetextent records and zombie `##,##` multipath devices after every move
+
+- **Fix multipath flush destroying destination device mid-copy (GitHub issue #15)**: The multipath map flush in `_free_image_iscsi` now derives the WWID directly from the TrueNAS extent NAA record (already fetched for deletion) rather than calling `path()` + `scsi_id` on the device path. `scsi_id` does not work reliably on DM devices (`/dev/mapper/mpathX`) and was silently returning empty, leaving zombie `##,##` DM entries after every disk move. The new approach also prevents flushing the wrong (destination) device during a concurrent disk move
+
+- **Fix race window between `multipath -r` and device access in `activate_volume` (GitHub issue #15)**: Added `udevadm settle` + 250ms grace period after `multipath -r` in `activate_volume` to allow multipathd to complete its DM table reload before `_device_for_lun` accesses the device. Without this, the device could appear ready in `/dev/disk/by-path` while multipathd still held it exclusively, causing intermittent EBUSY on the first I/O
+
+- **Fix force-logout retry incorrectly skipped during disk moves (GitHub issue #15)**: When `force_delete_on_inuse=1` is configured and a disk move has already allocated the destination LUN (making `active_luns >= 2`), the retry branch no longer resets `$need_force_logout` to 0. The retry now fires without a full target logout, relying on the prior SCSI teardown having released the specific LUN's kernel reference
+
+---
+
 ## Version 2.0.13 (March 31, 2026)
 
 ### Bug Fixes
