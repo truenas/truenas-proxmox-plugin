@@ -14,7 +14,7 @@ Advanced configuration, performance tuning, clustering, and security features of
   - [Rate Limiting Strategy](#rate-limiting-strategy)
 - [Cluster Configuration](#cluster-configuration)
   - [Shared Storage Setup](#shared-storage-setup)
-  - [Cluster Deployment Script](#cluster-deployment-script)
+  - [Cluster Deployment](#cluster-deployment)
   - [High Availability (HA)](#high-availability-ha)
   - [Cluster Testing](#cluster-testing)
 - [Security Configuration](#security-configuration)

@@ -517,8 +517,6 @@ bash install.sh
 
 ### Tests Performed
 
-The integrated test performs 8 comprehensive tests:
-
 The integrated test performs 8 comprehensive tests with 30-character label formatting for consistent output:
 
 **Test 1: Storage Accessibility** - Validates storage is active and accessible via Proxmox API

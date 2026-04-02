@@ -13,6 +13,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 
 ### Configuration
 - **[Configuration Reference](Configuration.md)** - Complete reference for all configuration parameters with examples for different use cases
+- **[NVMe Setup Guide](NVMe-Setup.md)** - NVMe/TCP transport configuration, DH-HMAC-CHAP authentication, and namespace management
 
 ### Testing and Validation
 - **[Testing Guide](Testing.md)** - Comprehensive guide for using the automated test suite to validate plugin functionality
@@ -53,13 +54,13 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 - [Performance Benchmarking](Testing.md#performance-benchmarking)
 
 **Tools**:
-- [Test Suite](Tools.md#test-suite)
+- [Test Suite](Tools.md#development-test-suite)
 - [Health Check Tool](Tools.md#health-check-tool)
 - [Diagnostics Bundle](Tools.md#diagnostics-bundle)
-- [Orphan Cleanup Tool](Tools.md#orphan-cleanup-tool)
+- [Orphan Cleanup Tool](Tools.md#orphan-cleanup)
 - [Cluster Update](Tools.md#cluster-update-script)
 - [Version Check](Tools.md#version-check-script)
-- [Deployment Automation](Tools.md#integration-with-cicd)
+- [Deployment Automation](Tools.md#cicd-integration)
 
 **Configuration**:
 - [Required Parameters](Configuration.md#required-parameters)
@@ -93,6 +94,7 @@ wiki/
 ├── README.md                   # This file - documentation index
 ├── Installation.md             # Installation and setup guide
 ├── Configuration.md            # Configuration reference
+├── NVMe-Setup.md               # NVMe/TCP transport setup and authentication
 ├── Testing.md                  # Test suite usage and validation
 ├── Tools.md                    # Tools and utilities (test suite, health check, diagnostics bundle, orphan cleanup, cluster deployment)
 ├── Troubleshooting.md          # Common issues and solutions
