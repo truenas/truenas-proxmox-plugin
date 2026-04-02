@@ -98,11 +98,11 @@ After installation, the installer provides a full-featured management interface:
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║              TRUENAS PROXMOX VE PLUGIN                   ║
-║                  Installer v1.0.0                        ║
+║                  Installer v2.0.0                        ║
 ╚══════════════════════════════════════════════════════════╝
 
-Plugin Status: Installed (v1.0.6)
-Update Available: v1.0.7
+Plugin Status: Installed (v2.0.12)
+Update Available: v2.0.13
 
 Main Menu:
   1) Update plugin
@@ -140,7 +140,7 @@ Choose an option:
 
 **Diagnostics Menu**
 - Unified diagnostics menu for troubleshooting and maintenance
-- 12-point comprehensive health validation
+- 13-point comprehensive health validation
   - Transport-aware validation (iSCSI and NVMe/TCP)
   - Plugin file verification and syntax check
   - Storage configuration validation
@@ -227,11 +227,11 @@ Non-interactive mode will:
 wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 
 # Installer will:
-# 1. Download and install plugin v1.0.7 (latest)
+# 1. Download and install plugin (latest)
 # 2. Prompt: "Would you like to configure storage now? (Y/n)"
 # 3. If yes: Launch configuration wizard
 # 4. Prompt: "Would you like to run a health check? (Y/n)"
-# 5. If yes: Run 11-point health validation
+# 5. If yes: Run 13-point health validation
 # 6. Display next steps and documentation links
 ```
 
@@ -241,8 +241,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 ./install.sh
 
 # Main menu will show:
-# "Plugin Status: Installed (v1.0.6)"
-# "Update Available: v1.0.7"
+# "Plugin Status: Installed (v2.0.12)"
+# "Update Available: v2.0.13"
 
 # Choose option 1: "Update plugin"
 # Sub-menu will present:
@@ -251,8 +251,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 #   0) Cancel
 
 # After selecting update target, installer will:
-# 1. Create backup of v1.0.6
-# 2. Download and install v1.0.7
+# 1. Create backup of v2.0.12
+# 2. Download and install v2.0.13
 # 3. Validate syntax
 # 4. Restart services
 # 5. Offer to run health check
@@ -426,9 +426,9 @@ Portal numbers (or press Enter to skip): 1 2
 
 # Displays available backups:
 Available Backups:
-  1) v1.0.7 - 2025-10-25 14:32:15 (2 hours ago) - 89.2 KB
-  2) v1.0.6 - 2025-10-24 09:15:42 (1 day ago) - 88.8 KB
-  3) v1.0.5 - 2025-10-20 11:22:03 (5 days ago) - 87.1 KB
+  1) v2.0.13 - 2026-03-31 14:32:15 (2 hours ago) - 89.2 KB
+  2) v2.0.12 - 2026-03-28 09:15:42 (3 days ago) - 88.8 KB
+  3) v2.0.11 - 2026-03-25 11:22:03 (6 days ago) - 87.1 KB
 
 Select backup to restore (1-3):
 ```

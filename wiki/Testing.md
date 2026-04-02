@@ -29,7 +29,7 @@ tools/dev-truenas-plugin-full-function-test.sh
 - **Proxmox Node Execution** - Test suite must run on a Proxmox node
 - **Plugin Installed** - TrueNAS plugin must be installed and configured
 - **Storage Configured** - Storage must be active and accessible
-- **Available VM IDs** - Test suite auto-selects available VM IDs (default: 990-999 range)
+- **Available VM IDs** - Test suite uses sequential VM IDs starting from a specified VMID (default: 9001)
 
 ### System Requirements
 - Proxmox VE 8.x or 9.x
@@ -44,36 +44,40 @@ tools/dev-truenas-plugin-full-function-test.sh
 # Make executable
 chmod +x tools/dev-truenas-plugin-full-function-test.sh
 
-# Run with default storage name 'tnscale'
-./tools/dev-truenas-plugin-full-function-test.sh
+# Run with default storage 'tnscale' starting at VMID 9001
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001
 
-# Run with custom storage name
-./tools/dev-truenas-plugin-full-function-test.sh your-storage-name
+# Run with custom storage name and VMID
+./tools/dev-truenas-plugin-full-function-test.sh your-storage-name 5000
 
-# Run with auto-confirmation (skip prompt)
-./tools/dev-truenas-plugin-full-function-test.sh your-storage-name -y
+# Run with backup tests enabled
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
 ```
 
 ### Command Syntax
 
 ```bash
-./tools/dev-truenas-plugin-full-function-test.sh [storage_name] [-y]
+./tools/dev-truenas-plugin-full-function-test.sh STORAGE_ID VMID_START [OPTIONS]
 ```
 
-**Parameters**:
-- `storage_name` - Name of TrueNAS storage from `/etc/pve/storage.cfg` (default: `tnscale`)
-- `-y` or `--yes` - Auto-confirm without prompting
+**Arguments**:
+- `STORAGE_ID` - TrueNAS storage ID from `/etc/pve/storage.cfg` (default: `tnscale`)
+- `VMID_START` - Starting VMID for test VMs (default: `9001`)
+
+**Options**:
+- `--backup-store STORAGE` - Backup storage ID for backup tests (if not specified, backup tests are skipped)
+- `--phase N` - Run only a specific test phase
 
 **Examples**:
 ```bash
-# Test storage named 'truenas-storage'
-./tools/dev-truenas-plugin-full-function-test.sh truenas-storage
+# Test storage named 'truenas-storage' starting at VMID 5000
+./tools/dev-truenas-plugin-full-function-test.sh truenas-storage 5000
 
-# Test with auto-confirmation
-./tools/dev-truenas-plugin-full-function-test.sh truenas-storage -y
+# Run with backup tests using PBS storage
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
 
-# Test default storage 'tnscale'
-./tools/dev-truenas-plugin-full-function-test.sh
+# Run only phase 2
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --phase 2
 ```
 
 ## What Gets Tested

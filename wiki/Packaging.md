@@ -8,7 +8,7 @@ For end-user APT repository setup and install commands, use the [Installation Gu
 
 - Package name: `truenas-proxmox-plugin`
 - Debian version source of truth: `debian/changelog`
-- Current mapping model: `2.0.3+deb1` in Debian packaging maps to Git tag `v2.0.3-deb1`
+- Example mapping model: `2.0.3+deb1` in Debian packaging maps to Git tag `v2.0.3-deb1`
 - APT publish target: GitHub Pages at `apt/` with suites `bookworm` and `trixie`
 
 ## Build the Package
@@ -40,7 +40,7 @@ Target state is zero lintian errors. If warnings remain, either fix them or docu
 
 ## Version and Tag Mapping
 
-Maintain a strict mapping between Debian package version and release tag:
+Maintain a strict mapping between Debian package version and release tag (example using 2.0.3):
 
 - Debian changelog version: `2.0.3+deb1`
 - Git tag used for release automation: `v2.0.3-deb1`
