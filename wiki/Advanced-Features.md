@@ -14,7 +14,7 @@ Advanced configuration, performance tuning, clustering, and security features of
   - [Rate Limiting Strategy](#rate-limiting-strategy)
 - [Cluster Configuration](#cluster-configuration)
   - [Shared Storage Setup](#shared-storage-setup)
-  - [Cluster Deployment Script](#cluster-deployment-script)
+  - [Cluster Deployment](#cluster-deployment)
   - [High Availability (HA)](#high-availability-ha)
   - [Cluster Testing](#cluster-testing)
 - [Security Configuration](#security-configuration)
@@ -1001,21 +1001,20 @@ The installer provides native cluster-wide deployment from v1.1.0+:
 - Passwordless SSH between cluster nodes (Proxmox configures automatically)
 - Interactive mode (use main menu, not --non-interactive flag)
 
-#### Manual Deployment Script
+#### Cluster-Wide Deployment
 
-For automated deployments, use the standalone cluster script:
+For automated deployments, use the installer's cluster feature:
 
 ```bash
-# Deploy to specific nodes
-cd tools/
-./update-cluster.sh node1 node2 node3
-
-# Script will:
-# 1. Copy TrueNASPlugin.pm to each node
-# 2. Install to /usr/share/perl5/PVE/Storage/Custom/
-# 3. Restart pvedaemon, pveproxy on each node
-# 4. Verify installation
+# Run installer and select cluster-wide option
+./install.sh  # "Install latest version (all cluster nodes)"
 ```
+
+The installer will:
+1. Discover all cluster nodes automatically
+2. Copy and install the plugin on each node
+3. Restart required Proxmox services
+4. Verify installation on each node
 
 Manual deployment:
 ```bash

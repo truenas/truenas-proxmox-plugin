@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.11';
+our $VERSION = '2.0.13';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -47,6 +47,9 @@ my %_target_id_cache;
 
 # Per-process cache for preflight check results (time-based, 30s validity)
 my $_preflight_last_ok = 0;
+
+# Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
+my %_portal_sync_last_ok;
 
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
@@ -113,8 +116,9 @@ sub _clear_cache {
         # Clear all cache
         %API_CACHE = ();
     }
-    # Also clear the target ID cache
+    # Also clear the target ID and portal sync caches
     %_target_id_cache = ();
+    %_portal_sync_last_ok = ();
 }
 
 # ======== Helper functions ========
@@ -3663,6 +3667,99 @@ sub _nvme_device_for_uuid {
     die $err_msg;
 }
 
+# Sync NVMe portals: ensure all configured portals have port bindings on TrueNAS.
+# Handles portals added to storage.cfg after initial subsystem setup (Issue #20).
+sub _nvme_sync_portals {
+    my ($scfg, $subsys_id) = @_;
+
+    my $sid = $scfg->{storeid} // 'unknown';
+    if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
+            . (time() - $_portal_sync_last_ok{$sid}) . "s ago)");
+        return;
+    }
+
+    # Collect desired portals from storage config
+    my @desired_portals = ();
+    push @desired_portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
+    push @desired_portals, split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+    return unless @desired_portals;
+
+    # Query existing port-subsystem bindings
+    # TrueNAS 25.10+ uses separate port and port_subsys entities
+    my $existing_bindings = eval {
+        _api_call($scfg, 'nvmet.port_subsys.query', []);
+    } // [];
+
+    # Build lookup of existing "addr:port" for this subsystem
+    my %existing_set;
+    for my $binding (@{$existing_bindings // []}) {
+        next unless $binding->{subsys} && $binding->{subsys}{id} == $subsys_id;
+        my $port = $binding->{port};
+        next unless $port;
+        my $key = lc("$port->{addr_traddr}:$port->{addr_trsvcid}");
+        $existing_set{$key} = 1;
+    }
+
+    # Create missing ports (TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association)
+    for my $portal (@desired_portals) {
+        my ($host, $port) = _nvme_parse_portal($portal);
+        my $lookup_key = lc("$host:$port");
+        next if $existing_set{$lookup_key};
+
+        _log($scfg, 1, 'info', "[TrueNAS] nvme_sync_portals: creating missing port for $host:$port (subsys_id=$subsys_id)");
+
+        my $port_id;
+        eval {
+            # Step 1: Create the port
+            my $port_result = _api_call_write($scfg, 'nvmet.port.create', [{
+                addr_trtype => 'TCP',
+                addr_traddr => $host,
+                addr_trsvcid => int($port),
+            }]);
+            $port_id = ref($port_result) eq 'HASH' ? $port_result->{id} : $port_result;
+        };
+        if ($@) {
+            my $create_err = $@;
+            # Port may already exist (shared across subsystems) — find and reuse it
+            if ($create_err =~ /already.*port.*same transport and address/i) {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: port $host:$port already exists, reusing");
+                eval {
+                    my $all_ports = _api_call($scfg, 'nvmet.port.query', []);
+                    for my $p (@{$all_ports // []}) {
+                        if (lc($p->{addr_traddr}) eq lc($host) && "$p->{addr_trsvcid}" eq "$port") {
+                            $port_id = $p->{id};
+                            last;
+                        }
+                    }
+                };
+            }
+            if (!$port_id) {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to create or find port for $portal: $create_err");
+                next;
+            }
+        }
+
+        # Step 2: Associate port with subsystem
+        eval {
+            _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+                port_id   => int($port_id),
+                subsys_id => int($subsys_id),
+            }]);
+        };
+        if ($@) {
+            # Association may already exist — not an error
+            if ($@ =~ /already exists/i) {
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: port_subsys association already exists for port_id=$port_id");
+            } else {
+                _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to associate port for $portal: $@");
+            }
+        }
+    }
+
+    $_portal_sync_last_ok{$sid} = time();
+}
+
 # Ensure NVMe subsystem exists on TrueNAS
 sub _nvme_ensure_subsystem {
     my ($scfg) = @_;
@@ -3677,8 +3774,12 @@ sub _nvme_ensure_subsystem {
 
     if ($subsystems && @$subsystems) {
         my $subsys = $subsystems->[0];
-        _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys->{id}");
-        return $subsys->{id};
+        my $subsys_id = $subsys->{id};
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys_id, syncing portals");
+
+        _nvme_sync_portals($scfg, $subsys_id);
+
+        return $subsys_id;
     }
 
     # Create subsystem if it doesn't exist
@@ -3709,12 +3810,44 @@ sub _nvme_ensure_subsystem {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: creating port for $host:$port");
 
         eval {
-            _api_call_write($scfg, 'nvmet.port.create', [{
-                subsys_id => $subsys_id,
-                trtype => 'TCP',
-                traddr => $host,
-                trsvcid => "$port",  # Must be string
-            }]);
+            # TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association
+            my $port_id;
+            my $port_result = eval {
+                _api_call_write($scfg, 'nvmet.port.create', [{
+                    addr_trtype => 'TCP',
+                    addr_traddr => $host,
+                    addr_trsvcid => int($port),
+                }]);
+            };
+            if ($@ && $@ =~ /already.*port.*same transport and address/i) {
+                # Port exists (may be shared with another subsystem) — find and reuse it
+                _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: port $host:$port already exists, reusing");
+                my $all_ports = _api_call($scfg, 'nvmet.port.query', []);
+                for my $p (@{$all_ports // []}) {
+                    if (lc($p->{addr_traddr}) eq lc($host) && "$p->{addr_trsvcid}" eq "$port") {
+                        $port_id = $p->{id};
+                        last;
+                    }
+                }
+            } elsif ($@) {
+                die $@;
+            } else {
+                $port_id = ref($port_result) eq 'HASH' ? $port_result->{id} : $port_result;
+            }
+
+            if (defined $port_id) {
+                eval {
+                    _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+                        port_id   => int($port_id),
+                        subsys_id => int($subsys_id),
+                    }]);
+                };
+                if ($@ && $@ =~ /already exists/i) {
+                    _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: port_subsys association already exists");
+                } elsif ($@) {
+                    die $@;
+                }
+            }
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_ensure_subsystem: failed to create port for $portal: $@");
@@ -4123,17 +4256,24 @@ sub _alloc_image_iscsi {
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: starting iSCSI device discovery for LUN $deferred_lun");
 
-        # Ensure iSCSI login
-        if (!_target_sessions_active($deferred_scfg)) {
-            _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
-            eval { _iscsi_login_all($deferred_scfg); };
-            if ($@) {
-                _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
-                return;
-            }
+        # When sessions are already active, skip the disruptive session rescan and multipath
+        # reload — these affect ALL iSCSI sessions/devices system-wide and can cause I/O errors
+        # on other active multipath devices (Issue #15). activate_volume handles authoritative
+        # device discovery with built-in rescans at safe intervals.
+        if (_target_sessions_active($deferred_scfg)) {
+            _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image deferred: sessions already active, skipping rescan (activate_volume will handle device discovery)");
+            return;
         }
 
-        # Rescan to detect the new LUN
+        # No active sessions — perform login and device discovery
+        _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
+        eval { _iscsi_login_all($deferred_scfg); };
+        if ($@) {
+            _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
+            return;
+        }
+
+        # Rescan to detect the new LUN (safe here — we just logged in, no existing I/O)
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
         if ($deferred_scfg->{use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
@@ -4378,6 +4518,9 @@ sub _free_image_iscsi {
     # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, check if safe to logout
     # Don't logout if there are other active LUNs - this breaks multi-disk operations
     if ($need_force_logout) {
+        # Invalidate cache to get fresh targetextent data — a destination LUN may have been
+        # created since the cache was last populated (e.g., during a disk move operation)
+        _clear_cache($scfg->{storeid} || 'unknown');
         # Check how many LUNs are currently mapped to this target
         my $active_luns = 0;
         eval {

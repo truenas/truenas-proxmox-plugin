@@ -276,7 +276,7 @@ pvesm status
 The installer supports additional features:
 - **Version management** - Install, update, or rollback to specific versions
 - **Configuration wizard** - Interactive guided setup with validation
-- **Health checks** - 12-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
+- **Health checks** - 13-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
 - **Plugin testing** - Integrated 8-test validation of core plugin operations with graceful interrupt handling and health-check style output
 - **Cluster support** - Automatic cluster detection and warnings
 - **Backup management** - Automatic backups with rollback capability
@@ -294,7 +294,12 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 - **[Troubleshooting Guide](wiki/Troubleshooting.md)** - Common issues and solutions
 - **[Advanced Features](wiki/Advanced-Features.md)** - Performance tuning, clustering, security
 - **[API Reference](wiki/API-Reference.md)** - Technical details on TrueNAS API integration
+- **[NVMe Setup Guide](wiki/NVMe-Setup.md)** - NVMe/TCP transport setup and authentication
+- **[Multi-Tenancy](wiki/Multi-Tenancy.md)** - Sharing TrueNAS across multiple Proxmox clusters
+- **[Testing Guide](wiki/Testing.md)** - Automated test suite for plugin validation
 - **[Known Limitations](wiki/Known-Limitations.md)** - Important limitations and workarounds
+- **[Ideas and Roadmap](wiki/Ideas.md)** - Feature ideas and development roadmap
+- **[Changelog](wiki/Changelog.md)** - Version history and release notes
 
 ## Important: TrueNAS API Changes
 
@@ -319,6 +324,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.0.11
-**Last Updated**: March 25, 2026
+**Version**: 2.0.13
+**Last Updated**: March 31, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

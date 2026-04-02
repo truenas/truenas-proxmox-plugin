@@ -1,5 +1,27 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.13 (March 31, 2026)
+
+### Bug Fixes
+
+- **Skip disruptive iSCSI rescan during allocation when sessions already active**: When iSCSI sessions are already established, `alloc_image` now skips the system-wide session rescan and multipath reload. These operations affect all active iSCSI devices and can cause I/O errors on unrelated disks during concurrent operations (GitHub issue #15)
+
+- **Invalidate targetextent cache in free_image**: The cache is now explicitly cleared before querying active LUNs during disk free operations, ensuring accurate counts when a destination LUN was created during a disk move (GitHub issue #15)
+
+---
+
+## Version 2.0.12 (March 27, 2026)
+
+### Bug Fixes
+
+- **Sync NVMe portals when subsystem already exists**: When `portals` are added to an existing NVMe/TCP storage configuration, the plugin now creates missing port bindings on TrueNAS during subsystem activation. Previously, portals added after initial storage setup were never registered on the TrueNAS side, causing `nvme connect` to silently fail for new paths and preventing multipath from activating (GitHub issue #20)
+
+### Performance
+
+- **Cache NVMe portal sync results**: Portal sync now caches its result per-storage for 60 seconds, avoiding a redundant `port_subsys.query` API call on every disk allocation when portals are already correctly bound
+
+---
+
 ## Version 2.0.11 (March 25, 2026)
 
 ### Bug Fixes

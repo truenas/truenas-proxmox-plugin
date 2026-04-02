@@ -441,12 +441,9 @@ show_cluster_warning() {
         echo
         warning "⚠️  Proxmox Cluster Detected (${node_count} nodes)"
         echo
-        info "This installer only updates the current node."
-        info "To update all cluster nodes, use the cluster update script:"
-        echo
-        echo "  wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/tools/update-cluster.sh"
-        echo "  chmod +x update-cluster.sh"
-        echo "  ./update-cluster.sh node1 node2 node3"
+        info "Installation was performed on this node only."
+        info "To update all cluster nodes, re-run this installer and select:"
+        info "  'Update plugin' → 'Update all cluster nodes'"
         echo
         return 0
     fi
@@ -7038,36 +7035,47 @@ tn_check_target() {
 
     log "INFO" "Checking if iSCSI target exists: $target_iqn"
 
-    local params
-    # Use Python to construct JSON with proper escaping
-    params=$(python3 -c "
-import json, sys
-data = [[['name', '=', sys.argv[1]]]]
-print(json.dumps(data))
-" "$target_iqn" 2>&1)
+    # Extract short name for query - TrueNAS stores the short suffix, not full IQN
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
 
-    if [[ $? -ne 0 ]]; then
-        log "ERROR" "Failed to construct target query params: $params"
-        return 1
+    # Search by short name first, then full IQN for backward compatibility
+    # with targets created by previous versions that stored full IQNs
+    local search_names=("$short_name")
+    if [[ "$short_name" != "$target_iqn" ]]; then
+        search_names+=("$target_iqn")
     fi
 
     local result
-    result=$(tn_api_call "$host" "$api_key" "iscsi.target.query" "$params" 2>&1)
-    local exit_code=$?
+    for name in "${search_names[@]}"; do
+        local params
+        # Use Python to construct JSON with proper escaping
+        params=$(python3 -c "
+import json, sys
+data = [[['name', '=', sys.argv[1]]]]
+print(json.dumps(data))
+" "$name" 2>&1)
 
-    if [[ $exit_code -ne 0 ]]; then
-        log "ERROR" "Target check failed: $result"
-        return 1
-    fi
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Failed to construct target query params: $params"
+            return 1
+        fi
 
-    if [[ "$result" == "[]" ]] || [[ -z "$result" ]]; then
-        log "INFO" "Target does not exist: $target_iqn"
-        return 1
-    fi
+        result=$(tn_api_call "$host" "$api_key" "iscsi.target.query" "$params" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Target check failed: $result"
+            return 1
+        fi
 
-    log "INFO" "Target exists: $target_iqn"
-    echo "$result"
-    return 0
+        if [[ "$result" != "[]" ]] && [[ -n "$result" ]]; then
+            log "INFO" "Target exists: $target_iqn (matched by: $name)"
+            echo "$result"
+            return 0
+        fi
+    done
+
+    log "INFO" "Target does not exist: $target_iqn"
+    return 1
 }
 
 # Generate a standard IQN for iSCSI target
@@ -7080,6 +7088,59 @@ generate_iqn() {
 
     # Format: iqn.YYYY-MM.org.freenas.ctl:storage-name
     echo "iqn.${year_month}.org.freenas.ctl:${storage_name}"
+}
+
+# Extract the short target name from an IQN
+# TrueNAS expects just the suffix (after the last colon) as the target name,
+# not a full IQN. Passing a full IQN causes double-nesting when TrueNAS
+# prepends its base name.
+# e.g., iqn.2026-03.org.freenas.ctl:truenas-main -> truenas-main
+# e.g., truenas-main -> truenas-main (no change if already short)
+iqn_to_short_name() {
+    local iqn="$1"
+    echo "${iqn##*:}"
+}
+
+# Get the TrueNAS iSCSI base IQN name
+# Parameters: host, api_key
+# Returns: base IQN string (e.g., iqn.2005-10.org.freenas.ctl)
+tn_get_base_iqn() {
+    local host="$1"
+    local api_key="$2"
+
+    local result
+    result=$(tn_api_call "$host" "$api_key" "iscsi.global.config" "[]" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        log "WARNING" "Failed to get TrueNAS base IQN: $result"
+        echo ""
+        return 1
+    fi
+
+    echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('basename',''))" 2>/dev/null
+}
+
+# Construct the correct full IQN for storage.cfg by combining
+# TrueNAS's base IQN with the short target name extracted from user input.
+# Parameters: host, api_key, target_iqn (user-provided full IQN or short name)
+# Returns: correct full IQN (e.g., iqn.2005-10.org.freenas.ctl:truenas-main)
+# Exits with error if base IQN cannot be retrieved
+construct_full_iqn() {
+    local host="$1"
+    local api_key="$2"
+    local target_iqn="$3"
+
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
+
+    local base_iqn
+    base_iqn=$(tn_get_base_iqn "$host" "$api_key")
+    if [[ -z "$base_iqn" ]]; then
+        log "ERROR" "Cannot construct IQN: failed to retrieve TrueNAS base IQN"
+        echo "$target_iqn"  # Fallback to user-provided value
+        return 1
+    fi
+
+    echo "${base_iqn}:${short_name}"
 }
 
 # Create an iSCSI target with portal association
@@ -7144,6 +7205,11 @@ print(json.dumps(data))
     fi
 
     # Step 2: Create target with portal group association
+    # Extract short name - TrueNAS expects just the suffix, not a full IQN.
+    # Passing a full IQN causes double-nesting when TrueNAS prepends its base name.
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
+
     local params
     # Use Python to construct JSON with proper escaping to prevent JSON injection
     params=$(python3 -c "
@@ -7157,7 +7223,7 @@ data = [{
     }]
 }]
 print(json.dumps(data))
-" "$target_iqn" "$portal_id" 2>&1)
+" "$short_name" "$portal_id" 2>&1)
 
     if [[ $? -ne 0 ]]; then
         log "ERROR" "Failed to construct target params JSON: $params"
@@ -8600,7 +8666,8 @@ execute_provisioning() {
         # iSCSI provisioning
         if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
             echo -e "$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Using existing"
-            PROVISIONED_TARGET_IQN="$PROV_IQN"
+            # Construct correct IQN using TrueNAS base name + short suffix
+            PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$PROV_IQN")
         else
             printf "%-30s " "iSCSI target:"
             start_spinner
@@ -8611,7 +8678,8 @@ execute_provisioning() {
             if [[ $exit_code -eq 0 ]]; then
                 echo -e "\r$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Created"
                 register_resource "target" "$PROV_IQN"
-                PROVISIONED_TARGET_IQN="$PROV_IQN"
+                # Construct correct IQN using TrueNAS base name + short suffix
+                PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$PROV_IQN")
                 PROVISIONED_PORTAL_IP="$PROV_PORTAL_IP"
                 PROVISIONED_PORTAL_PORT="$PROV_PORTAL_PORT"
             else
@@ -8890,7 +8958,8 @@ provision_iscsi() {
                     ;;
                 1)
                     info "Using existing target: $target_iqn"
-                    PROVISIONED_TARGET_IQN="$target_iqn"
+                    # Construct correct IQN using TrueNAS base name + short suffix
+                    PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$target_iqn")
                     PROVISIONED_PORTAL_IP="$portal_ip"
                     PROVISIONED_PORTAL_PORT="$portal_port"
                     PROVISIONED_PORTAL_ID="$portal_id"
@@ -8929,7 +8998,8 @@ provision_iscsi() {
 
     success "Target created: $target_iqn"
 
-    PROVISIONED_TARGET_IQN="$target_iqn"
+    # Construct correct IQN using TrueNAS base name + short suffix
+    PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$target_iqn")
     PROVISIONED_PORTAL_IP="$portal_ip"
     PROVISIONED_PORTAL_PORT="$portal_port"
     PROVISIONED_PORTAL_ID="$portal_id"

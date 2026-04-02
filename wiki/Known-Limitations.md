@@ -424,22 +424,22 @@ tail -f /var/log/middlewared.log | grep rate
 # Keep plugin source in safe location
 cp TrueNASPlugin.pm /root/truenas-plugin-backup/
 
-# Use cluster deployment script for easy reinstall
-./update-cluster.sh node1 node2 node3
+# Use installer for easy cluster-wide reinstall
+./install.sh  # Select "Install latest version (all cluster nodes)"
 ```
 
 ## Network Limitations
 
 ### No NFS/CIFS Support
 
-**Limitation**: Plugin only supports iSCSI block storage
+**Limitation**: Plugin only supports iSCSI and NVMe/TCP block storage
 
 **Not Supported**:
 - NFS file shares
 - SMB/CIFS file shares
 - Direct ZFS dataset mounting
 
-**Explanation**: Plugin architecture designed specifically for iSCSI
+**Explanation**: Plugin architecture designed specifically for block storage (iSCSI and NVMe/TCP)
 
 **Workaround**:
 ```bash
@@ -478,17 +478,20 @@ portals [2001:db8::101]:3260,[2001:db8::102]:3260
 
 ## Security Limitations
 
-### No Mutual CHAP
+### No Mutual CHAP (iSCSI)
 
-**Limitation**: Only one-way CHAP authentication supported
+**Limitation**: Only one-way CHAP authentication supported for iSCSI transport
 
 **Explanation**:
-- Plugin supports CHAP authentication (initiator → target)
-- Mutual CHAP (target → initiator) not implemented
+- iSCSI transport supports CHAP authentication (initiator → target)
+- Mutual CHAP (target → initiator) not implemented for iSCSI
 
-**Impact**: Slightly reduced security in high-security environments
+**Note**: NVMe/TCP transport supports full bidirectional DH-HMAC-CHAP authentication (host + controller secrets). See [NVMe Setup Guide](NVMe-Setup.md#authentication) for details.
+
+**Impact**: Slightly reduced security in high-security iSCSI environments
 
 **Mitigation**:
+- Use NVMe/TCP transport for bidirectional authentication
 - Use network segmentation (VLANs)
 - Firewall rules restricting iSCSI access
 - Strong CHAP passwords
