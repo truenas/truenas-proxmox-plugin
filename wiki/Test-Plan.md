@@ -6,15 +6,17 @@
 
 ## 1. Overview
 
-This plan covers functional, multipath, and cluster testing for the TrueNAS Proxmox VE Storage Plugin. Tests are organized in three hardware tiers. The automated harness (`tools/run-tests.sh`) runs all tiers that the available hardware supports.
+This plan covers functional, multipath, cluster, and HA failover testing for the TrueNAS Proxmox VE Storage Plugin. Tests are organized in five hardware tiers. The automated harness (`tools/run-tests.sh`) runs all tiers that the available hardware supports.
 
-Three hardware configurations are required for every release:
+Five hardware configurations are required for every release:
 
 | Config | Environment | Release Gate |
 |--------|-------------|--------------|
 | A | Single-node iSCSI, no multipath, Proxmox 8.x | Required |
 | D | 3-node iSCSI cluster + multipath, Proxmox 9.x | Required |
 | F | 3-node NVMe/TCP cluster, Proxmox 9.x | Required |
+| H | TrueNAS Enterprise HA pair, iSCSI via VIP | Required |
+| G | TrueNAS Enterprise HA pair, ALUA multipath + IPMI | Required |
 
 Configs B, C, and E are advisory — run them when hardware is available but they do not block a release.
 
@@ -22,14 +24,16 @@ Configs B, C, and E are advisory — run them when hardware is available but the
 
 ## 2. Hardware Configuration Matrix
 
-| ID | Transport | Multipath | Nodes | Proxmox | TrueNAS | Release Gate |
-|----|-----------|-----------|-------|---------|---------|--------------|
-| A  | iSCSI     | off       | 1     | 8.x     | 25.10+  | Required |
-| B  | iSCSI     | on (2p)   | 1     | 8.x     | 25.10+  | Advisory |
-| C  | iSCSI     | on (2p)   | 3     | 8.x     | 25.10+  | Advisory |
-| D  | iSCSI     | on (2p)   | 3     | 9.x     | 25.10+  | Required |
-| E  | NVMe/TCP  | kernel    | 1     | 9.x     | 25.10+  | Advisory |
-| F  | NVMe/TCP  | kernel    | 3     | 9.x     | 25.10+  | Required |
+| ID | Transport | Multipath | Nodes | Proxmox | TrueNAS | HA | Release Gate |
+|----|-----------|-----------|-------|---------|---------|-----|--------------|
+| A  | iSCSI     | off       | 1     | 8.x     | 25.10+  | —  | Required |
+| B  | iSCSI     | on (2p)   | 1     | 8.x     | 25.10+  | —  | Advisory |
+| C  | iSCSI     | on (2p)   | 3     | 8.x     | 25.10+  | —  | Advisory |
+| D  | iSCSI     | on (2p)   | 3     | 9.x     | 25.10+  | —  | Required |
+| E  | NVMe/TCP  | kernel    | 1     | 9.x     | 25.10+  | —  | Advisory |
+| F  | NVMe/TCP  | kernel    | 3     | 9.x     | 25.10+  | —  | Required |
+| H  | iSCSI     | off       | 1     | 8.x+    | Enterprise HA | VIP | Required |
+| G  | iSCSI     | on (2p)   | 1     | 8.x+    | Enterprise HA | ALUA + IPMI | Required |
 
 ---
 
@@ -57,6 +61,12 @@ tools/run-tests.sh --storage <name> --config D --yes
 # Run Config F gates (Tier 1 + Tier 3, NVMe/TCP cluster)
 tools/run-tests.sh --storage <name> --config F --yes
 
+# Run Config H gates (Tier 1 + Tier 4, TrueNAS Enterprise HA)
+tools/run-tests.sh --storage <name> --config H --yes
+
+# Run Config G gates (Tier 1 + Tier 5, ALUA + HA with IPMI crash)
+tools/run-tests.sh --storage <name> --config G --yes
+
 # Run only Tier 2 tests regardless of config
 tools/run-tests.sh --storage <name> --tier 2 --yes
 ```
@@ -66,8 +76,8 @@ tools/run-tests.sh --storage <name> --tier 2 --yes
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--storage <name>` | (required) | Proxmox storage ID configured for TrueNAS plugin |
-| `--config <A\|D\|F\|all>` | `all` | Hardware config context; validates hardware and sets transport skip rules |
-| `--tier <1\|2\|3\|all>` | `all` | Override tier selection; overrides `--config` tier logic |
+| `--config <A\|D\|F\|G\|H\|all>` | `all` | Hardware config context; validates hardware and sets transport skip rules |
+| `--tier <1\|2\|3\|4\|5\|all>` | `all` | Override tier selection; overrides `--config` tier logic |
 | `--yes` | off | Skip confirmation prompt |
 
 ### Exit Codes
@@ -125,6 +135,20 @@ The harness detects Tier 3 when `pvecm status` shows >=3 nodes and all peers are
 ssh-copy-id root@<peer-node>
 ```
 
+### Tier 4 — HA Failover/Failback (Config H)
+
+**Hardware:** Tier 1 + TrueNAS Enterprise HA pair with a licensed failover controller, reachable via VIP.
+**Runtime:** ~10 minutes additional (dominated by failover/failback wait times).
+
+The harness detects Tier 4 when `failover.licensed` returns `true` via the TrueNAS API.
+
+### Tier 5 — ALUA + HA Crash Failover (Config G)
+
+**Hardware:** Tier 4 + `use_multipath 1` in `storage.cfg` + at least 2 portals + IPMI access to both controllers.
+**Runtime:** ~20 minutes additional (IPMI crash + reboot cycle is slower than graceful failover).
+
+The harness detects Tier 5 when Tier 4 is available, multipath is configured with dual portals, and `tools/lib/ipmi.conf` provides BMC credentials (`IPMI_USER`, `IPMI_PASS`, `IPMI_BMC_A`, `IPMI_BMC_B`).
+
 ### Tier Override
 
 `--tier` overrides `--config` tier logic. Use to run a single tier in isolation during development:
@@ -177,6 +201,39 @@ tools/run-tests.sh --storage mystore --tier 2 --yes
 | T3-08 | Orphan scan on all nodes after clean deletion | Yes | — |
 | T3-09 | Plugin version consistency — identical checksums on all nodes | Yes | — |
 
+### Tier 4
+
+| ID | Description | Automated | Hard Gate |
+|----|-------------|-----------|-----------|
+| T4-01 | HA status baseline — record active controller, verify MASTER status | Yes | — |
+| T4-02 | Create test volume and start VM on HA storage | Yes | — |
+| T4-03 | Pre-failover I/O marker — write integrity marker to a separate volume | Yes | — |
+| T4-04 | Trigger HA failover via `failover.become_passive` | Yes | **Exit 2** |
+| T4-05 | API recovery timing — measure how long until VIP API responds after failover | Yes | — |
+| T4-06 | iSCSI session reconnection — sessions re-establish to new controller | Yes | — |
+| T4-07 | VM survival after failover — VM still running, disk accessible | Yes | — |
+| T4-08 | Storage operations post-failover — create/list/delete volume on new controller | Yes | — |
+| T4-09 | Trigger failback via `failover.become_passive` on new controller | Yes | — |
+| T4-10 | API recovery after failback | Yes | — |
+| T4-11 | VM survival after failback — VM still running on original controller | Yes | — |
+| T4-12 | Data integrity after failover/failback cycle — read back I/O marker | Yes | — |
+
+### Tier 5
+
+| ID | Description | Automated | Hard Gate |
+|----|-------------|-----------|-----------|
+| T5-01 | ALUA path state baseline — record Active Optimized / Non-Optimized paths and priorities | Yes | — |
+| T5-02 | Create test volume on dm-multipath — verify ALUA priority groups | Yes | — |
+| T5-03 | I/O routing baseline — confirm I/O flows through Active Optimized path | Yes | — |
+| T5-04 | Trigger crash failover via IPMI power-off of active controller | Yes | **Exit 2** |
+| T5-05 | ALUA state transition after failover — priorities invert, former standby is now optimized | Yes | — |
+| T5-06 | Multipath I/O continuity during failover — background I/O survives the transition | Yes | — |
+| T5-07 | I/O routing after failover — I/O now flows through the new Active Optimized path | Yes | — |
+| T5-08 | Trigger failback — power on crashed controller, wait for standby ready, call `failover.become_passive` | Yes | — |
+| T5-09 | ALUA state restored after failback — priorities return to original baseline | Yes | — |
+| T5-10 | Multipath I/O continuity after failback — background I/O survives the return trip | Yes | — |
+| T5-11 | Path group health — no failed or ghost paths remain after full cycle | Yes | — |
+
 ---
 
 ## 6. Manual Procedures
@@ -221,6 +278,8 @@ All three required configs must pass before a release tag is created. QA lead si
 | A | | | | T1-01 | | |
 | D | | | | T1-01, T2-03 | | |
 | F | | | | T1-01, T3-04 | | |
+| H | | | | T1-01, T4-04 | | |
+| G | | | | T1-01, T5-04 | | |
 
 **Sign-off:** _________________________ Date: _____________
 
@@ -235,6 +294,8 @@ Commit this file (with the sign-off table filled in) to the repo before creating
 | Any plugin code change | Tier 1 full (Config A) |
 | Multipath or ALUA code paths | Tier 1 + Tier 2 (Config D) |
 | Cluster or migration code paths | Tier 1 + Tier 3 (Config F) |
+| HA failover code paths | Tier 1 + Tier 4 (Config H) |
+| ALUA + HA code paths | Tier 1 + Tier 5 (Config G) |
 | Installer only | T1-01 (TLS audit) + installer health check |
 | Documentation only | No test run required |
 

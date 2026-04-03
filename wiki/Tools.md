@@ -13,7 +13,9 @@ The plugin includes several tools to simplify installation, testing, cluster man
 - **[Orphan Cleanup](#orphan-cleanup)** - Find and remove orphaned iSCSI resources
 
 **Standalone Tools**:
-- **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
+- **[Test Harness](#test-harness)** - Primary multi-tier test runner (`run-tests.sh`)
+- **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Single-node functional testing
+- **[NVMe Recovery](#nvme-recovery)** - NVMe namespace recovery utility
 - **[Debug Logging System](#debug-logging-system)** - Diagnostic logging for troubleshooting
 
 **Note**: Cluster-wide updates and version checking are now integrated into the installer menu. Standalone scripts for these functions have been removed in favor of the interactive installer.
@@ -22,12 +24,46 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 ```
 tools/
-└── dev-truenas-plugin-full-function-test.sh  # Development test suite (⚠️ DEV ONLY)
+├── run-tests.sh                              # Primary test harness (5 tiers, hard gates)
+├── dev-truenas-plugin-full-function-test.sh   # Legacy dev test suite (⚠️ DEV ONLY)
+├── build-deb.sh                               # Build .deb package
+├── nvme-recovery.sh                           # NVMe namespace recovery
+├── diag-nvme-namespace-publish.sh             # NVMe namespace diagnostics
+├── lib/
+│   ├── common.sh                              # Shared utilities (logging, API, iptables, parsing)
+│   ├── tier1.sh                               # Tier 1: Core functional tests
+│   ├── tier2.sh                               # Tier 2: Multipath / ALUA tests
+│   ├── tier3.sh                               # Tier 3: Cluster / migration tests
+│   ├── tier4.sh                               # Tier 4: HA failover/failback tests
+│   ├── tier5.sh                               # Tier 5: ALUA + HA crash failover tests
+│   └── ipmi.conf                              # IPMI credentials for Tier 5 (not committed)
+├── tests/
+│   ├── test_common.sh                         # Unit tests for common.sh
+│   └── test_arg_parsing.sh                    # Unit tests for CLI arg handling
+└── apt-repo/                                  # APT repository tooling
 ```
 
-**Note**: Most tools are now integrated into the interactive installer (`install.sh`). The standalone development test suite remains for development purposes only.
+**Note**: Most user-facing tools (health check, orphan cleanup, plugin function testing) are integrated into the `install.sh` installer via the Diagnostics menu. The tools above are for development and testing.
 
-Note: Health check, orphan cleanup, and plugin function testing are now integrated directly into the `install.sh` installer script via the Diagnostics menu.
+---
+
+## Test Harness
+
+The primary test tool. Runs five hardware tiers with hard gates that block releases.
+
+**Location**: `tools/run-tests.sh`
+
+```bash
+# Run all tiers that hardware supports
+tools/run-tests.sh --storage <name> --yes
+
+# Run a specific config
+tools/run-tests.sh --storage <name> --config G --yes
+```
+
+Configs: `A` (single-node iSCSI), `D` (multipath cluster), `F` (NVMe/TCP cluster), `H` (HA failover), `G` (ALUA + HA crash failover), `all`.
+
+See [Test Plan](Test-Plan.md) for the full test case reference, [Test Harness Architecture](Test-Harness-Architecture.md) for internals, and [Config Types](Test-Harness-Config-Types.md) for hardware profiles.
 
 ---
 

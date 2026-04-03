@@ -1,23 +1,41 @@
 # Testing Guide
 
-Comprehensive guide for testing the TrueNAS Proxmox VE Storage Plugin using the included test suite.
+Guide for testing the TrueNAS Proxmox VE Storage Plugin.
 
 ## Overview
 
-The TrueNAS Plugin Test Suite is an automated testing tool that validates all major plugin functionality through the Proxmox API. It simulates real-world usage patterns including VM creation, snapshot operations, cloning, resizing, and cleanup.
+There are two test tools:
 
-### Key Features
+1. **`tools/run-tests.sh`** — the primary test harness. Covers five hardware tiers (core functional, multipath, cluster, HA failover, ALUA+HA crash failover) with hard gates that block releases. See [Test Plan](Test-Plan.md) for the full test case reference and [Test Harness Architecture](Test-Harness-Architecture.md) for internals.
 
-- **API-Based Testing** - Uses Proxmox API (`pvesh`) to simulate GUI interactions
-- **Comprehensive Coverage** - Tests all major plugin features
-- **Performance Metrics** - Reports timing for all operations
-- **Compatible** - Works with Proxmox VE 8.x and 9.x
-- **Safe** - Uses isolated test VMs, automatic cleanup
-- **Detailed Logging** - Creates timestamped log files for troubleshooting
+2. **`tools/dev-truenas-plugin-full-function-test.sh`** — the original development test script. Runs 8 sub-tests (status, create, list, snapshot, clone, resize, start/stop, delete) against a single storage. The harness wraps this as part of Tier 1.
 
-## Test Suite Location
+### Quick Start (Test Harness)
 
-The test suite is included in the plugin repository:
+```bash
+# Run all tiers that hardware supports
+tools/run-tests.sh --storage <name> --yes
+
+# Single-node iSCSI only (Config A)
+tools/run-tests.sh --storage <name> --config A --yes
+
+# HA failover tests (Config H)
+tools/run-tests.sh --storage <name> --config H --yes
+
+# ALUA + HA crash failover (Config G — requires IPMI)
+tools/run-tests.sh --storage <name> --config G --yes
+```
+
+See [Test Plan — Running the Harness](Test-Plan.md#3-running-the-harness) for all flags and configs.
+
+---
+
+## Development Test Suite (Legacy)
+
+The original test script validates core plugin functionality on a single node. The test harness runs it automatically as part of Tier 1, but it can also be run standalone.
+
+### Location
+
 ```
 tools/dev-truenas-plugin-full-function-test.sh
 ```
