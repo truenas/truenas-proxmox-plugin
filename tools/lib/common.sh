@@ -160,6 +160,49 @@ tn_api_call() {
     ' "$api_host" "$api_key" "$api_insecure" "$method" "$params"
 }
 
+# Call a TrueNAS WebSocket API method on a specific host (not from storage.cfg).
+# Usage: tn_api_call_host <host_ip> <storage_name> <method> [json_params]
+# Reads api_key from storage.cfg, uses provided host. Forces api_insecure=1
+# since controller IPs may not match the TLS certificate.
+tn_api_call_host() {
+    if [[ $# -lt 3 ]]; then
+        echo "Usage: tn_api_call_host <host_ip> <storage_name> <method> [json_params]" >&2
+        return 1
+    fi
+    local host="$1" storage="$2" method="$3" params="${4:-[]}"
+
+    local api_key
+    api_key=$(read_storage_cfg "$storage" "api_key")
+
+    if [[ -z "$api_key" ]]; then
+        echo "tn_api_call_host: could not read api_key for storage '$storage'" >&2
+        return 1
+    fi
+
+    perl -e '
+        use strict; use warnings;
+        use JSON::PP;
+        my $scfg = {
+            api_host     => $ARGV[0],
+            api_key      => $ARGV[1],
+            api_insecure => 1,
+            prefer_ipv4  => 1,
+        };
+        my $method = $ARGV[2];
+        my $params = decode_json($ARGV[3]);
+
+        require PVE::Storage::Custom::TrueNASPlugin;
+        my $conn = PVE::Storage::Custom::TrueNASPlugin::_ws_open($scfg);
+        my $result = PVE::Storage::Custom::TrueNASPlugin::_ws_rpc($conn, {
+            jsonrpc => "2.0",
+            id      => 1,
+            method  => $method,
+            params  => $params,
+        });
+        print encode_json($result) . "\n" if defined $result;
+    ' "$host" "$api_key" "$method" "$params"
+}
+
 # Parse multipath -ll output for one device and emit shell variable assignments.
 # Usage: eval "$(multipath -ll <dm_device> | parse_multipath_ll)"
 # Sets: MP_DM_DEVICE, MP_HWHANDLER, MP_PRIO_HIGH, MP_PRIO_LOW,

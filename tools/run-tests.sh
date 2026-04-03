@@ -252,6 +252,9 @@ echo "======================================"
 if [[ "$HARD_GATE_FAILED" -ne 0 ]]; then
     exit 2
 elif [[ "$FAIL_COUNT" -gt 0 ]]; then
+    echo ""
+    echo "Pausing 10m before exit (Ctrl-C to stop loop)..."
+    sleep 600
     exit 1
 else
     exit 0

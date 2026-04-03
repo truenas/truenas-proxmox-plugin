@@ -357,6 +357,7 @@ defaults {
     failback immediate
     no_path_retry queue
     fast_io_fail_tmo 280
+    retain_attached_hw_handler yes
 }
 
 blacklist {
@@ -373,6 +374,8 @@ devices {
         prio alua
         path_grouping_policy group_by_prio
         failback immediate
+        no_path_retry queue
+        retain_attached_hw_handler yes
     }
 }
 ```
@@ -381,6 +384,8 @@ Key differences from non-ALUA:
 - `hardware_handler "1 alua"` — tells the kernel to use ALUA for path state management
 - `prio alua` — prioritizes paths based on ALUA target port group state
 - `path_grouping_policy group_by_prio` — groups paths by priority (Active Optimized vs Non-Optimized)
+- `no_path_retry queue` — queues I/O when all paths are down during failover instead of returning errors immediately. Without this, VMs will see I/O errors during the ZFS pool import blackout even if the paths recover within the timeout window.
+- `retain_attached_hw_handler yes` — preserves the ALUA hardware handler when multipathd reconfigures maps during path disruptions. Without this, ALUA can be lost intermittently during failover.
 - `fast_io_fail_tmo 280` — required for HA failback tolerance (see [iSCSI Timeout Tuning](#iscsi-timeout-tuning-for-ha-failover) below)
 
 Verify ALUA is working after configuration:
