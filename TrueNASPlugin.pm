@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.14';
+our $VERSION = '2.0.15';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -4472,12 +4472,9 @@ sub _free_image_iscsi {
     my $in_use = sub { my ($e)=@_; return ($e && $e =~ /in use/i) ? 1 : 0; };
     my $need_force_logout = 0;
     my $did_session_logout = 0;
-    my $scsi_teardown_done = 0;
 
     # Pre-teardown: remove this LUN's SCSI block device from the kernel before TrueNAS API calls.
     # The iSCSI TCP session stays open (needed for other LUNs), but the kernel device is released.
-    # After teardown succeeds, we pass force=true to TrueNAS delete calls to bypass the
-    # persistent-session check — the session no longer has any active I/O against this LUN.
     if (@scsi_devices_to_cleanup) {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: pre-teardown of " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) before API calls");
         my @device_paths;
@@ -4491,20 +4488,18 @@ sub _free_image_iscsi {
                 };
             }
         }
-        my $verified = _verify_devices_disconnected($scfg, \@device_paths);
+        _verify_devices_disconnected($scfg, \@device_paths);
         eval { run_command(['udevadm','settle'], outfunc => sub {}) };
         sleep(DEVICE_SETTLE_DELAY_S);
         @scsi_devices_to_cleanup = ();
-        # Only set flag when kernel confirms devices gone — gates force=true on API calls below
-        $scsi_teardown_done = $verified ? 1 : 0;
     }
 
     # 1) Delete targetextent mapping
-    # Pass force=true when SCSI teardown confirmed no active I/O against this LUN.
+    # Always pass force=true to bypass "target in use" checks from other cluster nodes' sessions.
     if ($tx && defined $tx->{id}) {
         my $id = $tx->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.targetextent.delete',[ $id, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
+            _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ]);
             1;
         };
         if (!$ok) {
@@ -4520,11 +4515,11 @@ sub _free_image_iscsi {
     }
 
     # 2) Delete extent (may still be mapped if step 1 failed)
-    # Pass force=true when SCSI teardown confirmed no active I/O against this LUN.
+    # Always pass force=true to bypass "target in use" checks from other cluster nodes' sessions.
     if ($extent && defined $extent->{id}) {
         my $eid = $extent->{id};
         my $ok = eval {
-            _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
+            _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ]);
             1;
         };
         if (!$ok) {
@@ -4572,7 +4567,7 @@ sub _free_image_iscsi {
         if ($tx && defined $tx->{id}) {
             my $id = $tx->{id};
             eval {
-                _api_call($scfg,'iscsi.targetextent.delete',[ $id, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
+                _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ]);
             };
             if ($@) {
                 # In cluster environments, other nodes may have active sessions causing "in use" errors
@@ -4586,7 +4581,7 @@ sub _free_image_iscsi {
         if ($extent && defined $extent->{id}) {
             my $eid = $extent->{id};
             eval {
-                _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, $scsi_teardown_done ? JSON::PP::true : JSON::PP::false ]);
+                _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ]);
             };
             if ($@) {
                 _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete extent id=$eid (may be in use by other cluster nodes)");

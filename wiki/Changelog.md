@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.15 (April 3, 2026)
+
+### Bug Fixes
+
+- **Fix iSCSI extent deletion failing in cluster environments during disk moves (GitHub issue #24)**: Always pass `force=true` to `iscsi.targetextent.delete` and `iscsi.extent.delete` in `_free_image_iscsi`. Previously, the force flag was gated on local SCSI device teardown (`$scsi_teardown_done`), which stayed false when Proxmox had already deactivated the device before calling `free_image` (e.g., during disk moves). In cluster environments, other nodes maintain active iSCSI sessions to the shared target for their own VMs, causing TrueNAS to refuse deletion with "Associated target is in use". The force flag safely bypasses this check — TrueNAS logs a warning and proceeds, affecting only the specific LUN mapping being removed
+
+---
+
 ## Version 2.0.14 (April 2, 2026)
 
 ### Bug Fixes
