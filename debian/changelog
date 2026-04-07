@@ -1,3 +1,14 @@
+truenas-proxmox-plugin (2.0.14+deb1) unstable; urgency=medium
+
+  * Fix disk move with multipath: SCSI teardown before TrueNAS delete APIs + force=true
+    to bypass persistent-session "in use" check (Issue #15)
+  * Fix multipath flush in free_image: derive WWID from extent NAA instead of scsi_id
+    on DM device — resolves zombie ##,## mpath entries after every disk move (Issue #15)
+  * Fix race window in activate_volume: add udevadm settle after multipath -r (Issue #15)
+  * Fix force-logout retry skipped during disk moves when active_luns >= 2 (Issue #15)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 02 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.13+deb1) unstable; urgency=medium
 
   * Skip disruptive iSCSI rescan during allocation when sessions already active (Issue #15)
