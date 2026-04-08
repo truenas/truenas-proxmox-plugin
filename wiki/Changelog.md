@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.17 (April 7, 2026)
+
+### Bug Fixes
+
+- **Fix stale weight extent mapping left by cache-collision bug (GitHub issue #27 follow-up)**: After upgrading from the v2.0.16 cache-collision fix, users with a corrupted TrueNAS state (weight extent mapped to the wrong target by the old plugin) would hit `Extent is already in use` errors on every pre-flight. `_ensure_target_visible` now detects a weight extent mapped to any target other than the expected one, removes the stale mapping, and creates the correct one
+
+---
+
 ## Version 2.0.16 (April 7, 2026)
 
 ### Bug Fixes

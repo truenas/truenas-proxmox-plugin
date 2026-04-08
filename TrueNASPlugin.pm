@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.16';
+our $VERSION = '2.0.17';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -5282,6 +5282,7 @@ sub _ensure_target_visible {
     # Step 5: Ensure extent is mapped to THIS target (not just any target)
     my $weight_mapped = 0;
     my $weight_extent_id;
+    my $stale_targetextent_id;  # mapping to wrong target left by cache-collision bug in older plugin versions
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
@@ -5294,14 +5295,30 @@ sub _ensure_target_visible {
         if ($weight_extent_id) {
             my $targetextents = _tn_targetextents($scfg);
             for my $te (@$targetextents) {
-                # Check if extent is mapped to THIS specific target
-                if ($te->{extent} == $weight_extent_id && $te->{target} == $target_id) {
-                    $weight_mapped = 1;
-                    last;
+                if ($te->{extent} == $weight_extent_id) {
+                    if ($te->{target} == $target_id) {
+                        # Mapped to the correct target
+                        $weight_mapped = 1;
+                        last;
+                    } else {
+                        # Mapped to wrong target — stale from cache-collision bug in older plugin versions
+                        $stale_targetextent_id = $te->{id};
+                    }
                 }
             }
         }
     };
+
+    # Remove stale wrong-target mapping before creating the correct one
+    if ($stale_targetextent_id) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: removing stale weight extent mapping from wrong target (leftover from cache-collision bug)");
+        eval { _tn_targetextent_delete($scfg, $stale_targetextent_id); };
+        if ($@) {
+            _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to remove stale weight mapping: $@");
+        } else {
+            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale weight mapping removed");
+        }
+    }
 
     if (!$weight_mapped && $weight_extent_id && $target_id) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: mapping weight extent to target");
