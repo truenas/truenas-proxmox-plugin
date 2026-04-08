@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.15';
+our $VERSION = '2.0.16';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -4017,20 +4017,22 @@ sub alloc_image {
     # Level 2: Verbose - unit conversion details
     _log($scfg, 2, 'debug', "[TrueNAS] alloc_image: converting $size_kib KiB → $bytes bytes");
 
-    # Parse configured blocksize to bytes for alignment
-    my $bs_bytes = _parse_blocksize($scfg->{zvol_blocksize});
+    # Determine effective volblocksize: step down by halves until it evenly divides $bytes.
+    # Do NOT round $bytes up — that makes the zvol larger than requested and breaks QEMU
+    # drive-mirror size checks during VM migration (issue #25).
+    my $blocksize = $scfg->{zvol_blocksize};
+    my $bs_bytes  = _parse_blocksize($blocksize);
 
-    # Align to volblocksize if configured (mirrors volume_resize logic at line 1307-1311)
-    if ($bs_bytes && $bs_bytes > 0) {
-        my $original_bytes = $bytes;
-        my $rem = $bytes % $bs_bytes;
-        if ($rem) {
-            $bytes += ($bs_bytes - $rem);
-            _log($scfg, 1, 'info', "[TrueNAS] " . sprintf(
-                "alloc_image: size alignment: requested %d bytes → aligned %d bytes (volblocksize: %s)",
-                $original_bytes, $bytes, $scfg->{zvol_blocksize}
-            ));
+    if ($bs_bytes && $bs_bytes > 0 && ($bytes % $bs_bytes) != 0) {
+        my $orig_bs = $blocksize;
+        while ($bs_bytes > 512 && ($bytes % $bs_bytes) != 0) {
+            $bs_bytes = int($bs_bytes / 2);
         }
+        $blocksize = ($bs_bytes >= 1024) ? (int($bs_bytes / 1024) . 'K') : "$bs_bytes";
+        _log($scfg, 1, 'info', "[TrueNAS] " . sprintf(
+            "alloc_image: volblocksize stepped down: %s → %s to fit %d bytes exactly (avoids size mismatch on migration)",
+            $orig_bs, $blocksize, $bytes
+        ));
     }
 
     # Pre-flight checks: validate all prerequisites before expensive operations
@@ -4058,7 +4060,7 @@ sub alloc_image {
 
     # 1) Create the zvol (VOLUME) on TrueNAS with requested size
     # Note: $bytes already calculated above in space check (size in KiB * 1024)
-    my $blocksize = $scfg->{zvol_blocksize};
+    # Note: $blocksize was determined above (may be stepped-down from configured value)
 
     # Handle race condition: if dataset already exists (e.g., from concurrent delete still in progress),
     # retry with an incremented disk number. This can happen during rapid create/delete cycles where

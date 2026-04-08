@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.16 (April 7, 2026)
+
+### Bug Fixes
+
+- **Fix VM migration failing with "Source and target image have different sizes" (GitHub issue #25)**: `alloc_image` no longer rounds `$bytes` up to the next volblocksize boundary. Instead, the configured volblocksize is stepped down by halves until it evenly divides the requested size, ensuring the created zvol is exactly the size QEMU expects. Previously, a non-aligned size (e.g. 32 GiB with a 64K blocksize) caused the zvol to be created slightly larger than the source disk, causing QEMU's `drive-mirror` to abort with a size mismatch.
+
+---
+
 ## Version 2.0.15 (April 3, 2026)
 
 ### Bug Fixes
