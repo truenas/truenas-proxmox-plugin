@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.15';
+our $VERSION = '2.0.16';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -45,8 +45,8 @@ my $CACHE_TTL = 60; # 60 seconds
 # Per-process cache for _resolve_target_id results (avoids redundant API calls)
 my %_target_id_cache;
 
-# Per-process cache for preflight check results (time-based, 30s validity)
-my $_preflight_last_ok = 0;
+# Per-host cache for preflight check results (time-based, 30s validity)
+my %_preflight_last_ok;
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
@@ -110,14 +110,17 @@ sub _set_cache {
 sub _clear_cache {
     my ($storage_id) = @_;
     if ($storage_id) {
-        # Clear cache for specific storage
+        # Clear cache for specific storage (storage_id is api_host)
         delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
+        delete $_target_id_cache{$_} for grep { /^\Q$storage_id\E:/ } keys %_target_id_cache;
+        delete $_preflight_last_ok{$storage_id};
     } else {
         # Clear all cache
         %API_CACHE = ();
+        %_target_id_cache = ();
+        %_preflight_last_ok = ();
     }
-    # Also clear the target ID and portal sync caches
-    %_target_id_cache = ();
+    # Also clear the portal sync cache (not scoped by api_host, clear entirely)
     %_portal_sync_last_ok = ();
 }
 
@@ -1494,7 +1497,7 @@ sub _tn_get_target($scfg) {
     return _api_call($scfg, 'iscsi.target.query', []);
 }
 sub _tn_targetextents($scfg) {
-    my $storage_id = $scfg->{storeid} || 'unknown';
+    my $storage_id = $scfg->{api_host} || $scfg->{storeid} || 'unknown';
 
     # Try cache first (but with shorter TTL since mappings change more frequently)
     my $cached = _get_cached($storage_id, 'targetextents');
@@ -1507,7 +1510,7 @@ sub _tn_targetextents($scfg) {
     return _set_cache($storage_id, 'targetextents', $res);
 }
 sub _tn_extents($scfg) {
-    my $storage_id = $scfg->{storeid} || 'unknown';
+    my $storage_id = $scfg->{api_host} || $scfg->{storeid} || 'unknown';
 
     # Try cache first
     my $cached = _get_cached($storage_id, 'extents');
@@ -2081,13 +2084,13 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     };
     my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ]);
     # Invalidate cache since extents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown') if $result;
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
     my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ]);
     # Invalidate cache since extents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown') if $result;
     return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
@@ -2108,13 +2111,13 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     $payload->{lunid} = $lun if defined $lun;
     my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]);
     # Invalidate cache since targetextents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown') if $result;
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
     my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ]);
     # Invalidate cache since targetextents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown') if $result;
     return $result;
 }
 sub _current_lun_for_zname($scfg, $zname) {
@@ -2136,10 +2139,11 @@ sub _current_lun_for_zname($scfg, $zname) {
 # Results are cached for 30 seconds to avoid redundant checks during multi-disk creation.
 sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
+    my $api_host_key = $scfg->{api_host} // 'unknown';
 
     # Skip redundant preflight checks when allocating multiple disks rapidly
-    if (time() - $_preflight_last_ok < 30) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok) . "s ago)");
+    if (time() - ($_preflight_last_ok{$api_host_key} // 0) < 30) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok{$api_host_key}) . "s ago)");
         return [];
     }
 
@@ -2276,7 +2280,7 @@ sub _preflight_check_alloc {
     }
 
     # Cache successful result for 30s to speed up multi-disk creation
-    $_preflight_last_ok = time() if !@errors;
+    $_preflight_last_ok{$api_host_key} = time() if !@errors;
 
     return \@errors;
 }
@@ -2286,11 +2290,13 @@ sub _preflight_check_alloc {
 sub _resolve_target_id {
     my ($scfg) = @_;
     my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
+    my $api_host = $scfg->{api_host} // '';
+    my $cache_key = "$api_host:$want";
 
     # Return cached result if available
-    if (exists $_target_id_cache{$want}) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _resolve_target_id: using cached target_id=$_target_id_cache{$want} for $want");
-        return $_target_id_cache{$want};
+    if (exists $_target_id_cache{$cache_key}) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _resolve_target_id: using cached target_id=$_target_id_cache{$cache_key} for $want");
+        return $_target_id_cache{$cache_key};
     }
 
     # 1) Get targets; if empty, surface a clear diagnostic
@@ -2360,7 +2366,7 @@ sub _resolve_target_id {
             $want
         );
     }
-    $_target_id_cache{$want} = $found->{id};
+    $_target_id_cache{$cache_key} = $found->{id};
     return $found->{id};
 }
 
@@ -3672,7 +3678,7 @@ sub _nvme_device_for_uuid {
 sub _nvme_sync_portals {
     my ($scfg, $subsys_id) = @_;
 
-    my $sid = $scfg->{storeid} // 'unknown';
+    my $sid = $scfg->{api_host} // 'unknown';
     if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
             . (time() - $_portal_sync_last_ok{$sid}) . "s ago)");
@@ -4212,7 +4218,7 @@ sub _alloc_image_iscsi {
         $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
 
         # Invalidate cache after creating new mapping
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown');
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {
@@ -4539,7 +4545,7 @@ sub _free_image_iscsi {
     if ($need_force_logout) {
         # Invalidate cache to get fresh targetextent data — a destination LUN may have been
         # created since the cache was last populated (e.g., during a disk move operation)
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown');
         # Check how many LUNs are currently mapped to this target
         my $active_luns = 0;
         eval {
@@ -5247,11 +5253,12 @@ sub _ensure_target_visible {
     }
 
     # Step 4: Create extent for weight zvol if it doesn't exist
+    my $expected_disk = "zvol/$weight_zname";
     my $weight_extent_exists = 0;
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name) {
+            if (($ext->{name} // '') eq $weight_name && ($ext->{disk} // '') eq $expected_disk) {
                 $weight_extent_exists = 1;
                 last;
             }
@@ -5278,7 +5285,7 @@ sub _ensure_target_visible {
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name) {
+            if (($ext->{name} // '') eq $weight_name && ($ext->{disk} // '') eq $expected_disk) {
                 $weight_extent_id = $ext->{id};
                 last;
             }
@@ -5565,7 +5572,7 @@ sub _clone_image_iscsi {
         $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
 
         # Invalidate cache after creating new mapping
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown');
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {

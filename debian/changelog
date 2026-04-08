@@ -1,3 +1,20 @@
+truenas-proxmox-plugin (2.0.16+deb1) unstable; urgency=medium
+
+  * Fix extent/targetextent cache key collision: _tn_extents and _tn_targetextents
+    now key the API cache by api_host instead of storeid, preventing cross-host
+    cache contamination when multiple storages share a TrueNAS host
+  * Fix weight extent name-only lookup in _ensure_target_visible: both extent
+    search loops now also match on the zvol disk path to prevent false positives
+    from same-named extents on different datasets
+  * Fix _resolve_target_id cache collision: %_target_id_cache is now keyed by
+    "api_host:iqn" instead of iqn alone; _clear_cache deletes only matching
+    entries rather than wiping the entire hash
+  * Fix $_preflight_last_ok shared across all storages: converted to a per-host
+    hash %_preflight_last_ok keyed by api_host; _clear_cache clears only the
+    affected host entry
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 07 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.15+deb1) unstable; urgency=medium
 
   * Always force-delete iSCSI targetextent/extent in free_image to fix cluster

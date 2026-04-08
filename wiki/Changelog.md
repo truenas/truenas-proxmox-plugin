@@ -1,5 +1,19 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.16 (April 7, 2026)
+
+### Bug Fixes
+
+- **Fix extent/targetextent cache key collision across multiple TrueNAS hosts**: `_tn_extents` and `_tn_targetextents` now key the API result cache by `api_host` instead of `storeid`. Previously, two storage configurations pointing to different TrueNAS hosts but using the same `storeid` would share a single cache slot, causing one host's extents to be returned for the other
+
+- **Fix weight extent name-only lookup in `_ensure_target_visible`**: Both loops that check for and retrieve the weight extent ID now additionally match on the zvol disk path (`disk` field = `zvol/<dataset>/<weight_name>`). Previously, a same-named extent on a different dataset (e.g., from another storage sharing the same TrueNAS host) could be mistakenly matched, causing the wrong extent to be mapped to the target
+
+- **Fix target ID cache collision across multiple TrueNAS hosts in `_resolve_target_id`**: The in-process `%_target_id_cache` is now keyed by `"$api_host:$iqn"` instead of `$iqn` alone. Previously, identical IQNs configured against different TrueNAS hosts would share the same cache slot, returning a stale target ID from the wrong host. `_clear_cache` now removes only entries matching the given api_host prefix rather than wiping the entire hash
+
+- **Fix `$_preflight_last_ok` shared across all storages**: Converted the global scalar `$_preflight_last_ok` to a per-host hash `%_preflight_last_ok` keyed by `api_host`. Previously, a successful preflight on any one storage would suppress preflight checks on all other storages for 30 seconds, potentially masking service-down or misconfiguration on a different TrueNAS host. `_clear_cache` now deletes only the entry for the affected host
+
+---
+
 ## Version 2.0.15 (April 3, 2026)
 
 ### Bug Fixes
