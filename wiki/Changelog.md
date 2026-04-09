@@ -1,6 +1,14 @@
 # TrueNAS Plugin Changelog
 
-## Version 2.0.17 (April 7, 2026)
+## Version 2.0.18 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix `Extent is already in use` pre-flight failure in multi-node clusters (GitHub issue #27 follow-up)**: `_tn_targetextent_create` now handles the case where the weight extent is already correctly mapped but the in-memory cache was stale (e.g., another cluster node created the mapping after the local cache was last populated). When `Extent is already in use` is returned, the cache is force-refreshed and if the extent is found correctly mapped to the requested target, it returns the existing mapping as idempotent success instead of propagating an error
+
+---
+
+## Version 2.0.17 (April 8, 2026)
 
 ### Bug Fixes
 

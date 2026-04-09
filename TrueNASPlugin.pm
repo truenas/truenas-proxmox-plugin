@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.17';
+our $VERSION = '2.0.18';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -2109,7 +2109,27 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id };
     $payload->{lunid} = $lun if defined $lun;
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]);
+    my $result = eval { _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]); };
+    my $err = $@;
+
+    if ($err) {
+        if ($err =~ /Extent is already in use/i) {
+            # Cache may be stale — force-refresh and check if already correctly mapped
+            # (can happen when another cluster node created the mapping after our cache was populated)
+            my $host_key = $scfg->{api_host} || $scfg->{storeid} || 'unknown';
+            _clear_cache($host_key);
+            my $fresh_maps = _tn_targetextents($scfg) // [];
+            my ($found) = grep {
+                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+            } @$fresh_maps;
+            if ($found) {
+                _log($scfg, 2, 'debug', "[TrueNAS] Target-extent mapping already exists (stale cache) for extent_id=$extent_id (LUN $found->{lunid})");
+                return $found;
+            }
+        }
+        die $err;
+    }
+
     # Invalidate cache since targetextents list has changed
     _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown') if $result;
     return $result;
@@ -5303,6 +5323,7 @@ sub _ensure_target_visible {
                     } else {
                         # Mapped to wrong target — stale from cache-collision bug in older plugin versions
                         $stale_targetextent_id = $te->{id};
+                        last;
                     }
                 }
             }
@@ -5310,17 +5331,19 @@ sub _ensure_target_visible {
     };
 
     # Remove stale wrong-target mapping before creating the correct one
+    my $stale_delete_ok = 1;
     if ($stale_targetextent_id) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: removing stale weight extent mapping from wrong target (leftover from cache-collision bug)");
         eval { _tn_targetextent_delete($scfg, $stale_targetextent_id); };
         if ($@) {
             _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to remove stale weight mapping: $@");
+            $stale_delete_ok = 0;  # extent still locked to wrong target — skip create attempt
         } else {
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale weight mapping removed");
         }
     }
 
-    if (!$weight_mapped && $weight_extent_id && $target_id) {
+    if (!$weight_mapped && $stale_delete_ok && $weight_extent_id && $target_id) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: mapping weight extent to target");
         eval {
             _tn_targetextent_create($scfg, $target_id, $weight_extent_id, 0);
