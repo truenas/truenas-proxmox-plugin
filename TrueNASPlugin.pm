@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.18';
+our $VERSION = '2.0.20';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -5206,8 +5206,13 @@ sub _ensure_target_visible {
     $target_suffix =~ s/-+/-/g;  # Collapse multiple dashes
     $target_suffix =~ s/^-|-$//g;  # Remove leading/trailing dashes
 
-    my $weight_name = "pve-weight-$target_suffix";
-    my $weight_zname = $scfg->{dataset} . '/' . $weight_name;
+    # Append an 8-char SHA1 prefix of the full IQN to guarantee uniqueness across targets
+    # whose sanitized suffixes could otherwise collide (e.g. "target.foo" and "target-foo"
+    # both sanitize to "target-foo"). sha1_hex is already imported via Digest::SHA.
+    my $iqn_hash8          = substr(sha1_hex($iqn), 0, 8);
+    my $weight_name        = "pve-weight-$target_suffix-$iqn_hash8";  # canonical (v2.0.20+)
+    my $weight_name_legacy = "pve-weight-$target_suffix";             # pre-v2.0.20 deployments
+    my $weight_zname       = $scfg->{dataset} . '/' . $weight_name;
 
     # Level 1: Log pre-flight check start
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: checking target visibility for $iqn (weight: $weight_name)");
@@ -5272,41 +5277,60 @@ sub _ensure_target_visible {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol already exists");
     }
 
-    # Step 4: Create extent for weight zvol if it doesn't exist
-    my $expected_disk = "zvol/$weight_zname";
-    my $weight_extent_exists = 0;
+    # Step 4: Create extent for weight zvol if it doesn't exist.
+    # The weight extent is scoped to the iSCSI target (IQN), not the storage dataset.
+    # Multiple storages sharing the same target share the same weight extent, so we
+    # match by name only — the disk path may differ if another storage created it first.
+    # Try the canonical (new) name first, then fall back to the legacy name for clusters
+    # that already have a weight extent created by an older plugin version.
+    my $found_weight_name;  # actual name of the weight extent on TrueNAS (may be legacy)
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name && ($ext->{disk} // '') eq $expected_disk) {
-                $weight_extent_exists = 1;
+            my $ext_name = $ext->{name} // '';
+            if ($ext_name eq $weight_name) {
+                $found_weight_name = $weight_name;
+                last;
+            } elsif ($ext_name eq $weight_name_legacy) {
+                $found_weight_name = $weight_name_legacy;
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: using legacy weight extent '$weight_name_legacy' (pre-v2.0.20 name format; will continue working)");
                 last;
             }
         }
     };
 
-    if (!$weight_extent_exists) {
+    if (!$found_weight_name) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: creating extent for weight zvol");
         eval {
             _tn_extent_create($scfg, $weight_name, $weight_zname);
         };
         if ($@) {
-            _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight extent: $@");
-            die "Failed to create weight extent: $@\n";
+            if ($@ =~ /Extent name must be unique/i) {
+                # Another storage or concurrent process already created the weight extent
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent already exists (created concurrently or by another storage)");
+                _clear_cache($scfg->{api_host} || $scfg->{storeid} || 'unknown');
+                $found_weight_name = $weight_name;  # it exists now — step 5 will fetch it fresh
+            } else {
+                _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight extent: $@");
+                die "Failed to create weight extent: $@\n";
+            }
+        } else {
+            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
+            $found_weight_name = $weight_name;
         }
-        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
     } else {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent already exists");
     }
 
-    # Step 5: Ensure extent is mapped to THIS target (not just any target)
+    # Step 5: Ensure extent is mapped to THIS target (not just any target).
+    # Use $found_weight_name (may be legacy) so that lookups stay consistent with step 4.
     my $weight_mapped = 0;
     my $weight_extent_id;
     my $stale_targetextent_id;  # mapping to wrong target left by cache-collision bug in older plugin versions
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name && ($ext->{disk} // '') eq $expected_disk) {
+            if (($ext->{name} // '') eq ($found_weight_name // '')) {
                 $weight_extent_id = $ext->{id};
                 last;
             }

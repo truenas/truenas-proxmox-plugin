@@ -1,3 +1,22 @@
+truenas-proxmox-plugin (2.0.20+deb1) unstable; urgency=medium
+
+  * Fix weight extent name collision across distinct iSCSI targets: append
+    8-char SHA1 of full IQN to weight extent name (pve-weight-<suffix>-<hash8>)
+    to prevent targets with colliding sanitized suffixes from sharing a weight
+    extent; legacy name format accepted via fallback lookup for existing clusters
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.19+deb1) unstable; urgency=medium
+
+  * Fix weight extent lookup failing when multiple storages share the same
+    iSCSI target: weight extent in _ensure_target_visible now matched by name
+    only (not name+disk), since the extent belongs to the target IQN and may
+    be created by a different storage with a different dataset path; also handle
+    "Extent name must be unique" gracefully as idempotent success
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.18+deb1) unstable; urgency=medium
 
   * Fix "Extent is already in use" pre-flight failure in multi-node clusters:

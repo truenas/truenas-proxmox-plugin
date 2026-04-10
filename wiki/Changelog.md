@@ -1,5 +1,21 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.20 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent name collision across distinct iSCSI targets (GitHub issue #27 follow-up)**: The weight extent name was derived only from the sanitized IQN suffix (e.g., `iqn...ctl:target-foo-bar` → `pve-weight-target-foo-bar`). Two targets whose suffixes differ only in punctuation would produce the same name and, with the v2.0.19 name-only lookup, silently share a weight extent. The name now includes an 8-character SHA1 prefix of the full IQN (e.g., `pve-weight-target-foo-bar-a3f7c2d1`), making it cryptographically unique per target. Existing clusters with legacy-named weight extents continue to work via a fallback lookup that accepts the old format.
+
+---
+
+## Version 2.0.19 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent lookup failing when multiple storages share the same iSCSI target (GitHub issue #27 follow-up)**: `_ensure_target_visible` matched the weight extent by both name **and** disk path. When two storages use the same target IQN (e.g., `conexum-infrastructure`) but different datasets, the second storage could not find the weight extent created by the first (different disk path), attempted to create a duplicate, and hit TrueNAS's "Extent name must be unique" validation error. Weight extents are now matched by name only since they belong to the iSCSI target, not the dataset. The "Extent name must be unique" error during create is also handled gracefully as idempotent success.
+
+---
+
 ## Version 2.0.18 (April 8, 2026)
 
 ### Bug Fixes
