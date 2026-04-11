@@ -1,3 +1,44 @@
+truenas-proxmox-plugin (2.0.23+deb1) unstable; urgency=medium
+
+  * Fix extent delete in alloc/clone cleanup paths using read-path WebSocket
+    connection: _api_call replaced with _api_call_write for iscsi.extent.delete
+    in _alloc_image_iscsi and _clone_image_iscsi cleanup branches so failure is
+    not silently swallowed on persistent-connection setups
+  * Fix clone retry loop exhausting budget on warm dataset cache: invalidate
+    cache before _find_free_disk_name in retry branch of _clone_image_iscsi
+    and _clone_image_nvme so a fresh name is always resolved on collision
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 11 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.22+deb1) unstable; urgency=medium
+
+  * Fix orphaned zvol/extent in _alloc_image_iscsi: wrap extent.create and
+    targetextent.create in eval with cascading cleanup; replace bare _api_call
+    with _tn_targetextent_create for concurrent-node race recovery (C1)
+  * Fix silent zvol leak in free_image: re-raise non-"not found" dataset
+    deletion errors so Proxmox reports the failure (C2)
+  * Fix concurrent weight zvol create hard-dying in _ensure_target_visible:
+    treat "already exists" as idempotent success (M1)
+  * Fix _clone_image_iscsi missing _clear_cache and bare targetextent create (M2)
+  * Fix stale-mapping delete "not found" blocking correct mapping create (M3)
+  * Fix weight extent pointing to dead zvol after cross-dataset re-create (L1)
+  * Fix orphaned zvol in _alloc_image_nvme on namespace create failure (L2)
+  * Fix missing retry loop for "dataset already exists" in clone_image (L3)
+  * Fix _resolve_target_id process-lifetime cache: migrate to 60s TTL (L4)
+  * Fix global iSCSI rescan in volume_snapshot_rollback: scope to target IQN (L5)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.21+deb1) unstable; urgency=medium
+
+  * Fix FOREIGN KEY constraint failure when weight extent is deleted between
+    cache population and mapping: force-invalidate extents cache before step 5
+    ID lookup in _ensure_target_visible so stale cached IDs are never used for
+    iscsi.targetextent.create; add FOREIGN KEY error detection in mapping path
+    with cache-clearing recovery
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.20+deb1) unstable; urgency=medium
 
   * Fix weight extent name collision across distinct iSCSI targets: append

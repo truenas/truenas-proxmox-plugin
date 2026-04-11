@@ -1,5 +1,39 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.23 (April 11, 2026)
+
+### Bug Fixes
+
+- **Fix extent delete in `_alloc_image_iscsi` and `_clone_image_iscsi` cleanup paths using read-path WebSocket connection**: The `eval { _api_call(..., 'iscsi.extent.delete', ...) }` cleanup calls on targetextent mapping failure used `_api_call` (persistent read-path connection) instead of `_api_call_write` (ephemeral write-path connection). On a persistent-connection setup this could fail silently, leaving an orphaned extent on TrueNAS. Both cleanup paths now use `_api_call_write`, consistent with `_tn_extent_delete`.
+- **Fix clone retry loop exhausting budget on cached "dataset already exists" collision**: `_clone_image_iscsi` and `_clone_image_nvme` retry loops called `_find_free_disk_name` without first clearing the 60s TTL dataset cache. If the cache was still warm, the same name could be returned on successive attempts, burning all retry attempts against the same collision. The cache is now invalidated before each `_find_free_disk_name` call in the retry branch.
+
+---
+
+## Version 2.0.22 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix orphaned zvol/extent when `_alloc_image_iscsi` fails mid-allocation (C1)**: `iscsi.extent.create` and `iscsi.targetextent.create` were bare unguarded calls — any API throw (network drop, retry exhaustion) left the zvol and/or extent on TrueNAS with no Proxmox record. Both calls are now wrapped in `eval` with cascading cleanup on failure (delete extent → delete zvol). The bare `_api_call` for targetextent has been replaced with `_tn_targetextent_create`, which handles idempotency and "Extent is already in use" recovery for concurrent-node races.
+- **Fix silent zvol leak when dataset deletion fails in `free_image` (C2)**: The `eval { _delete_dataset_with_retry }` block was followed by a `warn` on any error, causing `free_image` to return success to Proxmox even when the zvol was still present on TrueNAS. Non-"not found" errors now `die` so Proxmox surfaces the failure. Applies to both iSCSI and NVMe paths.
+- **Fix concurrent weight zvol create causing hard `die` in `_ensure_target_visible` step 2 (M1)**: On cluster startup, two nodes race to create the weight zvol. The loser hit an unconditional `die`, skipping extent creation and mapping for that node. "Dataset already exists" errors are now treated as success (the zvol is present — desired state achieved).
+- **Fix `_clone_image_iscsi` using bare `_api_call` for targetextent create (M2)**: Added `_clear_cache` after extent create so the targetextents lookup uses fresh data; replaced bare `_api_call` for targetextent create with `_tn_targetextent_create` for proper "already in use" recovery.
+- **Fix concurrent stale-mapping delete causing `$stale_delete_ok=0` (M3)**: When two nodes raced to delete the same stale wrong-target weight mapping (post cache-collision bug upgrade), the second node got a "not found" error which set `$stale_delete_ok = 0`, preventing the correct mapping from being created. "Not found" class errors from the stale delete are now treated as success (the mapping is gone — desired state).
+- **Fix weight extent pointing to dead zvol path after cross-dataset zvol re-create (L1)**: Two storages sharing the same IQN but different datasets could leave the weight extent pointing to a deleted zvol from one storage's dataset while the other storage created an orphan zvol at its own dataset path. Step 4 now checks the extent's disk path against the current storage's expected path when the zvol was just created, and deletes stale extents for re-creation.
+- **Fix orphaned zvol when `_alloc_image_nvme` namespace create fails (L2)**: `nvmet.namespace.create` was an unguarded call — any throw left the zvol orphaned. Now wrapped in `eval` with zvol cleanup on failure.
+- **Fix missing retry loop for "dataset already exists" in `clone_image` (L3)**: `_clone_image_iscsi` and `_clone_image_nvme` called `_find_free_disk_name` then immediately attempted the clone with no retry, unlike `alloc_image` which has a 5-attempt retry loop. Concurrent template deployments could fail permanently on the TOCTOU race. Both functions now retry up to 5 times with a fresh name on "dataset already exists".
+- **Fix `_resolve_target_id` using process-lifetime cache with no TTL (L4)**: The `%_target_id_cache` hash had no TTL — if a TrueNAS target was deleted and recreated with a new integer ID, all subsequent writes would use the stale ID and fail with FOREIGN KEY errors until the process restarted. Target ID lookups are now backed by `_get_cached`/`_set_cache` (60s TTL), consistent with all other API caches, and `_clear_cache` invalidates them automatically.
+- **Fix global iSCSI session rescan in `volume_snapshot_rollback` (L5)**: `iscsiadm -m session -R` rescanned all iSCSI sessions on the node, potentially disrupting I/O on unrelated volumes during a snapshot rollback. Now uses `iscsiadm -m node -T <iqn> -R` to rescan only the target IQN associated with the storage being rolled back.
+
+---
+
+## Version 2.0.21 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix FOREIGN KEY constraint failure when weight extent is deleted between cache population and mapping (GitHub issue #27 follow-up)**: `_ensure_target_visible` used a 60-second cached extent list in step 5 to look up the weight extent's numeric ID. If the weight extent was deleted from TrueNAS after step 4's (possibly cached) lookup — e.g., by a manual cleanup, a test cycle, or a TrueNAS service restart — step 5 would resolve a stale ID and `iscsi.targetextent.create` would fail with `sqlite3.IntegrityError: FOREIGN KEY constraint failed`. The extents cache is now force-invalidated before the step 5 ID lookup so we always resolve the current TrueNAS state. As defense in depth, FOREIGN KEY errors in the mapping path are also detected explicitly, the cache is cleared, and a recovery log message is emitted instead of a generic warning.
+
+---
+
 ## Version 2.0.20 (April 8, 2026)
 
 ### Bug Fixes
