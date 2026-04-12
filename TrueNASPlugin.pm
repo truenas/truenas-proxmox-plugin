@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.23';
+our $VERSION = '2.0.24';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -192,6 +192,11 @@ sub _normalize_blocksize {
 sub _is_retryable_error {
     my ($error) = @_;
     return 0 if !defined $error;
+
+    # Do NOT retry on database integrity errors — check BEFORE connection patterns
+    # because FK errors include Python traceback paths containing "connection.py"
+    # which would otherwise false-match the /connection.*failed/ pattern below
+    return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
 
     # Retry on network errors, timeouts, connection issues
     return 1 if $error =~ /timeout|timed out/i;
@@ -5439,8 +5444,14 @@ sub _ensure_target_visible {
                 eval { _tn_targetextent_create($scfg, $target_id, $weight_extent_id, undef); };
                 if ($@) {
                     if ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
+                        # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
+                        # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
                         my $_hk = $scfg->{api_host} || $scfg->{storeid} || 'unknown';
-                        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FOREIGN KEY), clearing cache for re-derive on next cycle");
+                        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
+                        eval { _tn_extent_delete($scfg, $weight_extent_id) };
+                        if ($@) {
+                            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
+                        }
                         _clear_cache($_hk);
                     } else {
                         _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent with auto LUN: $@");
@@ -5449,8 +5460,14 @@ sub _ensure_target_visible {
                     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent mapped to target (auto LUN)");
                 }
             } elsif ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
+                # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
+                # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
                 my $_hk = $scfg->{api_host} || $scfg->{storeid} || 'unknown';
-                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FOREIGN KEY), clearing cache for re-derive on next cycle");
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
+                eval { _tn_extent_delete($scfg, $weight_extent_id) };
+                if ($@) {
+                    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
+                }
                 _clear_cache($_hk);
             } else {
                 _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent: $@");

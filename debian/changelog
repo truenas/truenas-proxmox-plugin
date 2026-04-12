@@ -1,3 +1,14 @@
+truenas-proxmox-plugin (2.0.24+deb1) unstable; urgency=medium
+
+  * Fix FK/IntegrityError causing unnecessary 3 retries before failing: check
+    database integrity patterns before connection patterns in _is_retryable_error
+    to prevent Python traceback paths like "connection.py" false-matching
+  * Fix weight extent FK constraint failure not cleaning TrueNAS state: attempt
+    to delete stale extent on FK failure to force configfs/DB resync instead of
+    only clearing plugin cache (which left TrueNAS in inconsistent state)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.23+deb1) unstable; urgency=medium
 
   * Fix extent delete in alloc/clone cleanup paths using read-path WebSocket

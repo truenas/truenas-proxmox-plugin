@@ -1,5 +1,14 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.24 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix FK/IntegrityError causing unnecessary 3 retries (7+ seconds) before failing (GitHub issue #27)**: The `_is_retryable_error` function's `/connection.*failed/i` pattern matched FK constraint errors because the JSON-encoded Python traceback contains file paths like `datastore/connection.py` and later "constraint **failed**". Since `encode_json` produces one long string (newlines become `\n` literals), the `.` bridged across everything. FK/IntegrityError patterns are now checked first before connection patterns, eliminating wasted retry cycles.
+- **Fix weight extent FK constraint failure only clearing cache instead of fixing TrueNAS state (GitHub issue #27)**: When `iscsi.extent.query` returned an extent ID that didn't exist in SQLite (TrueNAS configfs/DB desync), the pre-flight's FK handler only cleared the plugin's cache. On the next cycle, the same stale extent ID would be returned and fail again. The FK handler now attempts to delete the stale extent from TrueNAS to force a resync; the next cycle will recreate it cleanly.
+
+---
+
 ## Version 2.0.23 (April 11, 2026)
 
 ### Bug Fixes
