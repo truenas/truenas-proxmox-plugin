@@ -1,5 +1,24 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.26 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix duplicate weight zvol creation when upgrading from pre-v2.0.20 (GitHub issue #27 follow-up)**: When upgrading from a pre-v2.0.20 plugin that used legacy weight zvol names (e.g., `pve-weight-target-name`) to v2.0.20+ with hash-based names (e.g., `pve-weight-target-name-a3f7c2d1`), the plugin would create a new hash-named zvol even though the legacy zvol already existed. This caused: (1) duplicate 1GB zvols on TrueNAS, (2) orphaned legacy zvols that were never cleaned up, and (3) the legacy extent being deleted and recreated pointing to the new zvol. Step 2 of `_ensure_target_visible` now also checks for the legacy-named zvol; if found, it continues using it rather than creating a duplicate.
+
+---
+
+## Version 2.0.25 (April 12, 2026)
+
+### Code Quality
+
+- **Extract `_cache_host_key` helper**: Consolidated 19 occurrences of `$scfg->{api_host} || $scfg->{storeid} || 'unknown'` into a single helper function for consistency and maintainability.
+- **Extract `_invalidate_cache_key` helper**: Targeted cache invalidation now uses a helper instead of direct `%API_CACHE` manipulation.
+- **Fix `_api_call` vs `_api_call_write` inconsistency**: Extent creation in `_alloc_image_iscsi` and `_clone_image_iscsi` now uses `_api_call_write` (ephemeral connection) consistent with other write operations.
+- **Rename `$stale_delete_ok` to `$stale_cleared`**: Improved variable naming clarity in `_ensure_target_visible`.
+
+---
+
 ## Version 2.0.24 (April 12, 2026)
 
 ### Bug Fixes

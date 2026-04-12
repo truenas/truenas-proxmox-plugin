@@ -1,3 +1,19 @@
+truenas-proxmox-plugin (2.0.26+deb1) unstable; urgency=medium
+
+  * Fix duplicate weight zvol creation when upgrading from pre-v2.0.20: step 2
+    of _ensure_target_visible now checks for legacy-named zvol and reuses it
+    instead of creating a new hash-named duplicate (GitHub issue #27 follow-up)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.25+deb1) unstable; urgency=low
+
+  * Code quality: Extract _cache_host_key and _invalidate_cache_key helpers
+  * Code quality: Use _api_call_write for extent creation (ephemeral connection)
+  * Code quality: Rename $stale_delete_ok to $stale_cleared
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.24+deb1) unstable; urgency=medium
 
   * Fix FK/IntegrityError causing unnecessary 3 retries before failing: check
