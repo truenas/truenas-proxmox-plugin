@@ -216,6 +216,25 @@ sub _normalize_blocksize {
     return $blocksize;
 }
 
+# ======== Error classification helpers ========
+sub _is_connection_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|rate limit|ssl.*error|connection.*failed/i;
+}
+
+sub _is_not_found_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /404 Not Found|ENOENT|InstanceNotFound|does not exist|not found/i;
+}
+
+sub _is_auth_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key/i;
+}
+
 # ======== Retry logic with exponential backoff ========
 sub _is_retryable_error {
     my ($error) = @_;
@@ -226,20 +245,12 @@ sub _is_retryable_error {
     # which would otherwise false-match the /connection.*failed/ pattern below
     return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
 
-    # Retry on network errors, timeouts, connection issues
-    return 1 if $error =~ /timeout|timed out/i;
-    return 1 if $error =~ /connection refused|connection reset|broken pipe/i;
-    return 1 if $error =~ /network is unreachable|host is unreachable/i;
-    return 1 if $error =~ /temporary failure|service unavailable/i;
-    return 1 if $error =~ /502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout/i;
-    return 1 if $error =~ /rate limit/i;
-    return 1 if $error =~ /ssl.*error/i; # Transient SSL errors
-    return 1 if $error =~ /connection.*failed/i;
+    # Retry on transient connection/network errors
+    return 1 if _is_connection_error($error);
 
-    # Do NOT retry on authentication errors, not found, or validation errors
-    return 0 if $error =~ /401 Unauthorized|403 Forbidden|404 Not Found/i;
-    return 0 if $error =~ /ENOENT|InstanceNotFound|does not exist/i;
-    return 0 if $error =~ /invalid.*key|authentication.*failed/i;
+    # Do NOT retry on authentication, not found, or validation errors
+    return 0 if _is_auth_error($error);
+    return 0 if _is_not_found_error($error);
     return 0 if $error =~ /validation.*error|invalid.*parameter/i;
     return 0 if $error =~ /EINVAL|Invalid params/i;
 
@@ -447,6 +458,14 @@ sub properties {
             optional => 1,
         },
 
+        # ZFS compression algorithm for new volumes
+        compression => {
+            description => "ZFS compression algorithm for new volumes. When unset, inherits from parent dataset.",
+            type => 'string',
+            enum => [qw(OFF LZ4 GZIP GZIP-1 GZIP-9 ZSTD ZSTD-1 ZSTD-3 ZSTD-5 ZSTD-7 ZSTD-9 ZLE LZJB)],
+            optional => 1,
+        },
+
         # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
             description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
@@ -537,7 +556,8 @@ sub options {
         nvme_dhchap_secret     => { optional => 1 },
         nvme_dhchap_ctrl_secret => { optional => 1 },
 
-        # Thin toggle
+        # ZFS tunables
+        compression => { optional => 1 },
         tn_sparse => { optional => 1 },
 
         # Debug
@@ -1509,9 +1529,24 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
         # Use persistent connection for read operations (original behavior)
         return _retry_with_backoff($scfg, "WS $ws_method", sub {
             my $conn = _ws_get_persistent($scfg);
-            my $res = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-            });
+            my $res = eval {
+                _ws_rpc($conn, {
+                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+                });
+            };
+            if (my $err = $@) {
+                # On connection errors, invalidate the cached connection so the
+                # next retry gets a fresh one instead of re-pinging a dead socket
+                if (_is_connection_error($err)) {
+                    my $key = _ws_connection_key($scfg);
+                    if ($conn && $conn->{sock}) {
+                        eval { $conn->{sock}->close(); };
+                    }
+                    delete $_ws_connections{$key};
+                    _log($scfg, 1, 'info', "[TrueNAS] _api_call: invalidated dead persistent connection for $ws_method");
+                }
+                die $err;
+            }
 
             # Level 2: Verbose - log API response
             _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
@@ -2250,7 +2285,32 @@ sub _preflight_check_alloc {
         push @errors, "TrueNAS API is unreachable: $@";
     }
 
-    # Check 2: Service is running (transport-specific)
+    # Check 2: Pool health (degraded pools are functional but warrant a warning)
+    eval {
+        my ($pool_name) = split('/', $scfg->{dataset}, 2);
+        my $pools = _api_call($scfg, 'pool.query',
+            [[ ["name", "=", $pool_name] ]]);
+        if ($pools && @$pools) {
+            my $pool = $pools->[0];
+            if (!$pool->{healthy}) {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] preflight: pool '$pool_name' is not healthy (status: " .
+                    ($pool->{status} // 'UNKNOWN') . ")");
+            }
+            if (($pool->{status} // '') ne 'ONLINE') {
+                push @errors, sprintf(
+                    "ZFS pool '%s' is not ONLINE (status: %s)\n" .
+                    "  Check pool status in TrueNAS: Storage > Pools",
+                    $pool_name, $pool->{status} // 'UNKNOWN'
+                );
+            }
+        }
+    };
+    if ($@) {
+        _log($scfg, 1, 'info', "[TrueNAS] preflight: pool health check skipped: $@");
+    }
+
+    # Check 3: Service is running (transport-specific)
     if ($mode eq 'iscsi') {
         eval {
             my $services = _api_call($scfg, 'service.query',
@@ -2289,7 +2349,7 @@ sub _preflight_check_alloc {
         }
     }
 
-    # Check 3: Sufficient space available (with 20% overhead)
+    # Check 4: Sufficient space available (with 20% overhead)
     if (defined $size_bytes) {
         my $bytes = int($size_bytes);
         my $required = $bytes * 1.2;
@@ -2314,7 +2374,7 @@ sub _preflight_check_alloc {
         }
     }
 
-    # Check 4: Target/subsystem exists and is configured (transport-specific)
+    # Check 5: Target/subsystem exists and is configured (transport-specific)
     if ($mode eq 'iscsi') {
         eval {
             my $target_id = _resolve_target_id($scfg);
@@ -2356,7 +2416,7 @@ sub _preflight_check_alloc {
         }
     }
 
-    # Check 5: Parent dataset exists
+    # Check 6: Parent dataset exists
     eval {
         my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
         if (!$ds) {
@@ -4182,6 +4242,8 @@ sub alloc_image {
         };
         # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
         $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
+        # Pass compression algorithm if configured (otherwise inherits from parent dataset)
+        $create_payload->{compression} = uc($scfg->{compression}) if $scfg->{compression};
 
         eval {
             $create_result = _api_call(
@@ -5274,6 +5336,18 @@ sub status {
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
             $ds = _tn_dataset_get($scfg, $scfg->{dataset}, { retry_max => 0 });
             _set_cache($host_key, $status_method, $ds);
+
+            # Pool health check on cache miss only (non-fatal — log warning if degraded)
+            eval {
+                my ($pool_name) = split('/', $scfg->{dataset}, 2);
+                my $pools = _api_call($scfg, 'pool.query',
+                    [[ ["name", "=", $pool_name] ]]);
+                if ($pools && @$pools && !$pools->[0]->{healthy}) {
+                    _log($scfg, 0, 'warning',
+                        "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
+                        ($pools->[0]->{status} // 'UNKNOWN') . ")");
+                }
+            };
         }
 
         my $quota     = _normalize_value($ds->{quota});     # bytes; 0 = no quota
@@ -5294,15 +5368,15 @@ sub status {
         _invalidate_status_capacity_cache($storeid, $scfg);
 
         # Distinguish between connectivity issues and actual errors
-        if ($err =~ /timeout|timed out|connection refused|connection reset|unreachable|network|ssl.*error/i) {
+        if (_is_connection_error($err)) {
             # Network/connectivity issue - mark as inactive (temporary)
             _log($scfg, 0, 'info', "[TrueNAS] status: storage '$storeid' marked inactive (connectivity issue): $err");
             $active = 0;
-        } elsif ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+        } elsif (_is_not_found_error($err)) {
             # Dataset doesn't exist - this is a configuration error
             _log($scfg, 0, 'err', "[TrueNAS] status: storage '$storeid' configuration error (dataset not found): $err");
             $active = 0;
-        } elsif ($err =~ /401|403|authentication|unauthorized|forbidden/i) {
+        } elsif (_is_auth_error($err)) {
             # Authentication/permission issue - configuration error
             _log($scfg, 0, 'err', "[TrueNAS] status: storage '$storeid' authentication failed (check API key): $err");
             $active = 0;
