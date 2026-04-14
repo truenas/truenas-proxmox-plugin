@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.26';
+our $VERSION = '2.0.27';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -121,8 +121,12 @@ sub _clear_cache {
         %API_CACHE = ();
         %_preflight_last_ok = ();
     }
-    # Also clear the portal sync cache (not scoped by api_host, clear entirely)
-    %_portal_sync_last_ok = ();
+    # Keep portal sync cache aligned with the same host scoping
+    if ($storage_id) {
+        delete $_portal_sync_last_ok{$storage_id};
+    } else {
+        %_portal_sync_last_ok = ();
+    }
 }
 
 # Invalidate a specific cache entry without clearing the entire host's cache
@@ -2160,6 +2164,17 @@ sub _tn_targetextent_delete($scfg, $tx_id) {
     _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
+sub _handle_fk_stale_extent {
+    my ($scfg, $weight_extent_id) = @_;
+
+    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
+    eval { _tn_extent_delete($scfg, $weight_extent_id) };
+    if ($@) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
+    }
+    _clear_cache(_cache_host_key($scfg));
+}
+
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
     my $zvol_path = "zvol/$scfg->{dataset}/$zname";
@@ -2179,7 +2194,7 @@ sub _current_lun_for_zname($scfg, $zname) {
 # Results are cached for 30 seconds to avoid redundant checks during multi-disk creation.
 sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
-    my $api_host_key = $scfg->{api_host} // 'unknown';
+    my $api_host_key = _cache_host_key($scfg);
 
     # Skip redundant preflight checks when allocating multiple disks rapidly
     if (time() - ($_preflight_last_ok{$api_host_key} // 0) < 30) {
@@ -2330,7 +2345,7 @@ sub _preflight_check_alloc {
 sub _resolve_target_id {
     my ($scfg) = @_;
     my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
-    my $api_host = $scfg->{api_host} // '';
+    my $api_host = _cache_host_key($scfg);
 
     # Use the TTL-based %API_CACHE (60s) so stale IDs are automatically refreshed
     # and _clear_cache() always invalidates this alongside other cached data.
@@ -3718,7 +3733,7 @@ sub _nvme_device_for_uuid {
 sub _nvme_sync_portals {
     my ($scfg, $subsys_id) = @_;
 
-    my $sid = $scfg->{api_host} // 'unknown';
+    my $sid = _cache_host_key($scfg);
     if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
             . (time() - $_portal_sync_last_ok{$sid}) . "s ago)");
@@ -4063,21 +4078,24 @@ sub alloc_image {
     # Level 2: Verbose - unit conversion details
     _log($scfg, 2, 'debug', "[TrueNAS] alloc_image: converting $size_kib KiB → $bytes bytes");
 
-    # Parse configured blocksize to bytes for alignment
-    my $bs_bytes = _parse_blocksize($scfg->{zvol_blocksize});
+    # Determine effective volblocksize: step down by halves until it evenly divides $bytes.
+    # Do NOT round $bytes up — that makes the zvol larger than requested and breaks QEMU
+    # drive-mirror size checks during VM migration (issue #25).
+    my $blocksize = $scfg->{zvol_blocksize};
+    my $bs_bytes  = _parse_blocksize($blocksize);
 
-    # Align to volblocksize if configured (mirrors volume_resize logic at line 1307-1311)
-    if ($bs_bytes && $bs_bytes > 0) {
-        my $original_bytes = $bytes;
-        my $rem = $bytes % $bs_bytes;
-        if ($rem) {
-            $bytes += ($bs_bytes - $rem);
-            _log($scfg, 1, 'info', "[TrueNAS] " . sprintf(
-                "alloc_image: size alignment: requested %d bytes → aligned %d bytes (volblocksize: %s)",
-                $original_bytes, $bytes, $scfg->{zvol_blocksize}
-            ));
+    if ($bs_bytes && $bs_bytes > 0 && ($bytes % $bs_bytes) != 0) {
+        my $orig_bs = $blocksize;
+        while ($bs_bytes > 512 && ($bytes % $bs_bytes) != 0) {
+            $bs_bytes = int($bs_bytes / 2);
         }
+        $blocksize = ($bs_bytes >= 1024) ? (int($bs_bytes / 1024) . 'K') : "$bs_bytes";
+        _log($scfg, 1, 'info', "[TrueNAS] " . sprintf(
+            "alloc_image: volblocksize stepped down: %s → %s to fit %d bytes exactly (avoids size mismatch on migration)",
+            $orig_bs, $blocksize, $bytes
+        ));
     }
+
 
     # Pre-flight checks: validate all prerequisites before expensive operations
     _log($scfg, 1, 'info', "[TrueNAS] alloc_image: running pre-flight checks for $bytes bytes");
@@ -4104,7 +4122,7 @@ sub alloc_image {
 
     # 1) Create the zvol (VOLUME) on TrueNAS with requested size
     # Note: $bytes already calculated above in space check (size in KiB * 1024)
-    my $blocksize = $scfg->{zvol_blocksize};
+    # Note: $blocksize was determined above (may be stepped-down from configured value)
 
     # Handle race condition: if dataset already exists (e.g., from concurrent delete still in progress),
     # retry with an incremented disk number. This can happen during rapid create/delete cycles where
@@ -5298,7 +5316,6 @@ sub _ensure_target_visible {
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: ensuring weight volume exists for target reliability");
     my $weight_exists = 0;
     my $weight_zname_legacy = $scfg->{dataset} . '/' . $weight_name_legacy;
-    my $using_legacy_zvol = 0;  # true if we found the legacy zvol (affects step 4 disk-path check)
     eval {
         my $ds = _tn_dataset_get($scfg, $weight_zname);
         if ($ds) {
@@ -5310,7 +5327,6 @@ sub _ensure_target_visible {
             my $ds_legacy = _tn_dataset_get($scfg, $weight_zname_legacy);
             if ($ds_legacy) {
                 $weight_exists = 1;
-                $using_legacy_zvol = 1;
                 _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: found legacy weight zvol '$weight_zname_legacy' (pre-v2.0.20); continuing to use it");
             }
         }
@@ -5470,13 +5486,7 @@ sub _ensure_target_visible {
                     if ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
                         # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
                         # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
-                        my $_hk = _cache_host_key($scfg);
-                        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
-                        eval { _tn_extent_delete($scfg, $weight_extent_id) };
-                        if ($@) {
-                            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
-                        }
-                        _clear_cache($_hk);
+                        _handle_fk_stale_extent($scfg, $weight_extent_id);
                     } else {
                         _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent with auto LUN: $@");
                     }
@@ -5486,13 +5496,7 @@ sub _ensure_target_visible {
             } elsif ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
                 # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
                 # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
-                my $_hk = _cache_host_key($scfg);
-                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
-                eval { _tn_extent_delete($scfg, $weight_extent_id) };
-                if ($@) {
-                    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
-                }
-                _clear_cache($_hk);
+                _handle_fk_stale_extent($scfg, $weight_extent_id);
             } else {
                 _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent: $@");
             }
@@ -5680,7 +5684,7 @@ sub _clone_image_iscsi {
             }
             die $@;
         }
-        die "Failed to create clone after $max_clone_retries attempts\n" if $clone_attempt >= $max_clone_retries && !defined $clone_result;
+        die "Failed to create clone after $max_clone_retries attempts\n" if !defined $clone_result;
     }
 
     # Wait for clone job to complete if it returned a job ID
@@ -5821,7 +5825,7 @@ sub _clone_image_nvme {
             }
             die $@;
         }
-        die "Failed to create clone after $max_clone_retries attempts\n" if $clone_attempt >= $max_clone_retries && !defined $clone_result;
+        die "Failed to create clone after $max_clone_retries attempts\n" if !defined $clone_result;
     }
 
     # Wait for clone job to complete if it returned a job ID

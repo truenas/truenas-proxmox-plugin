@@ -1,3 +1,18 @@
+truenas-proxmox-plugin (2.0.27+deb1) unstable; urgency=medium
+
+  * Fix host-scoped cache key mismatches in preflight/target-id/NVMe portal
+    paths: use _cache_host_key consistently so targeted invalidation works
+    when api_host is unset
+  * Fix over-broad portal sync cache invalidation: clear portal-sync timestamp
+    only for the targeted host key on _clear_cache(storage_id)
+  * Refactor duplicated FK stale-extent recovery in _ensure_target_visible by
+    extracting shared _handle_fk_stale_extent helper
+  * Fix VM migration size mismatch (issue #25): alloc_image now steps
+    volblocksize down by powers of two to preserve exact requested bytes
+    instead of rounding zvol size upward
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sun, 13 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.26+deb1) unstable; urgency=medium
 
   * Fix duplicate weight zvol creation when upgrading from pre-v2.0.20: step 2

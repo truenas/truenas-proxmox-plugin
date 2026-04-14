@@ -1,5 +1,16 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.27 (April 13, 2026)
+
+### Bug Fixes
+
+- **Fix host-scoped cache key mismatches introduced during issue #27 follow-up hardening**: `_preflight_check_alloc`, `_resolve_target_id`, and `_nvme_sync_portals` now consistently use `_cache_host_key($scfg)` so per-host cache entries are invalidated correctly even when `api_host` is unset.
+- **Fix over-broad portal sync cache invalidation**: `_clear_cache($storage_id)` now clears `%_portal_sync_last_ok` only for the targeted host key instead of wiping all hosts, preventing unnecessary NVMe portal re-syncs across unrelated storages.
+- **Refactor duplicated FK stale-extent recovery path**: extracted `_handle_fk_stale_extent` helper and replaced duplicate in-branch blocks in `_ensure_target_visible` with shared logic.
+- **Fix VM migration size mismatch from zvol byte-rounding behavior (issue #25)**: `alloc_image` now preserves requested size exactly and steps `volblocksize` down by powers of two (to a 512-byte floor) when needed, instead of rounding zvol size up. This avoids QEMU drive-mirror size mismatches during migration.
+
+---
+
 ## Version 2.0.26 (April 12, 2026)
 
 ### Bug Fixes
