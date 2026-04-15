@@ -1,10 +1,121 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.27 (April 13, 2026)
+
+### Bug Fixes
+
+- **Fix host-scoped cache key mismatches introduced during issue #27 follow-up hardening**: `_preflight_check_alloc`, `_resolve_target_id`, and `_nvme_sync_portals` now consistently use `_cache_host_key($scfg)` so per-host cache entries are invalidated correctly even when `api_host` is unset.
+- **Fix over-broad portal sync cache invalidation**: `_clear_cache($storage_id)` now clears `%_portal_sync_last_ok` only for the targeted host key instead of wiping all hosts, preventing unnecessary NVMe portal re-syncs across unrelated storages.
+- **Refactor duplicated FK stale-extent recovery path**: extracted `_handle_fk_stale_extent` helper and replaced duplicate in-branch blocks in `_ensure_target_visible` with shared logic.
+- **Fix VM migration size mismatch from zvol byte-rounding behavior (issue #25)**: `alloc_image` now preserves requested size exactly and steps `volblocksize` down by powers of two (to a 512-byte floor) when needed, instead of rounding zvol size up. This avoids QEMU drive-mirror size mismatches during migration.
+
+---
+
+## Version 2.0.26 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix duplicate weight zvol creation when upgrading from pre-v2.0.20 (GitHub issue #27 follow-up)**: When upgrading from a pre-v2.0.20 plugin that used legacy weight zvol names (e.g., `pve-weight-target-name`) to v2.0.20+ with hash-based names (e.g., `pve-weight-target-name-a3f7c2d1`), the plugin would create a new hash-named zvol even though the legacy zvol already existed. This caused: (1) duplicate 1GB zvols on TrueNAS, (2) orphaned legacy zvols that were never cleaned up, and (3) the legacy extent being deleted and recreated pointing to the new zvol. Step 2 of `_ensure_target_visible` now also checks for the legacy-named zvol; if found, it continues using it rather than creating a duplicate.
+
+---
+
+## Version 2.0.25 (April 12, 2026)
+
+### Code Quality
+
+- **Extract `_cache_host_key` helper**: Consolidated 19 occurrences of `$scfg->{api_host} || $scfg->{storeid} || 'unknown'` into a single helper function for consistency and maintainability.
+- **Extract `_invalidate_cache_key` helper**: Targeted cache invalidation now uses a helper instead of direct `%API_CACHE` manipulation.
+- **Fix `_api_call` vs `_api_call_write` inconsistency**: Extent creation in `_alloc_image_iscsi` and `_clone_image_iscsi` now uses `_api_call_write` (ephemeral connection) consistent with other write operations.
+- **Rename `$stale_delete_ok` to `$stale_cleared`**: Improved variable naming clarity in `_ensure_target_visible`.
+
+---
+
+## Version 2.0.24 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix FK/IntegrityError causing unnecessary 3 retries (7+ seconds) before failing (GitHub issue #27)**: The `_is_retryable_error` function's `/connection.*failed/i` pattern matched FK constraint errors because the JSON-encoded Python traceback contains file paths like `datastore/connection.py` and later "constraint **failed**". Since `encode_json` produces one long string (newlines become `\n` literals), the `.` bridged across everything. FK/IntegrityError patterns are now checked first before connection patterns, eliminating wasted retry cycles.
+- **Fix weight extent FK constraint failure only clearing cache instead of fixing TrueNAS state (GitHub issue #27)**: When `iscsi.extent.query` returned an extent ID that didn't exist in SQLite (TrueNAS configfs/DB desync), the pre-flight's FK handler only cleared the plugin's cache. On the next cycle, the same stale extent ID would be returned and fail again. The FK handler now attempts to delete the stale extent from TrueNAS to force a resync; the next cycle will recreate it cleanly.
+
+---
+
+## Version 2.0.23 (April 11, 2026)
+
+### Bug Fixes
+
+- **Fix extent delete in `_alloc_image_iscsi` and `_clone_image_iscsi` cleanup paths using read-path WebSocket connection**: The `eval { _api_call(..., 'iscsi.extent.delete', ...) }` cleanup calls on targetextent mapping failure used `_api_call` (persistent read-path connection) instead of `_api_call_write` (ephemeral write-path connection). On a persistent-connection setup this could fail silently, leaving an orphaned extent on TrueNAS. Both cleanup paths now use `_api_call_write`, consistent with `_tn_extent_delete`.
+- **Fix clone retry loop exhausting budget on cached "dataset already exists" collision**: `_clone_image_iscsi` and `_clone_image_nvme` retry loops called `_find_free_disk_name` without first clearing the 60s TTL dataset cache. If the cache was still warm, the same name could be returned on successive attempts, burning all retry attempts against the same collision. The cache is now invalidated before each `_find_free_disk_name` call in the retry branch.
+
+---
+
+## Version 2.0.22 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix orphaned zvol/extent when `_alloc_image_iscsi` fails mid-allocation (C1)**: `iscsi.extent.create` and `iscsi.targetextent.create` were bare unguarded calls — any API throw (network drop, retry exhaustion) left the zvol and/or extent on TrueNAS with no Proxmox record. Both calls are now wrapped in `eval` with cascading cleanup on failure (delete extent → delete zvol). The bare `_api_call` for targetextent has been replaced with `_tn_targetextent_create`, which handles idempotency and "Extent is already in use" recovery for concurrent-node races.
+- **Fix silent zvol leak when dataset deletion fails in `free_image` (C2)**: The `eval { _delete_dataset_with_retry }` block was followed by a `warn` on any error, causing `free_image` to return success to Proxmox even when the zvol was still present on TrueNAS. Non-"not found" errors now `die` so Proxmox surfaces the failure. Applies to both iSCSI and NVMe paths.
+- **Fix concurrent weight zvol create causing hard `die` in `_ensure_target_visible` step 2 (M1)**: On cluster startup, two nodes race to create the weight zvol. The loser hit an unconditional `die`, skipping extent creation and mapping for that node. "Dataset already exists" errors are now treated as success (the zvol is present — desired state achieved).
+- **Fix `_clone_image_iscsi` using bare `_api_call` for targetextent create (M2)**: Added `_clear_cache` after extent create so the targetextents lookup uses fresh data; replaced bare `_api_call` for targetextent create with `_tn_targetextent_create` for proper "already in use" recovery.
+- **Fix concurrent stale-mapping delete causing `$stale_delete_ok=0` (M3)**: When two nodes raced to delete the same stale wrong-target weight mapping (post cache-collision bug upgrade), the second node got a "not found" error which set `$stale_delete_ok = 0`, preventing the correct mapping from being created. "Not found" class errors from the stale delete are now treated as success (the mapping is gone — desired state).
+- **Fix weight extent pointing to dead zvol path after cross-dataset zvol re-create (L1)**: Two storages sharing the same IQN but different datasets could leave the weight extent pointing to a deleted zvol from one storage's dataset while the other storage created an orphan zvol at its own dataset path. Step 4 now checks the extent's disk path against the current storage's expected path when the zvol was just created, and deletes stale extents for re-creation.
+- **Fix orphaned zvol when `_alloc_image_nvme` namespace create fails (L2)**: `nvmet.namespace.create` was an unguarded call — any throw left the zvol orphaned. Now wrapped in `eval` with zvol cleanup on failure.
+- **Fix missing retry loop for "dataset already exists" in `clone_image` (L3)**: `_clone_image_iscsi` and `_clone_image_nvme` called `_find_free_disk_name` then immediately attempted the clone with no retry, unlike `alloc_image` which has a 5-attempt retry loop. Concurrent template deployments could fail permanently on the TOCTOU race. Both functions now retry up to 5 times with a fresh name on "dataset already exists".
+- **Fix `_resolve_target_id` using process-lifetime cache with no TTL (L4)**: The `%_target_id_cache` hash had no TTL — if a TrueNAS target was deleted and recreated with a new integer ID, all subsequent writes would use the stale ID and fail with FOREIGN KEY errors until the process restarted. Target ID lookups are now backed by `_get_cached`/`_set_cache` (60s TTL), consistent with all other API caches, and `_clear_cache` invalidates them automatically.
+- **Fix global iSCSI session rescan in `volume_snapshot_rollback` (L5)**: `iscsiadm -m session -R` rescanned all iSCSI sessions on the node, potentially disrupting I/O on unrelated volumes during a snapshot rollback. Now uses `iscsiadm -m node -T <iqn> -R` to rescan only the target IQN associated with the storage being rolled back.
+
+---
+
+## Version 2.0.21 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix FOREIGN KEY constraint failure when weight extent is deleted between cache population and mapping (GitHub issue #27 follow-up)**: `_ensure_target_visible` used a 60-second cached extent list in step 5 to look up the weight extent's numeric ID. If the weight extent was deleted from TrueNAS after step 4's (possibly cached) lookup — e.g., by a manual cleanup, a test cycle, or a TrueNAS service restart — step 5 would resolve a stale ID and `iscsi.targetextent.create` would fail with `sqlite3.IntegrityError: FOREIGN KEY constraint failed`. The extents cache is now force-invalidated before the step 5 ID lookup so we always resolve the current TrueNAS state. As defense in depth, FOREIGN KEY errors in the mapping path are also detected explicitly, the cache is cleared, and a recovery log message is emitted instead of a generic warning.
+
+---
+
+## Version 2.0.20 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent name collision across distinct iSCSI targets (GitHub issue #27 follow-up)**: The weight extent name was derived only from the sanitized IQN suffix (e.g., `iqn...ctl:target-foo-bar` → `pve-weight-target-foo-bar`). Two targets whose suffixes differ only in punctuation would produce the same name and, with the v2.0.19 name-only lookup, silently share a weight extent. The name now includes an 8-character SHA1 prefix of the full IQN (e.g., `pve-weight-target-foo-bar-a3f7c2d1`), making it cryptographically unique per target. Existing clusters with legacy-named weight extents continue to work via a fallback lookup that accepts the old format.
+
+---
+
+## Version 2.0.19 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent lookup failing when multiple storages share the same iSCSI target (GitHub issue #27 follow-up)**: `_ensure_target_visible` matched the weight extent by both name **and** disk path. When two storages use the same target IQN (e.g., `conexum-infrastructure`) but different datasets, the second storage could not find the weight extent created by the first (different disk path), attempted to create a duplicate, and hit TrueNAS's "Extent name must be unique" validation error. Weight extents are now matched by name only since they belong to the iSCSI target, not the dataset. The "Extent name must be unique" error during create is also handled gracefully as idempotent success.
+
+---
+
+## Version 2.0.18 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix `Extent is already in use` pre-flight failure in multi-node clusters (GitHub issue #27 follow-up)**: `_tn_targetextent_create` now handles the case where the weight extent is already correctly mapped but the in-memory cache was stale (e.g., another cluster node created the mapping after the local cache was last populated). When `Extent is already in use` is returned, the cache is force-refreshed and if the extent is found correctly mapped to the requested target, it returns the existing mapping as idempotent success instead of propagating an error
+
+---
+
+## Version 2.0.17 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix stale weight extent mapping left by cache-collision bug (GitHub issue #27 follow-up)**: After upgrading from the v2.0.16 cache-collision fix, users with a corrupted TrueNAS state (weight extent mapped to the wrong target by the old plugin) would hit `Extent is already in use` errors on every pre-flight. `_ensure_target_visible` now detects a weight extent mapped to any target other than the expected one, removes the stale mapping, and creates the correct one
+
+---
+
 ## Version 2.0.16 (April 7, 2026)
 
 ### Bug Fixes
 
-- **Fix VM migration failing with "Source and target image have different sizes" (GitHub issue #25)**: `alloc_image` no longer rounds `$bytes` up to the next volblocksize boundary. Instead, the configured volblocksize is stepped down by halves until it evenly divides the requested size, ensuring the created zvol is exactly the size QEMU expects. Previously, a non-aligned size (e.g. 32 GiB with a 64K blocksize) caused the zvol to be created slightly larger than the source disk, causing QEMU's `drive-mirror` to abort with a size mismatch.
+- **Fix extent/targetextent cache key collision across multiple TrueNAS hosts**: `_tn_extents` and `_tn_targetextents` now key the API result cache by `api_host` instead of `storeid`. Previously, two storage configurations pointing to different TrueNAS hosts but using the same `storeid` would share a single cache slot, causing one host's extents to be returned for the other
+
+- **Fix weight extent name-only lookup in `_ensure_target_visible`**: Both loops that check for and retrieve the weight extent ID now additionally match on the zvol disk path (`disk` field = `zvol/<dataset>/<weight_name>`). Previously, a same-named extent on a different dataset (e.g., from another storage sharing the same TrueNAS host) could be mistakenly matched, causing the wrong extent to be mapped to the target
+
+- **Fix target ID cache collision across multiple TrueNAS hosts in `_resolve_target_id`**: The in-process `%_target_id_cache` is now keyed by `"$api_host:$iqn"` instead of `$iqn` alone. Previously, identical IQNs configured against different TrueNAS hosts would share the same cache slot, returning a stale target ID from the wrong host. `_clear_cache` now removes only entries matching the given api_host prefix rather than wiping the entire hash
+
+- **Fix `$_preflight_last_ok` shared across all storages**: Converted the global scalar `$_preflight_last_ok` to a per-host hash `%_preflight_last_ok` keyed by `api_host`. Previously, a successful preflight on any one storage would suppress preflight checks on all other storages for 30 seconds, potentially masking service-down or misconfiguration on a different TrueNAS host. `_clear_cache` now deletes only the entry for the affected host
 
 ---
 

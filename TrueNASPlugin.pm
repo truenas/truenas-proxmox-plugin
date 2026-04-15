@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.16';
+our $VERSION = '2.0.27';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -42,11 +42,8 @@ package PVE::Storage::Custom::TrueNASPlugin;
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # 60 seconds
 
-# Per-process cache for _resolve_target_id results (avoids redundant API calls)
-my %_target_id_cache;
-
-# Per-process cache for preflight check results (time-based, 30s validity)
-my $_preflight_last_ok = 0;
+# Per-host cache for preflight check results (time-based, 30s validity)
+my %_preflight_last_ok;
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
@@ -86,6 +83,12 @@ sub _cache_key {
     return "${storage_id}:${method}";
 }
 
+# Returns the cache host key for a storage config (api_host preferred, storeid fallback)
+sub _cache_host_key {
+    my ($scfg) = @_;
+    return $scfg->{api_host} || $scfg->{storeid} || 'unknown';
+}
+
 sub _get_cached {
     my ($storage_id, $method) = @_;
     my $key = _cache_key($storage_id, $method);
@@ -110,15 +113,26 @@ sub _set_cache {
 sub _clear_cache {
     my ($storage_id) = @_;
     if ($storage_id) {
-        # Clear cache for specific storage
+        # Clear cache for specific storage (storage_id is api_host)
         delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
+        delete $_preflight_last_ok{$storage_id};
     } else {
         # Clear all cache
         %API_CACHE = ();
+        %_preflight_last_ok = ();
     }
-    # Also clear the target ID and portal sync caches
-    %_target_id_cache = ();
-    %_portal_sync_last_ok = ();
+    # Keep portal sync cache aligned with the same host scoping
+    if ($storage_id) {
+        delete $_portal_sync_last_ok{$storage_id};
+    } else {
+        %_portal_sync_last_ok = ();
+    }
+}
+
+# Invalidate a specific cache entry without clearing the entire host's cache
+sub _invalidate_cache_key {
+    my ($host_key, $method) = @_;
+    delete $API_CACHE{_cache_key($host_key, $method)};
 }
 
 # ======== Helper functions ========
@@ -194,6 +208,11 @@ sub _normalize_blocksize {
 sub _is_retryable_error {
     my ($error) = @_;
     return 0 if !defined $error;
+
+    # Do NOT retry on database integrity errors — check BEFORE connection patterns
+    # because FK errors include Python traceback paths containing "connection.py"
+    # which would otherwise false-match the /connection.*failed/ pattern below
+    return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
 
     # Retry on network errors, timeouts, connection issues
     return 1 if $error =~ /timeout|timed out/i;
@@ -1494,7 +1513,7 @@ sub _tn_get_target($scfg) {
     return _api_call($scfg, 'iscsi.target.query', []);
 }
 sub _tn_targetextents($scfg) {
-    my $storage_id = $scfg->{storeid} || 'unknown';
+    my $storage_id = _cache_host_key($scfg);
 
     # Try cache first (but with shorter TTL since mappings change more frequently)
     my $cached = _get_cached($storage_id, 'targetextents');
@@ -1507,7 +1526,7 @@ sub _tn_targetextents($scfg) {
     return _set_cache($storage_id, 'targetextents', $res);
 }
 sub _tn_extents($scfg) {
-    my $storage_id = $scfg->{storeid} || 'unknown';
+    my $storage_id = _cache_host_key($scfg);
 
     # Try cache first
     my $cached = _get_cached($storage_id, 'extents');
@@ -1952,8 +1971,16 @@ sub volume_snapshot_rollback {
         warn "Failed to clean up stale snapshot entries: $@" if $@;
     }
 
-    # Refresh initiator view
-    eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
+    # Refresh initiator view — rescan only this storage's target to avoid disrupting
+    # other active iSCSI sessions on unrelated volumes during the rollback
+    my $rollback_iqn = $scfg->{target_iqn};
+    eval {
+        if ($rollback_iqn) {
+            PVE::Tools::run_command(['iscsiadm','-m','node','-T',$rollback_iqn,'-R'], outfunc=>sub{});
+        } else {
+            PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{});
+        }
+    };
     if ($scfg->{use_multipath}) {
         eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
     }
@@ -2081,13 +2108,13 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     };
     my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ]);
     # Invalidate cache since extents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
     my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ]);
     # Invalidate cache since extents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
 sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
@@ -2106,17 +2133,48 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id };
     $payload->{lunid} = $lun if defined $lun;
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]);
+    my $result = eval { _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]); };
+    my $err = $@;
+
+    if ($err) {
+        if ($err =~ /Extent is already in use/i) {
+            # Cache may be stale — force-refresh and check if already correctly mapped
+            # (can happen when another cluster node created the mapping after our cache was populated)
+            my $host_key = _cache_host_key($scfg);
+            _clear_cache($host_key);
+            my $fresh_maps = _tn_targetextents($scfg) // [];
+            my ($found) = grep {
+                (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
+            } @$fresh_maps;
+            if ($found) {
+                _log($scfg, 2, 'debug', "[TrueNAS] Target-extent mapping already exists (stale cache) for extent_id=$extent_id (LUN $found->{lunid})");
+                return $found;
+            }
+        }
+        die $err;
+    }
+
     # Invalidate cache since targetextents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
     my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ]);
     # Invalidate cache since targetextents list has changed
-    _clear_cache($scfg->{storeid}) if $result;
+    _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
+sub _handle_fk_stale_extent {
+    my ($scfg, $weight_extent_id) = @_;
+
+    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent ID $weight_extent_id is stale (FK constraint failed), deleting to force resync");
+    eval { _tn_extent_delete($scfg, $weight_extent_id) };
+    if ($@) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale extent delete failed (may already be gone): $@");
+    }
+    _clear_cache(_cache_host_key($scfg));
+}
+
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
     my $zvol_path = "zvol/$scfg->{dataset}/$zname";
@@ -2136,10 +2194,11 @@ sub _current_lun_for_zname($scfg, $zname) {
 # Results are cached for 30 seconds to avoid redundant checks during multi-disk creation.
 sub _preflight_check_alloc {
     my ($scfg, $size_bytes) = @_;
+    my $api_host_key = _cache_host_key($scfg);
 
     # Skip redundant preflight checks when allocating multiple disks rapidly
-    if (time() - $_preflight_last_ok < 30) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok) . "s ago)");
+    if (time() - ($_preflight_last_ok{$api_host_key} // 0) < 30) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _preflight_check_alloc: skipping (recently validated " . (time() - $_preflight_last_ok{$api_host_key}) . "s ago)");
         return [];
     }
 
@@ -2276,7 +2335,7 @@ sub _preflight_check_alloc {
     }
 
     # Cache successful result for 30s to speed up multi-disk creation
-    $_preflight_last_ok = time() if !@errors;
+    $_preflight_last_ok{$api_host_key} = time() if !@errors;
 
     return \@errors;
 }
@@ -2286,11 +2345,14 @@ sub _preflight_check_alloc {
 sub _resolve_target_id {
     my ($scfg) = @_;
     my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
+    my $api_host = _cache_host_key($scfg);
 
-    # Return cached result if available
-    if (exists $_target_id_cache{$want}) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _resolve_target_id: using cached target_id=$_target_id_cache{$want} for $want");
-        return $_target_id_cache{$want};
+    # Use the TTL-based %API_CACHE (60s) so stale IDs are automatically refreshed
+    # and _clear_cache() always invalidates this alongside other cached data.
+    my $cached_id = _get_cached($api_host, "target_id:$want");
+    if (defined $cached_id) {
+        _log($scfg, 2, 'debug', "[TrueNAS] _resolve_target_id: using cached target_id=$cached_id for $want");
+        return $cached_id;
     }
 
     # 1) Get targets; if empty, surface a clear diagnostic
@@ -2360,8 +2422,7 @@ sub _resolve_target_id {
             $want
         );
     }
-    $_target_id_cache{$want} = $found->{id};
-    return $found->{id};
+    return _set_cache($api_host, "target_id:$want", $found->{id});
 }
 
 # ======== Portal normalization & reachability ========
@@ -3672,7 +3733,7 @@ sub _nvme_device_for_uuid {
 sub _nvme_sync_portals {
     my ($scfg, $subsys_id) = @_;
 
-    my $sid = $scfg->{storeid} // 'unknown';
+    my $sid = _cache_host_key($scfg);
     if (time() - ($_portal_sync_last_ok{$sid} // 0) < $CACHE_TTL) {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: skipping (recently synced "
             . (time() - $_portal_sync_last_ok{$sid}) . "s ago)");
@@ -4035,6 +4096,7 @@ sub alloc_image {
         ));
     }
 
+
     # Pre-flight checks: validate all prerequisites before expensive operations
     _log($scfg, 1, 'info', "[TrueNAS] alloc_image: running pre-flight checks for $bytes bytes");
     my $errors = _preflight_check_alloc($scfg, $bytes);
@@ -4162,15 +4224,25 @@ sub _alloc_image_iscsi {
     };
     my $extent_id;
     {
-        my $ext = _api_call(
-            $scfg,
-            'iscsi.extent.create',
-            [ $extent_payload ],
-        );
+        my $ext = eval {
+            _api_call_write(
+                $scfg,
+                'iscsi.extent.create',
+                [ $extent_payload ],
+            );
+        };
+        if ($@) {
+            # Cleanup: delete the zvol if extent creation failed
+            eval { _tn_dataset_delete($scfg, $full_ds) };
+            die "Failed to create iSCSI extent for disk '$zname': $@\n";
+        }
         # normalize id from WebSocket result (hashref)
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+        # Invalidate cache so subsequent targetextents lookup sees current state
+        _clear_cache(_cache_host_key($scfg));
     }
     if (!defined $extent_id) {
+        eval { _tn_dataset_delete($scfg, $full_ds) };
         die sprintf(
             "Failed to create iSCSI extent for disk '%s'\n\n" .
             "Dataset: %s\n" .
@@ -4190,51 +4262,42 @@ sub _alloc_image_iscsi {
         );
     }
 
-    # 3) Map extent to our shared target (targetextent.create); lunid is auto-assigned if not given
+    # 3) Map extent to our shared target via _tn_targetextent_create.
+    # This wrapper handles idempotency and "Extent is already in use" recovery
+    # for concurrent-node races, so no separate pre-check is needed.
     my $target_id = _resolve_target_id($scfg);
 
-    # First check if this mapping already exists
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($existing_map) = grep {
-        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-    } @$maps;
-
     my $lun;
-    if (!$existing_map) {
-        # Mapping doesn't exist, create it
-        _log($scfg, 2, 'debug', "[TrueNAS] alloc_image: creating target-extent mapping for extent_id=$extent_id to target_id=$target_id");
-        my $tx_payload = { target => $target_id, extent => $extent_id };
-        my $tx = _api_call(
-            $scfg,
-            'iscsi.targetextent.create',
-            [ $tx_payload ],
-        );
+    {
+        my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
+        if ($@) {
+            # Cleanup: delete extent and zvol if mapping creation failed
+            eval { _api_call_write($scfg, 'iscsi.extent.delete', [$extent_id]) };
+            eval { _tn_dataset_delete($scfg, $full_ds) };
+            die "Failed to create target-extent mapping for disk '$zname': $@\n";
+        }
 
-        # Extract LUN directly from create response (avoids a re-fetch query)
+        # Extract LUN from the returned mapping object
         $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
 
         # Invalidate cache after creating new mapping
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache(_cache_host_key($scfg));
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {
-            $maps = _tn_targetextents($scfg) // [];
-            ($existing_map) = grep {
+            my $maps = _tn_targetextents($scfg) // [];
+            my ($existing_map) = grep {
                 (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
             } @$maps;
             $lun = $existing_map->{lunid} if $existing_map;
         }
-    } else {
-        _log($scfg, 1, 'info', "[TrueNAS] alloc_image: target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
-        $lun = $existing_map->{lunid};
     }
     if (!defined $lun) {
         die sprintf(
             "Could not determine assigned LUN for disk '%s'\n\n" .
             "Target ID: %d\n" .
             "Extent ID: %d\n" .
-            "Extent name: %s\n" .
-            "Total target-extent mappings found: %d\n\n" .
+            "Extent name: %s\n\n" .
             "This usually means:\n" .
             "  1. Target-extent mapping creation failed silently\n" .
             "  2. TrueNAS cache not yet updated (rare)\n" .
@@ -4244,7 +4307,7 @@ sub _alloc_image_iscsi {
             "  - Verify extent '%s' is mapped to target ID %d\n" .
             "  - Check TrueNAS logs: /var/log/middlewared.log\n" .
             "  - Verify API has 'Sharing' read permissions\n",
-            $zname, $target_id, $extent_id, $zname, scalar(@$maps), $zname, $target_id
+            $zname, $target_id, $extent_id, $zname, $zname, $target_id
         );
     }
 
@@ -4315,14 +4378,24 @@ sub _alloc_image_nvme {
 
     # Create namespace on TrueNAS (locked section — API calls only)
     my $subsys_id = _nvme_ensure_subsystem($scfg);
-    my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [{
-        device_type => 'ZVOL',
-        device_path => $zvol_path,
-        subsys_id => $subsys_id,
-        enabled => JSON::PP::true,
-    }]);
+    my $ns = eval {
+        _api_call_write($scfg, 'nvmet.namespace.create', [{
+            device_type => 'ZVOL',
+            device_path => $zvol_path,
+            subsys_id => $subsys_id,
+            enabled => JSON::PP::true,
+        }]);
+    };
+    if ($@) {
+        # Cleanup: delete the zvol if namespace creation failed
+        eval { _tn_dataset_delete($scfg, $full_ds) };
+        die "Failed to create NVMe namespace for disk '$zname': $@\n";
+    }
     my $device_uuid = $ns->{device_uuid};
-    die "Failed to get device_uuid from namespace creation\n" unless $device_uuid;
+    unless ($device_uuid) {
+        eval { _tn_dataset_delete($scfg, $full_ds) };
+        die "Failed to get device_uuid from namespace creation\n";
+    }
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
     # Return volname immediately — defer connect + device discovery
@@ -4541,7 +4614,7 @@ sub _free_image_iscsi {
     if ($need_force_logout) {
         # Invalidate cache to get fresh targetextent data — a destination LUN may have been
         # created since the cache was last populated (e.g., during a disk move operation)
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache(_cache_host_key($scfg));
         # Check how many LUNs are currently mapped to this target
         my $active_luns = 0;
         eval {
@@ -4623,8 +4696,12 @@ sub _free_image_iscsi {
     # Handle any errors from dataset deletion
     if ($@) {
         my $err = $@ // '';
-        # Only warn if dataset actually exists - ENOENT means already cleaned up
-        warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            # Dataset already gone — treat as success (idempotent)
+        } else {
+            # Re-raise so Proxmox reports the failure; zvol is still present on TrueNAS
+            die "Failed to delete dataset $full_ds: $err\n";
+        }
     }
 
     # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
@@ -4795,8 +4872,12 @@ sub _free_image_nvme {
     # Handle any errors from dataset deletion
     if ($@) {
         my $err = $@ // '';
-        # Only warn if dataset actually exists - ENOENT means already cleaned up
-        warn "warning: delete dataset $full_ds failed: $err" unless $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+            # Dataset already gone — treat as success (idempotent)
+        } else {
+            # Re-raise so Proxmox reports the failure; zvol is still present on TrueNAS
+            die "Failed to delete dataset $full_ds: $err\n";
+        }
     }
 
     # 4) Defer udev cleanup after lock release
@@ -5182,8 +5263,13 @@ sub _ensure_target_visible {
     $target_suffix =~ s/-+/-/g;  # Collapse multiple dashes
     $target_suffix =~ s/^-|-$//g;  # Remove leading/trailing dashes
 
-    my $weight_name = "pve-weight-$target_suffix";
-    my $weight_zname = $scfg->{dataset} . '/' . $weight_name;
+    # Append an 8-char SHA1 prefix of the full IQN to guarantee uniqueness across targets
+    # whose sanitized suffixes could otherwise collide (e.g. "target.foo" and "target-foo"
+    # both sanitize to "target-foo"). sha1_hex is already imported via Digest::SHA.
+    my $iqn_hash8          = substr(sha1_hex($iqn), 0, 8);
+    my $weight_name        = "pve-weight-$target_suffix-$iqn_hash8";  # canonical (v2.0.20+)
+    my $weight_name_legacy = "pve-weight-$target_suffix";             # pre-v2.0.20 deployments
+    my $weight_zname       = $scfg->{dataset} . '/' . $weight_name;
 
     # Level 1: Log pre-flight check start
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: checking target visibility for $iqn (weight: $weight_name)");
@@ -5229,58 +5315,121 @@ sub _ensure_target_visible {
     # This prevents issues where weight gets deleted and target becomes undiscoverable
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: ensuring weight volume exists for target reliability");
     my $weight_exists = 0;
+    my $weight_zname_legacy = $scfg->{dataset} . '/' . $weight_name_legacy;
     eval {
         my $ds = _tn_dataset_get($scfg, $weight_zname);
-        $weight_exists = 1 if $ds;
+        if ($ds) {
+            $weight_exists = 1;
+        } else {
+            # Also check for legacy-named zvol (pre-v2.0.20 clusters upgrading in-place)
+            # If found, continue using it — no need to create a duplicate hash-named zvol.
+            # The legacy extent will continue to point to this zvol and work correctly.
+            my $ds_legacy = _tn_dataset_get($scfg, $weight_zname_legacy);
+            if ($ds_legacy) {
+                $weight_exists = 1;
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: found legacy weight zvol '$weight_zname_legacy' (pre-v2.0.20); continuing to use it");
+            }
+        }
     };
 
+    my $weight_zvol_just_created = 0;  # tracks whether we created the zvol in this run (for L1 disk-path check in step 4)
     if (!$weight_exists) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: creating weight zvol $weight_zname (1GB)");
         eval {
             _tn_dataset_create($scfg, $weight_zname, 1048576, '64K'); # 1GB in KiB
         };
         if ($@) {
-            _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight zvol: $@");
-            die "Failed to create weight zvol: $@\n";
+            if ($@ =~ /already exists|dataset.*exist/i) {
+                # Concurrent create from another cluster node — zvol is present, continue
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol $weight_zname already exists (concurrent create), continuing");
+            } else {
+                _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight zvol: $@");
+                die "Failed to create weight zvol: $@\n";
+            }
+        } else {
+            $weight_zvol_just_created = 1;
+            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol created");
         }
-        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol created");
     } else {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol already exists");
     }
 
-    # Step 4: Create extent for weight zvol if it doesn't exist
-    my $weight_extent_exists = 0;
+    # Step 4: Create extent for weight zvol if it doesn't exist.
+    # The weight extent is scoped to the iSCSI target (IQN), not the storage dataset.
+    # Multiple storages sharing the same target share the same weight extent, so we
+    # match by name only — the disk path may differ if another storage created it first.
+    # Try the canonical (new) name first, then fall back to the legacy name for clusters
+    # that already have a weight extent created by an older plugin version.
+    my $found_weight_name;  # actual name of the weight extent on TrueNAS (may be legacy)
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name) {
-                $weight_extent_exists = 1;
+            my $ext_name = $ext->{name} // '';
+            if ($ext_name eq $weight_name || $ext_name eq $weight_name_legacy) {
+                # If we just created the weight zvol this run, verify the extent's disk path
+                # matches OUR zvol path. Two storages sharing the same IQN but using different
+                # datasets can end up with the extent pointing to a dead zvol from the other
+                # dataset (e.g., flash/pve vs nvme/pve). Delete the stale extent and recreate.
+                if ($weight_zvol_just_created && ($ext->{disk} // '') ne "zvol/$weight_zname") {
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] Pre-flight: weight extent '$ext_name' points to '$ext->{disk}' " .
+                        "but our zvol is at 'zvol/$weight_zname' — deleting stale extent for re-create");
+                    eval { _tn_extent_delete($scfg, $ext->{id}) };
+                    if ($@) {
+                        _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to delete stale weight extent: $@");
+                        # Fall through: leave $found_weight_name unset so step 4 skips creation
+                        # (safer than a partially cleaned state). Next cycle will retry.
+                    }
+                    # $found_weight_name stays undef — step 4 will create a correct one
+                    last;
+                }
+                if ($ext_name eq $weight_name_legacy) {
+                    _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: using legacy weight extent '$weight_name_legacy' (pre-v2.0.20 name format; will continue working)");
+                }
+                $found_weight_name = $ext_name;
                 last;
             }
         }
     };
 
-    if (!$weight_extent_exists) {
+    if (!$found_weight_name) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: creating extent for weight zvol");
         eval {
             _tn_extent_create($scfg, $weight_name, $weight_zname);
         };
         if ($@) {
-            _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight extent: $@");
-            die "Failed to create weight extent: $@\n";
+            if ($@ =~ /Extent name must be unique/i) {
+                # Another storage or concurrent process already created the weight extent
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent already exists (created concurrently or by another storage)");
+                _clear_cache(_cache_host_key($scfg));
+                $found_weight_name = $weight_name;  # it exists now — step 5 will fetch it fresh
+            } else {
+                _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to create weight extent: $@");
+                die "Failed to create weight extent: $@\n";
+            }
+        } else {
+            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
+            $found_weight_name = $weight_name;
         }
-        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
     } else {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent already exists");
     }
 
-    # Step 5: Ensure extent is mapped to THIS target (not just any target)
+    # Step 5: Ensure extent is mapped to THIS target (not just any target).
+    # Force a fresh extent fetch here: if step 4 found the weight extent in the cache
+    # but the extent was subsequently deleted on TrueNAS, using the cached ID for
+    # iscsi.targetextent.create would trigger a FOREIGN KEY constraint failure.
+    # Always resolve the extent ID against live TrueNAS data before mapping.
+    # Force-invalidate extents cache so step 5 ID lookup uses live TrueNAS data
+    _invalidate_cache_key(_cache_host_key($scfg), 'extents');
+    # Use $found_weight_name (may be legacy) so that lookups stay consistent with step 4.
     my $weight_mapped = 0;
     my $weight_extent_id;
+    my $stale_targetextent_id;  # mapping to wrong target left by cache-collision bug in older plugin versions
     eval {
         my $extents = _tn_extents($scfg);
         for my $ext (@$extents) {
-            if (($ext->{name} // '') eq $weight_name) {
+            if (($ext->{name} // '') eq ($found_weight_name // '')) {
                 $weight_extent_id = $ext->{id};
                 last;
             }
@@ -5289,16 +5438,42 @@ sub _ensure_target_visible {
         if ($weight_extent_id) {
             my $targetextents = _tn_targetextents($scfg);
             for my $te (@$targetextents) {
-                # Check if extent is mapped to THIS specific target
-                if ($te->{extent} == $weight_extent_id && $te->{target} == $target_id) {
-                    $weight_mapped = 1;
-                    last;
+                if ($te->{extent} == $weight_extent_id) {
+                    if ($te->{target} == $target_id) {
+                        # Mapped to the correct target
+                        $weight_mapped = 1;
+                        last;
+                    } else {
+                        # Mapped to wrong target — stale from cache-collision bug in older plugin versions
+                        $stale_targetextent_id = $te->{id};
+                        last;
+                    }
                 }
             }
         }
     };
 
-    if (!$weight_mapped && $weight_extent_id && $target_id) {
+    # Remove stale wrong-target mapping before creating the correct one
+    my $stale_cleared = 1;
+    if ($stale_targetextent_id) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: removing stale weight extent mapping from wrong target (leftover from cache-collision bug)");
+        eval { _tn_targetextent_delete($scfg, $stale_targetextent_id); };
+        if ($@) {
+            if ($@ =~ /InstanceNotFound|does not exist|not found/i) {
+                # Mapping was already deleted (concurrent cleanup from another node, or stale cache)
+                # — desired state achieved; clear cache and proceed with correct mapping create
+                _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale mapping already gone (concurrent cleanup), continuing");
+                _clear_cache(_cache_host_key($scfg));
+            } else {
+                _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to remove stale weight mapping: $@");
+                $stale_cleared = 0;  # extent still locked to wrong target — skip create attempt
+            }
+        } else {
+            _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: stale weight mapping removed");
+        }
+    }
+
+    if (!$weight_mapped && $stale_cleared && $weight_extent_id && $target_id) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: mapping weight extent to target");
         eval {
             _tn_targetextent_create($scfg, $target_id, $weight_extent_id, 0);
@@ -5308,10 +5483,20 @@ sub _ensure_target_visible {
                 _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: LUN 0 in use, retrying weight mapping with auto-assigned LUN");
                 eval { _tn_targetextent_create($scfg, $target_id, $weight_extent_id, undef); };
                 if ($@) {
-                    _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent with auto LUN: $@");
+                    if ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
+                        # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
+                        # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
+                        _handle_fk_stale_extent($scfg, $weight_extent_id);
+                    } else {
+                        _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent with auto LUN: $@");
+                    }
                 } else {
                     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent mapped to target (auto LUN)");
                 }
+            } elsif ($@ =~ /FOREIGN KEY constraint failed|IntegrityError/i) {
+                # Extent ID exists in TrueNAS query but not in SQLite — configfs/DB desync.
+                # Delete the stale extent to force TrueNAS to resync; next cycle will recreate.
+                _handle_fk_stale_extent($scfg, $weight_extent_id);
             } else {
                 _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: failed to map weight extent: $@");
             }
@@ -5479,8 +5664,28 @@ sub _clone_image_iscsi {
 
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
 
-    # 1) Create ZFS clone from snapshot
-    my $clone_result = _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+    # 1) Create ZFS clone from snapshot, with retry on "already exists" TOCTOU race
+    # (two nodes picking the same free name between _find_free_disk_name and clone create)
+    my $clone_result;
+    {
+        my $max_clone_retries = 5;
+        my $clone_attempt = 0;
+        while ($clone_attempt < $max_clone_retries) {
+            $clone_attempt++;
+            $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $target_full) };
+            last unless $@;
+            if ($@ =~ /dataset already exists/i && !$name) {
+                # Race condition: name was taken between find and clone; pick a new one
+                _log($scfg, 1, 'warn', "[TrueNAS] _clone_image_iscsi: $target_full already exists (attempt $clone_attempt/$max_clone_retries), retrying with new name");
+                _clear_cache(_cache_host_key($scfg));
+                $target_zname = _find_free_disk_name($scfg, $vmid);
+                $target_full  = $scfg->{dataset} . '/' . $target_zname;
+                next;
+            }
+            die $@;
+        }
+        die "Failed to create clone after $max_clone_retries attempts\n" if !defined $clone_result;
+    }
 
     # Wait for clone job to complete if it returned a job ID
     if (defined $clone_result && !ref($clone_result) && $clone_result =~ /^\d+$/) {
@@ -5517,7 +5722,7 @@ sub _clone_image_iscsi {
         };
 
         my $ext = eval {
-            _api_call(
+            _api_call_write(
                 $scfg,
                 'iscsi.extent.create',
                 [ $extent_payload ],
@@ -5529,57 +5734,40 @@ sub _clone_image_iscsi {
             die "Failed to create iSCSI extent for clone: $@\n";
         }
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+        # Invalidate cache so the subsequent targetextents lookup sees current state
+        _clear_cache(_cache_host_key($scfg));
     }
 
     die "failed to create extent for clone $target_zname\n" if !defined $extent_id;
 
-    # 3) Map extent to target
+    # 3) Map extent to target via _tn_targetextent_create (handles idempotency and
+    # "Extent is already in use" recovery for concurrent-node races)
     my $target_id = _resolve_target_id($scfg);
 
-    # First check if this mapping already exists
-    my $maps = _tn_targetextents($scfg) // [];
-    my ($existing_map) = grep {
-        (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
-    } @$maps;
-
     my $lun;
-    if (!$existing_map) {
-        # Mapping doesn't exist, create it
-        _log($scfg, 2, 'debug', "[TrueNAS] _clone_image_iscsi: creating target-extent mapping for extent_id=$extent_id to target_id=$target_id");
-        my $tx_payload = { target => $target_id, extent => $extent_id };
-        my $tx = eval {
-            _api_call(
-                $scfg,
-                'iscsi.targetextent.create',
-                [ $tx_payload ],
-            );
-        };
+    {
+        my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
         if ($@) {
             # Cleanup: delete extent and zvol if mapping creation failed
-            eval {
-                _api_call($scfg, 'iscsi.extent.delete', [$extent_id]);
-            };
+            eval { _api_call_write($scfg, 'iscsi.extent.delete', [$extent_id]) };
             eval { _tn_dataset_delete($scfg, $target_full) };
             die "Failed to create target-extent mapping for clone: $@\n";
         }
 
-        # Extract LUN directly from create response (avoids a re-fetch query)
+        # Extract LUN from the returned mapping object
         $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
 
         # Invalidate cache after creating new mapping
-        _clear_cache($scfg->{storeid} || 'unknown');
+        _clear_cache(_cache_host_key($scfg));
 
         # Fallback: re-fetch if create response didn't include lunid
         if (!defined $lun) {
-            $maps = _tn_targetextents($scfg) // [];
-            ($existing_map) = grep {
+            my $maps = _tn_targetextents($scfg) // [];
+            my ($existing_map) = grep {
                 (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent_id)
             } @$maps;
             $lun = $existing_map->{lunid} if $existing_map;
         }
-    } else {
-        _log($scfg, 1, 'info', "[TrueNAS] _clone_image_iscsi: target-extent mapping already exists for extent_id=$extent_id (LUN $existing_map->{lunid})");
-        $lun = $existing_map->{lunid};
     }
 
     die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
@@ -5619,8 +5807,26 @@ sub _clone_image_nvme {
 
     my $target_full = $scfg->{dataset} . '/' . $target_zname;
 
-    # 1) Create ZFS clone from snapshot
-    my $clone_result = _tn_dataset_clone($scfg, $source_snapshot, $target_full);
+    # 1) Create ZFS clone from snapshot, with retry on "already exists" TOCTOU race
+    my $clone_result;
+    {
+        my $max_clone_retries = 5;
+        my $clone_attempt = 0;
+        while ($clone_attempt < $max_clone_retries) {
+            $clone_attempt++;
+            $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $target_full) };
+            last unless $@;
+            if ($@ =~ /dataset already exists/i && !$name) {
+                _log($scfg, 1, 'warn', "[TrueNAS] _clone_image_nvme: $target_full already exists (attempt $clone_attempt/$max_clone_retries), retrying with new name");
+                _clear_cache(_cache_host_key($scfg));
+                $target_zname = _find_free_disk_name($scfg, $vmid);
+                $target_full  = $scfg->{dataset} . '/' . $target_zname;
+                next;
+            }
+            die $@;
+        }
+        die "Failed to create clone after $max_clone_retries attempts\n" if !defined $clone_result;
+    }
 
     # Wait for clone job to complete if it returned a job ID
     if (defined $clone_result && !ref($clone_result) && $clone_result =~ /^\d+$/) {
