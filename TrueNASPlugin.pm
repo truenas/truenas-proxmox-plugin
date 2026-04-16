@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.27';
+our $VERSION = '2.0.28';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -5247,7 +5247,7 @@ sub status {
 # If the target has no extents, it won't appear in discovery.
 # This function creates a small "weight" zvol to keep the target visible.
 sub _ensure_target_visible {
-    my ($scfg) = @_;
+    my ($scfg, %opts) = @_;
 
     my $iqn = $scfg->{target_iqn};
     my $portal = _normalize_portal($scfg->{discovery_portal});
@@ -5507,6 +5507,15 @@ sub _ensure_target_visible {
     }
 
     # Step 6: Verify target is now discoverable
+    # Skip on status/activate path (caller passes skip_discovery_probe => 1) —
+    # the weight zvol + extent + mapping are already ensured above, and
+    # activate_volume handles authoritative device discovery. The deferred
+    # self-healing caller retains full verification.
+    if ($opts{skip_discovery_probe}) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn weight volume ensured (discovery probe skipped)");
+        return 1;
+    }
+
     sleep 2; # Give TrueNAS time to update
     my $target_discoverable = 0;
     eval {
@@ -5537,7 +5546,7 @@ sub activate_storage {
     if ($mode eq 'iscsi') {
         # Run pre-flight check to ensure target is visible
         eval {
-            _ensure_target_visible($scfg);
+            _ensure_target_visible($scfg, skip_discovery_probe => 1);
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: target visibility pre-flight check failed for $storeid: $@");

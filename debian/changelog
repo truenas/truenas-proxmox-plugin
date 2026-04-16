@@ -1,3 +1,11 @@
+truenas-proxmox-plugin (2.0.28+deb1) unstable; urgency=medium
+
+  * Fix storage status/summary load latency (issue #30): skip discovery
+    probe in activate_storage path while retaining full verification in
+    deferred self-healing
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 16 Apr 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.27+deb1) unstable; urgency=medium
 
   * Fix host-scoped cache key mismatches in preflight/target-id/NVMe portal

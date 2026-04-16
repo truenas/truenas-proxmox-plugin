@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.28 (April 16, 2026)
+
+### Bug Fixes
+
+- **Fix storage status/summary load latency (GitHub issue #30)**: `activate_storage` now skips the expensive `iscsiadm` discovery probe in `_ensure_target_visible` by passing `skip_discovery_probe => 1`. The weight zvol, extent, and target mapping are still ensured — only the post-verification `sleep 2` + discovery roundtrip is skipped on the status path. The deferred self-healing caller in `free_image` retains full verification for correctness.
+
+---
+
 ## Version 2.0.27 (April 13, 2026)
 
 ### Bug Fixes
