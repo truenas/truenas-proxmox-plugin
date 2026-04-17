@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.29 (April 17, 2026)
+
+### Performance
+
+- **Reduce `activate_storage` API round-trips (GitHub issue #30, phase 2)**: Added a 30s time-based throttle to `_ensure_target_visible` — repeated status queries within 30s of a successful preflight skip all TrueNAS API calls entirely. Cached `iscsi.target.query` results (previously the only uncached iSCSI query). Moved extent cache invalidation from unconditional (every call) to mutation-only paths (zvol/extent creation), eliminating a forced re-fetch on the happy path.
+
 ## Version 2.0.28 (April 16, 2026)
 
 ### Bug Fixes

@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.28';
+our $VERSION = '2.0.29';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -44,6 +44,7 @@ my $CACHE_TTL = 60; # 60 seconds
 
 # Per-host cache for preflight check results (time-based, 30s validity)
 my %_preflight_last_ok;
+my %_target_visible_last_ok;
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
@@ -116,10 +117,12 @@ sub _clear_cache {
         # Clear cache for specific storage (storage_id is api_host)
         delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
         delete $_preflight_last_ok{$storage_id};
+        delete $_target_visible_last_ok{$storage_id};
     } else {
         # Clear all cache
         %API_CACHE = ();
         %_preflight_last_ok = ();
+        %_target_visible_last_ok = ();
     }
     # Keep portal sync cache aligned with the same host scoping
     if ($storage_id) {
@@ -2023,8 +2026,11 @@ sub volume_snapshot_info {
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
 sub _tn_targets {
     my ($scfg) = @_;
+    my $storage_id = _cache_host_key($scfg);
+    my $cached = _get_cached($storage_id, 'targets');
+    return $cached if $cached;
     my $list = _api_call($scfg, 'iscsi.target.query', []);
-    return $list // [];
+    return _set_cache($storage_id, 'targets', $list // []);
 }
 
 # Find the first free disk name for a VM using a single batch query.
@@ -5250,6 +5256,15 @@ sub _ensure_target_visible {
     my ($scfg, %opts) = @_;
 
     my $iqn = $scfg->{target_iqn};
+
+    # Throttle: skip entire preflight on activate_storage path if recently verified
+    if ($opts{skip_discovery_probe}) {
+        my $host_key = _cache_host_key($scfg);
+        if (time() - ($_target_visible_last_ok{$host_key} // 0) < 30) {
+            _log($scfg, 2, 'debug', "[TrueNAS] Pre-flight: target $iqn recently verified (" . int(time() - ($_target_visible_last_ok{$host_key} // 0)) . "s ago), skipping");
+            return 1;
+        }
+    }
     my $portal = _normalize_portal($scfg->{discovery_portal});
 
     # Create a unique weight volume name per target
@@ -5348,6 +5363,7 @@ sub _ensure_target_visible {
             }
         } else {
             $weight_zvol_just_created = 1;
+            _invalidate_cache_key(_cache_host_key($scfg), 'extents');
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol created");
         }
     } else {
@@ -5408,6 +5424,7 @@ sub _ensure_target_visible {
                 die "Failed to create weight extent: $@\n";
             }
         } else {
+            _invalidate_cache_key(_cache_host_key($scfg), 'extents');
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
             $found_weight_name = $weight_name;
         }
@@ -5416,12 +5433,8 @@ sub _ensure_target_visible {
     }
 
     # Step 5: Ensure extent is mapped to THIS target (not just any target).
-    # Force a fresh extent fetch here: if step 4 found the weight extent in the cache
-    # but the extent was subsequently deleted on TrueNAS, using the cached ID for
-    # iscsi.targetextent.create would trigger a FOREIGN KEY constraint failure.
-    # Always resolve the extent ID against live TrueNAS data before mapping.
-    # Force-invalidate extents cache so step 5 ID lookup uses live TrueNAS data
-    _invalidate_cache_key(_cache_host_key($scfg), 'extents');
+    # Cache is invalidated only on mutation (zvol/extent create) — if the extent
+    # was deleted on TrueNAS after caching, the FK handler below recovers gracefully.
     # Use $found_weight_name (may be legacy) so that lookups stay consistent with step 4.
     my $weight_mapped = 0;
     my $weight_extent_id;
@@ -5513,6 +5526,7 @@ sub _ensure_target_visible {
     # self-healing caller retains full verification.
     if ($opts{skip_discovery_probe}) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn weight volume ensured (discovery probe skipped)");
+        $_target_visible_last_ok{_cache_host_key($scfg)} = time();
         return 1;
     }
 
@@ -5530,6 +5544,7 @@ sub _ensure_target_visible {
 
     if ($target_discoverable) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn is discoverable - weight volume ensures persistence");
+        $_target_visible_last_ok{_cache_host_key($scfg)} = time();
         return 1;
     } else {
         _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: target $iqn not discoverable despite weight volume - may need manual intervention");
