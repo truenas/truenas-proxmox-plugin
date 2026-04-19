@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.30 (April 18, 2026)
+
+### Performance
+
+- **Reduce idempotent status latency with bounded status caching (GitHub issue #30, phase 3)**: Added storage-scoped status capacity cache keys (`status-capacity:v1:<storeid>:<endpoint>:<dataset>`) with a short 10s TTL and status-only retry override (`retry_max => 0`) for `pool.dataset.get_instance` reads in `status()`. Failures now invalidate the status cache key immediately while preserving inactive + zeroed return semantics.
+- **Conservative preflight skip-throttle tuning**: Replaced the hardcoded 30s `_ensure_target_visible(... skip_discovery_probe => 1)` window with `TARGET_VISIBLE_SKIP_TTL_S = 60`, scoped by host + target identity to avoid cross-storage bleed during status polling.
+- **Mutation freshness hardening**: Ensured status-capacity cache invalidation runs only after successful create/update/delete/clone dataset mutations across helper and direct call paths, avoiding stale status after writes without invalidating on failed mutations.
+
 ## Version 2.0.29 (April 17, 2026)
 
 ### Performance
