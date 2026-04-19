@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.0.28 (April 19, 2026)
+
+### Features
+
+- **Add LXC container (rootdir) support**: The plugin now supports `rootdir` content type, allowing LXC container rootfs to be stored on TrueNAS-backed block storage (iSCSI and NVMe-TCP). PVE formats the block device with ext4 and mounts it as the container rootfs.
+
+---
+
 ## Version 2.0.27 (April 13, 2026)
 
 ### Bug Fixes

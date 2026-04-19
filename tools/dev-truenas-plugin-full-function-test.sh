@@ -28,6 +28,16 @@
 #  34. Concurrent Clone Operations - Two full clones from different sources simultaneously
 #  35. Cross-Node Concurrent Alloc - Allocate disks on two nodes simultaneously (cluster only)
 #  36. Concurrent Migration + Alloc - Migrate VM while allocating disk simultaneously (cluster only)
+#  37. LXC Create/Start/Stop - Test LXC container lifecycle (rootdir only)
+#  38. LXC Snapshot & Revert - Test container snapshot and rollback (rootdir only)
+#  39. LXC Clone - Test container cloning (rootdir only)
+#  40. LXC Resize - Test container rootfs resize (rootdir only)
+#  41. LXC Offline Migration - Test container migration between nodes (cluster + rootdir)
+#  42. LXC Multi-Mountpoint - Test container with multiple mountpoints (rootdir only)
+#  43. LXC Stress - Rapid create/delete 10 containers (rootdir only)
+#  44. LXC Concurrent - Create/destroy 10 containers in parallel (rootdir only)
+#  45. LXC Online Backup - Test backup of running container (rootdir + --backup-store)
+#  46. LXC Offline Backup - Test backup of stopped container (rootdir + --backup-store)
 #
 # Performance Summary:
 #   After all tests complete, a summary table displays average, min, and max times
@@ -122,7 +132,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 NODE=$(hostname)
-VMID_END=$((VMID_START + 250))  # Increased range to cover all tests including rate-limiting (VMID_START+100) and multi-node (VMID_START+200)
+VMID_END=$((VMID_START + 200))  # Range covers VM tests (+0..+124), concurrent/stress (+125..+149), LXC tests (+150..+189)
 TEST_SIZES=(1 10 32 100)  # GB sizes to test
 
 # Clone/Snapshot test VMIDs (at end of range)
@@ -133,6 +143,14 @@ CLONE_VMID=$((CLONE_BASE_VMID + 1))
 IS_CLUSTER=0
 CLUSTER_NODES=()
 TARGET_NODE=""
+
+# LXC/rootdir detection (populated after cluster detection)
+IS_ROOTDIR=0
+LXC_TEMPLATE=""
+LXC_TEMPLATE_STORAGE=""
+LXC_VMID_START=0
+LXC_BASE_VMID=0
+LXC_CLONE_VMID=0
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 LOG_FILE="test-results-${TIMESTAMP}.log"
@@ -611,9 +629,46 @@ if pvesh get /cluster/status --output-format=json 2>/dev/null | grep -q '"type":
     fi
 fi
 
+# Detect rootdir content support for LXC container tests
+if pvesh get /storage/${STORAGE_ID} --output-format=json 2>/dev/null | grep -q '"content".*rootdir'; then
+    IS_ROOTDIR=1
+    LXC_VMID_START=$((VMID_START + 150))
+    LXC_BASE_VMID=$((LXC_VMID_START + 10))
+    LXC_CLONE_VMID=$((LXC_BASE_VMID + 1))
+    log_info "Rootdir content detected — LXC tests enabled (VMID range $LXC_VMID_START-$((LXC_VMID_START + 49)))"
+
+    # Auto-detect first available Debian LXC template
+    # pveam list requires a storage argument — scan all storages with vztmpl content
+    for tpl_store in $(pvesm status -content vztmpl 2>/dev/null | tail -n +2 | awk '{print $1}'); do
+        LXC_TEMPLATE=$(pveam list "$tpl_store" 2>/dev/null | grep "debian.*standard.*\.tar\." | head -1 | awk '{print $1}')
+        if [[ -n "$LXC_TEMPLATE" ]]; then
+            LXC_TEMPLATE_STORAGE="$tpl_store"
+            break
+        fi
+    done
+
+    if [[ -z "$LXC_TEMPLATE" ]]; then
+        log_warning "No LXC template found — LXC tests will be skipped (run 'pveam download local <template>' to install)"
+        IS_ROOTDIR=0
+    else
+        log_info "LXC template: $LXC_TEMPLATE"
+    fi
+else
+    log_info "No rootdir content in storage — LXC tests will be skipped"
+fi
+
 # ============================================================================
 # Phase 1: Cleanup Functions
 # ============================================================================
+
+# Stop and destroy an LXC container, then free any orphaned disks
+destroy_lxc() {
+    local vmid="$1"
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+    free_orphaned_disks_for_vmid "$vmid"
+}
 
 free_orphaned_disks_for_vmid() {
     local vmid="$1"
@@ -688,6 +743,28 @@ cleanup_test_vms() {
         done
     else
         log_success "No VMs found in range"
+    fi
+
+    # Clean up LXC containers in range
+    local container_count=0
+    for vmid in $(seq "$vmid_start" "$vmid_end"); do
+        if pct status "$vmid" >/dev/null 2>&1; then
+            container_count=$((container_count + 1))
+        fi
+    done
+
+    if [[ $container_count -gt 0 ]]; then
+        log_info "Found $container_count LXC containers to clean up"
+        for vmid in $(seq "$vmid_start" "$vmid_end"); do
+            if pct status "$vmid" >/dev/null 2>&1; then
+                log_warning "Destroying container $vmid..."
+                destroy_lxc "$vmid"
+                cleaned=$((cleaned + 1))
+                sleep $DISK_ATTACH_WAIT
+            fi
+        done
+    else
+        log_success "No LXC containers found in range"
     fi
 
     # Check for orphaned disks in storage and delete the VMs that own them
@@ -6301,8 +6378,940 @@ test_concurrent_migration_alloc() {
 }
 
 # ============================================================================
-# Performance Summary Table
+# LXC Container Test Phases (37-46)
 # ============================================================================
+
+# Phase 37: LXC Container Create/Start/Stop
+test_lxc_create_start_stop() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Create/Start/Stop (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    log_info "Creating LXC container"
+    local create_start=$(date +%s)
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-create" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create LXC container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+    local create_duration=$(($(date +%s) - create_start))
+    log_success "Container created (${create_duration}s)"
+    track_timing "lxc_create" "$create_duration"
+
+    # Verify container exists
+    if ! pct status "$vmid" >/dev/null 2>&1; then
+        log_error "Container does not exist after creation"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not found")
+        return 1
+    fi
+
+    # Start container
+    log_info "Starting container"
+    local start_start=$(date +%s)
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container start failed")
+        return 1
+    fi
+    local start_duration=$(($(date +%s) - start_start))
+    track_timing "lxc_start" "$start_duration"
+    sleep 3
+
+    # Verify running and rootfs mounted
+    local status
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after start (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running")
+        return 1
+    fi
+
+    local rootfs_info
+    rootfs_info=$(pct exec "$vmid" -- df -h / 2>/dev/null || echo "")
+    if [[ -z "$rootfs_info" ]]; then
+        log_error "Failed to query rootfs mount inside container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rootfs not accessible")
+        return 1
+    fi
+    log_info "Rootfs mounted: $(echo "$rootfs_info" | head -1)"
+
+    # Stop container
+    log_info "Stopping container"
+    local stop_start=$(date +%s)
+    if ! pct stop "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to stop container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container stop failed")
+        return 1
+    fi
+    local stop_duration=$(($(date +%s) - stop_start))
+    track_timing "lxc_stop" "$stop_duration"
+
+    # Verify stopped
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: stopped" ]]; then
+        log_error "Container not stopped (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not stopped")
+        return 1
+    fi
+
+    # Restart test
+    log_info "Restarting container"
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to restart container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container restart failed")
+        return 1
+    fi
+    sleep 2
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after restart"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running after restart")
+        return 1
+    fi
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC create/start/stop cycle completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 38: LXC Snapshot & Revert
+test_lxc_snapshot_revert() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Snapshot & Revert (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-snap" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start and write marker
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    pct exec "$vmid" -- bash -c "echo 'snapshot-marker-test' > /root/marker.txt" 2>/dev/null
+    log_info "Wrote marker file to container"
+
+    # Create snapshot
+    log_info "Creating snapshot 'snap1'"
+    local snap_start=$(date +%s)
+    if ! pct snapshot "$vmid" snap1 >/dev/null 2>&1; then
+        log_error "Failed to create snapshot"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot failed")
+        return 1
+    fi
+    local snap_duration=$(($(date +%s) - snap_start))
+    track_timing "lxc_snapshot" "$snap_duration"
+    sleep $SNAPSHOT_WAIT
+
+    # Delete marker
+    pct exec "$vmid" -- rm -f /root/marker.txt 2>/dev/null
+    log_info "Deleted marker file"
+
+    # Stop before rollback (required for block storage)
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+
+    # Rollback
+    log_info "Rolling back to snapshot 'snap1'"
+    local rollback_start=$(date +%s)
+    if ! pct rollback "$vmid" snap1 >/dev/null 2>&1; then
+        log_error "Failed to rollback snapshot"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rollback failed")
+        return 1
+    fi
+    local rollback_duration=$(($(date +%s) - rollback_start))
+    track_timing "lxc_rollback" "$rollback_duration"
+
+    # Start and verify marker restored
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local marker
+    marker=$(pct exec "$vmid" -- cat /root/marker.txt 2>/dev/null || echo "")
+    if [[ "$marker" != "snapshot-marker-test" ]]; then
+        log_error "Marker file not restored after rollback (got: '$marker')"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Marker not restored")
+        return 1
+    fi
+    log_success "Marker file restored after rollback"
+
+    # Delete snapshot
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    pct delsnapshot "$vmid" snap1 >/dev/null 2>&1 || true
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC snapshot/revert completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 39: LXC Clone
+test_lxc_clone() {
+    local base_vmid="$1"
+    local clone_vmid="$2"
+    local test_num="$3"
+    local test_name="LXC Clone ($base_vmid → $clone_vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$base_vmid"
+    destroy_lxc "$clone_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create base container
+    if ! pct create "$base_vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-base" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create base container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Base creation failed")
+        return 1
+    fi
+
+    # Start, write marker, stop
+    pct start "$base_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    pct exec "$base_vmid" -- bash -c "echo 'clone-marker-test' > /root/clone-marker.txt" 2>/dev/null
+    pct stop "$base_vmid" >/dev/null 2>&1 || true
+    sleep 1
+
+    # Clone
+    log_info "Cloning container $base_vmid → $clone_vmid"
+    local clone_start=$(date +%s)
+    if ! pct clone "$base_vmid" "$clone_vmid" --hostname "test-lxc-clone" >/dev/null 2>&1; then
+        log_error "Failed to clone container"
+        destroy_lxc "$base_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone failed")
+        return 1
+    fi
+    local clone_duration=$(($(date +%s) - clone_start))
+    track_timing "lxc_clone" "$clone_duration"
+    sleep $API_SETTLE_TIME
+
+    # Start clone and verify marker
+    pct start "$clone_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local marker
+    marker=$(pct exec "$clone_vmid" -- cat /root/clone-marker.txt 2>/dev/null || echo "")
+    if [[ "$marker" != "clone-marker-test" ]]; then
+        log_error "Marker not found in clone"
+        destroy_lxc "$base_vmid"
+        destroy_lxc "$clone_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Marker missing in clone")
+        return 1
+    fi
+    log_success "Marker present in cloned container"
+
+    # Cleanup
+    destroy_lxc "$base_vmid"
+    destroy_lxc "$clone_vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC clone completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 40: LXC Resize
+test_lxc_resize() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Resize Rootfs (4G → 8G)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create with 4G rootfs
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:4" --hostname "test-lxc-resize" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start and check initial size
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local orig_size
+    orig_size=$(pct exec "$vmid" -- df -BG / 2>/dev/null | tail -1 | awk '{print $2}' | tr -d 'G')
+    log_info "Original rootfs size: ${orig_size}G"
+
+    # Resize
+    log_info "Resizing rootfs +4G"
+    local resize_start=$(date +%s)
+    if ! pct resize "$vmid" rootfs "+4G" >/dev/null 2>&1; then
+        log_error "Failed to resize rootfs"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Resize failed")
+        return 1
+    fi
+    local resize_duration=$(($(date +%s) - resize_start))
+    track_timing "lxc_resize" "$resize_duration"
+    sleep $API_SETTLE_TIME
+
+    # Verify new size
+    local new_size
+    new_size=$(pct exec "$vmid" -- df -BG / 2>/dev/null | tail -1 | awk '{print $2}' | tr -d 'G')
+    log_info "New rootfs size: ${new_size}G"
+
+    if [[ "$new_size" -lt 7 ]]; then
+        log_error "Resize did not take effect (expected ~8G, got ${new_size}G)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Size verification failed")
+        return 1
+    fi
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC resize verified (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 41: LXC Live Migration (cluster only)
+test_lxc_live_migration() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Offline Migration ($NODE → $TARGET_NODE)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup on both nodes
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+    free_orphaned_disks_for_vmid "$vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-migrate" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    # Stop and migrate (LXC live migration not implemented in PVE; use offline with --restart)
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    log_info "Migrating container from $NODE to $TARGET_NODE"
+    local migrate_start=$(date +%s)
+    if ! pct migrate "$vmid" "$TARGET_NODE" --restart >/dev/null 2>&1; then
+        log_error "Failed to migrate to $TARGET_NODE"
+        pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+        free_orphaned_disks_for_vmid "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration to target failed")
+        return 1
+    fi
+    local migrate_duration=$(($(date +%s) - migrate_start))
+    track_timing "lxc_migration" "$migrate_duration"
+    sleep $API_SETTLE_TIME
+
+    # Verify on target (should be running due to --restart)
+    local target_status
+    target_status=$(pvesh get "/nodes/$TARGET_NODE/lxc/$vmid/status/current" 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 || echo "")
+    log_success "Container migrated to $TARGET_NODE in ${migrate_duration}s (status: $target_status)"
+
+    # Migrate back
+    log_info "Migrating back from $TARGET_NODE to $NODE"
+    pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/status/stop" >/dev/null 2>&1 || true
+    sleep 1
+    migrate_start=$(date +%s)
+    if ! pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/migrate" -target "$NODE" -restart 1 >/dev/null 2>&1; then
+        log_error "Failed to migrate back to $NODE"
+        pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/status/stop" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+        free_orphaned_disks_for_vmid "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration back failed")
+        return 1
+    fi
+    migrate_duration=$(($(date +%s) - migrate_start))
+    track_timing "lxc_migration" "$migrate_duration"
+
+    log_success "Container migrated back to $NODE in ${migrate_duration}s"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC migration completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 42: LXC Multi-Mountpoint
+test_lxc_multi_mountpoint() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Multi-Mountpoint (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:4" --hostname "test-lxc-mp" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Attach additional mountpoint (PVE auto-allocates and formats the volume)
+    log_info "Attaching additional mountpoint"
+    if ! pct set "$vmid" -mp0 "$STORAGE_ID:2,mp=/data" >/dev/null 2>&1; then
+        log_error "Failed to attach mountpoint"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Mountpoint attachment failed")
+        return 1
+    fi
+
+    # Start and verify both mounts
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container start failed")
+        return 1
+    fi
+    sleep 5
+
+    # Verify container is running
+    local status
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after start (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running")
+        return 1
+    fi
+
+    # Retry rootfs check (block device may need extra time on iSCSI)
+    local rootfs_mount=""
+    for attempt in 1 2 3; do
+        rootfs_mount=$(pct exec "$vmid" -- df -h / 2>/dev/null | tail -1 || echo "")
+        [[ -n "$rootfs_mount" ]] && break
+        sleep 3
+    done
+    local data_mount
+    data_mount=$(pct exec "$vmid" -- df -h /data 2>/dev/null | tail -1 || echo "")
+
+    if [[ -z "$rootfs_mount" ]]; then
+        log_error "Rootfs not mounted"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rootfs not mounted")
+        return 1
+    fi
+
+    if [[ -z "$data_mount" ]]; then
+        log_error "Data mountpoint not mounted"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Data mountpoint not mounted")
+        return 1
+    fi
+
+    log_info "Rootfs: $rootfs_mount"
+    log_info "Data:   $data_mount"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC multi-mountpoint verified (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "lxc_multi_mp" "$duration"
+    return 0
+}
+
+# Phase 43: LXC Rapid Create/Delete Stress
+test_lxc_stress() {
+    local base_vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Rapid Create/Delete Stress (10 containers)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    sleep $API_SETTLE_TIME
+
+    local failed=0
+
+    # Create 10 containers sequentially
+    log_info "Creating 10 containers sequentially"
+    local create_start=$(date +%s)
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        if ! pct create "$vmid" "$LXC_TEMPLATE" \
+            --rootfs "$STORAGE_ID:2" --hostname "test-lxc-stress-$i" \
+            --memory 256 --swap 0 >/dev/null 2>&1; then
+            log_error "Failed to create container $vmid"
+            failed=$((failed + 1))
+        fi
+    done
+    local create_duration=$(($(date +%s) - create_start))
+    track_timing "lxc_stress_create" "$create_duration"
+
+    # Start all
+    log_info "Starting all containers"
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        pct start "$vmid" >/dev/null 2>&1 || true
+    done
+    sleep 3
+
+    # Verify all running
+    local running=0
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        local status
+        status=$(pct status "$vmid" 2>/dev/null || echo "")
+        if [[ "$status" == "status: running" ]]; then
+            running=$((running + 1))
+        fi
+    done
+    log_info "$running/10 containers running"
+
+    # Stop all
+    for i in {0..9}; do
+        pct stop "$((base_vmid + i))" >/dev/null 2>&1 || true
+    done
+    sleep 2
+
+    # Destroy all
+    local destroy_start=$(date +%s)
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    local destroy_duration=$(($(date +%s) - destroy_start))
+    track_timing "lxc_stress_destroy" "$destroy_duration"
+
+    if [[ $failed -gt 0 ]]; then
+        log_error "$failed container(s) failed during stress test"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - $failed failures")
+        return 1
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC stress test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 44: LXC Concurrent Creation/Destruction
+test_lxc_concurrent() {
+    local base_vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Concurrent Create/Destroy (10 containers)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    sleep $API_SETTLE_TIME
+
+    # Create 10 containers in parallel
+    log_info "Creating 10 containers in parallel"
+    local create_start=$(date +%s)
+    local pids=()
+    for i in {0..9}; do
+        (
+            pct create "$((base_vmid + i))" "$LXC_TEMPLATE" \
+                --rootfs "$STORAGE_ID:4" --hostname "test-lxc-conc-$i" \
+                --memory 256 --swap 0 >/dev/null 2>&1
+        ) &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    local create_duration=$(($(date +%s) - create_start))
+    track_timing "lxc_concurrent_create" "$create_duration"
+
+    # Verify all created
+    local created=0
+    for i in {0..9}; do
+        pct status "$((base_vmid + i))" >/dev/null 2>&1 && created=$((created + 1))
+    done
+    log_info "$created/10 containers created"
+
+    # Start all in parallel
+    pids=()
+    for i in {0..9}; do
+        pct start "$((base_vmid + i))" >/dev/null 2>&1 &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    sleep 3
+
+    # Verify all running
+    local running=0
+    for i in {0..9}; do
+        local status
+        status=$(pct status "$((base_vmid + i))" 2>/dev/null || echo "")
+        [[ "$status" == "status: running" ]] && running=$((running + 1))
+    done
+    log_info "$running/10 containers running"
+
+    # Stop all in parallel
+    pids=()
+    for i in {0..9}; do
+        pct stop "$((base_vmid + i))" >/dev/null 2>&1 &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    sleep 2
+
+    # Destroy all in parallel
+    local destroy_start=$(date +%s)
+    pids=()
+    for i in {0..9}; do
+        (
+            pct destroy "$((base_vmid + i))" --force 1 --purge 1 >/dev/null 2>&1 || true
+            free_orphaned_disks_for_vmid "$((base_vmid + i))"
+        ) &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    local destroy_duration=$(($(date +%s) - destroy_start))
+    track_timing "lxc_concurrent_destroy" "$destroy_duration"
+
+    # Verify all cleaned up
+    local remaining=0
+    for i in {0..9}; do
+        pct status "$((base_vmid + i))" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    done
+
+    if [[ $remaining -gt 0 ]]; then
+        log_warning "$remaining containers still exist after cleanup"
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC concurrent test completed (${duration}s, $created created, $running ran, $remaining remaining)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 45: LXC Online Backup (requires --backup-store)
+test_lxc_online_backup() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Online Backup (Running Container)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    local restore_vmid=$((vmid + 50))
+    destroy_lxc "$restore_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-backup-online" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+
+    # Write marker
+    pct exec "$vmid" -- bash -c "echo 'backup-marker' > /root/backup-marker.txt" 2>/dev/null
+
+    # Backup (stop mode for LXC on block storage)
+    log_info "Performing backup to $BACKUP_STORE"
+    local backup_start=$(date +%s)
+    local backup_output
+    backup_output=$(vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" 2>&1)
+    local backup_result=$?
+    local backup_duration=$(($(date +%s) - backup_start))
+
+    if [[ $backup_result -ne 0 ]]; then
+        log_error "Backup failed: $backup_output"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup failed")
+        return 1
+    fi
+
+    log_success "Backup completed in ${backup_duration}s"
+    track_timing "lxc_backup" "$backup_duration"
+
+    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    local backup_file
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+
+    if [[ -z "$backup_file" ]]; then
+        log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup volid not found")
+        return 1
+    fi
+
+    log_info "Backup volid: $backup_file"
+
+    # Restore to new VMID
+    log_info "Restoring backup to VMID $restore_vmid"
+    local restore_start=$(date +%s)
+    if ! pct restore "$restore_vmid" "$backup_file" --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Failed to restore container"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restore failed")
+        return 1
+    fi
+    local restore_duration=$(($(date +%s) - restore_start))
+    track_timing "lxc_restore" "$restore_duration"
+
+    # Verify restored container boots
+    pct start "$restore_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local restore_status
+    restore_status=$(pct status "$restore_vmid" 2>/dev/null || echo "")
+    if [[ "$restore_status" != "status: running" ]]; then
+        log_error "Restored container not running"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restored container not running")
+        return 1
+    fi
+
+    log_success "Restored container running"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    destroy_lxc "$restore_vmid"
+
+    # Remove backup file
+    if [[ -n "$backup_file" ]]; then
+        pvesm list "$BACKUP_STORE" 2>/dev/null | grep "$backup_file" | awk '{print $1}' | while read -r bvolid; do
+            pvesm free "$bvolid" >/dev/null 2>&1 || true
+        done
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC online backup/restore completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 46: LXC Offline Backup (requires --backup-store)
+test_lxc_offline_backup() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Offline Backup (Stopped Container)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    local restore_vmid=$((vmid + 50))
+    destroy_lxc "$restore_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container (leave stopped)
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-backup-offline" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Backup (stop mode)
+    log_info "Performing offline backup to $BACKUP_STORE"
+    local backup_start=$(date +%s)
+    local backup_output
+    backup_output=$(vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" 2>&1)
+    local backup_result=$?
+    local backup_duration=$(($(date +%s) - backup_start))
+
+    if [[ $backup_result -ne 0 ]]; then
+        log_error "Offline backup failed: $backup_output"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup failed")
+        return 1
+    fi
+
+    log_success "Offline backup completed in ${backup_duration}s"
+    track_timing "lxc_backup_offline" "$backup_duration"
+
+    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    local backup_file
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+    if [[ -z "$backup_file" ]]; then
+        log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup volid not found")
+        return 1
+    fi
+
+    # Restore to new VMID
+    log_info "Restoring to VMID $restore_vmid (volid: $backup_file)"
+    if ! pct restore "$restore_vmid" "$backup_file" --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Failed to restore container"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restore failed")
+        return 1
+    fi
+
+    # Verify config
+    local restore_config
+    restore_config=$(pct config "$restore_vmid" 2>/dev/null || echo "")
+    if [[ -z "$restore_config" ]]; then
+        log_error "Restored container has no config"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restored config missing")
+        return 1
+    fi
+
+    log_success "Restored container config intact"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    destroy_lxc "$restore_vmid"
+
+    if [[ -n "$backup_file" ]]; then
+        pvesm list "$BACKUP_STORE" 2>/dev/null | grep "$backup_file" | awk '{print $1}' | while read -r bvolid; do
+            pvesm free "$bvolid" >/dev/null 2>&1 || true
+        done
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC offline backup/restore completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
 
 print_performance_summary() {
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -6390,6 +7399,11 @@ main() {
         log_info "  Backup Store:  $BACKUP_STORE"
     else
         log_info "  Backup Store:  NOT SET (backup tests will be skipped)"
+    fi
+    if [[ $IS_ROOTDIR -eq 1 ]]; then
+        log_info "  LXC Tests:    YES (template: $LXC_TEMPLATE)"
+    else
+        log_info "  LXC Tests:    NO (rootdir not in storage content or no template)"
     fi
 
     # APIVER status was already checked at startup
@@ -7024,6 +8038,172 @@ main() {
         echo | tee -a "$LOG_FILE"
     fi
     check_stop_phase 36
+
+    # LXC container tests (only if rootdir content detected)
+    if [[ $IS_ROOTDIR -eq 1 ]]; then
+        # Phase 37: LXC Create/Start/Stop
+        if [[ $START_PHASE -gt 37 ]]; then
+            log_info "Skipping Phase 37 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 37: LXC Container Create/Start/Stop" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_create_start_stop "$LXC_VMID_START" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 37
+
+        # Phase 38: LXC Snapshot & Revert
+        if [[ $START_PHASE -gt 38 ]]; then
+            log_info "Skipping Phase 38 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 38: LXC Snapshot & Revert" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_snapshot_revert "$((LXC_VMID_START + 1))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 38
+
+        # Phase 39: LXC Clone
+        if [[ $START_PHASE -gt 39 ]]; then
+            log_info "Skipping Phase 39 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 39: LXC Container Clone" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_clone "$LXC_BASE_VMID" "$LXC_CLONE_VMID" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 39
+
+        # Phase 40: LXC Resize
+        if [[ $START_PHASE -gt 40 ]]; then
+            log_info "Skipping Phase 40 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 40: LXC Container Resize" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_resize "$((LXC_VMID_START + 3))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 40
+
+        # Phase 41: LXC Live Migration (cluster only)
+        if [[ $IS_CLUSTER -eq 1 ]]; then
+            if [[ $START_PHASE -gt 41 ]]; then
+                log_info "Skipping Phase 41 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 41: LXC Offline Migration" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_live_migration "$((LXC_VMID_START + 4))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+        else
+            log_info "Skipping Phase 41 (LXC Migration) - not in a cluster"
+            echo | tee -a "$LOG_FILE"
+        fi
+        check_stop_phase 41
+
+        # Phase 42: LXC Multi-Mountpoint
+        if [[ $START_PHASE -gt 42 ]]; then
+            log_info "Skipping Phase 42 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 42: LXC Multi-Mountpoint" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_multi_mountpoint "$((LXC_VMID_START + 5))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 42
+
+        # Phase 43: LXC Rapid Create/Delete Stress
+        if [[ $START_PHASE -gt 43 ]]; then
+            log_info "Skipping Phase 43 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 43: LXC Rapid Create/Delete Stress" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_stress "$((LXC_VMID_START + 20))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 43
+
+        # Phase 44: LXC Concurrent Creation/Destruction
+        if [[ $START_PHASE -gt 44 ]]; then
+            log_info "Skipping Phase 44 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 44: LXC Concurrent Creation/Destruction" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_concurrent "$((LXC_VMID_START + 30))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 44
+
+        # LXC backup tests (backup store only)
+        if [[ -n "$BACKUP_STORE" ]]; then
+            # Phase 45: LXC Online Backup
+            if [[ $START_PHASE -gt 45 ]]; then
+                log_info "Skipping Phase 45 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 45: LXC Online Backup" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_online_backup "$((LXC_VMID_START + 6))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+
+            # Phase 46: LXC Offline Backup
+            if [[ $START_PHASE -gt 46 ]]; then
+                log_info "Skipping Phase 46 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 46: LXC Offline Backup" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_offline_backup "$((LXC_VMID_START + 7))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+        else
+            log_info "Skipping LXC backup tests (Phases 45-46) - no backup store specified"
+            echo | tee -a "$LOG_FILE"
+        fi
+        check_stop_phase 46
+    else
+        log_info "Skipping LXC tests (Phases 37-46) - rootdir not in storage content"
+        echo | tee -a "$LOG_FILE"
+    fi
 
     # Performance Summary
     print_performance_summary

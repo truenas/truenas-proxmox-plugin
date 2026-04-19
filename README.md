@@ -1,12 +1,13 @@
 <h1 align="center">TrueNAS Proxmox VE Storage Plugin</h1>
 
-<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, ZFS integration, and cluster compatibility.</p>
+<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, LXC container storage, ZFS integration, and cluster compatibility.</p>
 
 ## Features
 
 - **Dual Transport Support** - iSCSI (traditional) or NVMe/TCP (lower latency) block storage
 - **iSCSI Block Storage** - Direct integration with TrueNAS SCALE via iSCSI targets
 - **NVMe/TCP Support** - Modern NVMe over TCP for reduced latency and CPU overhead (TrueNAS SCALE 25.10+)
+- **LXC Container Storage** - Block-backed container rootfs support alongside VM disk storage
 - **ZFS Snapshots** - Instant, space-efficient snapshots via TrueNAS ZFS
 - **Live Snapshots** - Full VM state snapshots including RAM (vmstate)
 - **Cluster Compatible** - Full support for Proxmox VE clusters with shared storage
@@ -35,7 +36,7 @@
 | **Pre-flight Checks** | ✅ | ❌ | ❌ |
 | **Multi-path I/O** | ✅ | ✅ | ❌ |
 | **ZFS Compression** | ✅ | ❌ | ❌ |
-| **Container Storage** | ❌ | ⚠️ | ✅ |
+| **Container Storage** | ✅ | ⚠️ | ✅ |
 | **Backup Storage** | ❌ | ❌ | ✅ |
 | **ISO Storage** | ❌ | ❌ | ✅ |
 | **Raw Image Format** | ✅ | ✅ | ✅ |
@@ -45,7 +46,7 @@
 **Notes**:
 - **Standard iSCSI**: Raw iSCSI lacks native snapshots/clones. Use LVM-thin on iSCSI for full snapshot/clone/thin-provisioning support, or volume chains (Proxmox VE 9+). Container storage available via LVM on iSCSI.
 - **NFS**: Snapshots/clones require qcow2 format (performance overhead vs raw). Supports backups, ISOs, and containers natively.
-- **TrueNAS Plugin**: Native ZFS features with raw image performance and automated zvol/iSCSI extent management via TrueNAS API.
+- **TrueNAS Plugin**: Native ZFS features with raw image performance and automated zvol/iSCSI extent management via TrueNAS API. Container (LXC) rootfs stored as ext4-formatted block devices.
 - **VM State Snapshots**: All storage types supporting the 'images' content type can store vmstate files for live snapshots with RAM.
 
 ## Quick Start
@@ -324,6 +325,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.0.27
-**Last Updated**: April 13, 2026
+**Version**: 2.0.28
+**Last Updated**: April 19, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

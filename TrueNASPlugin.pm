@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.27';
+our $VERSION = '2.0.28';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -309,7 +309,7 @@ sub api {
 sub type { return 'truenasplugin'; } # storage.cfg "type"
 sub plugindata {
     return {
-        content => [ { images => 1 }, { images => 1 } ],
+        content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
     };
 }
