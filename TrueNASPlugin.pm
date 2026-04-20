@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.27';
+our $VERSION = '2.0.30';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -38,12 +38,22 @@ package PVE::Storage::Custom::TrueNASPlugin::NullDestructor;
 sub DESTROY { }  # Intentionally empty - prevents any cleanup
 package PVE::Storage::Custom::TrueNASPlugin;
 
-# Simple cache for API results (static data)
+# Simple cache for API results
 my %API_CACHE = ();
-my $CACHE_TTL = 60; # 60 seconds
+my $CACHE_TTL = 60; # seconds
+my $STATUS_CAPACITY_TTL_S = 10;
+my $TARGET_VISIBLE_SKIP_TTL_S = 60;
 
-# Per-host cache for preflight check results (time-based, 30s validity)
+# Per-host cache for preflight check results
 my %_preflight_last_ok;
+my %_target_visible_last_ok;
+
+# Lightweight status-cache counters for tuning/verification
+my %_status_capacity_cache_stats = (
+    hit => 0,
+    miss => 0,
+    invalidate => 0,
+);
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
@@ -90,13 +100,13 @@ sub _cache_host_key {
 }
 
 sub _get_cached {
-    my ($storage_id, $method) = @_;
+    my ($storage_id, $method, $ttl_s) = @_;
     my $key = _cache_key($storage_id, $method);
     my $entry = $API_CACHE{$key};
     return unless $entry;
 
-    # Check if cache entry is still valid
-    return unless (time() - $entry->{timestamp}) < $CACHE_TTL;
+    my $ttl = defined($ttl_s) ? $ttl_s : $CACHE_TTL;
+    return unless (time() - $entry->{timestamp}) < $ttl;
     return $entry->{data};
 }
 
@@ -116,10 +126,12 @@ sub _clear_cache {
         # Clear cache for specific storage (storage_id is api_host)
         delete $API_CACHE{$_} for grep { /^\Q$storage_id\E:/ } keys %API_CACHE;
         delete $_preflight_last_ok{$storage_id};
+        delete $_target_visible_last_ok{$storage_id};
     } else {
         # Clear all cache
         %API_CACHE = ();
         %_preflight_last_ok = ();
+        %_target_visible_last_ok = ();
     }
     # Keep portal sync cache aligned with the same host scoping
     if ($storage_id) {
@@ -235,10 +247,14 @@ sub _is_retryable_error {
 }
 
 sub _retry_with_backoff {
-    my ($scfg, $operation_name, $code_ref) = @_;
+    my ($scfg, $operation_name, $code_ref, $retry_opts) = @_;
 
-    my $max_retries = $scfg->{api_retry_max} // 3;
-    my $initial_delay = $scfg->{api_retry_delay} // 1;
+    my $max_retries = defined($retry_opts) && exists($retry_opts->{retry_max})
+        ? $retry_opts->{retry_max}
+        : ($scfg->{api_retry_max} // 3);
+    my $initial_delay = defined($retry_opts) && exists($retry_opts->{retry_delay})
+        ? $retry_opts->{retry_delay}
+        : ($scfg->{api_retry_delay} // 1);
 
     my $attempt = 0;
     my $last_error;
@@ -1232,6 +1248,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
             my $id = URI::Escape::uri_escape($full_ds);
             my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
             _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload]);
+            _invalidate_status_capacity_cache(undef, $scfg);
         };
         push @all_errors, "Failed to delete dataset $dataset: $@" if $@;
     }
@@ -1419,6 +1436,7 @@ sub _delete_dataset_with_retry {
             if (!$job_result->{success}) {
                 die $job_result->{error};
             }
+            _invalidate_status_capacity_cache(undef, $scfg);
             _log($scfg, 1, 'info', "[TrueNAS] Successfully deleted dataset $full_ds");
         };
 
@@ -1456,6 +1474,7 @@ sub _delete_dataset_with_retry {
 #   - use_ephemeral: if true, use an ephemeral connection (for write operations)
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     my $use_ephemeral = $opts && $opts->{use_ephemeral};
+    my $retry_opts = $opts && $opts->{retry_opts};
 
     # Level 2: Verbose - log all API calls with parameters
     my $conn_type = $use_ephemeral ? 'ephemeral' : 'persistent';
@@ -1485,7 +1504,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
             _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
 
             return $res;
-        });
+        }, $retry_opts);
     } else {
         # Use persistent connection for read operations (original behavior)
         return _retry_with_backoff($scfg, "WS $ws_method", sub {
@@ -1498,7 +1517,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
             _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
 
             return $res;
-        });
+        }, $retry_opts);
     }
 }
 
@@ -1560,7 +1579,9 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     if ($blocksize) {
         $payload->{volblocksize} = _normalize_blocksize($blocksize);
     }
-    return _api_call_write($scfg, 'pool.dataset.create', [ $payload ]);
+    my $result = _api_call_write($scfg, 'pool.dataset.create', [ $payload ]);
+    _invalidate_status_capacity_cache(undef, $scfg);
+    return $result;
 }
 sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full);
@@ -1574,15 +1595,26 @@ sub _tn_dataset_delete($scfg, $full) {
         die $job_result->{error};
     }
 
+    _invalidate_status_capacity_cache(undef, $scfg);
     _log($scfg, 1, 'info', "[TrueNAS] _tn_dataset_delete: deleted $full");
     return $job_result->{result};
 }
-sub _tn_dataset_get($scfg, $full) {
-    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ]);
+sub _tn_dataset_get($scfg, $full, $opts = undef) {
+    my $api_opts;
+    if ($opts && exists($opts->{retry_max})) {
+        $api_opts = { retry_opts => { retry_max => $opts->{retry_max} } };
+    }
+    if ($opts && exists($opts->{retry_delay})) {
+        $api_opts //= { retry_opts => {} };
+        $api_opts->{retry_opts}{retry_delay} = $opts->{retry_delay};
+    }
+    return _api_call($scfg, 'pool.dataset.get_instance', [ $full ], $api_opts);
 }
 sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     my $payload = { volsize => int($new_bytes) }; # grow-only
-    return _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ]);
+    my $result = _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ]);
+    _invalidate_status_capacity_cache(undef, $scfg);
+    return $result;
 }
 sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
     # Clone a ZFS snapshot to create a new dataset
@@ -1802,6 +1834,8 @@ sub volume_resize {
         _log($scfg, 0, 'err', "[TrueNAS] volume_resize: failed for $volname: " . $job_result->{error});
         die $job_result->{error};
     }
+
+    _invalidate_status_capacity_cache($storeid, $scfg);
 
     # Initiator-side rescan so Linux sees the new size (transport-specific)
     my $mode = $scfg->{transport_mode} // 'iscsi';
@@ -2023,8 +2057,11 @@ sub volume_snapshot_info {
 # List TrueNAS iSCSI targets (array of hashes; each has at least {id, name, ...}).
 sub _tn_targets {
     my ($scfg) = @_;
+    my $storage_id = _cache_host_key($scfg);
+    my $cached = _get_cached($storage_id, 'targets');
+    return $cached if $cached;
     my $list = _api_call($scfg, 'iscsi.target.query', []);
-    return $list // [];
+    return _set_cache($storage_id, 'targets', $list // []);
 }
 
 # Find the first free disk name for a VM using a single batch query.
@@ -4196,6 +4233,8 @@ sub alloc_image {
         _log($scfg, 1, 'info', "[TrueNAS] alloc_image: zvol $full_ds created successfully");
     }
 
+    _invalidate_status_capacity_cache($storeid, $scfg);
+
     # 2) Transport-specific volume exposure
     my $zvol_path = 'zvol/' . $full_ds;
     my $mode = $scfg->{transport_mode} // 'iscsi';
@@ -5189,6 +5228,31 @@ sub _list_images_nvme {
     return $res;
 }
 
+sub _status_cache_storeid {
+    my ($storeid, $scfg) = @_;
+    return $storeid if defined($storeid) && $storeid ne '';
+    return $scfg->{storeid} if defined($scfg->{storeid}) && $scfg->{storeid} ne '';
+    return _cache_host_key($scfg);
+}
+
+sub _status_capacity_cache_method {
+    my ($storeid, $scfg) = @_;
+    my $effective_storeid = _status_cache_storeid($storeid, $scfg);
+    my $endpoint = $scfg->{api_host} // 'unknown-endpoint';
+    my $dataset = $scfg->{dataset} // 'unknown-dataset';
+    return "status-capacity:v1:$effective_storeid:$endpoint:$dataset";
+}
+
+sub _invalidate_status_capacity_cache {
+    my ($storeid, $scfg) = @_;
+    my $effective_storeid = _status_cache_storeid($storeid, $scfg);
+    my $host_key = _cache_host_key($scfg);
+    my $method = _status_capacity_cache_method($effective_storeid, $scfg);
+    _invalidate_cache_key($host_key, $method);
+    $_status_capacity_cache_stats{invalidate}++;
+    _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
+}
+
 # ======== status(): dataset capacity ========
 # total = quota (if set) else (written/used + available)
 # avail = (quota - written/used) when quota present, else dataset available
@@ -5197,8 +5261,21 @@ sub status {
     my ($class, $storeid, $scfg, $cache) = @_;
     my $active = 1;
     my ($total, $avail, $used) = (0,0,0);
+    my $host_key = _cache_host_key($scfg);
+    my $status_method = _status_capacity_cache_method($storeid, $scfg);
+
     eval {
-        my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
+        my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
+        if ($ds) {
+            $_status_capacity_cache_stats{hit}++;
+            _log($scfg, 2, 'debug', "[TrueNAS] status-cache: hit key=$status_method");
+        } else {
+            $_status_capacity_cache_stats{miss}++;
+            _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
+            $ds = _tn_dataset_get($scfg, $scfg->{dataset}, { retry_max => 0 });
+            _set_cache($host_key, $status_method, $ds);
+        }
+
         my $quota     = _normalize_value($ds->{quota});     # bytes; 0 = no quota
         my $available = _normalize_value($ds->{available}); # bytes
         $used         = _normalize_value($ds->{written});
@@ -5214,6 +5291,7 @@ sub status {
     };
     if ($@) {
         my $err = $@;
+        _invalidate_status_capacity_cache($storeid, $scfg);
 
         # Distinguish between connectivity issues and actual errors
         if ($err =~ /timeout|timed out|connection refused|connection reset|unreachable|network|ssl.*error/i) {
@@ -5247,9 +5325,18 @@ sub status {
 # If the target has no extents, it won't appear in discovery.
 # This function creates a small "weight" zvol to keep the target visible.
 sub _ensure_target_visible {
-    my ($scfg) = @_;
+    my ($scfg, %opts) = @_;
 
     my $iqn = $scfg->{target_iqn};
+
+    # Throttle: skip entire preflight on activate_storage path if recently verified
+    my $target_visible_key = _cache_host_key($scfg) . ':' . ($iqn // 'unknown-target');
+    if ($opts{skip_discovery_probe}) {
+        if (time() - ($_target_visible_last_ok{$target_visible_key} // 0) < $TARGET_VISIBLE_SKIP_TTL_S) {
+            _log($scfg, 2, 'debug', "[TrueNAS] Pre-flight: target $iqn recently verified (" . int(time() - ($_target_visible_last_ok{$target_visible_key} // 0)) . "s ago), skipping");
+            return 1;
+        }
+    }
     my $portal = _normalize_portal($scfg->{discovery_portal});
 
     # Create a unique weight volume name per target
@@ -5348,6 +5435,7 @@ sub _ensure_target_visible {
             }
         } else {
             $weight_zvol_just_created = 1;
+            _invalidate_cache_key(_cache_host_key($scfg), 'extents');
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight zvol created");
         }
     } else {
@@ -5408,6 +5496,7 @@ sub _ensure_target_visible {
                 die "Failed to create weight extent: $@\n";
             }
         } else {
+            _invalidate_cache_key(_cache_host_key($scfg), 'extents');
             _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: weight extent created");
             $found_weight_name = $weight_name;
         }
@@ -5416,12 +5505,8 @@ sub _ensure_target_visible {
     }
 
     # Step 5: Ensure extent is mapped to THIS target (not just any target).
-    # Force a fresh extent fetch here: if step 4 found the weight extent in the cache
-    # but the extent was subsequently deleted on TrueNAS, using the cached ID for
-    # iscsi.targetextent.create would trigger a FOREIGN KEY constraint failure.
-    # Always resolve the extent ID against live TrueNAS data before mapping.
-    # Force-invalidate extents cache so step 5 ID lookup uses live TrueNAS data
-    _invalidate_cache_key(_cache_host_key($scfg), 'extents');
+    # Cache is invalidated only on mutation (zvol/extent create) — if the extent
+    # was deleted on TrueNAS after caching, the FK handler below recovers gracefully.
     # Use $found_weight_name (may be legacy) so that lookups stay consistent with step 4.
     my $weight_mapped = 0;
     my $weight_extent_id;
@@ -5507,6 +5592,16 @@ sub _ensure_target_visible {
     }
 
     # Step 6: Verify target is now discoverable
+    # Skip on status/activate path (caller passes skip_discovery_probe => 1) —
+    # the weight zvol + extent + mapping are already ensured above, and
+    # activate_volume handles authoritative device discovery. The deferred
+    # self-healing caller retains full verification.
+    if ($opts{skip_discovery_probe}) {
+        _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn weight volume ensured (discovery probe skipped)");
+        $_target_visible_last_ok{$target_visible_key} = time();
+        return 1;
+    }
+
     sleep 2; # Give TrueNAS time to update
     my $target_discoverable = 0;
     eval {
@@ -5521,6 +5616,7 @@ sub _ensure_target_visible {
 
     if ($target_discoverable) {
         _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: target $iqn is discoverable - weight volume ensures persistence");
+        $_target_visible_last_ok{$target_visible_key} = time();
         return 1;
     } else {
         _log($scfg, 0, 'warning', "[TrueNAS] Pre-flight: target $iqn not discoverable despite weight volume - may need manual intervention");
@@ -5537,7 +5633,7 @@ sub activate_storage {
     if ($mode eq 'iscsi') {
         # Run pre-flight check to ensure target is visible
         eval {
-            _ensure_target_visible($scfg);
+            _ensure_target_visible($scfg, skip_discovery_probe => 1);
         };
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: target visibility pre-flight check failed for $storeid: $@");
@@ -5697,6 +5793,8 @@ sub _clone_image_iscsi {
         _log($scfg, 1, 'info', "[TrueNAS] _clone_image_iscsi: clone completed successfully");
     }
 
+    _invalidate_status_capacity_cache($storeid, $scfg);
+
     # 2) Create iSCSI extent for the cloned zvol
     my $zvol_path = 'zvol/' . $target_full;
 
@@ -5837,6 +5935,8 @@ sub _clone_image_nvme {
         }
         _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: clone completed successfully");
     }
+
+    _invalidate_status_capacity_cache($storeid, $scfg);
 
     # Verify cloned zvol exists and get its properties
     my $cloned_ds = eval { _tn_dataset_get($scfg, $target_full) };
