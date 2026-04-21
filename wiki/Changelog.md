@@ -1,10 +1,24 @@
 # TrueNAS Plugin Changelog
 
-## Version 2.0.28 (April 19, 2026)
+## Version 2.0.30 (April 18, 2026)
 
-### Features
+### Performance
 
-- **Add LXC container (rootdir) support**: The plugin now supports `rootdir` content type, allowing LXC container rootfs to be stored on TrueNAS-backed block storage (iSCSI and NVMe-TCP). PVE formats the block device with ext4 and mounts it as the container rootfs.
+- **Reduce idempotent status latency with bounded status caching (GitHub issue #30, phase 3)**: Added storage-scoped status capacity cache keys (`status-capacity:v1:<storeid>:<endpoint>:<dataset>`) with a short 10s TTL and status-only retry override (`retry_max => 0`) for `pool.dataset.get_instance` reads in `status()`. Failures now invalidate the status cache key immediately while preserving inactive + zeroed return semantics.
+- **Conservative preflight skip-throttle tuning**: Replaced the hardcoded 30s `_ensure_target_visible(... skip_discovery_probe => 1)` window with `TARGET_VISIBLE_SKIP_TTL_S = 60`, scoped by host + target identity to avoid cross-storage bleed during status polling.
+- **Mutation freshness hardening**: Ensured status-capacity cache invalidation runs only after successful create/update/delete/clone dataset mutations across helper and direct call paths, avoiding stale status after writes without invalidating on failed mutations.
+
+## Version 2.0.29 (April 17, 2026)
+
+### Performance
+
+- **Reduce `activate_storage` API round-trips (GitHub issue #30, phase 2)**: Added a 30s time-based throttle to `_ensure_target_visible` — repeated status queries within 30s of a successful preflight skip all TrueNAS API calls entirely. Cached `iscsi.target.query` results (previously the only uncached iSCSI query). Moved extent cache invalidation from unconditional (every call) to mutation-only paths (zvol/extent creation), eliminating a forced re-fetch on the happy path.
+
+## Version 2.0.28 (April 16, 2026)
+
+### Bug Fixes
+
+- **Fix storage status/summary load latency (GitHub issue #30)**: `activate_storage` now skips the expensive `iscsiadm` discovery probe in `_ensure_target_visible` by passing `skip_discovery_probe => 1`. The weight zvol, extent, and target mapping are still ensured — only the post-verification `sleep 2` + discovery roundtrip is skipped on the status path. The deferred self-healing caller in `free_image` retains full verification for correctness.
 
 ---
 
