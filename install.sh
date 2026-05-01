@@ -4713,10 +4713,10 @@ run_health_check() {
     # Check 4: Content type
     local content
     content=$(get_storage_config_value "$storage_name" "content")
-    if [[ "$content" == "images" ]]; then
-        check_result "Content type" "OK" "images"
+    if [[ "$content" == "images" || "$content" == "images,rootdir" || "$content" == "rootdir,images" ]]; then
+        check_result "Content type" "OK" "$content"
     elif [[ -n "$content" ]]; then
-        check_result "Content type" "WARNING" "$content (should be 'images')"
+        check_result "Content type" "WARNING" "$content (should include 'images' and optionally 'rootdir')"
     else
         check_result "Content type" "WARNING" "Not configured"
     fi
@@ -4827,7 +4827,7 @@ run_health_check() {
 
         # Make WebSocket API call to fetch dataset
         local dataset_info
-        dataset_info=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$dataset\"]]]" 2>/dev/null)
+        dataset_info=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$dataset\"]],{\"extra\":{\"retrieve_children\":false}}]" 2>/dev/null)
         local api_status=$?
 
         stop_spinner
