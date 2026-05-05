@@ -1601,6 +1601,24 @@ sub _tn_global($scfg) {
     return _api_call($scfg, 'iscsi.global.config', []);
 }
 
+# Returns the pool record for the dataset's containing pool, or undef.
+# Cached for $CACHE_TTL (60s) since pool health changes slowly.
+sub _tn_pool_health($scfg) {
+    my ($pool_name) = split('/', $scfg->{dataset}, 2);
+    return undef if !$pool_name;
+
+    my $host_key = _cache_host_key($scfg);
+    my $cached = _get_cached($host_key, "pool_health:$pool_name");
+    return $cached if defined $cached;
+
+    my $pools = eval {
+        _api_call($scfg, 'pool.query', [[ ["name", "=", $pool_name] ]]);
+    };
+    return undef if $@ || !$pools || !@$pools;
+
+    return _set_cache($host_key, "pool_health:$pool_name", $pools->[0]);
+}
+
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
@@ -2286,28 +2304,21 @@ sub _preflight_check_alloc {
     }
 
     # Check 2: Pool health (degraded pools are functional but warrant a warning)
-    eval {
+    my $pool = _tn_pool_health($scfg);
+    if ($pool) {
         my ($pool_name) = split('/', $scfg->{dataset}, 2);
-        my $pools = _api_call($scfg, 'pool.query',
-            [[ ["name", "=", $pool_name] ]]);
-        if ($pools && @$pools) {
-            my $pool = $pools->[0];
-            if (!$pool->{healthy}) {
-                _log($scfg, 0, 'warning',
-                    "[TrueNAS] preflight: pool '$pool_name' is not healthy (status: " .
-                    ($pool->{status} // 'UNKNOWN') . ")");
-            }
-            if (($pool->{status} // '') ne 'ONLINE') {
-                push @errors, sprintf(
-                    "ZFS pool '%s' is not ONLINE (status: %s)\n" .
-                    "  Check pool status in TrueNAS: Storage > Pools",
-                    $pool_name, $pool->{status} // 'UNKNOWN'
-                );
-            }
+        if (!$pool->{healthy}) {
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] preflight: pool '$pool_name' is not healthy (status: " .
+                ($pool->{status} // 'UNKNOWN') . ")");
         }
-    };
-    if ($@) {
-        _log($scfg, 1, 'info', "[TrueNAS] preflight: pool health check skipped: $@");
+        if (($pool->{status} // '') ne 'ONLINE') {
+            push @errors, sprintf(
+                "ZFS pool '%s' is not ONLINE (status: %s)\n" .
+                "  Check pool status in TrueNAS: Storage > Pools",
+                $pool_name, $pool->{status} // 'UNKNOWN'
+            );
+        }
     }
 
     # Check 3: Service is running (transport-specific)
@@ -5338,16 +5349,13 @@ sub status {
             _set_cache($host_key, $status_method, $ds);
 
             # Pool health check on cache miss only (non-fatal — log warning if degraded)
-            eval {
+            my $pool = _tn_pool_health($scfg);
+            if ($pool && !$pool->{healthy}) {
                 my ($pool_name) = split('/', $scfg->{dataset}, 2);
-                my $pools = _api_call($scfg, 'pool.query',
-                    [[ ["name", "=", $pool_name] ]]);
-                if ($pools && @$pools && !$pools->[0]->{healthy}) {
-                    _log($scfg, 0, 'warning',
-                        "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
-                        ($pools->[0]->{status} // 'UNKNOWN') . ")");
-                }
-            };
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
+                    ($pool->{status} // 'UNKNOWN') . ")");
+            }
         }
 
         my $quota     = _normalize_value($ds->{quota});     # bytes; 0 = no quota
