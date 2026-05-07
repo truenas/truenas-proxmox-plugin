@@ -5,36 +5,36 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: trixie
 Codename: trixie
-Date: Thu, 12 Mar 2026 06:31:53 UTC
+Date: Thu, 07 May 2026 14:49:43 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
 Description: TrueNAS Proxmox Plugin APT repository (trixie)
 MD5Sum:
- d7823929ce0098511bb37b525a05bfdc 919 main/binary-amd64/Packages
- b9c79998d66422d2400b80ffc6889296 577 main/binary-amd64/Packages.gz
+ 6ff09980c210de5651cb1a7a9fe2438a 921 main/binary-amd64/Packages
+ 101e4428875c46fa043480f27ead19f6 579 main/binary-amd64/Packages.gz
  8bfa35b71784c004bfe73d60ac5c0af5 173 main/binary-amd64/Release
 SHA1:
- 9ca1f12c05f363fdfc4d26cb0de7bf4383b93755 919 main/binary-amd64/Packages
- 9cbcc84185254a3a43f3783b0745c6b5269ad829 577 main/binary-amd64/Packages.gz
+ b1f031353875503eb03cec55590bfc5d5885d5c1 921 main/binary-amd64/Packages
+ 3a2068a07052e9d513e5d9264620b4c152ac9d39 579 main/binary-amd64/Packages.gz
  040cac17066721581c8f72bd25e716e1db9a4ffc 173 main/binary-amd64/Release
 SHA256:
- 6ddd9eb9569bb58d28e3665a6d22bec7d9099e15a5d5e67a8bde2102d57be6ad 919 main/binary-amd64/Packages
- d6f1dac92d3eb4ea8f45e4f7584b17e6d66785bcab3be6b17bbbd15bff14b893 577 main/binary-amd64/Packages.gz
+ d63dae48dbc929cfd4a279ef31fcb68ee5ec2d7ee5cceefb3b61f9d1aab8f216 921 main/binary-amd64/Packages
+ f158cbbce0b717ddc0dec6a68d87a9d294c8ff391ffb73a2b9eaad48fc9a8f0b 579 main/binary-amd64/Packages.gz
  6b03e33922db913500a68ebcfec689a61ddc300fe8e4cde30685d74d641a0398 173 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmmyXdoACgkQqX8sptOm
-79gSdBAAj5cEzZRXvSUg342LbsgpxJrZCNHDYkXNxNA/iuafhB9i8QTjVi110Q0u
-UDnM+3aIlL1bKyX9tOIc2myWnsndYAUWFrZ2ec6ansEubhnRQJ+AWuF/You530LB
-miuSKywlRlMFR7eLsRPbgN68ReSLbQ7ZlfH1Lv/njTvp48QPoEFZI/OQlc9feyDJ
-mM263oTygwz7fXLnBfu6RR9GdzlAuN68E4tA+9l8MB/JR+Ossh4LxGqMq4g5Vnm/
-83H971XAylvRce+eN6g8p1mpR0pXVqt1s6AvM7DHVuGaZZ8MMhR16YYcFAa+FAUp
-Wql+sQrvmu2xol85fMGl99/AHgVGuDRvpeHNALLlGrxZzbx95O/VgTj1Eif7pYe9
-228Wb1BWbtSX102YPAHskv+CCbFZqtsvOUix5YrYXFJF+7Awk/XTOLlYl70YwA+M
-e4fvz7U3s1eL9hQkClWimk+FNVcm29uWrioe85JbZjM3OKMPWTCIIUlKRZvB+Ba9
-E6ZbI5yaXbNBPgiekP4fhi4TzVgUjXsqw1QLSZxTk3fFDvr7bsszc2f/Dgf5LEGq
-a5d0su6Onod0MQtnoPQiPhdqktN9kPh4+uiZObLyCOE5IORsUso+bNkfR/QFE8yI
-Ymb58H1aZs4Ry23ctL8QUJkoQVnSmlbRduJOaZo4kdITpV8iLuA=
-=8Yz/
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmn8pocACgkQqX8sptOm
+79g4Qg//cMeu3Ngt+lKK2JA7dm5B52PxbW/fIfErjqKa6d+fhIQm7QJp5+AXRrY0
+cOsjbcY98H/vVGRUDTFA87eMkStP02e2fWsZIYQ2P+ncLtJnG18tyfjj3JAyV/83
+6bSWr8oLJiPF35s0FlGFxn2CKfqSRV5bQ8HdwyRGmOLkqbsPAAa2xPfnCTO5ts9w
+7/M544d7D+B5eVajDvjebK8kMbrz4HsBJG7KSoWpoTYbUAgnCbk+1K24IA/UVcev
+/uLMqbNBueyEhvAejpeIn0aZdndffTl9VyiW6F1sBsCpcOgMtsZywv64CwYphJWq
+5FxIJij/eWC/BqjtiuoJE0Q4/tP03ce8xFuXJN/IopSYplYz4hFBBHs24Oky4dr9
+1jwBwnrYp/YTUymEKYB0UxX5tSEfYa2hVzZenmHnqCxciHdhFdlIV4LJa0Q48t72
+RHFJnCugqvD4zkYCkhaxSo5bEbut6um9dljr/tIBM4r5zC+msG22wn3RTse31rh/
++rt3LGUWlL5k388MwQBkYRsYSVPcqfxUhzh2WWWgEP1p1G71RozXAsusa7oJip3Y
+7TEzarOgq7Qph1YC0Qh6m2nGIW5EkF3c72RsacS7rokXhMAfa7Gw5NIwcrdA1UpG
+WbrAEKmooEcIqR6JXnp+AbRKCLB8WmyckONYwlNE6YaiCCn7X6c=
+=X730
 -----END PGP SIGNATURE-----

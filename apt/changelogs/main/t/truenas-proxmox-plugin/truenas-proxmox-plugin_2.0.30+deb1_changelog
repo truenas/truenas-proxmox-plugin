@@ -1,0 +1,301 @@
+truenas-proxmox-plugin (2.0.30+deb1) unstable; urgency=medium
+
+  * Reduce status latency and preserve operation-path safety (issue #30 phase 3):
+    add short-TTL storage-scoped status capacity cache, status-only bounded
+    retry override (retry_max=0), and conservative 60s preflight skip throttle
+    keyed by host+target identity
+  * Harden cache correctness after writes: invalidate status-capacity cache on
+    successful dataset create/update/delete/clone paths (helper and direct
+    callsites), and invalidate immediately on status read failure while keeping
+    inactive+zeroed status semantics
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 18 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.29+deb1) unstable; urgency=medium
+
+  * Reduce activate_storage latency (issue #30 phase 2): add 30s preflight
+    throttle, cache iscsi.target.query, eliminate unconditional extent
+    cache invalidation on happy path
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 16 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.28+deb1) unstable; urgency=medium
+
+  * Fix storage status/summary load latency (issue #30): skip discovery
+    probe in activate_storage path while retaining full verification in
+    deferred self-healing
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 16 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.27+deb1) unstable; urgency=medium
+
+  * Fix host-scoped cache key mismatches in preflight/target-id/NVMe portal
+    paths: use _cache_host_key consistently so targeted invalidation works
+    when api_host is unset
+  * Fix over-broad portal sync cache invalidation: clear portal-sync timestamp
+    only for the targeted host key on _clear_cache(storage_id)
+  * Refactor duplicated FK stale-extent recovery in _ensure_target_visible by
+    extracting shared _handle_fk_stale_extent helper
+  * Fix VM migration size mismatch (issue #25): alloc_image now steps
+    volblocksize down by powers of two to preserve exact requested bytes
+    instead of rounding zvol size upward
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sun, 13 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.26+deb1) unstable; urgency=medium
+
+  * Fix duplicate weight zvol creation when upgrading from pre-v2.0.20: step 2
+    of _ensure_target_visible now checks for legacy-named zvol and reuses it
+    instead of creating a new hash-named duplicate (GitHub issue #27 follow-up)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.25+deb1) unstable; urgency=low
+
+  * Code quality: Extract _cache_host_key and _invalidate_cache_key helpers
+  * Code quality: Use _api_call_write for extent creation (ephemeral connection)
+  * Code quality: Rename $stale_delete_ok to $stale_cleared
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.24+deb1) unstable; urgency=medium
+
+  * Fix FK/IntegrityError causing unnecessary 3 retries before failing: check
+    database integrity patterns before connection patterns in _is_retryable_error
+    to prevent Python traceback paths like "connection.py" false-matching
+  * Fix weight extent FK constraint failure not cleaning TrueNAS state: attempt
+    to delete stale extent on FK failure to force configfs/DB resync instead of
+    only clearing plugin cache (which left TrueNAS in inconsistent state)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.23+deb1) unstable; urgency=medium
+
+  * Fix extent delete in alloc/clone cleanup paths using read-path WebSocket
+    connection: _api_call replaced with _api_call_write for iscsi.extent.delete
+    in _alloc_image_iscsi and _clone_image_iscsi cleanup branches so failure is
+    not silently swallowed on persistent-connection setups
+  * Fix clone retry loop exhausting budget on warm dataset cache: invalidate
+    cache before _find_free_disk_name in retry branch of _clone_image_iscsi
+    and _clone_image_nvme so a fresh name is always resolved on collision
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 11 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.22+deb1) unstable; urgency=medium
+
+  * Fix orphaned zvol/extent in _alloc_image_iscsi: wrap extent.create and
+    targetextent.create in eval with cascading cleanup; replace bare _api_call
+    with _tn_targetextent_create for concurrent-node race recovery (C1)
+  * Fix silent zvol leak in free_image: re-raise non-"not found" dataset
+    deletion errors so Proxmox reports the failure (C2)
+  * Fix concurrent weight zvol create hard-dying in _ensure_target_visible:
+    treat "already exists" as idempotent success (M1)
+  * Fix _clone_image_iscsi missing _clear_cache and bare targetextent create (M2)
+  * Fix stale-mapping delete "not found" blocking correct mapping create (M3)
+  * Fix weight extent pointing to dead zvol after cross-dataset re-create (L1)
+  * Fix orphaned zvol in _alloc_image_nvme on namespace create failure (L2)
+  * Fix missing retry loop for "dataset already exists" in clone_image (L3)
+  * Fix _resolve_target_id process-lifetime cache: migrate to 60s TTL (L4)
+  * Fix global iSCSI rescan in volume_snapshot_rollback: scope to target IQN (L5)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.21+deb1) unstable; urgency=medium
+
+  * Fix FOREIGN KEY constraint failure when weight extent is deleted between
+    cache population and mapping: force-invalidate extents cache before step 5
+    ID lookup in _ensure_target_visible so stale cached IDs are never used for
+    iscsi.targetextent.create; add FOREIGN KEY error detection in mapping path
+    with cache-clearing recovery
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.20+deb1) unstable; urgency=medium
+
+  * Fix weight extent name collision across distinct iSCSI targets: append
+    8-char SHA1 of full IQN to weight extent name (pve-weight-<suffix>-<hash8>)
+    to prevent targets with colliding sanitized suffixes from sharing a weight
+    extent; legacy name format accepted via fallback lookup for existing clusters
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.19+deb1) unstable; urgency=medium
+
+  * Fix weight extent lookup failing when multiple storages share the same
+    iSCSI target: weight extent in _ensure_target_visible now matched by name
+    only (not name+disk), since the extent belongs to the target IQN and may
+    be created by a different storage with a different dataset path; also handle
+    "Extent name must be unique" gracefully as idempotent success
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.18+deb1) unstable; urgency=medium
+
+  * Fix "Extent is already in use" pre-flight failure in multi-node clusters:
+    _tn_targetextent_create now handles stale in-memory cache by force-refreshing
+    when TrueNAS reports "Extent is already in use", returning the existing mapping
+    if the extent is already correctly mapped to the target; prevents spurious
+    warnings when another cluster node created the weight mapping after the local
+    cache was last populated
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.17+deb1) unstable; urgency=medium
+
+  * Fix stale weight extent mapping left by cache-collision bug: _ensure_target_visible
+    now detects a weight extent mapped to the wrong target (created by older plugin
+    versions with the cache-collision bug), removes the stale mapping, and creates
+    the correct one; fixes "Extent is already in use" errors on pre-flight after
+    upgrading from v2.0.16
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 07 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.16+deb1) unstable; urgency=medium
+
+  * Fix extent/targetextent cache key collision: _tn_extents and _tn_targetextents
+    now key the API cache by api_host instead of storeid, preventing cross-host
+    cache contamination when multiple storages share a TrueNAS host
+  * Fix weight extent name-only lookup in _ensure_target_visible: both extent
+    search loops now also match on the zvol disk path to prevent false positives
+    from same-named extents on different datasets
+  * Fix _resolve_target_id cache collision: %_target_id_cache is now keyed by
+    "api_host:iqn" instead of iqn alone; _clear_cache deletes only matching
+    entries rather than wiping the entire hash
+  * Fix $_preflight_last_ok shared across all storages: converted to a per-host
+    hash %_preflight_last_ok keyed by api_host; _clear_cache clears only the
+    affected host entry
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 07 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.15+deb1) unstable; urgency=medium
+
+  * Always force-delete iSCSI targetextent/extent in free_image to fix cluster
+    disk move failures when other nodes have active sessions (Issue #24)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 03 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.14+deb1) unstable; urgency=medium
+
+  * Fix disk move with multipath: SCSI teardown before TrueNAS delete APIs + force=true
+    to bypass persistent-session "in use" check (Issue #15)
+  * Fix multipath flush in free_image: derive WWID from extent NAA instead of scsi_id
+    on DM device — resolves zombie ##,## mpath entries after every disk move (Issue #15)
+  * Fix race window in activate_volume: add udevadm settle after multipath -r (Issue #15)
+  * Fix force-logout retry skipped during disk moves when active_luns >= 2 (Issue #15)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 02 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.13+deb1) unstable; urgency=medium
+
+  * Skip disruptive iSCSI rescan during allocation when sessions already active (Issue #15)
+  * Invalidate targetextent cache in free_image for accurate LUN counts during disk moves
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 31 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.12+deb1) unstable; urgency=medium
+
+  * Sync NVMe portals when subsystem already exists (Issue #20)
+  * Port bindings are now created for portals added to storage.cfg
+    after initial NVMe/TCP storage setup
+  * Cache portal sync results per-storage (60s TTL) to reduce API
+    overhead during rapid disk allocation
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 27 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.11+deb1) unstable; urgency=medium
+
+  * Force NVMe subsystem configfs sync after namespace creation
+  * Workaround for TrueNAS middleware bug (NAS-140266) where namespaces
+    are not published to kernel configfs after creation
+  * Fixes "stopped: unexpected status" errors with NVMe/TCP (Issues #7, #12)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 25 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.10+deb1) unstable; urgency=medium
+
+  * Add ns-rescan to NVMe alloc deferred path (mirrors clone path)
+  * Improves namespace discovery when TrueNAS AEN is unavailable
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 21 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.9+deb1) unstable; urgency=medium
+
+  * Fix stale NVMe subsystem entry preventing connection (_nvme_is_connected
+    now checks for live TCP transport, not just NQN presence)
+  * Handle "already connected" errors during NVMe reconnect after service restart
+  * Include stderr in NVMe connect failure log messages
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 23:30:00 +0000
+
+truenas-proxmox-plugin (2.0.8+deb1) unstable; urgency=medium
+
+  * Deferred I/O after CFS lock release for improved concurrent operation throughput
+  * Batch disk name finding via single pool.dataset.query call
+  * Target ID caching to avoid redundant iscsi.target.query API calls
+  * LUN ID extraction from iscsi.targetextent.create response (saves API round-trip)
+  * 30-second preflight check caching for multi-disk VM creation
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.7+deb1) unstable; urgency=medium
+
+  * NVMe write operations (subsystem/port/namespace create) use ephemeral WebSocket connections
+  * Controller-specific NVMe disconnect with NQN-wide fallback
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.6+deb2) unstable; urgency=medium
+
+  * Restart pvestatd on install/upgrade for fresh plugin code loading
+  * Add APT changelog support via Changelogs field in Release metadata
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 12 Mar 2026 18:00:00 +0000
+
+truenas-proxmox-plugin (2.0.6+deb1) unstable; urgency=medium
+
+  * Fix NVMe stale device NSID false-positive via NGUID cross-validation
+  * Add early stale NGUID reconnect trigger at i=10 (~1s recovery)
+  * Refactor NVMe namespace selector with structured results
+  * Fix WebSocket response desync via JSON-RPC request ID matching
+  * Untaint all NVMe CLI inputs (hosts, ports, NQNs, secrets)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 12 Mar 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.0.5+deb1) unstable; urgency=medium
+
+  * NVMe stale NGUID recovery with fuser safety check
+  * NVMe clone reliability: pre-settle, rescan, and enhanced failure diagnostics
+  * Fix clone namespace creation to use ephemeral WebSocket connection
+  * Fix _free_image_nvme device path hash key
+  * Extract reusable NVMe helpers for controller rescan, device enumeration,
+    and in-use detection
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 10 Mar 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.0.4+deb1) unstable; urgency=medium
+
+  * Add multipath-tools as a hard package dependency for default iSCSI installs
+  * Align Debian package version with plugin runtime version 2.0.4
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 10 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb3) unstable; urgency=medium
+
+  * Fix GitHub Actions publish dependency install to use sudo on ubuntu runner
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 03 Mar 2026 01:40:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb2) unstable; urgency=medium
+
+  * Bump Debian packaging revision for GitHub Pages APT publish retry
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 02 Mar 2026 18:45:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb1) unstable; urgency=medium
+
+  * Initial Debian packaging setup for APT repository publishing
+  * Configure debhelper-compat 13 and Standards-Version 4.6.2
+  * Add perl build dependencies for Proxmox VE plugin architecture
+  * Prepare for automated Debian package builds and releases
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 24 Feb 2026 16:00:00 +0000
