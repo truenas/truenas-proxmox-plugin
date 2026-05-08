@@ -53,7 +53,7 @@ The zvol block size significantly impacts performance:
 
 ```ini
 # Optimal for general VM workloads
-zvol_blocksize 128K
+tn_zvol_blocksize 128K
 ```
 
 **Trade-offs**:
@@ -131,9 +131,9 @@ Configure multiple portals for redundancy and load balancing:
 
 ```ini
 truenasplugin: truenas-storage
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
-    use_multipath 1
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_use_multipath 1
 ```
 
 **Benefits**:
@@ -189,8 +189,8 @@ This is the easiest method as the installer handles portal discovery, validation
 Add to your storage configuration in `/etc/pve/storage.cfg`:
 
 ```ini
-use_multipath 1
-portals 192.168.10.101:3260,192.168.10.102:3260
+tn_use_multipath 1
+tn_portals 192.168.10.101:3260,192.168.10.102:3260
 ```
 
 #### Network Requirements (CRITICAL)
@@ -421,32 +421,32 @@ Add to `/etc/pve/storage.cfg`:
 **For Single Portal Group (Approach 1):**
 ```ini
 truenasplugin: truenas-storage
-    api_host 10.15.14.172
-    api_key YOUR_API_KEY
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:3260
-    portals 10.30.30.2:3260
+    tn_api_host 10.15.14.172
+    tn_api_key YOUR_API_KEY
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:3260
+    tn_portals 10.30.30.2:3260
     content images
     shared 1
-    use_multipath 1
+    tn_use_multipath 1
 ```
 
 **For Separate Portal Groups (Approach 2):**
 ```ini
 truenasplugin: truenas-storage
-    api_host 10.15.14.172
-    api_key YOUR_API_KEY
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:3260
-    portals 10.30.30.2:3260
+    tn_api_host 10.15.14.172
+    tn_api_key YOUR_API_KEY
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:3260
+    tn_portals 10.30.30.2:3260
     content images
     shared 1
-    use_multipath 1
+    tn_use_multipath 1
 ```
 
-**Note**: The plugin configuration is identical for both approaches. `discovery_portal` specifies the primary portal for discovery, `portals` lists additional portals.
+**Note**: The plugin configuration is identical for both approaches. `tn_discovery_portal` specifies the primary portal for discovery, `tn_portals` lists additional portals.
 
 #### Verification and Testing
 
@@ -783,10 +783,10 @@ Choose where to store VM memory state during live snapshots:
 
 ```ini
 # Local storage (better performance, default)
-vmstate_storage local
+tn_vmstate_storage local
 
 # Shared storage (required for migration with snapshots)
-vmstate_storage shared
+tn_vmstate_storage shared
 ```
 
 **Recommendations**:
@@ -801,7 +801,7 @@ Enable bulk API operations to batch multiple calls:
 
 ```ini
 # Enabled by default
-enable_bulk_operations 1
+tn_enable_bulk_operations 1
 ```
 
 Batches multiple API calls into single `core.bulk` request, reducing:
@@ -822,12 +822,12 @@ Configure retry behavior for TrueNAS API rate limits (20 calls/60s):
 
 ```ini
 # Aggressive retry (high-availability)
-api_retry_max 5
-api_retry_delay 2
+tn_api_retry_max 5
+tn_api_retry_delay 2
 
 # Conservative retry (development)
-api_retry_max 3
-api_retry_delay 1
+tn_api_retry_max 3
+tn_api_retry_delay 1
 ```
 
 **Retry Schedule** (with defaults):
@@ -876,13 +876,13 @@ The Proxmox Cluster File System (CFS) requires a lock on the storage configurati
 
 ```ini
 # Extended timeout for parallel operations (default: 120 seconds)
-storage_lock_timeout 120
+tn_storage_lock_timeout 120
 
 # For high-concurrency scenarios (8+ parallel operations)
-storage_lock_timeout 180
+tn_storage_lock_timeout 180
 
 # For very high concurrency (enterprise bulk provisioning)
-storage_lock_timeout 300
+tn_storage_lock_timeout 300
 ```
 
 **Timeout Calculation**:
@@ -921,7 +921,7 @@ Check for lock timeout issues:
 journalctl --since '30 minutes ago' | grep 'lock timeout'
 
 # View detailed operation logs with debug enabled
-debug 1  # In storage configuration
+tn_debug 1  # In storage configuration
 journalctl -u pvedaemon -f | grep TrueNAS
 ```
 
@@ -934,7 +934,7 @@ journalctl -u pvedaemon -f | grep TrueNAS
 **Resolution**:
 ```ini
 # Increase storage_lock_timeout in /etc/pve/storage.cfg
-storage_lock_timeout 240
+tn_storage_lock_timeout 240
 
 # Restart services to apply
 systemctl restart pvedaemon pveproxy
@@ -948,15 +948,15 @@ For Proxmox VE clusters, configure shared storage:
 
 ```ini
 truenasplugin: cluster-storage
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster
-    dataset tank/cluster/proxmox
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster
+    tn_dataset tank/cluster/proxmox
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
-    use_multipath 1
+    tn_use_multipath 1
 ```
 
 **Critical Settings**:
@@ -1031,23 +1031,23 @@ Configure for HA environments:
 
 ```ini
 truenasplugin: ha-storage
-    api_host truenas-vip.company.com  # Use VIP for TrueNAS HA
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
-    dataset tank/ha/proxmox
-    discovery_portal 192.168.100.10:3260
-    portals 192.168.100.11:3260,192.168.100.12:3260
+    tn_api_host truenas-vip.company.com  # Use VIP for TrueNAS HA
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
+    tn_dataset tank/ha/proxmox
+    tn_discovery_portal 192.168.100.10:3260
+    tn_portals 192.168.100.11:3260,192.168.100.12:3260
     shared 1
-    use_multipath 1
-    force_delete_on_inuse 1
-    logout_on_free 0
-    api_retry_max 5
+    tn_use_multipath 1
+    tn_force_delete_on_inuse 1
+    tn_logout_on_free 0
+    tn_api_retry_max 5
 ```
 
 **HA Considerations**:
-- Use TrueNAS virtual IP (VIP) for `api_host`
+- Use TrueNAS virtual IP (VIP) for `tn_api_host`
 - Configure multiple portals on different TrueNAS controllers
-- Enable `force_delete_on_inuse` for HA VM failover
+- Enable `tn_force_delete_on_inuse` for HA VM failover
 - Set `logout_on_free 0` to maintain persistent connections
 - Increase retry limits for HA failover tolerance
 
@@ -1091,8 +1091,8 @@ Update portal: **Portals** → Edit portal → **Discovery Auth Method**: CHAP
 ```ini
 truenasplugin: secure-storage
     # ... other settings ...
-    chap_user proxmox-chap
-    chap_password your-secure-chap-password
+    tn_chap_user proxmox-chap
+    tn_chap_password your-secure-chap-password
 ```
 
 #### 3. Restart Services
@@ -1108,8 +1108,8 @@ systemctl restart pvedaemon pveproxy
 Always use encrypted transport in production:
 
 ```ini
-api_scheme wss      # For WebSocket (TrueNAS 25.10+)
-api_insecure 0      # Verify TLS certificates
+tn_api_scheme wss      # For WebSocket (TrueNAS 25.10+)
+tn_api_insecure 0      # Verify TLS certificates
 ```
 
 #### API Key Management
@@ -1195,8 +1195,8 @@ qm start 100  # VM resumes exactly where it was
 
 **Configuration**:
 ```ini
-enable_live_snapshots 1
-vmstate_storage local  # Or 'shared'
+tn_enable_live_snapshots 1
+tn_vmstate_storage local  # Or 'shared'
 ```
 
 **Use Cases**:
@@ -1209,7 +1209,7 @@ vmstate_storage local  # Or 'shared'
 Proxmox 9.x+ supports volume-based snapshot chains:
 
 ```ini
-snapshot_volume_chains 1
+tn_snapshot_volume_chains 1
 ```
 
 **Benefits**:
@@ -1535,7 +1535,7 @@ Cleanup complete!
 Allow deletion of volumes even when target is in use:
 
 ```ini
-force_delete_on_inuse 1
+tn_force_delete_on_inuse 1
 ```
 
 **Use Case**:
@@ -1549,7 +1549,7 @@ force_delete_on_inuse 1
 Automatically logout from target when no LUNs remain:
 
 ```ini
-logout_on_free 1
+tn_logout_on_free 1
 ```
 
 **Use Case**:
@@ -1566,18 +1566,18 @@ Configure for IPv6 environments:
 
 ```ini
 truenasplugin: ipv6-storage
-    api_host 2001:db8::100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:ipv6
-    dataset tank/ipv6/proxmox
-    discovery_portal [2001:db8::100]:3260
-    portals [2001:db8::101]:3260,[2001:db8::102]:3260
+    tn_api_host 2001:db8::100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ipv6
+    tn_dataset tank/ipv6/proxmox
+    tn_discovery_portal [2001:db8::100]:3260
+    tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
     content images
     shared 1
-    prefer_ipv4 0
-    ipv6_by_path 1
-    use_by_path 1
-    use_multipath 1
+    tn_prefer_ipv4 0
+    tn_ipv6_by_path 1
+    tn_use_by_path 1
+    tn_use_multipath 1
 ```
 
 **Key Settings**:
@@ -1591,17 +1591,17 @@ Relaxed security for testing:
 
 ```ini
 truenasplugin: dev-storage
-    api_host 192.168.1.50
-    api_key 1-dev-key
-    api_scheme ws
-    api_port 80
-    api_insecure 1
-    target_iqn iqn.2005-10.org.freenas.ctl:dev
-    dataset tank/dev
-    discovery_portal 192.168.1.50:3260
+    tn_api_host 192.168.1.50
+    tn_api_key 1-dev-key
+    tn_api_scheme ws
+    tn_api_port 80
+    tn_api_insecure 1
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:dev
+    tn_dataset tank/dev
+    tn_discovery_portal 192.168.1.50:3260
     content images
     shared 0
-    use_multipath 0
+    tn_use_multipath 0
 ```
 
 **Warning**: Never use in production

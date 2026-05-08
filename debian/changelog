@@ -1,3 +1,12 @@
+truenas-proxmox-plugin (2.1.0+deb1) unstable; urgency=medium
+
+  * Rename all storage.cfg option keys to tn_* prefix to avoid namespace
+    collisions with other PVE storage plugins; postinst migration script
+    handles existing configs automatically (with backup) or prompts for
+    manual migration when upgrading from versions prior to 2.1.0.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 07 May 2026 15:00:00 +0000
+
 truenas-proxmox-plugin (2.0.30+deb1) unstable; urgency=medium
 
   * Reduce status latency and preserve operation-path safety (issue #30 phase 3):

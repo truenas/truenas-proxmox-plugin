@@ -10,11 +10,11 @@
 # =============================================================================
 # Simple single-node setup with minimal configuration using iSCSI
 truenasplugin: truenas-basic
-    api_host 192.168.1.100
-    api_key 1-abcdef1234567890abcdef1234567890abcdef12
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox-target
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-abcdef1234567890abcdef1234567890abcdef12
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox-target
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 
@@ -23,12 +23,12 @@ truenasplugin: truenas-basic
 # =============================================================================
 # Simple single-node setup using NVMe/TCP for lower latency
 truenasplugin: truenas-nvme
-    api_host 192.168.1.100
-    api_key 1-abcdef1234567890abcdef1234567890abcdef12
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:4420
+    tn_api_host 192.168.1.100
+    tn_api_key 1-abcdef1234567890abcdef1234567890abcdef12
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:4420
     content images
     shared 1
 
@@ -37,119 +37,119 @@ truenasplugin: truenas-nvme
 # =============================================================================
 # High-performance cluster setup with redundancy and optimization
 truenasplugin: truenas-cluster
-    api_host 192.168.10.100
-    api_key 1-fedcba0987654321fedcba0987654321fedcba09
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster-storage
-    dataset tank/cluster/proxmox
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_api_host 192.168.10.100
+    tn_api_key 1-fedcba0987654321fedcba0987654321fedcba09
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-storage
+    tn_dataset tank/cluster/proxmox
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
     # Node restriction (optional - omit for all nodes)
     # nodes pve01,pve02,pve03
     # Performance optimizations
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    use_multipath 1
-    vmstate_storage local
+    tn_use_multipath 1
+    tn_vmstate_storage local
     # Security
-    chap_user proxmox-cluster
-    chap_password your-secure-chap-password
+    tn_chap_user proxmox-cluster
+    tn_chap_password your-secure-chap-password
     # Advanced options
-    force_delete_on_inuse 1
-    logout_on_free 0
+    tn_force_delete_on_inuse 1
+    tn_logout_on_free 0
 
 # =============================================================================
 # HIGH AVAILABILITY CONFIGURATION
 # =============================================================================
 # Enterprise HA setup with all redundancy features enabled
 truenasplugin: truenas-ha
-    api_host truenas-vip.company.com
-    api_key 1-1234567890abcdef1234567890abcdef12345678
-    api_scheme https
-    api_port 443
-    api_insecure 0
-    target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
-    dataset tank/ha/proxmox
-    discovery_portal 192.168.100.10:3260
-    portals 192.168.100.11:3260,192.168.100.12:3260,192.168.101.10:3260,192.168.101.11:3260
+    tn_api_host truenas-vip.company.com
+    tn_api_key 1-1234567890abcdef1234567890abcdef12345678
+    tn_api_scheme https
+    tn_api_port 443
+    tn_api_insecure 0
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
+    tn_dataset tank/ha/proxmox
+    tn_discovery_portal 192.168.100.10:3260
+    tn_portals 192.168.100.11:3260,192.168.100.12:3260,192.168.101.10:3260,192.168.101.11:3260
     content images
     shared 1
     # Performance
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    use_multipath 1
-    vmstate_storage local
+    tn_use_multipath 1
+    tn_vmstate_storage local
     # Security
-    chap_user proxmox-ha
-    chap_password very-secure-password-here
+    tn_chap_user proxmox-ha
+    tn_chap_password very-secure-password-here
     # HA specific
-    force_delete_on_inuse 1
-    logout_on_free 0
-    prefer_ipv4 1
+    tn_force_delete_on_inuse 1
+    tn_logout_on_free 0
+    tn_prefer_ipv4 1
 
 # =============================================================================
 # DEVELOPMENT/TESTING CONFIGURATION
 # =============================================================================
 # Development setup with relaxed security for testing
 truenasplugin: truenas-dev
-    api_host 192.168.1.50
-    api_key 1-dev123456789abcdef123456789abcdef123456789
-    api_scheme http
-    api_port 80
-    api_insecure 1
-    target_iqn iqn.2005-10.org.freenas.ctl:dev-target
-    dataset tank/development
-    discovery_portal 192.168.1.50:3260
+    tn_api_host 192.168.1.50
+    tn_api_key 1-dev123456789abcdef123456789abcdef123456789
+    tn_api_scheme http
+    tn_api_port 80
+    tn_api_insecure 1
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:dev-target
+    tn_dataset tank/development
+    tn_discovery_portal 192.168.1.50:3260
     content images
     shared 0
     # Development settings
-    zvol_blocksize 64K
+    tn_zvol_blocksize 64K
     tn_sparse 1
-    use_multipath 0
-    vmstate_storage shared
-    enable_live_snapshots 1
+    tn_use_multipath 0
+    tn_vmstate_storage shared
+    tn_enable_live_snapshots 1
 
 # =============================================================================
 # IPv6 CONFIGURATION
 # =============================================================================
 # Configuration for IPv6 environments
 truenasplugin: truenas-ipv6
-    api_host 2001:db8::100
-    api_key 1-ipv6example1234567890abcdef1234567890abc
-    target_iqn iqn.2005-10.org.freenas.ctl:ipv6-target
-    dataset tank/ipv6/proxmox
-    discovery_portal [2001:db8::100]:3260
-    portals [2001:db8::101]:3260,[2001:db8::102]:3260
+    tn_api_host 2001:db8::100
+    tn_api_key 1-ipv6example1234567890abcdef1234567890abc
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ipv6-target
+    tn_dataset tank/ipv6/proxmox
+    tn_discovery_portal [2001:db8::100]:3260
+    tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
     content images
     shared 1
     # IPv6 specific
-    prefer_ipv4 0
-    ipv6_by_path 1
-    use_by_path 1
+    tn_prefer_ipv4 0
+    tn_ipv6_by_path 1
+    tn_use_by_path 1
     # Standard options
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    use_multipath 1
+    tn_use_multipath 1
 
 # =============================================================================
 # WEBSOCKET CONFIGURATION
 # =============================================================================
 # Optimized for WebSocket API performance
 truenasplugin: truenas-websocket
-    api_host 192.168.1.100
-    api_key 1-websocket123456789abcdef123456789abcdef12
-    api_scheme wss
-    api_port 443
-    target_iqn iqn.2005-10.org.freenas.ctl:ws-target
-    dataset tank/websocket
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-websocket123456789abcdef123456789abcdef12
+    tn_api_scheme wss
+    tn_api_port 443
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ws-target
+    tn_dataset tank/websocket
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
     # WebSocket optimizations
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    vmstate_storage local
+    tn_vmstate_storage local
 
 
 # =============================================================================
@@ -157,35 +157,35 @@ truenasplugin: truenas-websocket
 # =============================================================================
 # Secure NVMe/TCP setup with mutual authentication
 truenasplugin: truenas-nvme-secure
-    api_host 192.168.10.100
-    api_key 1-nvmesecure123456789abcdef123456789abcdef
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
-    dataset tank/proxmox
-    discovery_portal 192.168.10.100:4420
-    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
-    nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
-    api_scheme wss
-    api_port 443
+    tn_api_host 192.168.10.100
+    tn_api_key 1-nvmesecure123456789abcdef123456789abcdef
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.10.100:4420
+    tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+    tn_api_scheme wss
+    tn_api_port 443
     content images
     shared 1
-    zvol_blocksize 64K
+    tn_zvol_blocksize 64K
 
 # =============================================================================
 # NVME/TCP MULTIPATH CONFIGURATION
 # =============================================================================
 # High-availability NVMe/TCP with multiple paths
 truenasplugin: truenas-nvme-multipath
-    api_host 192.168.10.100
-    api_key 1-nvmemulti123456789abcdef123456789abcdef12
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
-    dataset tank/proxmox
-    discovery_portal 192.168.10.100:4420
-    portals 192.168.10.101:4420,192.168.10.102:4420
+    tn_api_host 192.168.10.100
+    tn_api_key 1-nvmemulti123456789abcdef123456789abcdef12
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.10.100:4420
+    tn_portals 192.168.10.101:4420,192.168.10.102:4420
     content images
     shared 1
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
 
 # =============================================================================
@@ -193,21 +193,21 @@ truenasplugin: truenas-nvme-multipath
 # =============================================================================
 # Single TrueNAS server, small cluster (2-3 nodes)
 truenasplugin: truenas-soho
-    api_host truenas.local
-    api_key 1-soho123456789abcdef123456789abcdef1234567
-    target_iqn iqn.2005-10.org.freenas.ctl:office
-    dataset tank/office
-    discovery_portal truenas.local:3260
+    tn_api_host truenas.local
+    tn_api_key 1-soho123456789abcdef123456789abcdef1234567
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:office
+    tn_dataset tank/office
+    tn_discovery_portal truenas.local:3260
     content images
     shared 1
     # SOHO optimizations
-    zvol_blocksize 64K
+    tn_zvol_blocksize 64K
     tn_sparse 1
-    use_multipath 0
-    vmstate_storage local
+    tn_use_multipath 0
+    tn_vmstate_storage local
     # Simple security
-    chap_user office
-    chap_password office-password
+    tn_chap_user office
+    tn_chap_password office-password
 
 # =============================================================================
 # CONFIGURATION NOTES
@@ -254,7 +254,7 @@ truenasplugin: truenas-soho
 # Security:
 # - iSCSI: Use CHAP authentication in production
 # - NVMe/TCP: Use DH-CHAP secrets for authentication
-# - Disable api_insecure in production
+# - Disable tn_api_insecure in production
 # - Use dedicated VLANs for storage traffic
 #
 # Performance:

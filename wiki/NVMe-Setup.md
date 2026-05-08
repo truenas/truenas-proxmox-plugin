@@ -155,12 +155,12 @@ Edit `/etc/pve/storage.cfg` to add NVMe/TCP storage:
 **Minimal Configuration:**
 ```ini
 truenasplugin: truenas-nvme
-    api_host 10.15.14.172
-    api_key 2-YourAPIKeyHere
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:4420
+    tn_api_host 10.15.14.172
+    tn_api_key 2-YourAPIKeyHere
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:4420
     content images
     shared 1
 ```
@@ -168,17 +168,17 @@ truenasplugin: truenas-nvme
 **With Optional Parameters:**
 ```ini
 truenasplugin: truenas-nvme
-    api_host 10.15.14.172
-    api_key 2-YourAPIKeyHere
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:4420
-    api_scheme wss
-    api_port 443
-    api_insecure 1
-    zvol_blocksize 64K
+    tn_api_host 10.15.14.172
+    tn_api_key 2-YourAPIKeyHere
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:4420
+    tn_api_scheme wss
+    tn_api_port 443
+    tn_api_insecure 1
+    tn_zvol_blocksize 64K
     content images
     shared 1
 ```
@@ -187,18 +187,18 @@ truenasplugin: truenas-nvme
 
 | Parameter | Required | Description | Default |
 |-----------|----------|-------------|---------|
-| `transport_mode` | Yes | Must be `nvme-tcp` for NVMe/TCP | `iscsi` |
-| `subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
-| `hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
-| `discovery_portal` | Yes | Primary portal IP:port | None |
-| `nvme_dhchap_secret` | No | Host authentication secret | None |
-| `nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
+| `tn_transport_mode` | Yes | Must be `nvme-tcp` for NVMe/TCP | `iscsi` |
+| `tn_subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
+| `tn_hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
+| `tn_discovery_portal` | Yes | Primary portal IP:port | None |
+| `tn_nvme_dhchap_secret` | No | Host authentication secret | None |
+| `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
 
 **Important Notes:**
 - TrueNAS 25.10+ is required for NVMe-oF operations
 - The default port for NVMe/TCP is `4420` (different from iSCSI's `3260`)
 - TrueNAS SCALE 25.10+ automatically uses port 4420; manual specification is optional
-- `subsystem_nqn` cannot be changed after creation (prevents orphaned volumes)
+- `tn_subsystem_nqn` cannot be changed after creation (prevents orphaned volumes)
 
 ### Verify Connection
 
@@ -246,17 +246,17 @@ NVMe/TCP supports native multipath for high availability and increased bandwidth
 
 ### Proxmox Multipath Storage Configuration
 
-Add additional portals using the `portals` parameter:
+Add additional portals using the `tn_portals` parameter:
 
 ```ini
 truenasplugin: truenas-nvme-multipath
-    api_host 10.15.14.172
-    api_key 2-YourAPIKeyHere
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:4420
-    portals 10.15.14.173:4420,10.15.14.174:4420
+    tn_api_host 10.15.14.172
+    tn_api_key 2-YourAPIKeyHere
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:4420
+    tn_portals 10.15.14.173:4420,10.15.14.174:4420
     content images
     shared 1
 ```
@@ -327,7 +327,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 ```
 
 **Parameters:**
-- `hostnqn`: The Proxmox host's NQN (from `/etc/nvme/hostnqn`)
+- `tn_hostnqn`: The Proxmox host's NQN (from `/etc/nvme/hostnqn`)
 - `dhchap_key`: Host secret (Proxmox authenticates to TrueNAS)
 - `dhchap_ctrl_key`: Controller secret (TrueNAS authenticates to Proxmox) - optional
 - `dhchap_hash`: Hash algorithm (`SHA-256`, `SHA-384`, or `SHA-512`)
@@ -361,13 +361,13 @@ Add the secrets to Proxmox storage.cfg:
 **Unidirectional Authentication (Host Only):**
 ```ini
 truenasplugin: truenas-nvme-secure
-    api_host 10.15.14.172
-    api_key 2-YourAPIKeyHere
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:4420
-    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    tn_api_host 10.15.14.172
+    tn_api_key 2-YourAPIKeyHere
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:4420
+    tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
     content images
     shared 1
 ```
@@ -375,14 +375,14 @@ truenasplugin: truenas-nvme-secure
 **Bidirectional Authentication (Host + Controller):**
 ```ini
 truenasplugin: truenas-nvme-mutual
-    api_host 10.15.14.172
-    api_key 2-YourAPIKeyHere
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-mutual
-    dataset tank/proxmox
-    discovery_portal 10.15.14.172:4420
-    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
-    nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+    tn_api_host 10.15.14.172
+    tn_api_key 2-YourAPIKeyHere
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-mutual
+    tn_dataset tank/proxmox
+    tn_discovery_portal 10.15.14.172:4420
+    tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
     content images
     shared 1
 ```
@@ -404,7 +404,7 @@ Migrating from iSCSI to NVMe/TCP requires creating new storage and moving VM dis
 
 ### Why In-Place Migration Isn't Possible
 
-- `transport_mode` is marked as `fixed` (cannot be changed after creation)
+- `tn_transport_mode` is marked as `fixed` (cannot be changed after creation)
 - Volume naming formats are incompatible:
   - iSCSI: `vol-<zname>-lun<LUN>`
   - NVMe: `vol-<zname>-ns<UUID>`
@@ -418,12 +418,12 @@ Migrating from iSCSI to NVMe/TCP requires creating new storage and moving VM dis
    ```ini
    # Existing iSCSI storage
    truenasplugin: truenas-iscsi
-       transport_mode iscsi
+       tn_transport_mode iscsi
        ...
 
    # New NVMe/TCP storage
    truenasplugin: truenas-nvme
-       transport_mode nvme-tcp
+       tn_transport_mode nvme-tcp
        ...
    ```
 
@@ -478,9 +478,9 @@ Migrating from iSCSI to NVMe/TCP requires creating new storage and moving VM dis
 
 **ZFS Block Size:**
 ```ini
-zvol_blocksize 64K  # Default - good for general workloads
-zvol_blocksize 16K  # Better for database workloads (small random I/O)
-zvol_blocksize 128K # Better for sequential I/O (media, backups)
+tn_zvol_blocksize 64K  # Default - good for general workloads
+tn_zvol_blocksize 16K  # Better for database workloads (small random I/O)
+tn_zvol_blocksize 128K # Better for sequential I/O (media, backups)
 ```
 
 **Network Tuning:**
@@ -536,7 +536,7 @@ cat /etc/nvme/hostnqn
 ```
 
 **Error: "No portals configured for NVMe/TCP storage"**
-- Check storage.cfg for `discovery_portal` parameter
+- Check storage.cfg for `tn_discovery_portal` parameter
 - Verify format: `IP:PORT` (e.g., `10.15.14.172:4420`)
 
 **Error: "Failed to connect to any NVMe/TCP portal"**
@@ -614,7 +614,7 @@ nvme list | grep TrueNAS
 Verify NGUID matching (requires debug logging):
 ```bash
 # Enable debug logging in /etc/pve/storage.cfg:
-debug 2
+tn_debug 2
 
 # Watch device matching process
 journalctl -f | grep '\[TrueNAS\].*nvme_find_device'

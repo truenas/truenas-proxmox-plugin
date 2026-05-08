@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.0 (May 7, 2026)
+
+### Breaking Change
+
+- **Rename all storage.cfg keys to tn_* prefix**: All plugin-defined option keys now carry a `tn_` prefix (e.g. `api_host` → `tn_api_host`, `dataset` → `tn_dataset`) to prevent namespace collisions with other PVE storage plugins. The `debian/postinst` migration script automatically renames keys in existing `truenasplugin:` stanzas on upgrade (with backup), or prompts for manual migration. Only `truenasplugin:` stanzas are touched — no other storage type is affected.
+
+---
+
 ## Version 2.0.30 (April 18, 2026)
 
 ### Performance

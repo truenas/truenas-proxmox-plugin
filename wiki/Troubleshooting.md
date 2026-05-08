@@ -405,11 +405,11 @@ nano /etc/pve/storage.cfg
 
 # Add configuration manually:
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -474,10 +474,10 @@ openssl s_client -connect YOUR_TRUENAS_IP:443 -showcerts </dev/null
 
 # Check for certificate errors (self-signed, expired, etc.)
 
-# If using self-signed certificate, set api_insecure=1 for testing:
+# If using self-signed certificate, set tn_api_insecure=1 for testing:
 nano /etc/pve/storage.cfg
 # Add to storage configuration:
-api_insecure 1
+tn_api_insecure 1
 
 # For production, import TrueNAS certificate to Proxmox trust store
 # Copy TrueNAS CA cert to Proxmox:
@@ -492,9 +492,9 @@ api_insecure 1
 grep -E "api_scheme" /etc/pve/storage.cfg
 
 # Must be:
-api_scheme wss  # for secure WebSocket (recommended)
+tn_api_scheme wss  # for secure WebSocket (recommended)
 # OR
-api_scheme ws   # for insecure WebSocket (testing only)
+tn_api_scheme ws   # for insecure WebSocket (testing only)
 
 # Common mistake: Using http/https scheme instead of ws/wss
 # WRONG:
@@ -761,9 +761,9 @@ iptables -L -n | grep 443
 
 #### 3. Verify TLS Configuration
 ```bash
-# If using self-signed cert, use api_insecure=1 (testing only)
+# If using self-signed cert, use tn_api_insecure=1 (testing only)
 # In /etc/pve/storage.cfg:
-api_insecure 1
+tn_api_insecure 1
 
 # Production: import TrueNAS cert or use valid CA cert
 ```
@@ -786,14 +786,14 @@ tail -f /var/log/middlewared.log | grep rate
 #### 2. Increase Retry Delay
 ```ini
 # In /etc/pve/storage.cfg
-api_retry_max 5
-api_retry_delay 3
+tn_api_retry_max 5
+tn_api_retry_delay 3
 ```
 
 #### 3. Enable Bulk Operations
 ```ini
 # Batch multiple operations to reduce API calls
-enable_bulk_operations 1
+tn_enable_bulk_operations 1
 ```
 
 ## iSCSI Discovery and Connection Issues
@@ -862,7 +862,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 #### 2. Check IQN Match
 ```bash
 # In /etc/pve/storage.cfg, IQN must match exactly:
-target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
 
 # Copy IQN from TrueNAS target configuration
 ```
@@ -904,8 +904,8 @@ iscsiadm -m session
 ```bash
 # If using CHAP, verify credentials match
 # In /etc/pve/storage.cfg:
-chap_user your-username
-chap_password your-password
+tn_chap_user your-username
+tn_chap_password your-password
 
 # Must match TrueNAS: Shares > iSCSI > Authorized Access
 ```
@@ -990,7 +990,7 @@ cat /etc/nvme/hostnqn
 nano /etc/pve/storage.cfg
 
 # Add to NVMe storage configuration:
-hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
+tn_hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
 ```
 
 ### "Failed to connect to any NVMe/TCP portal"
@@ -1071,7 +1071,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 grep discovery_portal /etc/pve/storage.cfg
 
 # For NVMe/TCP, should be IP:4420 (not 3260)
-discovery_portal 192.168.1.100:4420
+tn_discovery_portal 192.168.1.100:4420
 
 # Verify subsystem_nqn is correctly formatted
 grep subsystem_nqn /etc/pve/storage.cfg
@@ -1255,7 +1255,7 @@ dmesg | grep -i "nvme.*namespace"
 ```bash
 # Enable debug logging to see matching details
 # In /etc/pve/storage.cfg:
-debug 2
+tn_debug 2
 
 # Then check logs for device matching
 journalctl -f | grep '\[TrueNAS\].*nvme_find_device'
@@ -1333,7 +1333,7 @@ nano /etc/pve/storage.cfg
 # Find your NVMe storage configuration
 # Verify WebSocket scheme:
 truenasplugin: truenas-nvme
-    api_scheme wss
+    tn_api_scheme wss
     # ... other parameters
 
 # Restart Proxmox services
@@ -1425,7 +1425,7 @@ zfs destroy tank/proxmox/vm-999-disk-0
 ```bash
 # Add more storage to pool or use larger pool
 # Or change dataset in /etc/pve/storage.cfg:
-dataset tank/larger-pool/proxmox
+tn_dataset tank/larger-pool/proxmox
 ```
 
 ### "Unable to find free disk name after 1000 attempts"
@@ -1655,7 +1655,7 @@ zfs list tank/proxmox
 ```bash
 # If using live snapshots, check vmstate storage
 # In /etc/pve/storage.cfg:
-vmstate_storage local
+tn_vmstate_storage local
 
 # Ensure local storage has space for RAM dump
 df -h /var/lib/vz
@@ -1700,14 +1700,14 @@ zfs list -t snapshot | grep vm-100
 #### 1. Optimize ZFS Block Size
 ```ini
 # In /etc/pve/storage.cfg
-zvol_blocksize 128K
+tn_zvol_blocksize 128K
 ```
 
 #### 2. Enable Multipath
 ```ini
 # Use multiple portals for load balancing
-portals 192.168.1.101:3260,192.168.1.102:3260
-use_multipath 1
+tn_portals 192.168.1.101:3260,192.168.1.102:3260
+tn_use_multipath 1
 ```
 
 #### 3. Network Optimization
@@ -1886,7 +1886,7 @@ ls -la /dev/disk/by-id/nvme-uuid.*
 
 # Enable debug logging to see device wait process
 # In /etc/pve/storage.cfg:
-debug 2
+tn_debug 2
 
 # Then check logs during migration
 journalctl -f | grep '\[TrueNAS\].*activate_volume'
@@ -1950,11 +1950,11 @@ The plugin has built-in debug logging with configurable verbosity levels. All lo
 ```ini
 # In /etc/pve/storage.cfg, add debug level to your storage entry:
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
+    tn_api_host 192.168.1.100
     # ... other parameters ...
-    debug 1    # Light debug (function calls)
+    tn_debug 1    # Light debug (function calls)
     # OR
-    debug 2    # Verbose debug (full API trace with parameters/responses)
+    tn_debug 2    # Verbose debug (full API trace with parameters/responses)
 ```
 
 **Debug Levels**:

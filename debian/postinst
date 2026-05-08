@@ -3,6 +3,7 @@
 set -e
 
 PLUGIN_PATH="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+STORAGE_CFG="/etc/pve/storage.cfg"
 
 restart_proxmox_services() {
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -13,6 +14,98 @@ restart_proxmox_services() {
     fi
 }
 
+_do_migrate() {
+    local backup="${STORAGE_CFG}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$STORAGE_CFG" "$backup"
+    echo "  Backup: $backup"
+
+    perl -i -pe '
+        BEGIN { our $in_stanza = 0 }
+        if (/^truenasplugin:/) { $in_stanza = 1 }
+        elsif (/^\S/)           { $in_stanza = 0 }
+        if ($in_stanza) {
+            s/^(\s+)(api_host)(\s)/${1}tn_api_host${3}/;
+            s/^(\s+)(api_key)(\s)/${1}tn_api_key${3}/;
+            s/^(\s+)(api_scheme)(\s)/${1}tn_api_scheme${3}/;
+            s/^(\s+)(api_transport)(\s)/${1}tn_api_transport${3}/;
+            s/^(\s+)(api_port)(\s)/${1}tn_api_port${3}/;
+            s/^(\s+)(api_insecure)(\s)/${1}tn_api_insecure${3}/;
+            s/^(\s+)(api_retry_max)(\s)/${1}tn_api_retry_max${3}/;
+            s/^(\s+)(api_retry_delay)(\s)/${1}tn_api_retry_delay${3}/;
+            s/^(\s+)(prefer_ipv4)(\s)/${1}tn_prefer_ipv4${3}/;
+            s/^(\s+)(dataset)(\s)/${1}tn_dataset${3}/;
+            s/^(\s+)(zvol_blocksize)(\s)/${1}tn_zvol_blocksize${3}/;
+            s/^(\s+)(compression)(\s)/${1}tn_compression${3}/;
+            s/^(\s+)(transport_mode)(\s)/${1}tn_transport_mode${3}/;
+            s/^(\s+)(target_iqn)(\s)/${1}tn_target_iqn${3}/;
+            s/^(\s+)(discovery_portal)(\s)/${1}tn_discovery_portal${3}/;
+            s/^(\s+)(portals)(\s)/${1}tn_portals${3}/;
+            s/^(\s+)(use_multipath)(\s)/${1}tn_use_multipath${3}/;
+            s/^(\s+)(force_delete_on_inuse)(\s)/${1}tn_force_delete_on_inuse${3}/;
+            s/^(\s+)(logout_on_free)(\s)/${1}tn_logout_on_free${3}/;
+            s/^(\s+)(use_by_path)(\s)/${1}tn_use_by_path${3}/;
+            s/^(\s+)(ipv6_by_path)(\s)/${1}tn_ipv6_by_path${3}/;
+            s/^(\s+)(chap_user)(\s)/${1}tn_chap_user${3}/;
+            s/^(\s+)(chap_password)(\s)/${1}tn_chap_password${3}/;
+            s/^(\s+)(subsystem_nqn)(\s)/${1}tn_subsystem_nqn${3}/;
+            s/^(\s+)(hostnqn)(\s)/${1}tn_hostnqn${3}/;
+            s/^(\s+)(nvme_dhchap_secret)(\s)/${1}tn_nvme_dhchap_secret${3}/;
+            s/^(\s+)(nvme_dhchap_ctrl_secret)(\s)/${1}tn_nvme_dhchap_ctrl_secret${3}/;
+            s/^(\s+)(enable_live_snapshots)(\s)/${1}tn_enable_live_snapshots${3}/;
+            s/^(\s+)(snapshot_volume_chains)(\s)/${1}tn_snapshot_volume_chains${3}/;
+            s/^(\s+)(vmstate_storage)(\s)/${1}tn_vmstate_storage${3}/;
+            s/^(\s+)(enable_bulk_operations)(\s)/${1}tn_enable_bulk_operations${3}/;
+            s/^(\s+)(storage_lock_timeout)(\s)/${1}tn_storage_lock_timeout${3}/;
+            s/^(\s+)(debug)(\s)/${1}tn_debug${3}/;
+            s/^(\s+)(device_ready_retries)(\s)/${1}tn_device_ready_retries${3}/;
+        }
+    ' "$STORAGE_CFG"
+
+    echo "  Migration complete."
+}
+
+migrate_storage_cfg() {
+    local old_version="$1"
+
+    # Only migrate when upgrading from a pre-2.1.0 version
+    dpkg --compare-versions "$old_version" lt "2.1.0" 2>/dev/null || return 0
+
+    [ -f "$STORAGE_CFG" ] || return 0
+
+    # Stanza-scoped detection: check for old key names only within truenasplugin: blocks
+    local KEYS="api_host|api_key|api_scheme|api_transport|api_port|api_insecure|api_retry_max|api_retry_delay|prefer_ipv4|dataset|zvol_blocksize|compression|transport_mode|target_iqn|discovery_portal|portals|use_multipath|force_delete_on_inuse|logout_on_free|use_by_path|ipv6_by_path|chap_user|chap_password|subsystem_nqn|hostnqn|nvme_dhchap_secret|nvme_dhchap_ctrl_secret|enable_live_snapshots|snapshot_volume_chains|vmstate_storage|enable_bulk_operations|storage_lock_timeout|debug|device_ready_retries"
+    perl -ne '
+        if (/^truenasplugin:/) { $in=1 } elsif (/^\S/) { $in=0 }
+        exit(0) if $in && /^\s+('"$KEYS"')\s/;
+        END { exit(1) }
+    ' "$STORAGE_CFG" || return 0
+
+    echo ""
+    echo "=== TrueNAS Plugin: storage.cfg migration required ==="
+    echo "Config keys in truenasplugin: stanzas must be renamed (tn_* prefix)."
+    echo "Affected lines:"
+    perl -ne '
+        if (/^truenasplugin:/) { $in=1; $f=$.." " } elsif (/^\S/) { $in=0 }
+        print "  $ARGV:$.: $_" if $in && /^\s+('"$KEYS"')\s/;
+    ' "$STORAGE_CFG"
+    echo ""
+
+    if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
+        echo "Non-interactive mode: auto-migrating."
+        _do_migrate
+        return
+    fi
+
+    printf "  [A] Auto-migrate (backup created first)\n"
+    printf "  [M] Skip - I will update manually\n"
+    printf "Choice [A/m]: "
+    read -r answer </dev/tty || answer="a"
+    case "${answer:-a}" in
+        [Mm]) echo "Skipped. Edit $STORAGE_CFG manually before restarting pvedaemon." ;;
+        *)    _do_migrate ;;
+    esac
+}
+
 case "$1" in
     configure)
         if [ ! -f "$PLUGIN_PATH" ]; then
@@ -21,6 +114,11 @@ case "$1" in
         fi
 
         perl -c "$PLUGIN_PATH" >/dev/null
+
+        if [ -n "$2" ]; then
+            migrate_storage_cfg "$2"
+        fi
+
         restart_proxmox_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure|triggered)

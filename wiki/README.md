@@ -120,7 +120,7 @@ pvesm status
 ```ini
 # /etc/pve/storage.cfg
 truenasplugin: storage-name
-    api_host 192.168.1.100
+    tn_api_host 192.168.1.100
 ```
 
 **Example Output**:
@@ -170,6 +170,6 @@ For issues not covered in documentation:
 
 ## Version Information
 
-**Version**: 2.0.30
-**Last Updated**: April 18, 2026
+**Version**: 2.1.0
+**Last Updated**: May 7, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

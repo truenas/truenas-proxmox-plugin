@@ -150,12 +150,12 @@ Add to `/etc/pve/storage.cfg`:
 
 ```ini
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    api_insecure 1
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_api_insecure 1
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -171,12 +171,12 @@ For lower latency and reduced CPU overhead, use NVMe/TCP instead of iSCSI:
 
 ```ini
 truenasplugin: truenas-nvme
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:4420
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:4420
     content images
     shared 1
 ```
@@ -325,6 +325,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.0.30
-**Last Updated**: April 18, 2026
+**Version**: 2.1.0
+**Last Updated**: May 7, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

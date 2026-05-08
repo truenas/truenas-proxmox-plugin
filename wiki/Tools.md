@@ -339,16 +339,16 @@ The plugin includes a 3-level debug logging system that can be enabled without c
 
 ### Configuration
 
-Edit `/etc/pve/storage.cfg` and add the `debug` parameter:
+Edit `/etc/pve/storage.cfg` and add the `tn_debug` parameter:
 
 ```ini
 truenasplugin: tnscale
-        api_host 10.15.14.172
-        api_key xxxxx
-        dataset pve_test/pve-storage
-        target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-        discovery_portal 10.15.14.172
-        debug 1
+        tn_api_host 10.15.14.172
+        tn_api_key xxxxx
+        tn_dataset pve_test/pve-storage
+        tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+        tn_discovery_portal 10.15.14.172
+        tn_debug 1
 ```
 
 **Available Values**:

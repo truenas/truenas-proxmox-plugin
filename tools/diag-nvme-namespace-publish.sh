@@ -48,14 +48,14 @@ die "Storage '"$STORAGE_ID"' not found\n" unless $scfg;
 print encode_json($scfg);
 ' 2>&1) || { echo "ERROR: $SCFG"; exit 1; }
 
-TRANSPORT=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{transport_mode}//"iscsi"')
+TRANSPORT=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{tn_transport_mode}//"iscsi"')
 if [[ "$TRANSPORT" != "nvme-tcp" ]]; then
-    echo "ERROR: Storage $STORAGE_ID uses transport_mode=$TRANSPORT, not nvme-tcp"
+    echo "ERROR: Storage $STORAGE_ID uses tn_transport_mode=$TRANSPORT, not nvme-tcp"
     exit 1
 fi
 
-SUBSYSTEM_NQN=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{subsystem_nqn}//"?"')
-DATASET=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{dataset}//"?"')
+SUBSYSTEM_NQN=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{tn_subsystem_nqn}//"?"')
+DATASET=$(echo "$SCFG" | perl -MJSON::PP -e '$s=decode_json(<STDIN>); print $s->{tn_dataset}//"?"')
 echo "  Storage ID:     $STORAGE_ID"
 echo "  Transport:      $TRANSPORT"
 echo "  Subsystem NQN:  $SUBSYSTEM_NQN"
@@ -99,7 +99,7 @@ my $cfg = PVE::Storage::config();
 my $scfg = $cfg->{ids}{"'"$STORAGE_ID"'"};
 
 my $subsys = PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, "nvmet.subsys.query", [
-    [["subnqn", "=", $scfg->{subsystem_nqn}]]
+    [["subnqn", "=", $scfg->{tn_subsystem_nqn}]]
 ]);
 if (!$subsys || !@$subsys) {
     print "  ERROR: Subsystem not found on TrueNAS!\n";
@@ -186,7 +186,7 @@ use JSON::PP;
 use Time::HiRes qw(time usleep);
 my $cfg = PVE::Storage::config();
 my $scfg = $cfg->{ids}{"'"$STORAGE_ID"'"};
-my $dataset = $scfg->{dataset};
+my $dataset = $scfg->{tn_dataset};
 my $zvol_name = "'"$DIAG_ZVOL_SUFFIX"'";
 my $full_ds = "$dataset/$zvol_name";
 my $zvol_path = "zvol/$full_ds";
@@ -198,7 +198,7 @@ if ($@) { print "  ERROR creating zvol: $@\n"; exit 1; }
 
 # Get subsystem ID
 my $subsystems = PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, "nvmet.subsys.query", [
-    [["subnqn", "=", $scfg->{subsystem_nqn}]]
+    [["subnqn", "=", $scfg->{tn_subsystem_nqn}]]
 ]);
 my $subsys_id = $subsystems->[0]{id};
 

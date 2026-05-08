@@ -361,10 +361,10 @@ get_storage_config() {
     local config_file="/etc/pve/storage.cfg"
 
     local api_host api_key dataset api_insecure
-    api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_host" | awk '{print $2}' | head -1)
-    api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_key" | awk '{print $2}' | head -1)
-    dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "dataset" | awk '{print $2}' | head -1)
-    api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_insecure" | awk '{print $2}' | head -1)
+    api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_host" | awk '{print $2}' | head -1)
+    api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_key" | awk '{print $2}' | head -1)
+    dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_dataset" | awk '{print $2}' | head -1)
+    api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_insecure" | awk '{print $2}' | head -1)
 
     echo "$api_host|$api_key|$dataset|$api_insecure"
 }
@@ -386,9 +386,9 @@ tn_api_call() {
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
         };
         my $params = eval { decode_json($params_json) } // [];
         my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, $method, $params); };
@@ -416,9 +416,9 @@ tn_api_call_write() {
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
         };
         my $params = eval { decode_json($params_json) } // [];
         my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params); };
@@ -3853,11 +3853,11 @@ test_transport_mode_verification() {
                 break
             fi
 
-            if [[ "$line" =~ ^[[:space:]]*transport_mode[[:space:]]+(.+)$ ]]; then
+            if [[ "$line" =~ ^[[:space:]]*tn_transport_mode[[:space:]]+(.+)$ ]]; then
                 transport_mode="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*target_iqn[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_target_iqn[[:space:]]+(.+)$ ]]; then
                 target_iqn="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*subsystem_nqn[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
                 subsystem_nqn="${BASH_REMATCH[1]}"
             fi
         fi
@@ -4902,13 +4902,13 @@ test_dataset_property_inheritance() {
                 break
             fi
 
-            if [[ "$line" =~ ^[[:space:]]*api_host[[:space:]]+(.+)$ ]]; then
+            if [[ "$line" =~ ^[[:space:]]*tn_api_host[[:space:]]+(.+)$ ]]; then
                 api_host="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*api_key[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_api_key[[:space:]]+(.+)$ ]]; then
                 api_key="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*dataset[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_dataset[[:space:]]+(.+)$ ]]; then
                 dataset="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*api_insecure[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_api_insecure[[:space:]]+(.+)$ ]]; then
                 api_insecure="${BASH_REMATCH[1]}"
             fi
         fi
@@ -5054,9 +5054,9 @@ test_nvme_stale_recovery() {
                 break
             fi
 
-            if [[ "$line" =~ ^[[:space:]]*transport_mode[[:space:]]+(.+)$ ]]; then
+            if [[ "$line" =~ ^[[:space:]]*tn_transport_mode[[:space:]]+(.+)$ ]]; then
                 transport_mode="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*subsystem_nqn[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
                 subsystem_nqn="${BASH_REMATCH[1]}"
             fi
         fi

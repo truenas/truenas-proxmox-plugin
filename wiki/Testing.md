@@ -574,12 +574,12 @@ Use test suite to benchmark different configurations:
 
 ```bash
 # Test with 64K blocks
-# Edit /etc/pve/storage.cfg: zvol_blocksize 64K
+# Edit /etc/pve/storage.cfg: tn_zvol_blocksize 64K
 # systemctl restart pvedaemon pveproxy
 ./tools/dev-truenas-plugin-full-function-test.sh test-64k -y > bench-64k.log
 
 # Test with 128K blocks
-# Edit /etc/pve/storage.cfg: zvol_blocksize 128K
+# Edit /etc/pve/storage.cfg: tn_zvol_blocksize 128K
 # systemctl restart pvedaemon pveproxy
 ./tools/dev-truenas-plugin-full-function-test.sh test-128k -y > bench-128k.log
 

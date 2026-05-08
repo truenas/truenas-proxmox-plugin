@@ -93,12 +93,12 @@ tn_api_call() {
         my ($host, $api_key, $method, $params_json, $api_port, $api_insecure, $api_scheme) = @ARGV;
 
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => int($api_insecure // 1),
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => int($api_insecure // 1),
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
-        $scfg->{api_scheme} = $api_scheme if $api_scheme;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_scheme} = $api_scheme if $api_scheme;
 
         my $params = eval { decode_json($params_json) } // [];
 
@@ -149,12 +149,12 @@ tn_api_call_write() {
         my ($host, $api_key, $method, $params_json, $api_port, $api_insecure, $api_scheme) = @ARGV;
 
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => int($api_insecure // 1),
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => int($api_insecure // 1),
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
-        $scfg->{api_scheme} = $api_scheme if $api_scheme;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_scheme} = $api_scheme if $api_scheme;
 
         my $params = eval { decode_json($params_json) };
         if ($@ || !defined $params) {
@@ -209,7 +209,7 @@ list_nvme_storages() {
     local name
     for name in $all_storages; do
         local mode
-        mode=$(get_storage_value "$name" "transport_mode")
+        mode=$(get_storage_value "$name" "tn_transport_mode")
         if [[ "$mode" == "nvme-tcp" ]]; then
             echo "$name"
         fi
@@ -344,13 +344,13 @@ discover() {
     info "Reading NVMe-TCP storage configurations..."
     while read -r name; do
         STORAGE_NAMES+=("$name")
-        STORAGE_HOST["$name"]=$(get_storage_value "$name" "api_host")
-        STORAGE_KEY["$name"]=$(get_storage_value "$name" "api_key")
-        STORAGE_NQN["$name"]=$(get_storage_value "$name" "subsystem_nqn")
-        STORAGE_DATASET["$name"]=$(get_storage_value "$name" "dataset")
-        STORAGE_PORT["$name"]=$(get_storage_value "$name" "api_port")
-        STORAGE_INSECURE["$name"]=$(get_storage_value "$name" "api_insecure")
-        STORAGE_SCHEME["$name"]=$(get_storage_value "$name" "api_scheme")
+        STORAGE_HOST["$name"]=$(get_storage_value "$name" "tn_api_host")
+        STORAGE_KEY["$name"]=$(get_storage_value "$name" "tn_api_key")
+        STORAGE_NQN["$name"]=$(get_storage_value "$name" "tn_subsystem_nqn")
+        STORAGE_DATASET["$name"]=$(get_storage_value "$name" "tn_dataset")
+        STORAGE_PORT["$name"]=$(get_storage_value "$name" "tn_api_port")
+        STORAGE_INSECURE["$name"]=$(get_storage_value "$name" "tn_api_insecure")
+        STORAGE_SCHEME["$name"]=$(get_storage_value "$name" "tn_api_scheme")
 
         printf '  %b•%b %-25s dataset=%-30s nqn=%s\n' "$c6" "$c0" "$name" \
             "${STORAGE_DATASET[$name]}" "${STORAGE_NQN[$name]}"

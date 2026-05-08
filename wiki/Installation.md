@@ -713,11 +713,11 @@ Add storage configuration to `/etc/pve/storage.cfg`:
 
 ```ini
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -779,15 +779,15 @@ The storage configuration in `/etc/pve/storage.cfg` is automatically shared acro
 
 ```ini
 truenasplugin: cluster-storage
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster
-    dataset tank/cluster/proxmox
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster
+    tn_dataset tank/cluster/proxmox
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
-    use_multipath 1
+    tn_use_multipath 1
 ```
 
 #### 4. Verify Cluster Installation
@@ -919,8 +919,8 @@ Navigate to **Shares** → **Block Shares (iSCSI)** → **Authorized Access**:
 ```ini
 truenasplugin: truenas-storage
     # ... other settings ...
-    chap_user your-chap-username
-    chap_password your-chap-password
+    tn_chap_user your-chap-username
+    tn_chap_password your-chap-password
 ```
 
 ### 7. Verify TrueNAS Configuration

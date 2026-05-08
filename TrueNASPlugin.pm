@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.0.30';
+our $VERSION = '2.1.0';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 13;
 use JSON::PP qw(encode_json decode_json);
@@ -96,7 +96,7 @@ sub _cache_key {
 # Returns the cache host key for a storage config (api_host preferred, storeid fallback)
 sub _cache_host_key {
     my ($scfg) = @_;
-    return $scfg->{api_host} || $scfg->{storeid} || 'unknown';
+    return $scfg->{tn_api_host} || $scfg->{storeid} || 'unknown';
 }
 
 sub _get_cached {
@@ -197,7 +197,7 @@ sub _log {
     return syslog($priority, $message) if $level == 0;
 
     # For level 1+, check debug configuration
-    my $debug_level = $scfg->{debug} // 0;
+    my $debug_level = $scfg->{tn_debug} // 0;
     return if $level > $debug_level;
 
     syslog($priority, $message);
@@ -262,10 +262,10 @@ sub _retry_with_backoff {
 
     my $max_retries = defined($retry_opts) && exists($retry_opts->{retry_max})
         ? $retry_opts->{retry_max}
-        : ($scfg->{api_retry_max} // 3);
+        : ($scfg->{tn_api_retry_max} // 3);
     my $initial_delay = defined($retry_opts) && exists($retry_opts->{retry_delay})
         ? $retry_opts->{retry_delay}
-        : ($scfg->{api_retry_delay} // 1);
+        : ($scfg->{tn_api_retry_delay} // 1);
 
     my $attempt = 0;
     my $last_error;
@@ -345,47 +345,47 @@ sub plugindata {
 sub properties {
     return {
         # Transport & connection
-        api_host => {
+        tn_api_host => {
             description => "TrueNAS hostname or IP.",
             type => 'string', format => 'pve-storage-server',
         },
-        api_key => {
+        tn_api_key => {
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
-        api_scheme => {
+        tn_api_scheme => {
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
         },
-        api_transport => {
+        tn_api_transport => {
             description => "Deprecated legacy transport selector. Ignored; WebSocket is always used.",
             type => 'string', optional => 1,
         },
-        api_port => {
+        tn_api_port => {
             description => "TCP port (defaults: 443 for wss, 80 for ws).",
             type => 'integer', optional => 1,
         },
-        api_insecure => {
+        tn_api_insecure => {
             description => "Skip TLS certificate verification.",
             type => 'boolean', optional => 1, default => 0,
         },
-        prefer_ipv4 => {
-            description => "Prefer IPv4 (A records) when resolving api_host.",
+        tn_prefer_ipv4 => {
+            description => "Prefer IPv4 (A records) when resolving tn_api_host.",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Placement
-        dataset => {
+        tn_dataset => {
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type => 'string',
         },
-        zvol_blocksize => {
+        tn_zvol_blocksize => {
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
             type => 'string', optional => 1,
         },
 
         # Transport mode selection
-        transport_mode => {
+        tn_transport_mode => {
             description => "Storage transport protocol: 'iscsi' or 'nvme-tcp'.",
             type => 'string',
             enum => ['iscsi', 'nvme-tcp'],
@@ -394,72 +394,72 @@ sub properties {
         },
 
         # iSCSI target & portals
-        target_iqn => {
+        tn_target_iqn => {
             description => "Shared iSCSI Target IQN on TrueNAS (or target's short name) - required for iSCSI transport.",
             type => 'string',
             optional => 1,
         },
-        discovery_portal => {
+        tn_discovery_portal => {
             description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
             type => 'string',
         },
-        portals => {
+        tn_portals => {
             description => "Comma-separated additional portals.",
             type => 'string', optional => 1,
         },
 
         # Initiator pathing
-        use_multipath => { type => 'boolean', optional => 1, default => 1 },
-        force_delete_on_inuse => {
+        tn_use_multipath => { type => 'boolean', optional => 1, default => 1 },
+        tn_force_delete_on_inuse => {
             description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
             type => 'boolean',
             default => 'false',
         },
-        logout_on_free => {
+        tn_logout_on_free => {
             description => 'After delete, logout the target if no LUNs remain for this node.',
             type => 'boolean',
             default => 'false',
         },
-        use_by_path  => { type => 'boolean', optional => 1, default => 0 },
-        ipv6_by_path => {
+        tn_use_by_path  => { type => 'boolean', optional => 1, default => 0 },
+        tn_ipv6_by_path => {
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type => 'boolean', optional => 1, default => 0,
         },
 
         # Debug level
-        debug => {
+        tn_debug => {
             description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
             type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
         # CHAP (optional - iSCSI only)
-        chap_user     => { type => 'string', optional => 1 },
-        chap_password => { type => 'string', optional => 1 },
+        tn_chap_user     => { type => 'string', optional => 1 },
+        tn_chap_password => { type => 'string', optional => 1 },
 
         # NVMe/TCP parameters
-        subsystem_nqn => {
+        tn_subsystem_nqn => {
             description => "NVMe subsystem NQN - required for nvme-tcp transport.",
             type => 'string',
             optional => 1,
         },
-        hostnqn => {
+        tn_hostnqn => {
             description => "NVMe host NQN (optional, auto-generated from /etc/nvme/hostnqn if not specified).",
             type => 'string',
             optional => 1,
         },
-        nvme_dhchap_secret => {
+        tn_nvme_dhchap_secret => {
             description => "DH-HMAC-CHAP host authentication key (format: DHHC-1:01:...) - optional.",
             type => 'string',
             optional => 1,
         },
-        nvme_dhchap_ctrl_secret => {
+        tn_nvme_dhchap_ctrl_secret => {
             description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
             type => 'string',
             optional => 1,
         },
 
         # ZFS compression algorithm for new volumes
-        compression => {
+        tn_compression => {
             description => "ZFS compression algorithm for new volumes. When unset, inherits from parent dataset.",
             type => 'string',
             enum => [qw(OFF LZ4 GZIP GZIP-1 GZIP-9 ZSTD ZSTD-1 ZSTD-3 ZSTD-5 ZSTD-7 ZSTD-9 ZLE LZJB)],
@@ -473,40 +473,44 @@ sub properties {
         },
 
         # Live snapshot support
-        enable_live_snapshots => {
+        tn_enable_live_snapshots => {
             description => "Enable live snapshots with VM state storage on TrueNAS.",
             type => 'boolean', optional => 1, default => 1,
         },
         # Volume chains for snapshots (enables vmstate support)
-        snapshot_volume_chains => {
+        tn_snapshot_volume_chains => {
             description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
             type => 'boolean', optional => 1, default => 1,
         },
         # vmstate storage location
-        vmstate_storage => {
+        tn_vmstate_storage => {
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
 
         # Bulk operations for improved performance
-        enable_bulk_operations => {
+        tn_enable_bulk_operations => {
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Retry configuration
-        api_retry_max => {
+        tn_api_retry_max => {
             description => "Maximum number of API call retries on transient failures.",
             type => 'integer', optional => 1, default => 3,
         },
-        api_retry_delay => {
+        tn_api_retry_delay => {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
-        storage_lock_timeout => {
+        tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
+        },
+        tn_device_ready_retries => {
+            description => "Number of 100ms retries waiting for a block device to appear after connect.",
+            type => 'integer', optional => 1, default => 200, minimum => 0, maximum => 600,
         },
     };
 }
@@ -519,64 +523,67 @@ sub options {
         shared  => { optional => 1 },
 
         # Connection (fixed to avoid orphaning volumes)
-        api_host      => { fixed => 1 },
-        api_key       => { fixed => 1 },
-        api_scheme    => { optional => 1, fixed => 1 },
-        api_transport => { optional => 1, fixed => 1 },
-        api_port      => { optional => 1, fixed => 1 },
-        api_insecure  => { optional => 1, fixed => 1 },
-        prefer_ipv4   => { optional => 1 },
+        tn_api_host      => { fixed => 1 },
+        tn_api_key       => { fixed => 1 },
+        tn_api_scheme    => { optional => 1, fixed => 1 },
+        tn_api_transport => { optional => 1, fixed => 1 },
+        tn_api_port      => { optional => 1, fixed => 1 },
+        tn_api_insecure  => { optional => 1, fixed => 1 },
+        tn_prefer_ipv4   => { optional => 1 },
 
         # Placement
-        dataset        => { fixed => 1 },
-        zvol_blocksize => { optional => 1, fixed => 1 },
+        tn_dataset        => { fixed => 1 },
+        tn_zvol_blocksize => { optional => 1, fixed => 1 },
 
         # Transport mode
-        transport_mode => { optional => 1, fixed => 1 },
+        tn_transport_mode => { optional => 1, fixed => 1 },
 
         # iSCSI target & portals
-        target_iqn             => { optional => 1, fixed => 1 },
-        discovery_portal       => { optional => 1, fixed => 1 },
-        portals                => { optional => 1 },
-        force_delete_on_inuse  => { optional => 1 },
-        logout_on_free         => { optional => 1 },
+        tn_target_iqn             => { optional => 1, fixed => 1 },
+        tn_discovery_portal       => { optional => 1, fixed => 1 },
+        tn_portals                => { optional => 1 },
+        tn_force_delete_on_inuse  => { optional => 1 },
+        tn_logout_on_free         => { optional => 1 },
 
         # Initiator
-        use_multipath => { optional => 1 },
-        use_by_path   => { optional => 1 },
-        ipv6_by_path  => { optional => 1 },
+        tn_use_multipath => { optional => 1 },
+        tn_use_by_path   => { optional => 1 },
+        tn_ipv6_by_path  => { optional => 1 },
 
         # CHAP (iSCSI)
-        chap_user     => { optional => 1 },
-        chap_password => { optional => 1 },
+        tn_chap_user     => { optional => 1 },
+        tn_chap_password => { optional => 1 },
 
         # NVMe/TCP parameters
-        subsystem_nqn          => { optional => 1, fixed => 1 },
-        hostnqn                => { optional => 1 },
-        nvme_dhchap_secret     => { optional => 1 },
-        nvme_dhchap_ctrl_secret => { optional => 1 },
+        tn_subsystem_nqn          => { optional => 1, fixed => 1 },
+        tn_hostnqn                => { optional => 1 },
+        tn_nvme_dhchap_secret     => { optional => 1 },
+        tn_nvme_dhchap_ctrl_secret => { optional => 1 },
 
         # ZFS tunables
-        compression => { optional => 1 },
+        tn_compression => { optional => 1 },
         tn_sparse => { optional => 1 },
 
         # Debug
-        debug => { optional => 1 },
+        tn_debug => { optional => 1 },
 
         # Live snapshots
-        enable_live_snapshots => { optional => 1 },
-        snapshot_volume_chains => { optional => 1 },
-        vmstate_storage => { optional => 1 },
+        tn_enable_live_snapshots => { optional => 1 },
+        tn_snapshot_volume_chains => { optional => 1 },
+        tn_vmstate_storage => { optional => 1 },
 
         # Bulk operations
-        enable_bulk_operations => { optional => 1 },
+        tn_enable_bulk_operations => { optional => 1 },
 
         # Retry configuration
-        api_retry_max => { optional => 1 },
-        api_retry_delay => { optional => 1 },
+        tn_api_retry_max => { optional => 1 },
+        tn_api_retry_delay => { optional => 1 },
 
         # Concurrency
-        storage_lock_timeout => { optional => 1 },
+        tn_storage_lock_timeout => { optional => 1 },
+
+        # Device readiness
+        tn_device_ready_retries => { optional => 1 },
     };
 }
 
@@ -590,73 +597,73 @@ sub check_config {
 
     # Backward compatibility: accept legacy api_transport without breaking config parsing.
     # TrueNAS SCALE API is WebSocket-only in current plugin versions.
-    if (defined $opts->{api_transport}) {
-        my $legacy_transport = lc($opts->{api_transport} // '');
+    if (defined $opts->{tn_api_transport}) {
+        my $legacy_transport = lc($opts->{tn_api_transport} // '');
 
-        if (!defined($opts->{api_scheme}) || $opts->{api_scheme} eq '') {
+        if (!defined($opts->{tn_api_scheme}) || $opts->{tn_api_scheme} eq '') {
             if ($legacy_transport eq 'wss') {
-                $opts->{api_scheme} = 'wss';
+                $opts->{tn_api_scheme} = 'wss';
             } else {
                 # Legacy api_transport values are deprecated and should not force insecure WS.
                 # Default to secure websocket behavior for compatibility.
-                $opts->{api_scheme} = 'wss';
+                $opts->{tn_api_scheme} = 'wss';
             }
         }
 
         if ($legacy_transport eq 'rest') {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': api_transport=rest is deprecated and unsupported. " .
-                "Using WebSocket transport instead (api_scheme=$opts->{api_scheme})."
+                "[TrueNAS] Storage '$sectionId': tn_api_transport=rest is deprecated and unsupported. " .
+                "Using WebSocket transport instead (tn_api_scheme=$opts->{tn_api_scheme})."
             );
         } elsif ($legacy_transport eq 'ws') {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': api_transport=ws is deprecated; " .
-                "using secure websocket transport instead (api_scheme=$opts->{api_scheme})."
+                "[TrueNAS] Storage '$sectionId': tn_api_transport=ws is deprecated; " .
+                "using secure websocket transport instead (tn_api_scheme=$opts->{tn_api_scheme})."
             );
         } else {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': api_transport is deprecated and ignored; " .
-                "use api_scheme/api_port if transport tuning is needed."
+                "[TrueNAS] Storage '$sectionId': tn_api_transport is deprecated and ignored; " .
+                "use tn_api_scheme/tn_api_port if transport tuning is needed."
             );
         }
     }
 
     # Validate retry configuration parameters
-    if (defined $opts->{api_retry_max}) {
-        die "api_retry_max must be between 0 and 10 (got $opts->{api_retry_max})\n"
-            if $opts->{api_retry_max} < 0 || $opts->{api_retry_max} > 10;
+    if (defined $opts->{tn_api_retry_max}) {
+        die "tn_api_retry_max must be between 0 and 10 (got $opts->{tn_api_retry_max})\n"
+            if $opts->{tn_api_retry_max} < 0 || $opts->{tn_api_retry_max} > 10;
     }
-    if (defined $opts->{api_retry_delay}) {
-        die "api_retry_delay must be between 0.1 and 60 seconds (got $opts->{api_retry_delay})\n"
-            if $opts->{api_retry_delay} < 0.1 || $opts->{api_retry_delay} > 60;
+    if (defined $opts->{tn_api_retry_delay}) {
+        die "tn_api_retry_delay must be between 0.1 and 60 seconds (got $opts->{tn_api_retry_delay})\n"
+            if $opts->{tn_api_retry_delay} < 0.1 || $opts->{tn_api_retry_delay} > 60;
     }
 
     # Validate dataset name follows ZFS naming conventions
-    if ($opts->{dataset}) {
+    if ($opts->{tn_dataset}) {
         # ZFS datasets: alphanumeric, underscore, hyphen, period, slash (for hierarchy)
-        if ($opts->{dataset} =~ /[^a-zA-Z0-9_\-\.\/]/) {
-            die "dataset name contains invalid characters: '$opts->{dataset}'\n" .
+        if ($opts->{tn_dataset} =~ /[^a-zA-Z0-9_\-\.\/]/) {
+            die "dataset name contains invalid characters: '$opts->{tn_dataset}'\n" .
                 "  Allowed characters: a-z A-Z 0-9 _ - . /\n";
         }
 
         # Must not start or end with slash
-        if ($opts->{dataset} =~ /^\/|\/$/) {
-            die "dataset name must not start or end with '/': '$opts->{dataset}'\n";
+        if ($opts->{tn_dataset} =~ /^\/|\/$/) {
+            die "dataset name must not start or end with '/': '$opts->{tn_dataset}'\n";
         }
 
         # Must not contain double slashes
-        if ($opts->{dataset} =~ /\/\//) {
-            die "dataset name must not contain '//': '$opts->{dataset}'\n";
+        if ($opts->{tn_dataset} =~ /\/\//) {
+            die "dataset name must not contain '//': '$opts->{tn_dataset}'\n";
         }
 
         # Must not be empty after trimming
-        if ($opts->{dataset} eq '') {
+        if ($opts->{tn_dataset} eq '') {
             die "dataset name cannot be empty\n";
         }
     }
 
     # Warn if using insecure WebSocket
-    if (defined $opts->{api_scheme} && lc($opts->{api_scheme}) eq 'ws') {
+    if (defined $opts->{tn_api_scheme} && lc($opts->{tn_api_scheme}) eq 'ws') {
         syslog('warning',
             "[TrueNAS] Storage '$sectionId' is using insecure WebSocket (ws://). " .
             "Consider using secure WebSocket (wss://) for API communication."
@@ -664,70 +671,70 @@ sub check_config {
     }
 
     # Validate required fields are present
-    if (!$opts->{api_host}) {
-        die "api_host is required\n";
+    if (!$opts->{tn_api_host}) {
+        die "tn_api_host is required\n";
     }
-    if (!$opts->{api_key}) {
-        die "api_key is required\n";
+    if (!$opts->{tn_api_key}) {
+        die "tn_api_key is required\n";
     }
-    if (!$opts->{dataset}) {
-        die "dataset is required\n";
+    if (!$opts->{tn_dataset}) {
+        die "tn_dataset is required\n";
     }
 
     # Validate transport mode and transport-specific parameters
-    my $mode = $opts->{transport_mode} // 'iscsi';
+    my $mode = $opts->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         # iSCSI mode requires target_iqn and discovery_portal
-        if (!$opts->{target_iqn}) {
-            die "target_iqn is required for iSCSI transport\n";
+        if (!$opts->{tn_target_iqn}) {
+            die "tn_target_iqn is required for iSCSI transport\n";
         }
-        if (!$opts->{discovery_portal}) {
-            die "discovery_portal is required for iSCSI transport\n";
+        if (!$opts->{tn_discovery_portal}) {
+            die "tn_discovery_portal is required for iSCSI transport\n";
         }
 
         # Warn if NVMe-specific parameters are set in iSCSI mode
-        if ($opts->{subsystem_nqn}) {
+        if ($opts->{tn_subsystem_nqn}) {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': subsystem_nqn is ignored in iSCSI mode"
+                "[TrueNAS] Storage '$sectionId': tn_subsystem_nqn is ignored in iSCSI mode"
             );
         }
-        if ($opts->{hostnqn}) {
+        if ($opts->{tn_hostnqn}) {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': hostnqn is ignored in iSCSI mode"
+                "[TrueNAS] Storage '$sectionId': tn_hostnqn is ignored in iSCSI mode"
             );
         }
 
     } elsif ($mode eq 'nvme-tcp') {
         # NVMe/TCP mode requires subsystem_nqn
-        if (!$opts->{subsystem_nqn}) {
-            die "subsystem_nqn is required for nvme-tcp transport\n";
+        if (!$opts->{tn_subsystem_nqn}) {
+            die "tn_subsystem_nqn is required for nvme-tcp transport\n";
         }
 
         # Validate NQN format (basic check)
-        if ($opts->{subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
-            die "subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
+        if ($opts->{tn_subsystem_nqn} !~ /^nqn\.\d{4}-\d{2}\./) {
+            die "tn_subsystem_nqn must follow NVMe NQN format (e.g., nqn.2005-10.org.example:identifier)\n";
         }
 
         # Validate hostnqn format if provided
-        if ($opts->{hostnqn} && $opts->{hostnqn} !~ /^nqn\./) {
-            die "hostnqn must follow NVMe NQN format\n";
+        if ($opts->{tn_hostnqn} && $opts->{tn_hostnqn} !~ /^nqn\./) {
+            die "tn_hostnqn must follow NVMe NQN format\n";
         }
 
         # Warn if iSCSI-specific parameters are set in NVMe mode
-        if ($opts->{target_iqn}) {
+        if ($opts->{tn_target_iqn}) {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': target_iqn is ignored in nvme-tcp mode"
+                "[TrueNAS] Storage '$sectionId': tn_target_iqn is ignored in nvme-tcp mode"
             );
         }
-        if ($opts->{chap_user} || $opts->{chap_password}) {
+        if ($opts->{tn_chap_user} || $opts->{tn_chap_password}) {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use nvme_dhchap_secret instead)"
+                "[TrueNAS] Storage '$sectionId': CHAP parameters are ignored in nvme-tcp mode (use tn_nvme_dhchap_secret instead)"
             );
         }
-        if ($opts->{use_by_path}) {
+        if ($opts->{tn_use_by_path}) {
             syslog('warning',
-                "[TrueNAS] Storage '$sectionId': use_by_path is ignored in nvme-tcp mode (UUID paths used)"
+                "[TrueNAS] Storage '$sectionId': tn_use_by_path is ignored in nvme-tcp mode (UUID paths used)"
             );
         }
 
@@ -752,17 +759,17 @@ sub _host_ipv4($host) {
 # ======== WebSocket JSON-RPC client ========
 # Connect to ws(s)://<host>/api/current; auth via auth.login_with_api_key.
 sub _ws_defaults($scfg) {
-    my $scheme = $scfg->{api_scheme};
+    my $scheme = $scfg->{tn_api_scheme};
     if (!$scheme) { $scheme = 'wss'; }
     elsif ($scheme =~ /^https$/i) { $scheme = 'wss'; }
     elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
-    my $port = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
+    my $port = $scfg->{tn_api_port} // (($scheme eq 'wss') ? 443 : 80);
     return ($scheme, $port);
 }
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
-    my $host = $scfg->{api_host};
-    my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
+    my $host = $scfg->{tn_api_host};
+    my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
 
     # Add small delay to avoid rate limiting
@@ -773,7 +780,7 @@ sub _ws_open($scfg) {
         $sock = IO::Socket::SSL->new(
             PeerHost => $peer,
             PeerPort => $port,
-            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_verify_mode => $scfg->{tn_api_insecure} ? 0x00 : 0x02,
             SSL_hostname    => $host,
             Timeout => 15,
         ) or die "WebSocket secure connection failed (wss://): $SSL_ERROR\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
@@ -809,7 +816,7 @@ sub _ws_open($scfg) {
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
-        params  => [ $scfg->{api_key} ],
+        params  => [ $scfg->{tn_api_key} ],
     }) or die "TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.\n";
     return $conn;
 }
@@ -976,8 +983,8 @@ my $_ws_creator_pid = $$; # Track PID to detect fork
 
 sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
-    my $host = $scfg->{api_host};
-    my $key = $scfg->{api_key};
+    my $host = $scfg->{tn_api_host};
+    my $key = $scfg->{tn_api_key};
     return "$host:$key";
 }
 
@@ -1100,7 +1107,7 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
     # $params_array should be an array of parameter arrays
 
     # Check if bulk operations are enabled (default: enabled)
-    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+    my $bulk_enabled = $scfg->{tn_enable_bulk_operations} // 1;
     if (!$bulk_enabled) {
         die "Bulk operations are disabled in storage configuration";
     }
@@ -1211,7 +1218,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
     my @dataset_names = grep { defined } map { $_->{zname} } @$volume_info_list;
 
     my @all_errors;
-    my $bulk_enabled = $scfg->{enable_bulk_operations} // 1;
+    my $bulk_enabled = $scfg->{tn_enable_bulk_operations} // 1;
 
     # Delete targetextents - use bulk if enabled and multiple items
     if (@targetextent_ids > 1 && $bulk_enabled) {
@@ -1264,7 +1271,7 @@ sub _cleanup_multiple_volumes($scfg, $volume_info_list) {
     # Datasets are typically deleted individually since they might have different parameters
     for my $dataset (@dataset_names) {
         eval {
-            my $full_ds = $scfg->{dataset} . '/' . $dataset;
+            my $full_ds = $scfg->{tn_dataset} . '/' . $dataset;
             my $id = URI::Escape::uri_escape($full_ds);
             my $payload = { recursive => JSON::PP::true, force => JSON::PP::true };
             _api_call($scfg, 'pool.dataset.delete', [$full_ds, $payload]);
@@ -1282,7 +1289,7 @@ sub bulk_delete_snapshots {
     return [] if !$snapshot_names || !@$snapshot_names;
 
     my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my $full = $scfg->{tn_dataset} . '/' . $zname;
 
     # Convert snapshot names to full snapshot names
     my @full_snapshots = map { "$full\@$_" } @$snapshot_names;
@@ -1604,7 +1611,7 @@ sub _tn_global($scfg) {
 # Returns the pool record for the dataset's containing pool, or undef.
 # Cached for $CACHE_TTL (60s) since pool health changes slowly.
 sub _tn_pool_health($scfg) {
-    my ($pool_name) = split('/', $scfg->{dataset}, 2);
+    my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
     return undef if !$pool_name;
 
     my $host_key = _cache_host_key($scfg);
@@ -1828,7 +1835,7 @@ sub volume_resize {
     my (undef, $zname, undef, undef, undef, undef, $fmt, $lun) =
         $class->parse_volname($volname);
     die "only raw is supported\n" if defined($fmt) && $fmt ne 'raw';
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my $full = $scfg->{tn_dataset} . '/' . $zname;
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_resize: volname=$volname, target_size=$new_size_bytes");
 
@@ -1860,7 +1867,7 @@ sub volume_resize {
     my $delta = $req_bytes - $cur_bytes;
 
     # ---- Preflight: mirror TrueNAS middleware's ~80% headroom rule ----
-    my $pds = eval { _tn_dataset_get($scfg, $scfg->{dataset}) } // {};
+    my $pds = eval { _tn_dataset_get($scfg, $scfg->{tn_dataset}) } // {};
     my $avail_bytes = _normalize_value($pds->{available}); # parent dataset/pool available
     my $max_grow    = $avail_bytes ? int($avail_bytes * 0.80) : 0;
     if ($avail_bytes && $delta > $max_grow) {
@@ -1868,7 +1875,7 @@ sub volume_resize {
         die sprintf(
             "resize refused by preflight: requested grow %s exceeds TrueNAS ~80%% headroom (%s) on dataset %s.\n".
             "Reduce the grow amount or free space on the backing dataset/pool.\n",
-            $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{dataset}
+            $fmt_g->($delta), $fmt_g->($max_grow), $scfg->{tn_dataset}
         );
     }
     # ---- End preflight ----
@@ -1891,17 +1898,17 @@ sub volume_resize {
     _invalidate_status_capacity_cache($storeid, $scfg);
 
     # Initiator-side rescan so Linux sees the new size (transport-specific)
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
     if ($mode eq 'iscsi') {
         _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed");
-        if ($scfg->{use_multipath}) {
+        if ($scfg->{tn_use_multipath}) {
             _try_run(['multipath','-r'], "multipath map reload failed");
         }
     } elsif ($mode eq 'nvme-tcp') {
         # NVMe namespace size updates automatically when zvol is resized
         # Trigger device rescan to ensure kernel sees updated size
         # Find NVMe controllers connected to our subsystem and rescan them
-        my $nqn = $scfg->{subsystem_nqn};
+        my $nqn = $scfg->{tn_subsystem_nqn};
         my $rescanned = 0;
 
         eval {
@@ -1964,7 +1971,7 @@ sub volume_resize {
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+    my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: creating $snap_full");
@@ -1997,7 +2004,7 @@ sub volume_snapshot {
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+    my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
     my $snap_full = $full . '@' . $snapname;    # full snapshot name
     my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
@@ -2022,7 +2029,7 @@ sub volume_snapshot_delete {
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
     my (undef, $zname, $vmid) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my $full = $scfg->{tn_dataset} . '/' . $zname;
     my $snap_full = $full . '@' . $snapname;
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolling back to $snap_full");
@@ -2060,7 +2067,7 @@ sub volume_snapshot_rollback {
 
     # Refresh initiator view — rescan only this storage's target to avoid disrupting
     # other active iSCSI sessions on unrelated volumes during the rollback
-    my $rollback_iqn = $scfg->{target_iqn};
+    my $rollback_iqn = $scfg->{tn_target_iqn};
     eval {
         if ($rollback_iqn) {
             PVE::Tools::run_command(['iscsiadm','-m','node','-T',$rollback_iqn,'-R'], outfunc=>sub{});
@@ -2068,7 +2075,7 @@ sub volume_snapshot_rollback {
             PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{});
         }
     };
-    if ($scfg->{use_multipath}) {
+    if ($scfg->{tn_use_multipath}) {
         eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
     }
     eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
@@ -2082,7 +2089,7 @@ sub volume_snapshot_rollback {
 sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;
     my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my $full = $scfg->{tn_dataset} . '/' . $zname;
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
@@ -2121,7 +2128,7 @@ sub _tn_targets {
 # Replaces the naive loop that called _tn_dataset_get per candidate name.
 sub _find_free_disk_name {
     my ($scfg, $vmid) = @_;
-    my $dataset = $scfg->{dataset};
+    my $dataset = $scfg->{tn_dataset};
     my $prefix = "vm-$vmid-disk-";
 
     # Single query: fetch all children of the parent dataset matching our VM's prefix
@@ -2167,7 +2174,7 @@ sub _generate_extent_name($scfg, $zname) {
     # Weight volumes are exempt - keep name unchanged
     return $zname if $zname =~ /^pve-weight-/;
 
-    my $full_path = $scfg->{dataset} . "/" . $zname;
+    my $full_path = $scfg->{tn_dataset} . "/" . $zname;
     my $hash8 = substr(sha1_hex($full_path), 0, 8);
 
     # Enforce TrueNAS naming constraints
@@ -2186,7 +2193,7 @@ sub _generate_extent_name($scfg, $zname) {
 # Resolve an iSCSI extent by its disk (zvol) path instead of by name.
 # Returns the first matching extent hashref, or undef if none found.
 sub _resolve_extent_by_disk($scfg, $zname) {
-    my $zvol_path = "zvol/" . $scfg->{dataset} . "/" . $zname;
+    my $zvol_path = "zvol/" . $scfg->{tn_dataset} . "/" . $zname;
     my $extents = _tn_extents($scfg) // [];
     my ($match) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
     return $match;
@@ -2267,7 +2274,7 @@ sub _handle_fk_stale_extent {
 
 sub _current_lun_for_zname($scfg, $zname) {
     my $extents = _tn_extents($scfg) // [];
-    my $zvol_path = "zvol/$scfg->{dataset}/$zname";
+    my $zvol_path = "zvol/$scfg->{tn_dataset}/$zname";
     my ($extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents;
     return undef if !$extent || !defined $extent->{id};
     my $target_id = _resolve_target_id($scfg);
@@ -2293,7 +2300,7 @@ sub _preflight_check_alloc {
     }
 
     my @errors;
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     # Check 1: TrueNAS API is reachable
     eval {
@@ -2306,7 +2313,7 @@ sub _preflight_check_alloc {
     # Check 2: Pool health (degraded pools are functional but warrant a warning)
     my $pool = _tn_pool_health($scfg);
     if ($pool) {
-        my ($pool_name) = split('/', $scfg->{dataset}, 2);
+        my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
         if (!$pool->{healthy}) {
             _log($scfg, 0, 'warning',
                 "[TrueNAS] preflight: pool '$pool_name' is not healthy (status: " .
@@ -2366,14 +2373,14 @@ sub _preflight_check_alloc {
         my $required = $bytes * 1.2;
 
         eval {
-            my $ds_info = _tn_dataset_get($scfg, $scfg->{dataset});
+            my $ds_info = _tn_dataset_get($scfg, $scfg->{tn_dataset});
             if ($ds_info) {
                 my $available = _normalize_value($ds_info->{available}) || 0;
 
                 if ($available < $required) {
                     push @errors, sprintf(
                         "Insufficient space on dataset '%s': need %s (with 20%% overhead), have %s available",
-                        $scfg->{dataset},
+                        $scfg->{tn_dataset},
                         _format_bytes($required),
                         _format_bytes($available)
                     );
@@ -2393,7 +2400,7 @@ sub _preflight_check_alloc {
                 push @errors, sprintf(
                     "iSCSI target not found: %s\n" .
                     "  Verify target exists in TrueNAS: Shares > Block Shares (iSCSI) > Targets",
-                    $scfg->{target_iqn}
+                    $scfg->{tn_target_iqn}
                 );
             }
         };
@@ -2402,7 +2409,7 @@ sub _preflight_check_alloc {
         }
     } elsif ($mode eq 'nvme-tcp') {
         eval {
-            my $nqn = $scfg->{subsystem_nqn};
+            my $nqn = $scfg->{tn_subsystem_nqn};
             if (!$nqn) {
                 push @errors, "NVMe subsystem NQN not configured in storage.cfg";
                 return;
@@ -2429,12 +2436,12 @@ sub _preflight_check_alloc {
 
     # Check 6: Parent dataset exists
     eval {
-        my $ds = _tn_dataset_get($scfg, $scfg->{dataset});
+        my $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset});
         if (!$ds) {
             push @errors, sprintf(
                 "Parent dataset does not exist: %s\n" .
                 "  Create the dataset in TrueNAS: Storage > Pools",
-                $scfg->{dataset}
+                $scfg->{tn_dataset}
             );
         }
     };
@@ -2452,7 +2459,7 @@ sub _preflight_check_alloc {
 # Result is cached per IQN to avoid redundant API calls within the same process.
 sub _resolve_target_id {
     my ($scfg) = @_;
-    my $want = $scfg->{target_iqn} // die "target_iqn not set in storage.cfg\n";
+    my $want = $scfg->{tn_target_iqn} // die "tn_target_iqn not set in storage.cfg\n";
     my $api_host = _cache_host_key($scfg);
 
     # Use the TTL-based %API_CACHE (60s) so stale IDs are automatically refreshed
@@ -2469,7 +2476,7 @@ sub _resolve_target_id {
         # Try to fetch the base name for a more helpful message
         my $global   = eval { _api_call($scfg, 'iscsi.global.config', []) } // {};
         my $basename = $global->{basename} // '(unknown)';
-        my $portal   = $scfg->{discovery_portal} // '(none)';
+        my $portal   = $scfg->{tn_discovery_portal} // '(none)';
         my $msg = join("\n",
             "TrueNAS API returned no iSCSI targets.",
             "  iSCSI Base Name: $basename",
@@ -2575,7 +2582,7 @@ sub _run_lines {
 # ======== Initiator: discovery/login and device resolution ========
 # Check if target sessions are already active
 sub _target_sessions_active($scfg) {
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
 
     # Use eval to safely check for existing sessions
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
@@ -2590,7 +2597,7 @@ sub _target_sessions_active($scfg) {
 
 # Check if a specific portal has an active session for this target
 sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
     my $norm_portal = _normalize_portal($portal);
 
     # Get active sessions if not provided
@@ -2614,12 +2621,12 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
 
 # Check if all configured portals have active sessions for this target
 sub _all_portals_connected($scfg) {
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
 
     # Get all configured portals
     my @portals = ();
-    push @portals, _normalize_portal($scfg->{discovery_portal}) if $scfg->{discovery_portal};
-    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+    push @portals, _normalize_portal($scfg->{tn_discovery_portal}) if $scfg->{tn_discovery_portal};
+    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{tn_portals}) if $scfg->{tn_portals};
 
     return 0 if !@portals; # No portals configured
 
@@ -2640,8 +2647,8 @@ sub _iscsi_login_all($scfg) {
     # This ensures multipath configurations establish sessions to ALL portals
     return if _all_portals_connected($scfg);
 
-    my $primary = _normalize_portal($scfg->{discovery_portal});
-    my @extra   = $scfg->{portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{portals}) : ();
+    my $primary = _normalize_portal($scfg->{tn_discovery_portal});
+    my @extra   = $scfg->{tn_portals} ? map { _normalize_portal($_) } split(/\s*,\s*/, $scfg->{tn_portals}) : ();
 
     # Preflight reachability
     _probe_portal($primary);
@@ -2653,7 +2660,7 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p], "iSCSI discovery failed ($p)");
     }
 
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
     my @nodes = _run_lines(['iscsiadm','-m','node','-T',$iqn]);
 
     # Get current session list once for efficiency
@@ -2665,11 +2672,11 @@ sub _iscsi_login_all($scfg) {
         my $portal = _normalize_portal($1);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
-        if ($scfg->{chap_user} && $scfg->{chap_password}) {
+        if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
             for my $cmd (
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
-                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{chap_user}],
-                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{chap_password}],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{tn_chap_user}],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{tn_chap_password}],
             ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
         }
         # Skip login if this portal is already connected
@@ -2701,7 +2708,7 @@ sub _iscsi_login_all($scfg) {
 }
 
 sub _find_by_path_for_lun($scfg, $lun) {
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
     my $pattern = "-iscsi-$iqn-lun-$lun";
     opendir(my $dh, "/dev/disk/by-path") or die "cannot open /dev/disk/by-path\n";
     my @paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
@@ -2743,10 +2750,10 @@ sub _dm_map_for_leaf($leaf) {
 
 sub _logout_target_all_portals {
     my ($scfg) = @_;
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
     my @portals = ();
-    push @portals, _normalize_portal($scfg->{discovery_portal}) if $scfg->{discovery_portal};
-    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{portals}//''));
+    push @portals, _normalize_portal($scfg->{tn_discovery_portal}) if $scfg->{tn_discovery_portal};
+    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{tn_portals}//''));
     for my $p (@portals) {
         eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'--logout'], errfunc=>sub{} ) };
         eval { PVE::Tools::run_command(['iscsiadm','-m','node','-p',$p,'--targetname',$iqn,'-o','delete'], errfunc=>sub{} ) };
@@ -2754,10 +2761,10 @@ sub _logout_target_all_portals {
 }
 sub _login_target_all_portals {
     my ($scfg) = @_;
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
     my @portals = ();
-    push @portals, _normalize_portal($scfg->{discovery_portal}) if $scfg->{discovery_portal};
-    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{portals}//''));
+    push @portals, _normalize_portal($scfg->{tn_discovery_portal}) if $scfg->{tn_discovery_portal};
+    push @portals, map { _normalize_portal($_) } split(/\s*,\s*/, ($scfg->{tn_portals}//''));
     for my $p (@portals) {
         eval {
             # Ensure node record exists & autostarts, then login
@@ -2769,7 +2776,7 @@ sub _login_target_all_portals {
     # Refresh kernel & multipath views
     eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
     eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
-    if ($scfg->{use_multipath}) {
+    if ($scfg->{tn_use_multipath}) {
         eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
         eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
     }
@@ -2778,7 +2785,7 @@ sub _login_target_all_portals {
 sub _device_for_lun($scfg, $lun) {
     # Wait briefly for by-path to appear if needed
     my $by;
-    my $max_retries = $scfg->{device_ready_retries} // 200; # up to ~20s with 100ms sleep
+    my $max_retries = $scfg->{tn_device_ready_retries} // 200; # up to ~20s with 100ms sleep
     for (my $i = 1; $i <= $max_retries; $i++) {
         $by = _find_by_path_for_lun($scfg, $lun);
         last if $by && -e $by;
@@ -2790,7 +2797,7 @@ sub _device_for_lun($scfg, $lun) {
         usleep(DEVICE_READY_TIMEOUT_US);
     }
     if (!$by || !-e $by) {
-        my $iqn = $scfg->{target_iqn} // '';
+        my $iqn = $scfg->{tn_target_iqn} // '';
         my @sessions = _run_lines(['iscsiadm','-m','session']);
         my $session_text = @sessions ? join('; ', @sessions) : 'none';
 
@@ -2810,7 +2817,7 @@ sub _device_for_lun($scfg, $lun) {
     }
 
     # Multipath preference
-    if ($scfg->{use_multipath} && !$scfg->{use_by_path}) {
+    if ($scfg->{tn_use_multipath} && !$scfg->{tn_use_by_path}) {
         my $real = abs_path($by);
         if ($real && $real =~ m{^/dev/([^/]+)$}) {
             my $leaf = $1; # e.g., sdc
@@ -2830,7 +2837,7 @@ sub _nvme_get_hostnqn {
     my ($scfg) = @_;
 
     # If explicitly configured, use that
-    return $scfg->{hostnqn} if $scfg->{hostnqn};
+    return $scfg->{tn_hostnqn} if $scfg->{tn_hostnqn};
 
     # Otherwise read from /etc/nvme/hostnqn
     my $hostnqn_file = '/etc/nvme/hostnqn';
@@ -2938,7 +2945,7 @@ sub _nvme_untaint_cli_secret {
 # Check if connected to a subsystem
 sub _nvme_is_connected {
     my ($scfg) = @_;
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     my $in_our_subsys = 0;
     my $connected = 0;
@@ -2965,27 +2972,27 @@ sub _nvme_is_connected {
 sub _nvme_connect {
     my ($scfg) = @_;
 
-    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: connecting to subsystem $scfg->{subsystem_nqn}");
+    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: connecting to subsystem $scfg->{tn_subsystem_nqn}");
 
     # Check if already connected
     return if _nvme_is_connected($scfg);
 
-    my $nqn = _nvme_untaint_cli_nqn($scfg->{subsystem_nqn}, 'NVMe subsystem NQN');
+    my $nqn = _nvme_untaint_cli_nqn($scfg->{tn_subsystem_nqn}, 'NVMe subsystem NQN');
     my @portals = ();
 
     # Primary portal
-    push @portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
+    push @portals, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
 
     # Additional portals
-    if ($scfg->{portals}) {
-        push @portals, split(/\s*,\s*/, $scfg->{portals});
+    if ($scfg->{tn_portals}) {
+        push @portals, split(/\s*,\s*/, $scfg->{tn_portals});
     }
 
     die "No portals configured for NVMe/TCP storage\n" unless @portals;
 
     my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN');
-    my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
-    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
+    my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
+    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;
 
     for my $portal (@portals) {
@@ -3042,7 +3049,7 @@ sub _nvme_connect {
 # sharing the same subsystem NQN. Falls back to NQN-wide disconnect if needed.
 sub _nvme_disconnect {
     my ($scfg) = @_;
-    my $nqn = _nvme_untaint_cli_nqn($scfg->{subsystem_nqn}, 'NVMe subsystem NQN');
+    my $nqn = _nvme_untaint_cli_nqn($scfg->{tn_subsystem_nqn}, 'NVMe subsystem NQN');
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_disconnect: disconnecting from subsystem $nqn");
 
@@ -3083,7 +3090,7 @@ sub _nvme_disconnect {
 sub _nvme_rescan_subsystem_controllers {
     my ($scfg) = @_;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     opendir(my $dh, "/sys/class/nvme-subsystem") or return;
     while (my $subsys = readdir($dh)) {
@@ -3116,12 +3123,12 @@ sub _nvme_rescan_subsystem_controllers {
 sub _nvme_find_controllers_for_subsystem {
     my ($scfg) = @_;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
     my @controllers;
 
     # Build set of portals to match against
     my %portal_set;
-    for my $portal_str ($scfg->{discovery_portal}, $scfg->{portals} ? split(/\s*,\s*/, $scfg->{portals}) : ()) {
+    for my $portal_str ($scfg->{tn_discovery_portal}, $scfg->{tn_portals} ? split(/\s*,\s*/, $scfg->{tn_portals}) : ()) {
         next unless $portal_str;
         my ($host, $port) = _nvme_parse_portal($portal_str);
         $portal_set{"$host:$port"} = 1;
@@ -3289,7 +3296,7 @@ sub _nvme_selector_failure_detail {
 sub _nvme_get_namespace_selector_metadata {
     my ($scfg, $device_uuid) = @_;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
     my $result = {
         namespace => undef,
         api_namespace_count => undef,
@@ -3437,7 +3444,7 @@ sub _nvme_select_namespace_device {
         } elsif ($mismatch_reason eq 'namespace_uuid_not_returned') {
             _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: namespace UUID $device_uuid was not returned by TrueNAS API");
         } elsif ($mismatch_reason eq 'api_subsystem_not_found') {
-            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: subsystem $scfg->{subsystem_nqn} was not returned by TrueNAS API");
+            _log($scfg, 1, 'warning', "[TrueNAS] nvme_find_device: subsystem $scfg->{tn_subsystem_nqn} was not returned by TrueNAS API");
         }
 
         return _nvme_selector_result(
@@ -3491,7 +3498,7 @@ sub _nvme_select_namespace_device {
 sub _nvme_find_device_by_subsystem {
     my ($scfg, $device_uuid) = @_;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     # Find subsystem matching our NQN
     opendir(my $dh, "/sys/class/nvme-subsystem") or return _nvme_selector_result(
@@ -3601,7 +3608,7 @@ sub _nvme_find_device_by_subsystem {
 sub _nvme_get_subsystem_device_paths {
     my ($scfg) = @_;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
     my @paths;
 
     opendir(my $bdh, "/sys/block") or return @paths;
@@ -3656,7 +3663,7 @@ sub _nvme_device_for_uuid {
     my ($scfg, $device_uuid, %opts) = @_;
     my $allow_reconnect = $opts{allow_reconnect} // 0;
 
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     _log($scfg, 2, 'debug', "[TrueNAS] nvme_device_for_uuid: searching for namespace with UUID $device_uuid in subsystem $nqn");
 
@@ -3829,7 +3836,7 @@ sub _nvme_device_for_uuid {
         $device_uuid,
         $nqn,
         $nqn,
-        $scfg->{api_host},
+        $scfg->{tn_api_host},
         $namespace_detail,
     );
 
@@ -3850,8 +3857,8 @@ sub _nvme_sync_portals {
 
     # Collect desired portals from storage config
     my @desired_portals = ();
-    push @desired_portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
-    push @desired_portals, split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+    push @desired_portals, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
+    push @desired_portals, split(/\s*,\s*/, $scfg->{tn_portals}) if $scfg->{tn_portals};
     return unless @desired_portals;
 
     # Query existing port-subsystem bindings
@@ -3932,7 +3939,7 @@ sub _nvme_sync_portals {
 # Ensure NVMe subsystem exists on TrueNAS
 sub _nvme_ensure_subsystem {
     my ($scfg) = @_;
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: checking for subsystem $nqn");
 
@@ -3970,8 +3977,8 @@ sub _nvme_ensure_subsystem {
 
     # Create ports for all configured portals
     my @portals = ();
-    push @portals, $scfg->{discovery_portal} if $scfg->{discovery_portal};
-    push @portals, split(/\s*,\s*/, $scfg->{portals}) if $scfg->{portals};
+    push @portals, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
+    push @portals, split(/\s*,\s*/, $scfg->{tn_portals}) if $scfg->{tn_portals};
 
     for my $portal (@portals) {
         my ($host, $port) = _nvme_parse_portal($portal);
@@ -4073,7 +4080,7 @@ sub _nvme_delete_namespace {
     _log($scfg, 1, 'info', "[TrueNAS] nvme_delete_namespace: deleting namespace for $zname");
 
     # Get subsystem ID
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
     my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
         [["subnqn", "=", $nqn]]
     ]);
@@ -4135,7 +4142,7 @@ sub path {
     # Note: snapname is used during clone operations - we support snapshots via ZFS
     my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
 
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         # iSCSI: metadata is LUN number
@@ -4150,7 +4157,7 @@ sub path {
                 $dev = _device_for_lun($scfg, $real_lun);
             } else {
                 die $@ if $@; # bubble up original cause
-                die "Could not locate device for LUN $lun (IQN $scfg->{target_iqn})\n";
+                die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
             }
         }
         return ($dev, $vmid, 'images');
@@ -4189,7 +4196,7 @@ sub alloc_image {
     # Determine effective volblocksize: step down by halves until it evenly divides $bytes.
     # Do NOT round $bytes up — that makes the zvol larger than requested and breaks QEMU
     # drive-mirror size checks during VM migration (issue #25).
-    my $blocksize = $scfg->{zvol_blocksize};
+    my $blocksize = $scfg->{tn_zvol_blocksize};
     my $bs_bytes  = _parse_blocksize($blocksize);
 
     if ($bs_bytes && $bs_bytes > 0 && ($bytes % $bs_bytes) != 0) {
@@ -4217,7 +4224,7 @@ sub alloc_image {
     # Log successful pre-flight checks
     _log($scfg, 1, 'info', sprintf(
         "[TrueNAS] alloc_image: pre-flight checks passed for %s volume allocation on '%s' (VM %d)",
-        _format_bytes($bytes), $scfg->{dataset}, $vmid
+        _format_bytes($bytes), $scfg->{tn_dataset}, $vmid
     ));
 
     # Determine a disk name under our dataset: vm-<vmid>-disk-<n>
@@ -4226,7 +4233,7 @@ sub alloc_image {
         $zname = _find_free_disk_name($scfg, $vmid);
     }
 
-    my $full_ds = $scfg->{dataset} . '/' . $zname;
+    my $full_ds = $scfg->{tn_dataset} . '/' . $zname;
 
     # 1) Create the zvol (VOLUME) on TrueNAS with requested size
     # Note: $bytes already calculated above in space check (size in KiB * 1024)
@@ -4254,7 +4261,7 @@ sub alloc_image {
         # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
         $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
-        $create_payload->{compression} = uc($scfg->{compression}) if $scfg->{compression};
+        $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 
         eval {
             $create_result = _api_call(
@@ -4274,7 +4281,7 @@ sub alloc_image {
                 if ($zname =~ /^(vm-\d+-disk-)(\d+)(.*)$/) {
                     my ($prefix, $num, $suffix) = ($1, $2, $3);
                     $zname = $prefix . ($num + 1) . $suffix;
-                    $full_ds = $scfg->{dataset} . '/' . $zname;
+                    $full_ds = $scfg->{tn_dataset} . '/' . $zname;
                     _log($scfg, 1, 'info', "[TrueNAS] alloc_image: retrying with name $zname");
                     next;  # Retry with new name
                 } else {
@@ -4310,7 +4317,7 @@ sub alloc_image {
 
     # 2) Transport-specific volume exposure
     my $zvol_path = 'zvol/' . $full_ds;
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         return _alloc_image_iscsi($class, $scfg, $zname, $full_ds, $zvol_path);
@@ -4443,7 +4450,7 @@ sub _alloc_image_iscsi {
         }
 
         # No active sessions — perform login and device discovery
-        _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{target_iqn}");
+        _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image deferred: logging in to target $deferred_scfg->{tn_target_iqn}");
         eval { _iscsi_login_all($deferred_scfg); };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image deferred: iSCSI login failed (activate_volume will retry): $@");
@@ -4452,7 +4459,7 @@ sub _alloc_image_iscsi {
 
         # Rescan to detect the new LUN (safe here — we just logged in, no existing I/O)
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-        if ($deferred_scfg->{use_multipath}) {
+        if ($deferred_scfg->{tn_use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
         }
         eval { run_command(['udevadm','settle'], outfunc => sub {}); };
@@ -4551,7 +4558,7 @@ sub volume_size_info {
     my (undef, $zname, undef, undef, undef, undef, $fmt, undef) =
         $class->parse_volname($volname);
     $fmt //= 'raw';
-    my $full = $scfg->{dataset} . '/' . $zname;
+    my $full = $scfg->{tn_dataset} . '/' . $zname;
     my $ds = eval { _tn_dataset_get($scfg, $full) } // {};
     if (my $err = $@) {
         if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
@@ -4575,7 +4582,7 @@ sub free_image {
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
     my (undef, $zname, undef, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
-    my $full_ds = $scfg->{dataset} . '/' . $zname;
+    my $full_ds = $scfg->{tn_dataset} . '/' . $zname;
 
     # Protect weight volume from deletion - it maintains target visibility
     # Match both old format (pve-plugin-weight) and new format (pve-weight-*)
@@ -4588,7 +4595,7 @@ sub free_image {
     _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
 
     # Dispatch to transport-specific deletion
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
@@ -4608,7 +4615,7 @@ sub _free_image_iscsi {
     my @scsi_devices_to_cleanup;
     if (defined $lun) {
         eval {
-            my $iqn = $scfg->{target_iqn};
+            my $iqn = $scfg->{tn_target_iqn};
             my $pattern = "-iscsi-$iqn-lun-$lun";
             if (opendir(my $dh, "/dev/disk/by-path")) {
                 my @by_paths = grep { $_ =~ /^ip-.*\Q$pattern\E$/ } readdir($dh);
@@ -4632,7 +4639,7 @@ sub _free_image_iscsi {
     # Resolve target/extent/mapping on TrueNAS (moved up: needed for WWID validation below)
     my $target_id = _resolve_target_id($scfg);
     my $extents = _tn_extents($scfg) // [];
-    my $zvol_path_match = "zvol/$scfg->{dataset}/$zname";
+    my $zvol_path_match = "zvol/$scfg->{tn_dataset}/$zname";
     my ($extent) = grep { ($_->{disk}//'') eq $zvol_path_match } @$extents;
     my $maps = _tn_targetextents($scfg) // [];
     my ($tx) = ($extent && $target_id)
@@ -4644,7 +4651,7 @@ sub _free_image_iscsi {
     # calling path() + scsi_id — scsi_id does not work reliably on DM devices (/dev/mapper/mpathX),
     # and calling path() here would re-enter the login path on a volume being deleted.
     # TrueNAS NAA format: "0x6589cfc..." → multipath WWID: "36589cfc..." (0x prefix → NAA-6 type byte 3)
-    if ($scfg->{use_multipath}) {
+    if ($scfg->{tn_use_multipath}) {
         eval {
             if ($extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
                 (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
@@ -4691,7 +4698,7 @@ sub _free_image_iscsi {
         };
         if (!$ok) {
             my $err = $@ // '';
-            if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+            if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
             } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
                 # Only warn if resource actually exists - ENOENT means already cleaned up
@@ -4711,7 +4718,7 @@ sub _free_image_iscsi {
         };
         if (!$ok) {
             my $err = $@ // '';
-            if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+            if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
                 $need_force_logout = 1;
             } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
                 # Only warn if resource actually exists - ENOENT means already cleaned up
@@ -4824,13 +4831,13 @@ sub _free_image_iscsi {
 
         if ($deferred_need_force_logout) {
             # Just clean up stale multipath mappings without reconnecting
-            if ($deferred_scfg->{use_multipath}) {
+            if ($deferred_scfg->{tn_use_multipath}) {
                 eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
             }
             eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
         } else {
             eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
-            if ($deferred_scfg->{use_multipath}) {
+            if ($deferred_scfg->{tn_use_multipath}) {
                 eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
             }
             eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
@@ -4846,7 +4853,7 @@ sub _free_image_iscsi {
         }
 
         # Optional: logout if no LUNs remain for this target on this node
-        if ($deferred_scfg->{logout_on_free}) {
+        if ($deferred_scfg->{tn_logout_on_free}) {
             eval {
                 if (_session_has_no_luns($deferred_scfg)) {
                     _logout_target_all_portals($deferred_scfg);
@@ -4880,7 +4887,7 @@ sub _free_image_nvme {
     };
     if (!$ok) {
         my $err = $@ // '';
-        if ($scfg->{force_delete_on_inuse} && $in_use->($err)) {
+        if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
             $need_force_disconnect = 1;
             _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: namespace deletion blocked (in use), will retry after disconnect: $err");
         } elsif ($err !~ /does not exist|ENOENT|not found/i) {
@@ -4894,7 +4901,7 @@ sub _free_image_nvme {
         # Check if there are other active namespaces in this subsystem
         my $active_ns_count = 0;
         eval {
-            my $nqn = $scfg->{subsystem_nqn};
+            my $nqn = $scfg->{tn_subsystem_nqn};
             my $subsystems = _api_call($scfg, 'nvmet.subsys.query',
                 [[ ["subnqn", "=", $nqn] ]]);
 
@@ -5006,7 +5013,7 @@ sub _free_image_nvme {
 # Conservative: we only logout if we see a session for the IQN AND there are zero LUNs listed.
 sub _session_has_no_luns {
     my ($scfg) = @_;
-    my $target_iqn = $scfg->{target_iqn} // return 0;
+    my $target_iqn = $scfg->{tn_target_iqn} // return 0;
 
     my $buf = '';
     eval {
@@ -5036,7 +5043,7 @@ sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
     my $res = [];
 
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         return _list_images_iscsi($class, $storeid, $scfg, $vmid, $vollist, $cache);
@@ -5073,7 +5080,7 @@ sub _list_images_iscsi {
         # Query TrueNAS for all child datasets under our storage dataset
         # This is significantly faster than individual _tn_dataset_get() calls per volume
         my $datasets = _api_call($scfg, 'pool.dataset.query', [
-            [["id", "^", "$scfg->{dataset}/"]]
+            [["id", "^", "$scfg->{tn_dataset}/"]]
         ]);
 
         # Build hash lookup table: dataset_id => dataset_info
@@ -5100,7 +5107,7 @@ sub _list_images_iscsi {
         my $ds_full = $1;
 
         # Extract zvol name from path, filtering by configured dataset
-        next MAPPING unless $ds_full =~ m{^\Q$scfg->{dataset}\E/(.+)$};
+        next MAPPING unless $ds_full =~ m{^\Q$scfg->{tn_dataset}\E/(.+)$};
         my $zname = $1;
 
         # Determine assigned LUN id
@@ -5174,7 +5181,7 @@ sub _list_images_nvme {
     my $res = [];
 
     # Get subsystem ID
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
     my $subsystems = eval {
         _api_call($scfg, 'nvmet.subsys.query', [
             [["subnqn", "=", $nqn]]
@@ -5217,7 +5224,7 @@ sub _list_images_nvme {
         # Query TrueNAS for all child datasets under our storage dataset
         # This is significantly faster than individual _tn_dataset_get() calls per volume
         my $datasets = _api_call($scfg, 'pool.dataset.query', [
-            [["id", "^", "$scfg->{dataset}/"]]
+            [["id", "^", "$scfg->{tn_dataset}/"]]
         ]);
 
         # Build hash lookup table: dataset_id => dataset_info
@@ -5239,7 +5246,7 @@ sub _list_images_nvme {
         my $ds_full = $1;  # e.g., "flash/nvme-test/vm-998-disk-0"
 
         # Extract zvol name from path
-        next unless $ds_full =~ m{^\Q$scfg->{dataset}\E/(.+)$};
+        next unless $ds_full =~ m{^\Q$scfg->{tn_dataset}\E/(.+)$};
         my $zname = $1;  # e.g., "vm-998-disk-0"
 
         # Owner (vmid) from naming convention
@@ -5311,8 +5318,8 @@ sub _status_cache_storeid {
 sub _status_capacity_cache_method {
     my ($storeid, $scfg) = @_;
     my $effective_storeid = _status_cache_storeid($storeid, $scfg);
-    my $endpoint = $scfg->{api_host} // 'unknown-endpoint';
-    my $dataset = $scfg->{dataset} // 'unknown-dataset';
+    my $endpoint = $scfg->{tn_api_host} // 'unknown-endpoint';
+    my $dataset = $scfg->{tn_dataset} // 'unknown-dataset';
     return "status-capacity:v1:$effective_storeid:$endpoint:$dataset";
 }
 
@@ -5345,13 +5352,13 @@ sub status {
         } else {
             $_status_capacity_cache_stats{miss}++;
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: miss key=$status_method");
-            $ds = _tn_dataset_get($scfg, $scfg->{dataset}, { retry_max => 0 });
+            $ds = _tn_dataset_get($scfg, $scfg->{tn_dataset}, { retry_max => 0 });
             _set_cache($host_key, $status_method, $ds);
 
             # Pool health check on cache miss only (non-fatal — log warning if degraded)
             my $pool = _tn_pool_health($scfg);
             if ($pool && !$pool->{healthy}) {
-                my ($pool_name) = split('/', $scfg->{dataset}, 2);
+                my ($pool_name) = split('/', $scfg->{tn_dataset}, 2);
                 _log($scfg, 0, 'warning',
                     "[TrueNAS] status: pool '$pool_name' is not healthy (status: " .
                     ($pool->{status} // 'UNKNOWN') . ")");
@@ -5409,7 +5416,7 @@ sub status {
 sub _ensure_target_visible {
     my ($scfg, %opts) = @_;
 
-    my $iqn = $scfg->{target_iqn};
+    my $iqn = $scfg->{tn_target_iqn};
 
     # Throttle: skip entire preflight on activate_storage path if recently verified
     my $target_visible_key = _cache_host_key($scfg) . ':' . ($iqn // 'unknown-target');
@@ -5419,7 +5426,7 @@ sub _ensure_target_visible {
             return 1;
         }
     }
-    my $portal = _normalize_portal($scfg->{discovery_portal});
+    my $portal = _normalize_portal($scfg->{tn_discovery_portal});
 
     # Create a unique weight volume name per target
     # Extract short name from IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
@@ -5438,7 +5445,7 @@ sub _ensure_target_visible {
     my $iqn_hash8          = substr(sha1_hex($iqn), 0, 8);
     my $weight_name        = "pve-weight-$target_suffix-$iqn_hash8";  # canonical (v2.0.20+)
     my $weight_name_legacy = "pve-weight-$target_suffix";             # pre-v2.0.20 deployments
-    my $weight_zname       = $scfg->{dataset} . '/' . $weight_name;
+    my $weight_zname       = $scfg->{tn_dataset} . '/' . $weight_name;
 
     # Level 1: Log pre-flight check start
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: checking target visibility for $iqn (weight: $weight_name)");
@@ -5484,7 +5491,7 @@ sub _ensure_target_visible {
     # This prevents issues where weight gets deleted and target becomes undiscoverable
     _log($scfg, 1, 'info', "[TrueNAS] Pre-flight: ensuring weight volume exists for target reliability");
     my $weight_exists = 0;
-    my $weight_zname_legacy = $scfg->{dataset} . '/' . $weight_name_legacy;
+    my $weight_zname_legacy = $scfg->{tn_dataset} . '/' . $weight_name_legacy;
     eval {
         my $ds = _tn_dataset_get($scfg, $weight_zname);
         if ($ds) {
@@ -5710,7 +5717,7 @@ sub _ensure_target_visible {
 sub activate_storage {
     my ($class, $storeid, $scfg, $cache) = @_;
 
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
         # Run pre-flight check to ensure target is visible
@@ -5750,14 +5757,14 @@ sub activate_volume {
 
     _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: volname=$volname");
 
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     # Parse volname to extract metadata (LUN for iSCSI, UUID for NVMe)
     my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
 
     if ($mode eq 'iscsi') {
         _iscsi_login_all($scfg);
-        if ($scfg->{use_multipath}) {
+        if ($scfg->{tn_use_multipath}) {
             run_command(['multipath','-r'], outfunc => sub {});
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
             usleep(UDEV_SETTLE_TIMEOUT_US);
@@ -5812,7 +5819,7 @@ sub clone_image {
     _log($scfg, 1, 'info', "[TrueNAS] clone_image: volname=$volname, vmid=$vmid, snapname=$snapname");
 
     # Dispatch by transport mode
-    my $mode = $scfg->{transport_mode} // 'iscsi';
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
     if ($mode eq 'iscsi') {
         return _clone_image_iscsi($class, $scfg, $storeid, $volname, $vmid, $snapname, $name);
     } elsif ($mode eq 'nvme-tcp') {
@@ -5829,7 +5836,7 @@ sub _clone_image_iscsi {
 
     # Parse source volume information
     my (undef, $source_zname) = $class->parse_volname($volname);
-    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_full = $scfg->{tn_dataset} . '/' . $source_zname;
     my $source_snapshot = $source_full . '@' . $snapname;
 
     _log($scfg, 2, 'debug', "[TrueNAS] _clone_image_iscsi: cloning from $source_snapshot");
@@ -5840,7 +5847,7 @@ sub _clone_image_iscsi {
         $target_zname = _find_free_disk_name($scfg, $vmid);
     }
 
-    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+    my $target_full = $scfg->{tn_dataset} . '/' . $target_zname;
 
     # 1) Create ZFS clone from snapshot, with retry on "already exists" TOCTOU race
     # (two nodes picking the same free name between _find_free_disk_name and clone create)
@@ -5857,7 +5864,7 @@ sub _clone_image_iscsi {
                 _log($scfg, 1, 'warn', "[TrueNAS] _clone_image_iscsi: $target_full already exists (attempt $clone_attempt/$max_clone_retries), retrying with new name");
                 _clear_cache(_cache_host_key($scfg));
                 $target_zname = _find_free_disk_name($scfg, $vmid);
-                $target_full  = $scfg->{dataset} . '/' . $target_zname;
+                $target_full  = $scfg->{tn_dataset} . '/' . $target_zname;
                 next;
             }
             die $@;
@@ -5959,7 +5966,7 @@ sub _clone_image_iscsi {
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_iscsi deferred: refreshing initiator view");
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
-        if ($deferred_scfg->{use_multipath}) {
+        if ($deferred_scfg->{tn_use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
         }
         eval { run_command(['udevadm','settle'], outfunc => sub {}); };
@@ -5974,7 +5981,7 @@ sub _clone_image_nvme {
 
     # Parse source volume information
     my (undef, $source_zname) = $class->parse_volname($volname);
-    my $source_full = $scfg->{dataset} . '/' . $source_zname;
+    my $source_full = $scfg->{tn_dataset} . '/' . $source_zname;
     my $source_snapshot = $source_full . '@' . $snapname;
 
     _log($scfg, 2, 'debug', "[TrueNAS] _clone_image_nvme: cloning from $source_snapshot");
@@ -5985,7 +5992,7 @@ sub _clone_image_nvme {
         $target_zname = _find_free_disk_name($scfg, $vmid);
     }
 
-    my $target_full = $scfg->{dataset} . '/' . $target_zname;
+    my $target_full = $scfg->{tn_dataset} . '/' . $target_zname;
 
     # 1) Create ZFS clone from snapshot, with retry on "already exists" TOCTOU race
     my $clone_result;
@@ -6000,7 +6007,7 @@ sub _clone_image_nvme {
                 _log($scfg, 1, 'warn', "[TrueNAS] _clone_image_nvme: $target_full already exists (attempt $clone_attempt/$max_clone_retries), retrying with new name");
                 _clear_cache(_cache_host_key($scfg));
                 $target_zname = _find_free_disk_name($scfg, $vmid);
-                $target_full  = $scfg->{dataset} . '/' . $target_zname;
+                $target_full  = $scfg->{tn_dataset} . '/' . $target_zname;
                 next;
             }
             die $@;
@@ -6029,7 +6036,7 @@ sub _clone_image_nvme {
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: verified cloned zvol size = $cloned_size bytes");
 
     # 2) Create NVMe namespace for the cloned zvol
-    my $nqn = $scfg->{subsystem_nqn};
+    my $nqn = $scfg->{tn_subsystem_nqn};
 
     # Get subsystem ID
     my $subsystems = eval {
@@ -6134,7 +6141,7 @@ sub cluster_lock_storage {
     # Use configured timeout or our default (much longer than Proxmox's 10s)
     my $cfg = PVE::Storage::config();
     my $scfg = PVE::Storage::storage_config($cfg, $storeid, 1);
-    my $lock_timeout = $scfg->{storage_lock_timeout} // DEFAULT_LOCK_TIMEOUT;
+    my $lock_timeout = $scfg->{tn_storage_lock_timeout} // DEFAULT_LOCK_TIMEOUT;
 
     # Override the timeout if not explicitly provided or if it's the Proxmox default
     $timeout = $lock_timeout if !defined($timeout) || $timeout < $lock_timeout;

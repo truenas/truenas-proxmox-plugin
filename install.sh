@@ -2690,7 +2690,7 @@ run_diagnostics_bundle() {
         # Section 3: Storage config (all TrueNAS storages, API keys redacted)
         echo "=== Storage Configuration (API keys redacted) ==="
         if [[ -f "$STORAGE_CFG" ]]; then
-            grep -A 20 "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | sed 's/api_key .*/api_key [REDACTED]/g' || echo "No TrueNAS storages configured"
+            grep -A 20 "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | sed 's/tn_api_key .*/tn_api_key [REDACTED]/g' || echo "No TrueNAS storages configured"
         else
             echo "Storage config not found at $STORAGE_CFG"
         fi
@@ -3769,7 +3769,7 @@ menu_cleanup_orphans() {
         local i=1
         for storage in "${storage_list[@]}"; do
             local mode
-            mode=$(get_storage_config_value "$storage" "transport_mode" || true)
+            mode=$(get_storage_config_value "$storage" "tn_transport_mode" || true)
             [[ -z "$mode" ]] && mode="iscsi"
             echo "  $i) $storage ($mode)"
             ((i++))
@@ -3805,12 +3805,12 @@ menu_cleanup_orphans() {
 
     # Get storage configuration
     local api_host api_key dataset api_insecure transport_mode
-    api_host=$(get_storage_config_value "$storage_name" "api_host" || true)
-    api_key=$(get_storage_config_value "$storage_name" "api_key" || true)
-    dataset=$(get_storage_config_value "$storage_name" "dataset" || true)
-    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure" || true)
-    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" || true)
-    TN_API_PORT="$(get_storage_config_value "$storage_name" "api_port" 2>/dev/null || true)"
+    api_host=$(get_storage_config_value "$storage_name" "tn_api_host" || true)
+    api_key=$(get_storage_config_value "$storage_name" "tn_api_key" || true)
+    dataset=$(get_storage_config_value "$storage_name" "tn_dataset" || true)
+    api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure" || true)
+    transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode" || true)
+    TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
     TN_API_PORT="${TN_API_PORT:-443}"
 
     # Default to iscsi if not specified
@@ -4556,7 +4556,7 @@ _detect_orphaned_resources_nvme() {
         local configured_nqns=()
         while IFS= read -r nqn; do
             [[ -n "$nqn" ]] && configured_nqns+=("$nqn")
-        done < <(grep -h "subsystem_nqn" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}')
+        done < <(grep -h "tn_subsystem_nqn" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}')
 
         log "INFO" "_detect_orphaned_resources_nvme: ${#configured_nqns[@]} subsystems configured in storage.cfg"
 
@@ -4723,9 +4723,9 @@ run_health_check() {
 
     # Check 5: TrueNAS API reachability
     local api_host
-    api_host=$(get_storage_config_value "$storage_name" "api_host")
+    api_host=$(get_storage_config_value "$storage_name" "tn_api_host")
     local api_port
-    api_port=$(get_storage_config_value "$storage_name" "api_port")
+    api_port=$(get_storage_config_value "$storage_name" "tn_api_port")
     api_port=${api_port:-443}
     TN_API_PORT="$api_port"
 
@@ -4749,7 +4749,7 @@ run_health_check() {
 
     # Check 5b: API authentication
     local api_key_early
-    api_key_early=$(get_storage_config_value "$storage_name" "api_key")
+    api_key_early=$(get_storage_config_value "$storage_name" "tn_api_key")
     if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
         printf "%-30s " "API authentication:"
         start_spinner
@@ -4770,7 +4770,7 @@ run_health_check() {
 
     # Detect transport mode (needed for service check and later checks)
     local transport_mode
-    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
+    transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode")
     transport_mode=${transport_mode:-iscsi}  # Default to iscsi if not specified
 
     # Check 5c: TrueNAS target service status
@@ -4808,7 +4808,7 @@ run_health_check() {
 
     # Check 6: Dataset configuration
     local dataset
-    dataset=$(get_storage_config_value "$storage_name" "dataset")
+    dataset=$(get_storage_config_value "$storage_name" "tn_dataset")
     if [[ -n "$dataset" ]]; then
         check_result "Dataset" "OK" "$dataset"
     else
@@ -4817,9 +4817,9 @@ run_health_check() {
 
     # Check 6.5: Dataset type validation (must be FILESYSTEM, not VOLUME)
     local api_key
-    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    api_key=$(get_storage_config_value "$storage_name" "tn_api_key")
     local api_insecure
-    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+    api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure")
 
     if [[ -n "$dataset" ]] && [[ -n "$api_host" ]] && [[ -n "$api_key" ]]; then
         printf "%-30s " "Dataset type:"
@@ -4876,7 +4876,7 @@ run_health_check() {
 
         # Check subsystem NQN
         local subsystem_nqn
-        subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn")
+        subsystem_nqn=$(get_storage_config_value "$storage_name" "tn_subsystem_nqn")
         if [[ -n "$subsystem_nqn" ]]; then
             check_result "Subsystem NQN" "OK" "$subsystem_nqn"
         else
@@ -4885,7 +4885,7 @@ run_health_check() {
 
         # Check host NQN
         local hostnqn
-        hostnqn=$(get_storage_config_value "$storage_name" "hostnqn")
+        hostnqn=$(get_storage_config_value "$storage_name" "tn_hostnqn")
         if [[ -n "$hostnqn" ]]; then
             check_result "Host NQN" "OK" "$hostnqn"
         elif [[ -f /etc/nvme/hostnqn ]]; then
@@ -4908,7 +4908,7 @@ run_health_check() {
     else
         # iSCSI mode - check target IQN
         local target_iqn
-        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        target_iqn=$(get_storage_config_value "$storage_name" "tn_target_iqn")
         if [[ -n "$target_iqn" ]]; then
             check_result "Target IQN" "OK" "$target_iqn"
         else
@@ -4918,7 +4918,7 @@ run_health_check() {
 
     # Check 8: Discovery portal
     local discovery_portal
-    discovery_portal=$(get_storage_config_value "$storage_name" "discovery_portal")
+    discovery_portal=$(get_storage_config_value "$storage_name" "tn_discovery_portal")
     if [[ -n "$discovery_portal" ]]; then
         check_result "Discovery portal" "OK" "$discovery_portal"
     else
@@ -5029,7 +5029,7 @@ run_health_check() {
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         # Check native NVMe multipath
         local portals
-        portals=$(get_storage_config_value "$storage_name" "portals")
+        portals=$(get_storage_config_value "$storage_name" "tn_portals")
         if [[ -n "$portals" ]]; then
             if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
                 local nvme_mp
@@ -5048,7 +5048,7 @@ run_health_check() {
     else
         # iSCSI multipath check
         local use_multipath
-        use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+        use_multipath=$(get_storage_config_value "$storage_name" "tn_use_multipath")
         if [[ "$use_multipath" == "1" ]]; then
             if command -v multipath &> /dev/null; then
                 local mpath_count
@@ -5070,12 +5070,12 @@ run_health_check() {
     # Check 11: Orphaned resources (iSCSI only)
     if [[ "$transport_mode" == "iscsi" ]]; then
         local api_host
-        api_host=$(get_storage_config_value "$storage_name" "api_host")
+        api_host=$(get_storage_config_value "$storage_name" "tn_api_host")
         local api_key
-        api_key=$(get_storage_config_value "$storage_name" "api_key")
+        api_key=$(get_storage_config_value "$storage_name" "tn_api_key")
         local api_insecure
-        api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
-        TN_API_PORT="$(get_storage_config_value "$storage_name" "api_port" 2>/dev/null || true)"
+        api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure")
+        TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
         TN_API_PORT="${TN_API_PORT:-443}"
 
         if [[ -n "$api_host" ]] && [[ -n "$api_key" ]] && [[ -n "$dataset" ]]; then
@@ -5106,12 +5106,12 @@ run_health_check() {
     else
         # NVMe/TCP mode - detect orphaned namespaces/zvols/subsystems
         local api_host_nvme
-        api_host_nvme=$(get_storage_config_value "$storage_name" "api_host")
+        api_host_nvme=$(get_storage_config_value "$storage_name" "tn_api_host")
         local api_key_nvme
-        api_key_nvme=$(get_storage_config_value "$storage_name" "api_key")
+        api_key_nvme=$(get_storage_config_value "$storage_name" "tn_api_key")
         local api_insecure_nvme
-        api_insecure_nvme=$(get_storage_config_value "$storage_name" "api_insecure")
-        TN_API_PORT="$(get_storage_config_value "$storage_name" "api_port" 2>/dev/null || true)"
+        api_insecure_nvme=$(get_storage_config_value "$storage_name" "tn_api_insecure")
+        TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
         TN_API_PORT="${TN_API_PORT:-443}"
 
         if [[ -n "$api_host_nvme" ]] && [[ -n "$api_key_nvme" ]] && [[ -n "$dataset" ]]; then
@@ -5162,7 +5162,7 @@ run_health_check() {
 
         # Get target IQN to derive weight volume name
         local target_iqn
-        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        target_iqn=$(get_storage_config_value "$storage_name" "tn_target_iqn")
 
         # Derive weight name from IQN (same logic as plugin)
         # Extract suffix from IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
@@ -5625,7 +5625,7 @@ check_subsystem_in_use() {
         if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
             current_storage="${BASH_REMATCH[1]}"
             current_storage="$(echo "$current_storage" | xargs)"
-        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+subsystem_nqn[[:space:]]+(.+)$ ]]; then
+        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
             local nqn="${BASH_REMATCH[1]}"
             nqn="$(echo "$nqn" | xargs)"
             if [[ "$nqn" == "$subsystem_nqn" && "$current_storage" != "$exclude_name" ]]; then
@@ -9353,51 +9353,51 @@ generate_storage_config() {
 
     cat <<EOF
 truenasplugin: ${name}
-	api_host ${ip}
-	api_key ${apikey}
-	dataset ${dataset}
+	tn_api_host ${ip}
+	tn_api_key ${apikey}
+	tn_dataset ${dataset}
 EOF
 
-    # Add api_port only when non-default
+    # Add tn_api_port only when non-default
     if [[ "$api_port" != "443" ]]; then
-        echo "	api_port ${api_port}"
+        echo "	tn_api_port ${api_port}"
     fi
 
     # Add transport mode if not default iSCSI
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        echo "	transport_mode nvme-tcp"
-        echo "	subsystem_nqn ${target_or_nqn}"
+        echo "	tn_transport_mode nvme-tcp"
+        echo "	tn_subsystem_nqn ${target_or_nqn}"
     else
-        echo "	target_iqn ${target_or_nqn}"
+        echo "	tn_target_iqn ${target_or_nqn}"
     fi
 
-    echo "	api_insecure 1"
+    echo "	tn_api_insecure 1"
     echo "	shared 1"
 
     if [[ -n "$portal" ]]; then
-        echo "	discovery_portal ${portal}"
+        echo "	tn_discovery_portal ${portal}"
     fi
 
     if [[ -n "$blocksize" ]]; then
-        echo "	zvol_blocksize ${blocksize}"
+        echo "	tn_zvol_blocksize ${blocksize}"
     fi
 
     if [[ -n "$sparse" ]]; then
         echo "	tn_sparse ${sparse}"
     fi
 
-    # Only add use_multipath for iSCSI (NVMe uses native multipath)
+    # Only add tn_use_multipath for iSCSI (NVMe uses native multipath)
     if [[ -n "$use_multipath" ]] && [[ "$transport_mode" == "iscsi" ]]; then
-        echo "	use_multipath ${use_multipath}"
+        echo "	tn_use_multipath ${use_multipath}"
     fi
 
     if [[ -n "$portals" ]]; then
-        echo "	portals ${portals}"
+        echo "	tn_portals ${portals}"
     fi
 
-    # Add hostnqn for NVMe if provided
+    # Add tn_hostnqn for NVMe if provided
     if [[ -n "$hostnqn" ]] && [[ "$transport_mode" == "nvme-tcp" ]]; then
-        echo "	hostnqn ${hostnqn}"
+        echo "	tn_hostnqn ${hostnqn}"
     fi
 
     # Add node restriction if specified (omit for all nodes)
@@ -10251,11 +10251,11 @@ menu_configure_storage() {
 
                 # Read config values BEFORE deletion (config will be gone after)
                 local transport_mode api_host api_key subsystem_nqn
-                transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
-                api_host=$(get_storage_config_value "$storage_name" "api_host" 2>/dev/null)
-                api_key=$(get_storage_config_value "$storage_name" "api_key" 2>/dev/null)
-                subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn" 2>/dev/null)
-                TN_API_PORT="$(get_storage_config_value "$storage_name" "api_port" 2>/dev/null || true)"
+                transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode" 2>/dev/null || echo "iscsi")
+                api_host=$(get_storage_config_value "$storage_name" "tn_api_host" 2>/dev/null)
+                api_key=$(get_storage_config_value "$storage_name" "tn_api_key" 2>/dev/null)
+                subsystem_nqn=$(get_storage_config_value "$storage_name" "tn_subsystem_nqn" 2>/dev/null)
+                TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
                 TN_API_PORT="${TN_API_PORT:-443}"
 
                 # Perform deletion

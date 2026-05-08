@@ -12,8 +12,8 @@ The plugin integrates with TrueNAS SCALE via WebSocket (JSON-RPC) only.
 
 **Configuration**:
 ```ini
-api_scheme wss      # or ws for unencrypted
-api_port 443        # or 80 for unencrypted
+tn_api_scheme wss      # or ws for unencrypted
+tn_api_port 443        # or 80 for unencrypted
 ```
 
 **Connection URL**:
@@ -658,16 +658,16 @@ Reduces:
 
 **Production** (recommended):
 ```ini
-api_scheme wss      # or https
-api_insecure 0      # Verify certificates
+tn_api_scheme wss      # or https
+tn_api_insecure 0      # Verify certificates
 ```
 
 **Testing** (self-signed certs):
 ```ini
-api_insecure 1      # Skip verification
+tn_api_insecure 1      # Skip verification
 ```
 
-**Warning**: Never use `api_insecure=1` in production
+**Warning**: Never use `tn_api_insecure=1` in production
 
 ### API Key Storage
 
