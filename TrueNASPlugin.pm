@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.0';
+our $VERSION = '2.1.1';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 13;
+our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -311,7 +311,7 @@ sub _retry_with_backoff {
 
 # ======== Storage plugin identity ========
 # Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 13)
+# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 14)
 sub api {
     my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
 

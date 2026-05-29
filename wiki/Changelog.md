@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.1 (May 29, 2026)
+
+- **Bump storage API version to 14 (GitHub issue #41)**: Updated `$TESTED_APIVER` from 13 to 14 to match `libpve-storage-perl` 9.1.3+ (Proxmox VE 9.2+), eliminating the "implementing an older storage API" warning logged at every plugin load. The APIVER 14 bump in PVE was backward compatible (added optional `get_identity()` method); no new plugin methods are required.
+
+---
+
 ## Version 2.1.0 (May 7, 2026)
 
 ### Breaking Change

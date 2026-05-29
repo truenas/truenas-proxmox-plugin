@@ -1,3 +1,11 @@
+truenas-proxmox-plugin (2.1.1+deb1) unstable; urgency=medium
+
+  * Bump storage API version to 14 to match libpve-storage-perl 9.1.3+
+    (Proxmox VE 9.2+); eliminates "implementing an older storage API" warning
+    on every plugin load (issue #41).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 29 May 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.0+deb1) unstable; urgency=medium
 
   * Rename all storage.cfg option keys to tn_* prefix to avoid namespace

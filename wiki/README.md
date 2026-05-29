@@ -170,6 +170,6 @@ For issues not covered in documentation:
 
 ## Version Information
 
-**Version**: 2.1.0
-**Last Updated**: May 7, 2026
+**Version**: 2.1.1
+**Last Updated**: May 29, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
