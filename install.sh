@@ -5531,12 +5531,14 @@ validate_ip() {
 # Validate storage name format (must match Proxmox PVE::JSONSchema::parse_id rules)
 validate_storage_name() {
     local name="$1"
-    # Must start with a letter, contain only letters/numbers/hyphens/underscores/dots,
-    # end with a letter or number, and be at least 2 characters
+    # Must start with a lowercase letter, contain only lowercase letters/numbers/hyphens/underscores/dots,
+    # end with a lowercase letter or number, and be at least 2 characters.
+    # Uppercase is rejected: TrueNAS SCALE enforces lowercase-only for iSCSI target and NVMe
+    # subsystem names, so an uppercase storage name would cause provisioning to fail at the API layer.
     if [[ ${#name} -lt 2 ]]; then
         return 1
     fi
-    if [[ $name =~ ^[a-zA-Z][a-zA-Z0-9_.-]*[a-zA-Z0-9]$ ]]; then
+    if [[ $name =~ ^[a-z][a-z0-9_.-]*[a-z0-9]$ ]]; then
         return 0
     fi
     return 1
@@ -7087,7 +7089,8 @@ generate_iqn() {
     year_month=$(date +%Y-%m)
 
     # Format: iqn.YYYY-MM.org.freenas.ctl:storage-name
-    echo "iqn.${year_month}.org.freenas.ctl:${storage_name}"
+    # Lowercase the suffix: TrueNAS SCALE enforces lowercase-only target names
+    echo "iqn.${year_month}.org.freenas.ctl:${storage_name,,}"
 }
 
 # Extract the short target name from an IQN
@@ -7354,7 +7357,8 @@ generate_nqn() {
     year_month=$(date +%Y-%m)
 
     # Format: nqn.YYYY-MM.org.freenas.ctl:storage-name
-    echo "nqn.${year_month}.org.freenas.ctl:${storage_name}"
+    # Lowercase the suffix: TrueNAS SCALE enforces lowercase-only subsystem names
+    echo "nqn.${year_month}.org.freenas.ctl:${storage_name,,}"
 }
 
 # Create an NVMe subsystem
@@ -9975,7 +9979,7 @@ wizard_add_storage() {
             continue
         fi
         if ! validate_storage_name "$WIZARD_STORAGE_NAME"; then
-            error "Invalid storage name. Must start with a letter, end with a letter or number, and contain only letters, numbers, hyphens, underscores, or dots (min 2 characters)"
+            error "Invalid storage name. Must start with a lowercase letter, end with a lowercase letter or number, and contain only lowercase letters, numbers, hyphens, underscores, or dots (min 2 characters)"
             continue
         fi
         if storage_name_exists "$WIZARD_STORAGE_NAME"; then
