@@ -193,6 +193,7 @@ truenasplugin: truenas-nvme
 | `tn_discovery_portal` | Yes | Primary portal IP:port | None |
 | `tn_nvme_dhchap_secret` | No | Host authentication secret | None |
 | `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
+| `tn_nr_io_queues` | No | Pin NVMe/TCP I/O queue count per controller (1–256). Auto-detected when unset: uses online CPU count normally, or `floor(possible/2)` when any CPU is offline. Set manually if TrueNAS reports queue limit errors. | Auto-detected |
 
 **Important Notes:**
 - TrueNAS 25.10+ is required for NVMe-oF operations

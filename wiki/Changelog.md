@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.2 (June 3, 2026)
+
+- **Fix NVMe/TCP connect failure when CPUs are offlined (issue #48)**: When CPU threads are taken offline via `/sys/devices/system/cpu/cpuN/online`, the kernel NVMe-TCP driver maps I/O queues to CPUs by index. If any CPU in the possible range is offline, connecting with more queues than `floor(possible_cpus / 2)` causes `errno: -18 (EXDEV)` because at least one queue is assigned to an offline CPU with no online fallback. `_nvme_connect` now always passes `--nr-io-queues`: the online CPU count when all CPUs are online (matching the prior kernel default), or `floor(possible / 2)` when any CPU is offline (guarantees each queue has ≥2 possible CPUs in its affinity set). New optional `tn_nr_io_queues` storage.cfg key (1–256) allows manual override for environments with TrueNAS-side queue limits.
+
+---
+
 ## Version 2.1.1 (May 29, 2026)
 
 - **Bump storage API version to 14 (GitHub issue #41)**: Updated `$TESTED_APIVER` from 13 to 14 to match `libpve-storage-perl` 9.1.3+ (Proxmox VE 9.2+), eliminating the "implementing an older storage API" warning logged at every plugin load. The APIVER 14 bump in PVE was backward compatible (added optional `get_identity()` method); no new plugin methods are required.
