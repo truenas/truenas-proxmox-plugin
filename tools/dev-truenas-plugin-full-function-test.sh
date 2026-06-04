@@ -3626,6 +3626,14 @@ test_interrupted_operations() {
         track_timing "interrupted_ops_orphans" "$total_orphans"
     fi
 
+    # Wait for the storage CFS lock from test 1's interrupted allocation to release.
+    # The NVMe plugin holds the lock during its cleanup phase; under set -euo pipefail
+    # a blocked pvesh create produces empty output which previously crashed the script.
+    # parse_volid() now handles that gracefully, but waiting here lets test 2 actually
+    # succeed rather than skip due to lock contention.
+    log_info "Waiting 30s for storage lock to release after interrupted allocation..."
+    sleep 30
+
     # Test 2: Verify system can handle normal operations after interruption
     log_info "Test 2: Verifying normal operations after interruption"
     vmid=$((base_vmid + 1))
