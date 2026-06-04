@@ -670,6 +670,20 @@ destroy_lxc() {
     free_orphaned_disks_for_vmid "$vmid"
 }
 
+# Extract a storage:volid string from pvesh JSON output.
+# Returns empty string (never exits non-zero) so callers work under set -euo pipefail.
+parse_volid() {
+    # Accept JSON either as first argument or from stdin.
+    # Returns empty string (never exits non-zero) so callers work under set -euo pipefail.
+    local json
+    if [[ $# -gt 0 ]]; then
+        json="$1"
+        echo "$json"
+    else
+        cat
+    fi | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1 || true
+}
+
 free_orphaned_disks_for_vmid() {
     local vmid="$1"
     local disks
@@ -858,7 +872,7 @@ test_disk_allocation() {
         -vmid $vmid \
         -filename "vm-$vmid-disk-0" \
         -size "${size_gb}G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
         log_error "Failed to allocate disk"
@@ -1114,7 +1128,7 @@ test_create_base_vm_for_clone() {
         -vmid $vmid \
         -filename "vm-$vmid-disk-0" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
         log_error "Failed to allocate disk"
@@ -1313,7 +1327,7 @@ test_disk_resize() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -1423,7 +1437,7 @@ test_concurrent_operations() {
                     -size "5G" \
                     --output-format=json 2>&1)
 
-                volid=$(echo "$output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+                volid=$(echo "$output" | parse_volid)
 
                 [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID:vol- ]] && break
                 volid=""
@@ -1658,7 +1672,7 @@ test_performance() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     local alloc_end=$(date +%s%3N)
     local elapsed=$((alloc_end - alloc_start))
 
@@ -1681,7 +1695,7 @@ test_performance() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "20G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     alloc_end=$(date +%s%3N)
     elapsed=$((alloc_end - alloc_start))
 
@@ -1756,7 +1770,7 @@ test_multiple_disks() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i"
@@ -1866,7 +1880,7 @@ test_efi_vm_creation() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "1M" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$efi_volid" ]] || [[ "$efi_volid" == *"error"* ]]; then
         log_error "Failed to allocate EFI disk"
@@ -1892,7 +1906,7 @@ test_efi_vm_creation() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-1" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$data_volid" >/dev/null 2>&1; then
         log_error "Failed to attach data disk"
@@ -1999,7 +2013,7 @@ test_multidisk_advanced_operations() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk $i"
@@ -2115,7 +2129,7 @@ test_multidisk_advanced_operations() {
             -vmid "$base_clone_vmid" \
             -filename "vm-${base_clone_vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$base_clone_vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i to base VM"
@@ -2217,7 +2231,7 @@ test_multidisk_advanced_operations() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i"
@@ -2319,7 +2333,7 @@ test_multidisk_advanced_operations() {
                 -vmid "$vmid" \
                 -filename "vm-${vmid}-disk-${i}" \
                 -size "5G" \
-                --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+                --output-format=json 2>&1 | parse_volid)
 
             if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
                 log_error "Failed to attach disk $i"
@@ -2460,7 +2474,7 @@ test_live_migration() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2577,7 +2591,7 @@ test_offline_migration() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2677,7 +2691,7 @@ test_online_backup() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2776,7 +2790,7 @@ test_offline_backup() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2862,7 +2876,7 @@ test_cross_node_clone_online() {
         -vmid "$base_vmid" \
         -filename "vm-${base_vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$base_vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2967,7 +2981,7 @@ test_cross_node_clone_offline() {
         -vmid "$base_vmid" \
         -filename "vm-${base_vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$base_vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -3061,7 +3075,7 @@ test_rapid_create_delete_stress() {
             -filename "vm-${vmid}-disk-0" \
             -size "1G" \
             --output-format=json 2>&1) || true
-        volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        volid=$(echo "$alloc_output" | parse_volid)
 
         if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk for VM $vmid"
@@ -3269,7 +3283,7 @@ test_storage_exhaustion() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "${excessive_gb}G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1) || alloc_exit_code=$?
+        --output-format=json 2>&1 | parse_volid) || alloc_exit_code=$?
 
     # Handle timeout (exit code 124)
     if [[ $alloc_exit_code -eq 124 ]]; then
@@ -3633,7 +3647,7 @@ test_interrupted_operations() {
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
         --output-format=json 2>&1) || alloc_exit_code=$?
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     # Check if allocation failed due to storage lock (known bug from interrupted operation)
     if echo "$alloc_output" | grep -q "cfs-lock.*error.*timeout" || \
@@ -3714,7 +3728,7 @@ test_large_disk_operations() {
         -filename "vm-${vmid}-disk-0" \
         -size "200G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
     local alloc_duration=$(($(date +%s) - alloc_start))
 
     # Check if allocation failed due to storage lock (persisting from Phase 20)
@@ -3946,7 +3960,7 @@ test_transport_mode_verification() {
         --output-format=json 2>&1) || true
     # Extract volid - successful response is just a quoted string like "storage:vol-..."
     # Error response is JSON with "code" field - check for storage ID prefix to validate
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate test disk"
@@ -4206,7 +4220,7 @@ test_snapshot_reversion() {
         -filename "vm-${vmid}-disk-0" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate disk"
@@ -4539,7 +4553,7 @@ test_disk_hotswap() {
         -filename "vm-${vmid}-disk-0" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate primary disk"
@@ -4587,7 +4601,7 @@ test_disk_hotswap() {
         -filename "vm-${vmid}-disk-1" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid2=$(echo "$alloc_output2" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid2=$(echo "$alloc_output2" | parse_volid)
 
     if [[ -z "$volid2" ]] || [[ "$volid2" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate second disk"
@@ -5122,7 +5136,7 @@ test_nvme_stale_recovery() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "1G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
         log_error "Failed to allocate disk: $volid"
@@ -5294,7 +5308,7 @@ test_concurrent_alloc_free_contention() {
         -vmid "$vmid_free" \
         -filename "vm-${vmid_free}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
         log_error "Failed to allocate free-target disk"
@@ -5324,7 +5338,7 @@ test_concurrent_alloc_free_contention() {
         -vmid "$vmid_alloc" \
         -filename "vm-${vmid_alloc}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     local baseline_end=$(date +%s%3N)
     local baseline_ms=$((baseline_end - baseline_start))
 
@@ -5359,7 +5373,7 @@ test_concurrent_alloc_free_contention() {
             -vmid "$vmid_alloc" \
             -filename "vm-${vmid_alloc}-disk-0" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local op_end=$(date +%s%3N)
         local duration_ms=$((op_end - op_start))
 
@@ -5485,7 +5499,7 @@ test_multi_disk_sequential_timing() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local disk_end=$(date +%s%3N)
         local disk_ms=$((disk_end - disk_start))
         disk_times+=("$disk_ms")
@@ -5593,7 +5607,7 @@ test_mixed_concurrent_operations() {
         -vmid "$vmid_clone_src" \
         -filename "vm-${vmid_clone_src}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$src_volid" || "$src_volid" == *"error"* ]]; then
         log_error "Failed to allocate clone source disk"
@@ -5627,7 +5641,7 @@ test_mixed_concurrent_operations() {
         -vmid "$vmid_alloc" \
         -filename "vm-${vmid_alloc}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
         log_error "Failed to create free-target disk"
@@ -5655,7 +5669,7 @@ test_mixed_concurrent_operations() {
             -vmid "$vmid_alloc" \
             -filename "vm-${vmid_alloc}-disk-1" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local op_end=$(date +%s%3N)
         local duration_ms=$((op_end - op_start))
 
@@ -5810,7 +5824,7 @@ test_concurrent_clone_operations() {
             -vmid "$vid" \
             -filename "vm-${vid}-disk-0" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if [[ -z "$volid" || "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk for source VM $vid"
@@ -6018,7 +6032,7 @@ test_cross_node_concurrent_alloc() {
         -vmid "$vmid_local" \
         -filename "vm-${vmid_local}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     local baseline_end=$(date +%s%3N)
     local baseline_ms=$((baseline_end - baseline_start))
 
@@ -6053,7 +6067,7 @@ test_cross_node_concurrent_alloc() {
             -vmid "$vmid_local" \
             -filename "vm-${vmid_local}-disk-0" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local op_end=$(date +%s%3N)
         local duration_ms=$((op_end - op_start))
 
@@ -6073,7 +6087,7 @@ test_cross_node_concurrent_alloc() {
             -vmid "$vmid_remote" \
             -filename "vm-${vmid_remote}-disk-0" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local op_end=$(date +%s%3N)
         local duration_ms=$((op_end - op_start))
 
@@ -6171,7 +6185,7 @@ test_concurrent_migration_alloc() {
         -vmid "$vmid_migrate" \
         -filename "vm-${vmid_migrate}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$migrate_volid" || "$migrate_volid" == *"error"* ]]; then
         log_error "Failed to allocate migration disk"
@@ -6242,7 +6256,7 @@ test_concurrent_migration_alloc() {
         -vmid "$vmid_alloc" \
         -filename "vm-${vmid_alloc}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     local baseline_alloc_end=$(date +%s%3N)
     local baseline_alloc_ms=$((baseline_alloc_end - baseline_alloc_start))
 
@@ -6293,7 +6307,7 @@ test_concurrent_migration_alloc() {
             -vmid "$vmid_alloc" \
             -filename "vm-${vmid_alloc}-disk-0" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
         local op_end=$(date +%s%3N)
         local duration_ms=$((op_end - op_start))
 
