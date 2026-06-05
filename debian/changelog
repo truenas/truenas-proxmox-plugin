@@ -1,3 +1,13 @@
+truenas-proxmox-plugin (2.1.2+deb1) unstable; urgency=medium
+
+  * Fix NVMe/TCP connect failure when CPUs are offlined (issue #48): pass
+    --nr-io-queues to nvme connect to avoid kernel queue-to-CPU mapping
+    failures (EXDEV/-18) when CPU topology has gaps. Uses online CPU count
+    when all CPUs are online; floor(possible/2) when any CPU is offline.
+    Adds optional tn_nr_io_queues storage.cfg key (1-256) for manual override.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 03 Jun 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.1+deb1) unstable; urgency=medium
 
   * Bump storage API version to 14 to match libpve-storage-perl 9.1.3+

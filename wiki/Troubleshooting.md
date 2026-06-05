@@ -26,6 +26,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - ["nvme-cli is not installed"](#nvme-cli-is-not-installed)
   - ["Could not determine host NQN"](#could-not-determine-host-nqn)
   - ["Failed to connect to any NVMe/TCP portal"](#failed-to-connect-to-any-nvmetcp-portal)
+  - [NVMe Connect Fails After Offlining CPU Threads (EXDEV / errno -18)](#nvme-connect-fails-after-offlining-cpu-threads-exdev--errno--18)
   - [DH-CHAP Authentication Failures](#dh-chap-authentication-failures)
 - [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
   - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
@@ -1092,6 +1093,44 @@ nvme list-subsys | grep -A 5 "proxmox-test"
 # Disconnect after test
 nvme disconnect -n nqn.2005-10.org.freenas.ctl:proxmox-test
 ```
+
+### NVMe Connect Fails After Offlining CPU Threads (EXDEV / errno -18)
+
+**Symptom**: NVMe/TCP connection fails after CPU threads are taken offline via `/sys/devices/system/cpu/cpuN/online` (e.g. for power saving or isolation via `isolcpus`/`cset`).
+
+**Error in dmesg**:
+```
+nvme nvmeX: Connect command failed, errno: -18
+nvme nvmeX: failed to connect queue: N ret=-18
+```
+
+**Root cause**: The kernel NVMe-TCP driver maps I/O queue N to CPU N by index. When a CPU in the middle of the possible range is offline, at least one queue gets assigned exclusively to an offline CPU, causing `EXDEV` (-18). This is a kernel driver limitation — the queue affinity is computed from the *possible* CPU bitmap, not the *online* bitmap.
+
+**Fix (v2.1.2+)**: The plugin automatically detects offline CPUs and passes `--nr-io-queues=floor(possible/2)` to `nvme connect`, which guarantees each queue maps to at least 2 possible CPUs. No manual action is required after upgrading.
+
+**Manual override** (if TrueNAS also reports queue limit errors):
+```
+# In storage.cfg — pin to a safe value for your hardware:
+tn_nr_io_queues 4
+```
+
+**Verify the fix is active**:
+```bash
+# After a connect, check how many queues were created:
+dmesg | grep -i "nvme.*creating.*I/O queues"
+# e.g.: nvme nvme3: creating 3 I/O queues.
+```
+
+**If running v2.1.1 or earlier**:
+```bash
+# Temporary workaround — reconnect with explicit queue cap:
+NQN=$(awk '/^truenasplugin: tn-nvme/{f=1} f && /tn_subsystem_nqn/{print $2; exit}' /etc/pve/storage.cfg)
+nvme disconnect -n "$NQN"
+nvme connect -t tcp -a <portal_ip> -s 4420 -n "$NQN" \
+  --nr-io-queues=$(( $(nproc --all) / 2 ))
+```
+
+---
 
 ### DH-CHAP Authentication Failures
 
