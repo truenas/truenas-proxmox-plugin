@@ -512,6 +512,14 @@ sub properties {
             description => "Number of 100ms retries waiting for a block device to appear after connect.",
             type => 'integer', optional => 1, default => 200, minimum => 0, maximum => 600,
         },
+        tn_nr_io_queues => {
+            description => "Number of NVMe/TCP I/O queues per controller. When unset, " .
+                          "auto-detected: uses online CPU count when all CPUs are online, " .
+                          "or half of possible CPUs when any CPU is offline (avoids kernel " .
+                          "queue-to-CPU mapping failures with gapped CPU topologies, " .
+                          "see issue #48). Set manually if TrueNAS reports queue limit errors.",
+            type => 'integer', optional => 1, minimum => 1, maximum => 256,
+        },
     };
 }
 sub options {
@@ -584,6 +592,9 @@ sub options {
 
         # Device readiness
         tn_device_ready_retries => { optional => 1 },
+
+        # NVMe/TCP queue tuning
+        tn_nr_io_queues => { optional => 1 },
     };
 }
 
@@ -3015,6 +3026,27 @@ sub _nvme_is_connected {
     return $connected;
 }
 
+# Count CPUs listed in a sysfs range file (e.g. /sys/devices/system/cpu/online).
+# The file contains comma-separated ranges like "0-3,5,7-9".
+# Returns the total CPU count, or undef on read failure.
+sub _read_cpu_count {
+    my ($path) = @_;
+    open my $fh, '<', $path or return undef;
+    my $line = <$fh>;
+    close $fh;
+    return undef unless defined $line;
+    chomp $line;
+    my $count = 0;
+    for my $part (split /,/, $line) {
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            $count += $2 - $1 + 1;
+        } elsif ($part =~ /^(\d+)$/) {
+            $count += 1;
+        }
+    }
+    return $count || undef;
+}
+
 # Connect to NVMe/TCP subsystem (all portals)
 sub _nvme_connect {
     my ($scfg) = @_;
@@ -3050,6 +3082,26 @@ sub _nvme_connect {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: connecting to $host:$port");
 
         my @cmd = ('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port);
+
+        # Cap I/O queues to avoid kernel queue-to-CPU mapping failures when CPUs are
+        # offlined (issue #48). The kernel maps queue N to CPU N by index; if a CPU in
+        # the possible range is offline, connecting with more queues than
+        # floor(possible/2) causes EXDEV (-18) because at least one queue has no online
+        # CPU in its affinity set. floor(possible/2) guarantees each queue maps to at
+        # least 2 possible CPUs, so one offline CPU never orphans a queue.
+        # When all CPUs are online (online == possible) we pass nproc, matching the
+        # kernel default. tn_nr_io_queues overrides both.
+        my $nr_io_queues;
+        if (defined $scfg->{tn_nr_io_queues}) {
+            $nr_io_queues = $scfg->{tn_nr_io_queues};
+        } else {
+            my $nr_conf   = _read_cpu_count('/sys/devices/system/cpu/possible');
+            my $nr_online = _read_cpu_count('/sys/devices/system/cpu/online');
+            $nr_io_queues = ($nr_conf && $nr_online && $nr_online < $nr_conf)
+                ? int($nr_conf / 2)
+                : $nr_online;
+        }
+        push @cmd, '--nr-io-queues', $nr_io_queues if $nr_io_queues && $nr_io_queues > 0;
 
         # Add host NQN if not default
         push @cmd, '--hostnqn', $hostnqn if $hostnqn;

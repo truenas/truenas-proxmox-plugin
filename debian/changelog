@@ -12,6 +12,11 @@ truenas-proxmox-plugin (2.1.2+deb1) unstable; urgency=medium
     counter in _free_image_nvme filters by subsys.id.
   * Filter ephemeral vzdump-* snapshot clones from list_images to avoid
     phantom vmid 0 volumes during backups.
+  * Fix NVMe/TCP connect failure when CPUs are offlined (issue #48): pass
+    --nr-io-queues to nvme connect to avoid kernel queue-to-CPU mapping
+    failures (EXDEV/-18) when CPU topology has gaps. Uses online CPU count
+    when all CPUs are online; floor(possible/2) when any CPU is offline.
+    Adds optional tn_nr_io_queues storage.cfg key (1-256) for manual override.
 
  -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 06 Jun 2026 00:00:00 +0000
 
