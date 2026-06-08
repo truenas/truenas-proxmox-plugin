@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.1';
+our $VERSION = '2.1.2';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -2010,6 +2010,18 @@ sub volume_snapshot_delete {
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
 
+    # Tear down any ephemeral vzdump snapshot clone before deleting the ZFS
+    # snapshot (issue #42). PVE's LXC vzdump path unmounts then calls
+    # volume_snapshot_delete directly — it never calls deactivate_volume with a
+    # snapname — so the clone would otherwise be orphaned. A clone also holds the
+    # snapshot as its origin, blocking the snapshot delete below until removed.
+    # Best-effort: _teardown_snapshot_device is idempotent and no-ops when no
+    # clone exists.
+    if (defined($snapname) && $snapname ne '') {
+        eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+        warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
+    }
+
     my $result = _api_call_write(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
     );
@@ -2188,6 +2200,41 @@ sub _generate_extent_name($scfg, $zname) {
     }
 
     return "${base}-${hash8}";
+}
+
+# Derive a deterministic, collision-resistant zvol name for an ephemeral
+# snapshot clone (issue #42). LXC vzdump snapshot-mode backups call
+# activate_volume/path/deactivate_volume with $snapname set; we expose a
+# throwaway clone of <zvol>@<snapname> as its own block device.
+#
+# The same ($zname, $snapname) pair must always map to the same clone name so
+# path() can locate the device that activate_volume created, and so
+# deactivate_volume can tear down exactly what was exposed. We hash the
+# source pair to guarantee a unique, name-constraint-safe suffix.
+use constant SNAPSHOT_CLONE_PREFIX => 'vzdump-';
+
+sub _snapshot_clone_zname {
+    my ($scfg, $zname, $snapname) = @_;
+    my $hash8 = substr(sha1_hex("$zname\@$snapname"), 0, 8);
+    my $base  = lc(SNAPSHOT_CLONE_PREFIX . "$zname-$snapname");
+    # Match TrueNAS zvol name constraints (mirror _generate_extent_name):
+    # lowercase alphanumerics plus '.', '-'. Drop everything else.
+    $base =~ s/[^a-z0-9.\-]//g;
+    my $max_base = 63 - 9;   # leave room for '-' + 8 hex chars (<= 63 total)
+    $base = substr($base, 0, $max_base) if length($base) > $max_base;
+    return "${base}-${hash8}";
+}
+
+sub _snapshot_clone_paths {
+    my ($scfg, $zname, $snapname) = @_;
+    my $clone_zname = _snapshot_clone_zname($scfg, $zname, $snapname);
+    my $clone_full = $scfg->{tn_dataset} . '/' . $clone_zname;
+    return ($clone_zname, $clone_full, "zvol/$clone_full");
+}
+
+sub _is_snapshot_clone_zname {
+    my ($zname) = @_;
+    return index($zname, SNAPSHOT_CLONE_PREFIX) == 0;
 }
 
 # Resolve an iSCSI extent by its disk (zvol) path instead of by name.
@@ -4073,26 +4120,22 @@ sub _nvme_create_namespace {
     return $device_uuid;
 }
 
+# Resolve NVMe namespaces by their globally unique device path. Query results
+# nest the subsystem under 'subsys.id'; 'subsys_id' is create-only input.
+sub _nvme_namespaces_for_device_path {
+    my ($scfg, $device_path) = @_;
+    return _api_call($scfg, 'nvmet.namespace.query', [
+        [["device_path", "=", $device_path]]
+    ]) // [];
+}
+
 # Delete NVMe namespace
 sub _nvme_delete_namespace {
     my ($scfg, $zname, $full_ds) = @_;
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_delete_namespace: deleting namespace for $zname");
 
-    # Get subsystem ID
-    my $nqn = $scfg->{tn_subsystem_nqn};
-    my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [
-        [["subnqn", "=", $nqn]]
-    ]);
-
-    return unless $subsystems && @$subsystems;
-    my $subsys_id = $subsystems->[0]{id};
-
-    # Find namespace for this zvol
-    my $zvol_path = "zvol/$full_ds";
-    my $namespaces = _api_call($scfg, 'nvmet.namespace.query', [
-        [["subsys_id", "=", $subsys_id], ["device_path", "=", $zvol_path]]
-    ]);
+    my $namespaces = _nvme_namespaces_for_device_path($scfg, "zvol/$full_ds");
 
     return unless $namespaces && @$namespaces;
 
@@ -4143,6 +4186,28 @@ sub path {
     my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
 
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
+
+    # Snapshot mode (issue #42): return the device for the ephemeral snapshot
+    # clone that activate_volume exposed, rather than the live volume's device.
+    if (defined($snapname) && $snapname ne '') {
+        my ($clone_zname, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
+        if ($mode eq 'iscsi') {
+            _iscsi_login_all($scfg);
+            my $lun = _current_lun_for_zname($scfg, $clone_zname);
+            die "snapshot device not active for $volname\@$snapname\n" if !defined $lun;
+            my $dev = _device_for_lun($scfg, $lun);
+            return ($dev, $vmid, 'images');
+        } elsif ($mode eq 'nvme-tcp') {
+            _nvme_connect($scfg);
+            my $ns = _nvme_namespaces_for_device_path($scfg, "zvol/$clone_full");
+            my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
+            die "snapshot namespace not active for $volname\@$snapname\n" if !$uuid;
+            my $dev = _nvme_device_for_uuid($scfg, $uuid);
+            return ($dev, $vmid, 'images');
+        } else {
+            die "Unknown transport mode: $mode\n";
+        }
+    }
 
     if ($mode eq 'iscsi') {
         # iSCSI: metadata is LUN number
@@ -4907,8 +4972,11 @@ sub _free_image_nvme {
 
             if ($subsystems && @$subsystems) {
                 my $subsys_id = $subsystems->[0]{id};
+                # Count all namespaces in this subsystem. Query results nest the
+                # subsystem under 'subsys.id' (the 'subsys_id' form is create-only
+                # input), so filter on 'subsys.id'.
                 my $namespaces = _api_call($scfg, 'nvmet.namespace.query',
-                    [[ ["subsys_id", "=", $subsys_id] ]]);
+                    [[ ["subsys.id", "=", $subsys_id] ]]);
                 $active_ns_count = $namespaces ? scalar(@$namespaces) : 0;
             }
         };
@@ -5110,6 +5178,11 @@ sub _list_images_iscsi {
         next MAPPING unless $ds_full =~ m{^\Q$scfg->{tn_dataset}\E/(.+)$};
         my $zname = $1;
 
+        # Skip ephemeral vzdump snapshot clones (issue #42). These are transient
+        # devices exposed only for the duration of an LXC snapshot backup; they
+        # are not Proxmox-managed volumes and must not appear in list_images.
+        next MAPPING if _is_snapshot_clone_zname($zname);
+
         # Determine assigned LUN id
         my $lun = $tx->{lunid};
         next MAPPING if !defined $lun;
@@ -5248,6 +5321,11 @@ sub _list_images_nvme {
         # Extract zvol name from path
         next unless $ds_full =~ m{^\Q$scfg->{tn_dataset}\E/(.+)$};
         my $zname = $1;  # e.g., "vm-998-disk-0"
+
+        # Skip ephemeral vzdump snapshot clones (issue #42). These are transient
+        # devices exposed only for the duration of an LXC snapshot backup; they
+        # are not Proxmox-managed volumes and must not appear in list_images.
+        next if _is_snapshot_clone_zname($zname);
 
         # Owner (vmid) from naming convention
         my $owner;
@@ -5751,11 +5829,234 @@ sub activate_storage {
 
 sub deactivate_storage { return 1; }
 
+# ======== Ephemeral snapshot device exposure (issue #42) ========
+# LXC vzdump in "snapshot" mode backs up from <zvol>@<snapname> while the live
+# volume keeps running. Because our volumes are raw block devices (iSCSI LUN /
+# NVMe namespace), a ZFS snapshot is not directly addressable as a device. To
+# give vzdump something to read, we clone the snapshot into a throwaway zvol and
+# expose that clone as its own LUN / namespace for the duration of the backup,
+# tearing it all down again in deactivate_volume.
+
+# Clone <source_full>@<snapname> into the deterministic clone zvol. Idempotent:
+# if the clone already exists (e.g. retried activate_volume) we treat it as
+# success. Waits for the async clone job if one is returned.
+sub _clone_snapshot_zvol {
+    my ($scfg, $source_full, $snapname, $clone_full) = @_;
+    my $source_snapshot = "$source_full\@$snapname";
+
+    my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full) };
+    if (my $err = $@) {
+        # Already present from a prior activate — reuse it.
+        return if $err =~ /dataset already exists/i;
+        die "Failed to clone snapshot $source_snapshot to $clone_full: $err\n";
+    }
+
+    # Wait for clone job to complete if it returned a job ID
+    if (defined $clone_result && !ref($clone_result) && $clone_result =~ /^\d+$/) {
+        _log($scfg, 1, 'info', "[TrueNAS] _clone_snapshot_zvol: waiting for clone job $clone_result");
+        my $job_result = _wait_for_job_completion($scfg, $clone_result, 30);
+        unless ($job_result->{success}) {
+            die "Failed to clone snapshot $source_snapshot to $clone_full: "
+                . ($job_result->{error} // 'Unknown error') . "\n";
+        }
+    }
+
+    _invalidate_status_capacity_cache(undef, $scfg);
+    return;
+}
+
+# Expose <zvol>@<snapname> as a temporary block device. Returns the device path.
+# On any failure after the clone is created, the clone is destroyed before the
+# error is re-thrown so we never leak a zvol.
+#
+# Note: this runs without a CFS cluster lock, by design. Proxmox calls
+# activate_volume synchronously before vzdump reads the device, so the clone and
+# its extent/namespace must exist by the time we return - the deferred-after-lock
+# mechanism used elsewhere would complete too late. The clone name is
+# deterministic per ($zname,$snapname) and all create steps are idempotent, so
+# concurrent activations of the same snapshot converge on one device safely.
+sub _expose_snapshot_device {
+    my ($class, $scfg, $volname, $snapname) = @_;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my $source_full = $scfg->{tn_dataset} . '/' . $zname;
+    my ($clone_zname, $clone_full, $zvol_path) = _snapshot_clone_paths($scfg, $zname, $snapname);
+
+    _log($scfg, 1, 'info', "[TrueNAS] _expose_snapshot_device: $volname\@$snapname -> $clone_zname");
+
+    _clone_snapshot_zvol($scfg, $source_full, $snapname, $clone_full);
+
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
+
+    my $dev = eval {
+        if ($mode eq 'iscsi') {
+            # Reuse an existing extent for this clone if present, else create one.
+            _clear_cache(_cache_host_key($scfg));
+            my $extent = _resolve_extent_by_disk($scfg, $clone_zname);
+            my $extent_id = $extent ? $extent->{id} : undef;
+
+            if (!defined $extent_id) {
+                my $ext = _tn_extent_create(
+                    $scfg, $clone_zname, $clone_full, _generate_extent_name($scfg, $clone_zname));
+                $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
+            }
+            die "failed to create extent for snapshot clone $clone_zname\n" if !defined $extent_id;
+
+            # Map extent to the shared target (idempotent).
+            my $target_id = _resolve_target_id($scfg);
+            my $tx = _tn_targetextent_create($scfg, $target_id, $extent_id, undef);
+
+            my $lun = ref($tx) eq 'HASH' ? $tx->{lunid} : undef;
+            $lun //= _current_lun_for_zname($scfg, $clone_zname);
+            die "could not determine LUN for snapshot clone $clone_zname\n" if !defined $lun;
+
+            # Bring the LUN online locally and resolve to a device node.
+            _iscsi_login_all($scfg);
+            _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan");
+            if ($scfg->{tn_use_multipath}) {
+                eval { _try_run(['multipath','-r'], "multipath reload"); };
+            }
+            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
+            return _device_for_lun($scfg, $lun);
+
+        } elsif ($mode eq 'nvme-tcp') {
+            # Reuse an existing namespace for this clone if present, else create one.
+            my $nqn = $scfg->{tn_subsystem_nqn};
+            my $subsystems = _api_call($scfg, 'nvmet.subsys.query', [[ ["subnqn", "=", $nqn] ]]);
+            die "Failed to query NVMe subsystem $nqn\n" if !$subsystems || !@$subsystems;
+            my $subsys_id = $subsystems->[0]{id};
+
+            my $existing = _nvme_namespaces_for_device_path($scfg, $zvol_path);
+            my $device_uuid = @$existing ? $existing->[0]{device_uuid} : undef;
+
+            if (!defined $device_uuid) {
+                my $ns_payload = {
+                    subsys_id   => $subsys_id,
+                    device_path => $zvol_path,
+                    device_type => 'ZVOL',
+                };
+                my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+                $device_uuid = $ns->{device_uuid}
+                    // die "No device_uuid returned from namespace creation\n";
+                # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
+                eval { _api_call_write($scfg, 'nvmet.subsys.update',
+                    [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+            }
+
+            _nvme_connect($scfg);
+            eval { _nvme_rescan_subsystem_controllers($scfg) };
+            eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+            return _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
+
+        } else {
+            die "Unknown transport mode: $mode\n";
+        }
+    };
+    if (my $err = $@) {
+        # Expose failed after the clone was created — tear it back down so we
+        # don't leak the clone (and any half-created extent/namespace).
+        _log($scfg, 0, 'err', "[TrueNAS] _expose_snapshot_device: expose failed, rolling back clone: $err");
+        eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+        die $err;
+    }
+
+    return $dev;
+}
+
+# Tear down everything _expose_snapshot_device created. Best-effort: every step
+# is wrapped so a single failure cannot prevent the rest of the cleanup.
+sub _teardown_snapshot_device {
+    my ($class, $scfg, $volname, $snapname) = @_;
+
+    my (undef, $zname) = $class->parse_volname($volname);
+    my ($clone_zname, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
+
+    _log($scfg, 1, 'info', "[TrueNAS] _teardown_snapshot_device: tearing down $clone_zname");
+
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        eval {
+            _clear_cache(_cache_host_key($scfg));
+            my $target_id = _resolve_target_id($scfg);
+            my $extent = _resolve_extent_by_disk($scfg, $clone_zname);
+
+            # Capture local SCSI device(s) for this LUN before deleting the mapping.
+            my $lun = $extent ? _current_lun_for_zname($scfg, $clone_zname) : undef;
+            my @scsi_devices;
+            if (defined $lun) {
+                my $iqn = $scfg->{tn_target_iqn};
+                my $pattern = "-iscsi-$iqn-lun-$lun";
+                if (opendir(my $dh, "/dev/disk/by-path")) {
+                    my @by_paths = grep { /^ip-.*\Q$pattern\E$/ } readdir($dh);
+                    closedir($dh);
+                    for my $bp (@by_paths) {
+                        next unless $bp =~ m{^(ip-[\w.:,\[\]\-]+iscsi-[\w.:,\[\]\-]+lun-\d+)$};
+                        my $full_path = "/dev/disk/by-path/$1";
+                        next unless -l $full_path;
+                        my $real = Cwd::abs_path($full_path);
+                        push @scsi_devices, $1 if $real && $real =~ m{^/dev/(sd[a-z]{1,4})$};
+                    }
+                }
+            }
+
+            # Flush multipath map for this clone's WWID (derived from extent NAA).
+            if ($scfg->{tn_use_multipath} && $extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
+                (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
+                eval { run_command(['multipath','-f',$flush_wwid], outfunc=>sub{}, errfunc=>sub{}) };
+            }
+
+            # Remove local SCSI block devices for this LUN.
+            for my $dev (@scsi_devices) {
+                my $delete_path = "/sys/block/$dev/device/delete";
+                if (-e $delete_path && -w $delete_path) {
+                    eval { if (open my $fh, '>', $delete_path) { print $fh "1"; close $fh; } };
+                }
+            }
+
+            # Delete targetextent mapping (force=true), then the extent.
+            if ($extent && $target_id) {
+                my $maps = _tn_targetextents($scfg) // [];
+                my ($tx) = grep {
+                    (($_->{target}//-1) == $target_id) && (($_->{extent}//-1) == $extent->{id})
+                } @$maps;
+                if ($tx && defined $tx->{id}) {
+                    eval { _api_call($scfg,'iscsi.targetextent.delete',[ $tx->{id}, JSON::PP::true ]) };
+                }
+                eval { _api_call($scfg,'iscsi.extent.delete',[ $extent->{id}, JSON::PP::false, JSON::PP::true ]) };
+            }
+            _clear_cache(_cache_host_key($scfg));
+        };
+        warn "[TrueNAS] _teardown_snapshot_device: iSCSI cleanup failed: $@\n" if $@;
+
+    } elsif ($mode eq 'nvme-tcp') {
+        eval { _nvme_delete_namespace($scfg, $clone_zname, $clone_full) };
+        warn "[TrueNAS] _teardown_snapshot_device: namespace delete failed: $@\n" if $@;
+    }
+
+    # Destroy the clone zvol (ignore if already gone).
+    eval { _tn_dataset_delete($scfg, $clone_full) };
+    if (my $err = $@) {
+        warn "[TrueNAS] _teardown_snapshot_device: clone delete failed: $err\n"
+            if $err !~ /does not exist|ENOENT|InstanceNotFound/i;
+    }
+
+    return;
+}
+
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
     # Note: snapname is used for snapshot operations, we support snapshots via ZFS
 
     _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: volname=$volname");
+
+    # Snapshot mode (issue #42): expose an ephemeral clone of the snapshot as its
+    # own device so LXC vzdump snapshot backups can read it. path() resolves the
+    # same clone; deactivate_volume tears it down.
+    if (defined($snapname) && $snapname ne '') {
+        $class->_expose_snapshot_device($scfg, $volname, $snapname);
+        return 1;
+    }
 
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
@@ -5806,7 +6107,16 @@ sub activate_volume {
 
     return 1;
 }
-sub deactivate_volume { return 1; }
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    # Snapshot mode (issue #42): tear down the ephemeral clone device that
+    # activate_volume exposed for vzdump snapshot backups. Best-effort.
+    if (defined($snapname) && $snapname ne '') {
+        eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+        warn "[TrueNAS] deactivate_volume snapshot teardown failed: $@\n" if $@;
+    }
+    return 1;
+}
 
 # Note: snapshot functions are implemented above and MUST NOT be overridden here.
 

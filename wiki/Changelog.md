@@ -1,5 +1,18 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.2 (June 6, 2026)
+
+### Features
+
+- **LXC vzdump snapshot mode support (GitHub issue #42)**: `activate_volume`, `path`, and `deactivate_volume` previously ignored `$snapname` and returned the live block device, so LXC `vzdump` snapshot-mode backups failed when mounting the snapshot read-only. The plugin now exposes a snapshot as its own idle device: when `$snapname` is set it creates an ephemeral clone zvol from `<zvol>@<snapname>` (deterministic name per source/snapshot pair) and exposes it as its own iSCSI LUN or NVMe-TCP namespace, returning that device. The clone is torn down — extent/LUN or namespace removed and the clone zvol destroyed — in `volume_snapshot_delete` (the LXC vzdump path does not call `deactivate_volume`) and also in `deactivate_volume` as a fallback for other flows. Works for both iSCSI and NVMe-TCP transports.
+
+### Bug Fixes
+
+- **Fix NVMe namespace lookup using the wrong query field**: `nvmet.namespace.query` results nest the subsystem under `subsys.id`, while `subsys_id` is only accepted as a create-time input. `_nvme_delete_namespace` filtered queries by `subsys_id`, so on some TrueNAS versions namespaces were never matched for deletion (which would also leave a snapshot clone's origin in place, blocking snapshot deletion). Namespace lookups now query by the unique `device_path` alone, and the active-namespace counter in `_free_image_nvme` now filters by `subsys.id`.
+- **Filter ephemeral vzdump clones from `list_images`**: Snapshot clone zvols are named `vzdump-*` and are not Proxmox-managed volumes. `_list_images_iscsi` and `_list_images_nvme` now skip them so they do not appear as phantom `vmid 0` volumes during a backup.
+
+---
+
 ## Version 2.1.1 (May 29, 2026)
 
 - **Bump storage API version to 14 (GitHub issue #41)**: Updated `$TESTED_APIVER` from 13 to 14 to match `libpve-storage-perl` 9.1.3+ (Proxmox VE 9.2+), eliminating the "implementing an older storage API" warning logged at every plugin load. The APIVER 14 bump in PVE was backward compatible (added optional `get_identity()` method); no new plugin methods are required.

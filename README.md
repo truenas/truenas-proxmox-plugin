@@ -325,6 +325,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.1
-**Last Updated**: May 29, 2026
+**Version**: 2.1.2
+**Last Updated**: June 6, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
