@@ -783,9 +783,6 @@ sub _ws_open($scfg) {
     my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
 
-    # Add small delay to avoid rate limiting
-    usleep(DEVICE_READY_TIMEOUT_US); # 100ms delay
-
     my $sock;
     if ($scheme eq 'wss') {
         $sock = IO::Socket::SSL->new(
@@ -1509,7 +1506,7 @@ sub _delete_dataset_with_retry {
 
 # ======== WebSocket API operations ========
 # $opts is an optional hashref with:
-#   - use_ephemeral: if true, use an ephemeral connection (for write operations)
+#   - use_ephemeral: marks write operations (retained until the follow-up branch collapse)
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     my $use_ephemeral = $opts && $opts->{use_ephemeral};
     my $retry_opts = $opts && $opts->{retry_opts};
@@ -1523,20 +1520,25 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     }
 
     if ($use_ephemeral) {
-        # Use ephemeral connection for write operations to avoid race conditions
-        # Each write gets its own isolated connection
+        # Write operations now reuse the fork-safe persistent connection.
         return _retry_with_backoff($scfg, "WS $ws_method", sub {
-            my $conn = _ws_open_ephemeral($scfg);
-            my $res;
-            eval {
-                $res = _ws_rpc($conn, {
+            my $conn = _ws_get_persistent($scfg);
+            my $res = eval {
+                _ws_rpc($conn, {
                     jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
                 });
             };
-            my $err = $@;
-            # Always close ephemeral connection, even on error
-            _ws_close_ephemeral($conn);
-            die $err if $err;
+            if (my $err = $@) {
+                if (_is_connection_error($err)) {
+                    my $key = _ws_connection_key($scfg);
+                    if ($conn && $conn->{sock}) {
+                        eval { $conn->{sock}->close(); };
+                    }
+                    delete $_ws_connections{$key};
+                    _log($scfg, 1, 'info', "[TrueNAS] _api_call: invalidated dead persistent connection for $ws_method");
+                }
+                die $err;
+            }
 
             # Level 2: Verbose - log API response
             _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
@@ -1706,19 +1708,12 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     # WebSocket-only for snapshot rollback (requires TrueNAS 25.10+)
     # TrueNAS 25.10+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
     my $attempt_rollback = sub {
-        my $conn = _ws_open_ephemeral($scfg);
-        my $result;
-        eval {
-            $result = _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 1,
-                method  => "zfs.snapshot.rollback",
-                params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
-            });
-        };
-        my $err = $@;
-        _ws_close_ephemeral($conn);
-        die $err if $err;
-        return $result;
+        my $conn = _ws_get_persistent($scfg);
+        return _ws_rpc($conn, {
+            jsonrpc => "2.0", id => $conn->{next_id}++,
+            method  => "zfs.snapshot.rollback",
+            params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
+        });
     };
 
     eval { $attempt_rollback->(); };
@@ -1730,18 +1725,12 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
             if ($force_bool && !$recursive_bool) {
                 # Retry with recursive=1 to delete newer snapshots
                 eval {
-                    my $conn = _ws_open_ephemeral($scfg);
-                    my $result;
-                    eval {
-                        $result = _ws_rpc($conn, {
-                            jsonrpc => "2.0", id => 2,
-                            method  => "zfs.snapshot.rollback",
-                            params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
-                        });
-                    };
-                    my $inner_err = $@;
-                    _ws_close_ephemeral($conn);
-                    die $inner_err if $inner_err;
+                    my $conn = _ws_get_persistent($scfg);
+                    _ws_rpc($conn, {
+                        jsonrpc => "2.0", id => $conn->{next_id}++,
+                        method  => "zfs.snapshot.rollback",
+                        params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
+                    });
                 };
                 return 1 if !$@;
             }
