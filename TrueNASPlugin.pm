@@ -1082,33 +1082,6 @@ sub _ws_cleanup_connections() {
     %_ws_connections = ();
 }
 
-# ======== Ephemeral WebSocket Connection for Write Operations ========
-# Creates a fresh, isolated connection for write operations to avoid
-# race conditions when multiple processes share persistent connections.
-# Each write operation gets its own connection that is closed after use.
-
-sub _ws_open_ephemeral($scfg) {
-    # Create a new WebSocket connection that will NOT be cached
-    # This is identical to _ws_open() but the caller is responsible
-    # for closing it after use via _ws_close_ephemeral()
-    return _ws_open($scfg);
-}
-
-sub _ws_close_ephemeral($conn, $scfg = undef) {
-    # Close an ephemeral connection after use
-    return unless $conn && $conn->{sock};
-    eval {
-        # Send minimal WebSocket close frame per RFC 6455 (FIN + close opcode, no payload)
-        my $close_frame = pack('CC', 0x88, 0x00);
-        $conn->{sock}->syswrite($close_frame);
-        $conn->{sock}->close();
-    };
-    if ($@ && $scfg) {
-        _log($scfg, 2, 'debug', "[TrueNAS] Failed to close ephemeral connection cleanly: $@");
-    }
-    # Ignore errors during close - connection may already be dead
-}
-
 # ======== Bulk Operations Helper ========
 sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
     # Use core.bulk to batch multiple calls of the same method
