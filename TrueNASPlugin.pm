@@ -220,7 +220,7 @@ sub _normalize_blocksize {
 sub _is_connection_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|rate limit|ssl.*error|connection.*failed/i;
+    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed/i;
 }
 
 sub _is_not_found_error {
