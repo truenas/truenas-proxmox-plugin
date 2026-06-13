@@ -1479,80 +1479,48 @@ sub _delete_dataset_with_retry {
 
 # ======== WebSocket API operations ========
 # $opts is an optional hashref with:
-#   - use_ephemeral: marks write operations (retained until the follow-up branch collapse)
+#   - retry_opts: options passed to _retry_with_backoff
 sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
-    my $use_ephemeral = $opts && $opts->{use_ephemeral};
     my $retry_opts = $opts && $opts->{retry_opts};
 
     # Level 2: Verbose - log all API calls with parameters
-    my $conn_type = $use_ephemeral ? 'ephemeral' : 'persistent';
     if ($ws_params && ref($ws_params) eq 'ARRAY' && @$ws_params) {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=$conn_type, params=" . encode_json($ws_params));
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent, params=" . encode_json($ws_params));
     } else {
-        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=$conn_type");
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: method=$ws_method, conn=persistent");
     }
 
-    if ($use_ephemeral) {
-        # Write operations now reuse the fork-safe persistent connection.
-        return _retry_with_backoff($scfg, "WS $ws_method", sub {
-            my $conn = _ws_get_persistent($scfg);
-            my $res = eval {
-                _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-                });
-            };
-            if (my $err = $@) {
-                if (_is_connection_error($err)) {
-                    my $key = _ws_connection_key($scfg);
-                    if ($conn && $conn->{sock}) {
-                        eval { $conn->{sock}->close(); };
-                    }
-                    delete $_ws_connections{$key};
-                    _log($scfg, 1, 'info', "[TrueNAS] _api_call: invalidated dead persistent connection for $ws_method");
+    return _retry_with_backoff($scfg, "WS $ws_method", sub {
+        my $conn = _ws_get_persistent($scfg);
+        my $res = eval {
+            _ws_rpc($conn, {
+                jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
+            });
+        };
+        if (my $err = $@) {
+            # On connection errors, invalidate the cached connection so the
+            # next retry gets a fresh one instead of re-pinging a dead socket
+            if (_is_connection_error($err)) {
+                my $key = _ws_connection_key($scfg);
+                if ($conn && $conn->{sock}) {
+                    eval { $conn->{sock}->close(); };
                 }
-                die $err;
+                delete $_ws_connections{$key};
+                _log($scfg, 1, 'info', "[TrueNAS] _api_call: invalidated dead persistent connection for $ws_method");
             }
+            die $err;
+        }
 
-            # Level 2: Verbose - log API response
-            _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
+        # Level 2: Verbose - log API response
+        _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
 
-            return $res;
-        }, $retry_opts);
-    } else {
-        # Use persistent connection for read operations (original behavior)
-        return _retry_with_backoff($scfg, "WS $ws_method", sub {
-            my $conn = _ws_get_persistent($scfg);
-            my $res = eval {
-                _ws_rpc($conn, {
-                    jsonrpc => "2.0", id => $conn->{next_id}++, method => $ws_method, params => $ws_params // [],
-                });
-            };
-            if (my $err = $@) {
-                # On connection errors, invalidate the cached connection so the
-                # next retry gets a fresh one instead of re-pinging a dead socket
-                if (_is_connection_error($err)) {
-                    my $key = _ws_connection_key($scfg);
-                    if ($conn && $conn->{sock}) {
-                        eval { $conn->{sock}->close(); };
-                    }
-                    delete $_ws_connections{$key};
-                    _log($scfg, 1, 'info', "[TrueNAS] _api_call: invalidated dead persistent connection for $ws_method");
-                }
-                die $err;
-            }
-
-            # Level 2: Verbose - log API response
-            _log($scfg, 2, 'debug', "[TrueNAS] _api_call: response from $ws_method: " . (ref($res) ? encode_json($res) : ($res // 'undef')));
-
-            return $res;
-        }, $retry_opts);
-    }
+        return $res;
+    }, $retry_opts);
 }
 
-# Convenience wrapper for write operations that need ephemeral connections
-# Use this for create, update, delete operations to avoid WebSocket race conditions
+# Helper identifying API calls that mutate TrueNAS state
 sub _api_call_mutate($scfg, $ws_method, $ws_params) {
-    return _api_call($scfg, $ws_method, $ws_params, { use_ephemeral => 1 });
+    return _api_call($scfg, $ws_method, $ws_params);
 }
 
 # ======== TrueNAS API ops (WebSocket) ========
