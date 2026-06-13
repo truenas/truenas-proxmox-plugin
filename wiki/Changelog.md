@@ -1,5 +1,17 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.3 (June 13, 2026)
+
+### Bug Fixes
+
+- **Eliminate TrueNAS authentication rate-limit exhaustion under load**: Write operations and snapshot rollbacks now reuse the existing fork-safe persistent WebSocket connection instead of opening and authenticating a separate connection for every mutation. Dead cached connections are invalidated before retry, and the ineffective 100ms pre-connection delay has been removed. The allocation benchmark reduced `auth.login_with_api_key` sessions from 45 to 15 with no response corruption under concurrent load.
+- **Stop retrying rate-limit errors**: `Rate Limit Exceeded` responses are no longer classified as connection errors. They now fail immediately instead of entering exponential backoff and issuing more login attempts inside the 60-second lockout window.
+- **Report pre-flight target query failures accurately**: A failed `iscsi.target.query` no longer causes the misleading follow-up error that the target does not exist. Rate-limit failures receive a specific message, other query errors preserve their cause, and confirmed absence is reported only after a successful query.
+
+### Maintenance
+
+- Remove unused ephemeral WebSocket helpers, rename the mutation API wrapper, and collapse duplicated read/mutation API call paths.
+
 ## Version 2.1.2 (June 6, 2026)
 
 ### Features
