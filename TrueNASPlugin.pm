@@ -1094,7 +1094,7 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
     }
 
     # Bulk operations are always write operations, use ephemeral connection
-    return _api_call_write($scfg, 'core.bulk', [$method_name, $params_array, $description],
+    return _api_call_mutate($scfg, 'core.bulk', [$method_name, $params_array, $description],
         sub { die "Bulk operations require WebSocket transport (TrueNAS 25.10+ only)\n"; });
 }
 
@@ -1438,7 +1438,7 @@ sub _delete_dataset_with_retry {
     for my $attempt (1..$max_retries) {
         eval {
             _log($scfg, 1, 'info', "[TrueNAS] Deleting dataset $full_ds (attempt $attempt/$max_retries)");
-            my $result = _api_call_write($scfg,'pool.dataset.delete',[ $full_ds, $payload ]);
+            my $result = _api_call_mutate($scfg,'pool.dataset.delete',[ $full_ds, $payload ]);
 
             my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion for $full_ds", DATASET_DELETE_TIMEOUT_S);
             if (!$job_result->{success}) {
@@ -1551,7 +1551,7 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
 
 # Convenience wrapper for write operations that need ephemeral connections
 # Use this for create, update, delete operations to avoid WebSocket race conditions
-sub _api_call_write($scfg, $ws_method, $ws_params) {
+sub _api_call_mutate($scfg, $ws_method, $ws_params) {
     return _api_call($scfg, $ws_method, $ws_params, { use_ephemeral => 1 });
 }
 
@@ -1625,7 +1625,7 @@ sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     if ($blocksize) {
         $payload->{volblocksize} = _normalize_blocksize($blocksize);
     }
-    my $result = _api_call_write($scfg, 'pool.dataset.create', [ $payload ]);
+    my $result = _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ]);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
 }
@@ -1633,7 +1633,7 @@ sub _tn_dataset_delete($scfg, $full) {
     my $id = uri_escape($full);
 
     _log($scfg, 1, 'info', "[TrueNAS] _tn_dataset_delete: deleting $full (recursive=true)");
-    my $result = _api_call_write($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ]);
+    my $result = _api_call_mutate($scfg, 'pool.dataset.delete', [ $full, { recursive => JSON::PP::true } ]);
 
     # Handle potential async job for dataset deletion
     my $job_result = _handle_api_result_with_job_support($scfg, $result, "dataset deletion (helper) for $full", 60);
@@ -1658,7 +1658,7 @@ sub _tn_dataset_get($scfg, $full, $opts = undef) {
 }
 sub _tn_dataset_resize($scfg, $full, $new_bytes) {
     my $payload = { volsize => int($new_bytes) }; # grow-only
-    my $result = _api_call_write($scfg, 'pool.dataset.update', [ $full, $payload ]);
+    my $result = _api_call_mutate($scfg, 'pool.dataset.update', [ $full, $payload ]);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
 }
@@ -1670,7 +1670,7 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call_write($scfg, 'zfs.snapshot.clone', [ $payload ]);
+    return _api_call_mutate($scfg, 'zfs.snapshot.clone', [ $payload ]);
 }
 
 # ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
@@ -1951,7 +1951,7 @@ sub volume_snapshot {
 
     # Create ZFS snapshot for the disk
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-    my $result = _api_call_write(
+    my $result = _api_call_mutate(
         $scfg, 'zfs.snapshot.create', [ $payload ],
     );
 
@@ -1995,7 +1995,7 @@ sub volume_snapshot_delete {
         warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
     }
 
-    my $result = _api_call_write(
+    my $result = _api_call_mutate(
         $scfg, 'zfs.snapshot.delete', [ $snap_full ],
     );
 
@@ -2223,13 +2223,13 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     my $payload = {
         name => $extent_name // $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    my $result = _api_call_write($scfg, 'iscsi.extent.create', [ $payload ]);
+    my $result = _api_call_mutate($scfg, 'iscsi.extent.create', [ $payload ]);
     # Invalidate cache since extents list has changed
     _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
 }
 sub _tn_extent_delete($scfg, $extent_id) {
-    my $result = _api_call_write($scfg, 'iscsi.extent.delete', [ $extent_id ]);
+    my $result = _api_call_mutate($scfg, 'iscsi.extent.delete', [ $extent_id ]);
     # Invalidate cache since extents list has changed
     _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
@@ -2250,7 +2250,7 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     # Mapping doesn't exist, create it
     my $payload = { target => $target_id, extent => $extent_id };
     $payload->{lunid} = $lun if defined $lun;
-    my $result = eval { _api_call_write($scfg, 'iscsi.targetextent.create', [ $payload ]); };
+    my $result = eval { _api_call_mutate($scfg, 'iscsi.targetextent.create', [ $payload ]); };
     my $err = $@;
 
     if ($err) {
@@ -2276,7 +2276,7 @@ sub _tn_targetextent_create($scfg, $target_id, $extent_id, $lun) {
     return $result;
 }
 sub _tn_targetextent_delete($scfg, $tx_id) {
-    my $result = _api_call_write($scfg, 'iscsi.targetextent.delete', [ $tx_id ]);
+    my $result = _api_call_mutate($scfg, 'iscsi.targetextent.delete', [ $tx_id ]);
     # Invalidate cache since targetextents list has changed
     _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
@@ -3949,7 +3949,7 @@ sub _nvme_sync_portals {
         my $port_id;
         eval {
             # Step 1: Create the port
-            my $port_result = _api_call_write($scfg, 'nvmet.port.create', [{
+            my $port_result = _api_call_mutate($scfg, 'nvmet.port.create', [{
                 addr_trtype => 'TCP',
                 addr_traddr => $host,
                 addr_trsvcid => int($port),
@@ -3979,7 +3979,7 @@ sub _nvme_sync_portals {
 
         # Step 2: Associate port with subsystem
         eval {
-            _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+            _api_call_mutate($scfg, 'nvmet.port_subsys.create', [{
                 port_id   => int($port_id),
                 subsys_id => int($subsys_id),
             }]);
@@ -4028,7 +4028,7 @@ sub _nvme_ensure_subsystem {
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
     # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
-    my $subsys = _api_call_write($scfg, 'nvmet.subsys.create', [{
+    my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
@@ -4050,7 +4050,7 @@ sub _nvme_ensure_subsystem {
             # TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association
             my $port_id;
             my $port_result = eval {
-                _api_call_write($scfg, 'nvmet.port.create', [{
+                _api_call_mutate($scfg, 'nvmet.port.create', [{
                     addr_trtype => 'TCP',
                     addr_traddr => $host,
                     addr_trsvcid => int($port),
@@ -4074,7 +4074,7 @@ sub _nvme_ensure_subsystem {
 
             if (defined $port_id) {
                 eval {
-                    _api_call_write($scfg, 'nvmet.port_subsys.create', [{
+                    _api_call_mutate($scfg, 'nvmet.port_subsys.create', [{
                         port_id   => int($port_id),
                         subsys_id => int($subsys_id),
                     }]);
@@ -4106,7 +4106,7 @@ sub _nvme_create_namespace {
 
     # Create namespace
     # Note: zvol creation job is now waited on in alloc_image() before calling this function
-    my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [{
+    my $ns = _api_call_mutate($scfg, 'nvmet.namespace.create', [{
         device_type => 'ZVOL',
         device_path => $zvol_path,  # Already has 'zvol/' prefix
         subsys_id => $subsys_id,
@@ -4119,7 +4119,7 @@ sub _nvme_create_namespace {
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: created namespace with UUID $device_uuid");
 
     # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-    eval { _api_call_write($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+    eval { _api_call_mutate($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
     if ($@) {
         _log($scfg, 1, 'warning', "[TrueNAS] nvme_create_namespace: subsystem reapply failed (non-fatal): $@");
     }
@@ -4423,7 +4423,7 @@ sub _alloc_image_iscsi {
     my $extent_id;
     {
         my $ext = eval {
-            _api_call_write(
+            _api_call_mutate(
                 $scfg,
                 'iscsi.extent.create',
                 [ $extent_payload ],
@@ -4470,7 +4470,7 @@ sub _alloc_image_iscsi {
         my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
         if ($@) {
             # Cleanup: delete extent and zvol if mapping creation failed
-            eval { _api_call_write($scfg, 'iscsi.extent.delete', [$extent_id]) };
+            eval { _api_call_mutate($scfg, 'iscsi.extent.delete', [$extent_id]) };
             eval { _tn_dataset_delete($scfg, $full_ds) };
             die "Failed to create target-extent mapping for disk '$zname': $@\n";
         }
@@ -4577,7 +4577,7 @@ sub _alloc_image_nvme {
     # Create namespace on TrueNAS (locked section — API calls only)
     my $subsys_id = _nvme_ensure_subsystem($scfg);
     my $ns = eval {
-        _api_call_write($scfg, 'nvmet.namespace.create', [{
+        _api_call_mutate($scfg, 'nvmet.namespace.create', [{
             device_type => 'ZVOL',
             device_path => $zvol_path,
             subsys_id => $subsys_id,
@@ -4604,7 +4604,7 @@ sub _alloc_image_nvme {
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
         # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_write($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }
@@ -5949,11 +5949,11 @@ sub _expose_snapshot_device {
                     device_path => $zvol_path,
                     device_type => 'ZVOL',
                 };
-                my $ns = _api_call_write($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+                my $ns = _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
                 $device_uuid = $ns->{device_uuid}
                     // die "No device_uuid returned from namespace creation\n";
                 # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-                eval { _api_call_write($scfg, 'nvmet.subsys.update',
+                eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
                     [$subsys_id, { allow_any_host => JSON::PP::true }]) };
             }
 
@@ -6233,7 +6233,7 @@ sub _clone_image_iscsi {
         };
 
         my $ext = eval {
-            _api_call_write(
+            _api_call_mutate(
                 $scfg,
                 'iscsi.extent.create',
                 [ $extent_payload ],
@@ -6260,7 +6260,7 @@ sub _clone_image_iscsi {
         my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
         if ($@) {
             # Cleanup: delete extent and zvol if mapping creation failed
-            eval { _api_call_write($scfg, 'iscsi.extent.delete', [$extent_id]) };
+            eval { _api_call_mutate($scfg, 'iscsi.extent.delete', [$extent_id]) };
             eval { _tn_dataset_delete($scfg, $target_full) };
             die "Failed to create target-extent mapping for clone: $@\n";
         }
@@ -6383,7 +6383,7 @@ sub _clone_image_nvme {
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
     my $ns = eval {
-        _api_call_write($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+        _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
     };
     if ($@) {
         # Cleanup: delete the zvol clone if namespace creation failed
@@ -6403,7 +6403,7 @@ sub _clone_image_nvme {
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
         # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_write($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] clone_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }
