@@ -5537,7 +5537,16 @@ sub _ensure_target_visible {
         }
     };
     if ($@) {
-        _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to query targets: $@");
+        my $query_err = $@;
+        # Distinguish query failure from confirmed target absence.
+        # If the query itself failed (rate-limit, network, etc.), we cannot conclude
+        # the target is absent — log a clear cause and propagate the original error.
+        if ($query_err =~ /rate.limit|EBUSY/i) {
+            _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: TrueNAS API rate limited while querying targets — too many connections from this node. Wait 60s and retry.");
+        } else {
+            _log($scfg, 0, 'err', "[TrueNAS] Pre-flight: failed to query targets: $query_err");
+        }
+        die "Pre-flight: could not verify iSCSI target $iqn (query failed: $query_err)\n";
     }
 
     if (!$target_exists) {
