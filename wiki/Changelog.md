@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.4 (June 15, 2026)
+
+### Maintenance
+
+- **Remove proactive `core.ping` health check from `_ws_get_persistent`**: The per-call liveness ping added one round-trip (~2.5ms) before every API call with no benefit on healthy connections. Dead connections are already detected and handled reactively in `_api_call`'s error path, which invalidates the cached connection and lets `_retry_with_backoff` reopen it.
+
 ## Version 2.1.3 (June 13, 2026)
 
 ### Bug Fixes

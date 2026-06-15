@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.3';
+our $VERSION = '2.1.4';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -1028,26 +1028,6 @@ sub _ws_get_persistent($scfg) {
 
     my $key = _ws_connection_key($scfg);
     my $conn = $_ws_connections{$key};
-
-    # Test if existing connection is still alive
-    if ($conn && $conn->{sock}) {
-        # Quick connection test - try to send a ping
-        eval {
-            # Test with a lightweight method call
-            _ws_rpc($conn, {
-                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
-            });
-        };
-        if ($@) {
-            # Connection is dead, close socket properly before removing from cache
-            # This prevents "free unreferenced scalar" errors from IO::Socket::SSL
-            if ($conn && $conn->{sock}) {
-                eval { $conn->{sock}->close(); };
-            }
-            delete $_ws_connections{$key};
-            $conn = undef;
-        }
-    }
 
     # Create new connection if needed
     if (!$conn) {
