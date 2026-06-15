@@ -2134,8 +2134,9 @@ test_multidisk_advanced_operations() {
     # Create full clone
     log_info "Creating full clone with all 3 disks"
     local clone_start=$(date +%s)
-    if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" >/dev/null 2>&1; then
+    if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" 2>/tmp/clone-err.log; then
         log_error "Failed to create multi-disk clone"
+        log_error "stderr: $(cat /tmp/clone-err.log)"
         pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - Clone operation failed")

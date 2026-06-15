@@ -1,3 +1,31 @@
+truenas-proxmox-plugin (2.0.31+deb1) unstable; urgency=medium
+
+  * Fix TrueNAS auth.login_with_api_key rate-limit storms under bursty
+    workloads (issue #45 follow-up):
+    - D1: write operations no longer open a fresh ephemeral WebSocket per
+      RPC; pool.dataset.create, iscsi.extent.create, iscsi.targetextent.create,
+      pool.dataset.delete and friends now ride the persistent authenticated
+      socket alongside reads
+    - D2: new session-broker daemon (truenas-plugin-broker) holds one
+      authenticated WebSocket per (host, api_key) pair on each PVE node and
+      proxies JSON-RPC for every plugin invocation via /run/truenas-plugin/
+      broker.sock; eliminates per-process re-auth from forked qm, pvesh
+      and pveproxy workers
+    - D3: 'Rate Limit Exceeded' is no longer in the retryable error class.
+      A new _is_rate_limit_error classifier matches the EBUSY/Rate Limit
+      Exceeded signature and short-circuits _is_retryable_error so a
+      throttled write does not feed the sticky 60s counter via retries
+    - D4: removed the cosmetic 100ms pre-login sleep
+      (DEVICE_READY_TIMEOUT_US) at the top of _ws_open_at; 100ms between
+      logins is irrelevant against a 20/60s per-IP limiter
+  * Ship truenas-plugin-broker.service systemd unit (mode-0600 Unix socket
+    under /run/truenas-plugin, idle-WS reaping at 600s, core.ping liveness)
+  * Add regression suite under t/rate-limit/ (real-TN, audit-counted) that
+    covers all four defects plus an in-process session-reuse positive
+    control. See t/rate-limit/INSTALL.md for deployment notes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 15 Jun 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.0.30+deb1) unstable; urgency=medium
 
   * Reduce status latency and preserve operation-path safety (issue #30 phase 3):

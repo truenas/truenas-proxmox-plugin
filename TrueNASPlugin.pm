@@ -220,7 +220,17 @@ sub _normalize_blocksize {
 sub _is_connection_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|rate limit|ssl.*error|connection.*failed/i;
+    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed/i;
+}
+
+# Rate-limit (TN middleware) is its own class. The middleware counter is
+# 20 calls / 60 s / IP / method on auth.login_with_api_key and is sticky:
+# additional attempts inside the window extend the lockout. Retrying here
+# only makes it worse. Caller surfaces the error to PVE without retrying.
+sub _is_rate_limit_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /Rate Limit Exceeded|errno\s*16|errname[^A-Za-z]*EBUSY/i;
 }
 
 sub _is_not_found_error {
@@ -244,6 +254,11 @@ sub _is_retryable_error {
     # because FK errors include Python traceback paths containing "connection.py"
     # which would otherwise false-match the /connection.*failed/ pattern below
     return 0 if $error =~ /FOREIGN KEY constraint failed|IntegrityError|constraint failed/i;
+
+    # Do NOT retry on rate-limit. Each retry calls auth.login_with_api_key again,
+    # which feeds the same 20/60s/IP counter that triggered the failure. Retrying
+    # extends the lockout — known as the D3 death-spiral. Surface the error.
+    return 0 if _is_rate_limit_error($error);
 
     # Retry on transient connection/network errors
     return 1 if _is_connection_error($error);
@@ -373,6 +388,7 @@ sub properties {
             description => "Prefer IPv4 (A records) when resolving api_host.",
             type => 'boolean', optional => 1, default => 1,
         },
+
 
         # Placement
         dataset => {
@@ -577,6 +593,8 @@ sub options {
 
         # Concurrency
         storage_lock_timeout => { optional => 1 },
+
+
     };
 }
 
@@ -759,14 +777,11 @@ sub _ws_defaults($scfg) {
     my $port = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
     return ($scheme, $port);
 }
-sub _ws_open($scfg) {
+# Open a WebSocket connection to an explicit path and authenticate via JSON-RPC.
+sub _ws_open_at($scfg, $path) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{api_host};
     my $peer = ($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
-    my $path = '/api/current';
-
-    # Add small delay to avoid rate limiting
-    usleep(DEVICE_READY_TIMEOUT_US); # 100ms delay
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -782,7 +797,6 @@ sub _ws_open($scfg) {
             PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
         ) or die "WebSocket connection failed (ws://): $!\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     }
-    # WebSocket handshake
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
     my $key_b64 = encode_base64($key_raw, '');
     my $hosthdr = $host.":".$port;
@@ -804,14 +818,21 @@ sub _ws_open($scfg) {
     my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
     my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
     die "WebSocket handshake invalid: invalid accept key. Ensure TrueNAS 25.10+ is running with WebSocket API enabled.\n" if ($accept // '') ne $expect;
-    # Authenticate with API key (JSON-RPC)
     my $conn = { sock => $sock, next_id => 1 };
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
         params  => [ $scfg->{api_key} ],
-    }) or die "TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.\n";
+    }) or die "TrueNAS authentication failed: auth.login_with_api_key error on $path. Verify API key.\n";
     return $conn;
+}
+
+# Pin to v25.10.2 API. Plugin code targets v25 semantics; do not auto-upgrade to
+# v26+ paths since the API changed between 25 and 26.
+use constant PINNED_API_PATH => '/api/v25.10.2';
+
+sub _ws_open($scfg) {
+    return _ws_open_at($scfg, PINNED_API_PATH);
 }
 # ---- WS framing helpers (text only) ----
 sub _xor_mask {
@@ -926,6 +947,13 @@ sub _ws_recv_text {
 }
 sub _ws_rpc {
     my ($conn, $obj) = @_;
+
+    # If the caller handed us a broker-proxied connection, forward the
+    # JSON-RPC over the broker's Unix socket instead of running the WS
+    # handshake/frame protocol locally. The broker handles the upstream
+    # TLS+WS+auth and pools sessions across all PVE processes on the node.
+    return _broker_rpc($conn, $obj) if $conn->{type} && $conn->{type} eq 'broker';
+
     my $request_id = $obj->{id};
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
@@ -970,6 +998,91 @@ sub _ws_rpc {
         . "(request id=$request_id, method=$obj->{method})";
 }
 
+# ======== Session broker client (D2 mitigation) ========
+# When /run/truenas-plugin/broker.sock is present, every plugin process on
+# this node funnels JSON-RPC through the broker daemon, which holds a
+# single authenticated WebSocket per (host, api_key). This eliminates the
+# per-process re-auth that previously fed the TN login rate limiter.
+use constant BROKER_SOCKET_PATH => '/run/truenas-plugin/broker.sock';
+
+sub _broker_open_socket {
+    return undef unless -S BROKER_SOCKET_PATH;
+    require IO::Socket::UNIX;
+    my $sock = IO::Socket::UNIX->new(
+        Peer => BROKER_SOCKET_PATH,
+        Type => 1,    # SOCK_STREAM
+    );
+    return $sock;
+}
+
+# Try to obtain a broker-proxied connection wrapper for this $scfg.
+# Returns a connection hashref with type=>'broker' on success, undef on
+# failure (caller falls back to direct WS).
+sub _broker_try_open($scfg) {
+    my $sock = _broker_open_socket() or return undef;
+    return { type => 'broker', sock => $sock, scfg => $scfg, next_id => 1 };
+}
+
+# Forward one JSON-RPC call through the broker. The broker reads a single
+# newline-terminated JSON request, performs the upstream RPC on its pooled
+# WS, and returns a single newline-terminated JSON response with either
+# `result` or `error`. We then translate to the same return/die contract
+# the rest of the plugin expects from _ws_rpc.
+sub _broker_rpc {
+    my ($conn, $obj) = @_;
+    my $scfg = $conn->{scfg};
+
+    my $req = {
+        scfg => {
+            api_host     => $scfg->{api_host},
+            api_key      => $scfg->{api_key},
+            api_scheme   => $scfg->{api_scheme} // 'wss',
+            api_port     => $scfg->{api_port},
+            api_insecure => $scfg->{api_insecure} // 0,
+            prefer_ipv4  => $scfg->{prefer_ipv4} // 1,
+        },
+        method => $obj->{method},
+        params => $obj->{params} // [],
+    };
+    my $payload = encode_json($req) . "\n";
+
+    my $sock = $conn->{sock};
+    my $result;
+    eval {
+        my $written = 0;
+        while ($written < length($payload)) {
+            my $n = $sock->syswrite(substr($payload, $written));
+            die "broker: write failed: $!" unless defined $n && $n > 0;
+            $written += $n;
+        }
+
+        my $buf = '';
+        while (1) {
+            my $got = $sock->sysread(my $chunk, 4096);
+            die "broker: read failed: $!" unless defined $got;
+            die "broker: EOF before complete response" if $got == 0;
+            $buf .= $chunk;
+            last if index($buf, "\n") >= 0;
+        }
+        my ($line) = split /\n/, $buf, 2;
+        my $decoded = eval { decode_json($line) };
+        die "broker: bad response: $@" if $@ || ref($decoded) ne 'HASH';
+
+        die "JSON-RPC error: $decoded->{error}" if exists $decoded->{error};
+        $result = $decoded->{result};
+    };
+    my $err = $@;
+    # One round trip per broker Unix-socket connection: close after use.
+    eval { $sock->close(); };
+    die $err if $err;
+    return $result;
+}
+
+sub _broker_close($conn) {
+    return unless $conn && $conn->{sock};
+    eval { $conn->{sock}->close(); };
+}
+
 # ======== Persistent WebSocket Connection Management ========
 my %_ws_connections; # Global connection cache
 my $_ws_creator_pid = $$; # Track PID to detect fork
@@ -982,6 +1095,16 @@ sub _ws_connection_key($scfg) {
 }
 
 sub _ws_get_persistent($scfg) {
+    # Broker fast path: if /run/truenas-plugin/broker.sock exists, every call
+    # in this process gets a fresh broker-client wrapper. The broker holds
+    # the upstream WS so we never call auth.login_with_api_key here.
+    # Broker-conn objects are NOT cached in %_ws_connections — Unix socket
+    # connections are cheap (no auth round trip) and avoiding the cache
+    # sidesteps the fork-detection/SSL-DESTROY mess that motivated this fix.
+    if (my $bconn = _broker_try_open($scfg)) {
+        return $bconn;
+    }
+
     # Fork detection: if we're in a child process, inherited connections are invalid
     # CRITICAL: When child exits, Perl's global destruction calls DESTROY on all objects,
     # including inherited IO::Socket::SSL sockets. DESTROY calls SSL_free() which corrupts
@@ -1117,7 +1240,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
     # Prepare parameter arrays for each snapshot deletion
     my @params_array = map { [$_] } @$snapshot_list;
 
-    my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
+    my $results = _api_bulk_call($scfg, 'pool.snapshot.delete', \@params_array,
         'Deleting snapshot {0}');
 
     # Check if results is actually an array reference or a job ID
@@ -1556,10 +1679,20 @@ sub _api_call($scfg, $ws_method, $ws_params, $opts = undef) {
     }
 }
 
-# Convenience wrapper for write operations that need ephemeral connections
-# Use this for create, update, delete operations to avoid WebSocket race conditions
+# Write operations now ride the persistent authenticated WebSocket alongside
+# reads. The previous ephemeral-per-write design opened a fresh TLS+WS+login
+# for every dataset.create / extent.create / targetextent.create / etc., which
+# could trip the TN per-IP login rate limit (20/60 s) on bursty workloads
+# like multi-disk VM creation, vzdump, clone storms (D1).
+#
+# Fork safety: _ws_get_persistent re-creates the connection per-process via
+# the existing fork-detection path. Sockets are not shared across fork.
+#
+# Concurrency: PVE uses fork-based concurrency; per-process there is at most
+# one in-flight call on the persistent socket at any time. Multi-threaded
+# users can still pass { use_ephemeral => 1 } explicitly via _api_call.
 sub _api_call_write($scfg, $ws_method, $ws_params) {
-    return _api_call($scfg, $ws_method, $ws_params, { use_ephemeral => 1 });
+    return _api_call($scfg, $ws_method, $ws_params);
 }
 
 # ======== TrueNAS API ops (WebSocket) ========
@@ -1594,7 +1727,7 @@ sub _tn_extents($scfg) {
 }
 
 sub _tn_snapshots($scfg) {
-    return _api_call($scfg, 'zfs.snapshot.query', []);
+    return _api_call($scfg, 'pool.snapshot.query', []);
 }
 
 sub _tn_global($scfg) {
@@ -1677,7 +1810,7 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call_write($scfg, 'zfs.snapshot.clone', [ $payload ]);
+    return _api_call_write($scfg, 'pool.snapshot.clone', [ $payload ]);
 }
 
 # ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
@@ -1686,14 +1819,14 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
 
     # WebSocket-only for snapshot rollback (requires TrueNAS 25.10+)
-    # TrueNAS 25.10+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
+    # Uses: pool.snapshot.rollback(snapshot_id, {force: bool, recursive: bool})
     my $attempt_rollback = sub {
         my $conn = _ws_open_ephemeral($scfg);
         my $result;
         eval {
             $result = _ws_rpc($conn, {
                 jsonrpc => "2.0", id => 1,
-                method  => "zfs.snapshot.rollback",
+                method  => "pool.snapshot.rollback",
                 params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
             });
         };
@@ -1717,7 +1850,7 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
                     eval {
                         $result = _ws_rpc($conn, {
                             jsonrpc => "2.0", id => 2,
-                            method  => "zfs.snapshot.rollback",
+                            method  => "pool.snapshot.rollback",
                             params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
                         });
                     };
@@ -1972,7 +2105,7 @@ sub volume_snapshot {
     # Create ZFS snapshot for the disk
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
     my $result = _api_call_write(
-        $scfg, 'zfs.snapshot.create', [ $payload ],
+        $scfg, 'pool.snapshot.create', [ $payload ],
     );
 
     # Handle potential async job for snapshot creation
@@ -2004,7 +2137,7 @@ sub volume_snapshot_delete {
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
 
     my $result = _api_call_write(
-        $scfg, 'zfs.snapshot.delete', [ $snap_full ],
+        $scfg, 'pool.snapshot.delete', [ $snap_full ],
     );
 
     # Handle potential async job for snapshot deletion
@@ -2086,7 +2219,7 @@ sub volume_snapshot_info {
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
-    my $list = _api_call($scfg, 'zfs.snapshot.query', []) // [];
+    my $list = _api_call($scfg, 'pool.snapshot.query', []) // [];
 
     my $snaps = {};
     for my $s (@$list) {

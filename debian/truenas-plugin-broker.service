@@ -1,0 +1,22 @@
+[Unit]
+Description=TrueNAS Proxmox Plugin Session Broker
+Documentation=https://github.com/truenas/truenas-proxmox-plugin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/truenas-plugin-broker --foreground
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=truenas-plugin
+RuntimeDirectoryMode=0700
+StandardOutput=journal
+StandardError=journal
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
