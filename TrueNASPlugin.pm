@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.4';
+our $VERSION = '2.1.5';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -220,7 +220,10 @@ sub _normalize_blocksize {
 sub _is_connection_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed/i;
+    return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|
+        network is unreachable|host is unreachable|temporary failure|service unavailable|
+        502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed|
+        WS read|WS len|WS payload|WebSocket.*closed/xi;
 }
 
 sub _is_not_found_error {

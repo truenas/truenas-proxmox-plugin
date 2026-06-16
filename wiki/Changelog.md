@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.5 (June 16, 2026)
+
+### Bug Fixes
+
+- **Fix stale WebSocket connections not triggering reconnect**: WS framing errors (`WS read hdr failed`, `WS len16/64 read fail`, `WS payload read fail`) are now recognised as connection errors. They were previously not matched by `_is_connection_error`, so a stale persistent connection would fail permanently instead of being invalidated and reopened by the existing retry path. Under parallel load these appeared as intermittent "API is unreachable" failures even when TrueNAS was healthy.
+
 ## Version 2.1.4 (June 15, 2026)
 
 ### Maintenance

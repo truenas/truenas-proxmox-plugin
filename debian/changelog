@@ -1,3 +1,11 @@
+truenas-proxmox-plugin (2.1.5+deb1) unstable; urgency=low
+
+  * Classify WS framing errors (WS read/len/payload) as connection errors so
+    stale persistent connections are invalidated and reopened by the existing
+    retry path instead of failing permanently.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 16 Jun 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.4+deb1) unstable; urgency=low
 
   * Remove proactive core.ping health check from _ws_get_persistent; dead
