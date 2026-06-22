@@ -1,3 +1,18 @@
+truenas-proxmox-plugin (2.1.7+deb1) unstable; urgency=medium
+
+  * truenas-plugin-broker: log every error response (lwarn). Before this
+    change the daemon only logged WS lifecycle events (opened / reaping /
+    startup / shutdown) and was silent when upstream RPCs failed. After
+    a broker restart, the first upstream auth.login_with_api_key can be
+    rejected by TN's per-IP rate limiter from prior activity, and the
+    failure was invisible in the journal. Now broker logs bad request
+    JSON, missing scfg fields, no-method requests, upstream RPC
+    exceptions (including the dead-pool cleanup), no-response-from-
+    upstream conditions, and structured JSON-RPC errors returned by TN
+    (e.g. EBUSY / Rate Limit Exceeded). No behaviour change beyond logs.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (2.1.6+deb1) unstable; urgency=medium
 
   * Add node-local session broker daemon (truenas-plugin-broker) that holds

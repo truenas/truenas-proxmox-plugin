@@ -321,12 +321,14 @@ sub handle_request {
     return unless defined $line;
     my $req = eval { decode_json($line) };
     if ($@ || !$req) {
+        lwarn("bad request JSON: $@");
         my $err = encode_json({ error => "broker: bad request JSON: $@" });
         $client->syswrite("$err\n");
         return;
     }
     my $scfg = $req->{scfg};
     if (!$scfg || !$scfg->{api_host} || !$scfg->{api_key}) {
+        lwarn("scfg missing api_host/api_key in request");
         my $err = encode_json({ error => "broker: scfg missing api_host/api_key" });
         $client->syswrite("$err\n");
         return;
@@ -334,11 +336,13 @@ sub handle_request {
     my $method = $req->{method};
     my $params = $req->{params} // [];
     if (!$method) {
+        lwarn("request missing method (host=$scfg->{api_host})");
         my $err = encode_json({ error => "broker: no method" });
         $client->syswrite("$err\n");
         return;
     }
 
+    my $sk = scfg_key($scfg);
     my $result_obj;
     eval {
         my $conn = get_or_open_ws($scfg);
@@ -349,8 +353,12 @@ sub handle_request {
         $result_obj = ws_rpc($conn, $rpc);
     };
     if (my $err = $@) {
-        # Drop the cached conn — likely dead
-        my $sk = scfg_key($scfg);
+        # Drop the cached conn — likely dead — and surface the failure in
+        # the journal so the operator can tell the difference between
+        # "broker quiet because all RPCs succeed" and "broker quiet because
+        # auth keeps failing". Before this lwarn the daemon was opaque on
+        # failure: only WS lifecycle events were logged.
+        lwarn("upstream RPC failed (sk=$sk method=$method): $err");
         if (my $e = delete $POOL{$sk}) {
             eval { $e->{conn}->{sock}->close(); };
         }
@@ -359,12 +367,18 @@ sub handle_request {
         return;
     }
     if (!$result_obj) {
+        lwarn("no response from upstream (sk=$sk method=$method)");
         my $msg = encode_json({ error => "broker: no response from upstream" });
         $client->syswrite("$msg\n");
         return;
     }
 
     if (exists $result_obj->{error}) {
+        # Upstream returned a structured JSON-RPC error (e.g. EBUSY /
+        # Rate Limit Exceeded, invalid params, method not found). Worth
+        # logging so users can match a failing test to a TN-side cause.
+        my $err_repr = ref($result_obj->{error}) ? encode_json($result_obj->{error}) : $result_obj->{error};
+        lwarn("upstream error (sk=$sk method=$method): $err_repr");
         my $msg = encode_json({ error => encode_json($result_obj->{error}) });
         $client->syswrite("$msg\n");
     } else {
