@@ -1,0 +1,415 @@
+#!/usr/bin/perl
+# truenas-plugin-broker
+#
+# Holds one persistent authenticated WebSocket per (host, api_key) pair to
+# the TrueNAS middleware and proxies JSON-RPC for any number of local PVE
+# plugin clients via a Unix socket.
+#
+# Goal: every PVE plugin invocation (forked qm/pvesh/pveproxy worker, every
+# pvedaemon process) reuses the broker's WS instead of opening a fresh one.
+# TrueNAS rate-limits auth.login_with_api_key at 20 calls / 60 s / IP /
+# method, so per-process re-auth used to trip a sticky 60 s lockout
+# (death-spiral D2). With the broker, the node logs in once per upstream
+# session and never re-auths under normal operation.
+#
+# Protocol (newline-delimited JSON over Unix socket):
+#   client -> broker:
+#     {"scfg":{"api_host":"...","api_key":"...","api_scheme":"wss",
+#              "api_insecure":0,"prefer_ipv4":1,"api_port":443},
+#      "method":"system.version","params":[]}
+#   broker -> client:
+#     {"result":...}            on success
+#     {"error":"..."}           on failure (string contains TN error body)
+#
+# Trust model: Unix socket is root-only (mode 0600). API keys are passed
+# in each request because the broker is stateless w.r.t. credentials.
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use IO::Socket::SSL;
+use IO::Socket::INET;
+use IO::Select;
+use Fcntl qw(:flock);
+use POSIX qw(setsid strftime);
+use Digest::SHA qw(sha1 sha1_hex);
+use MIME::Base64 qw(encode_base64);
+use JSON::PP;
+use Socket;
+use Time::HiRes qw(time);
+
+my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
+my $PIDFILE        = '/run/truenas-plugin/broker.pid';
+my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
+my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
+my $WS_PINNED_PATH = '/api/v25.10.2';
+
+my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
+my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
+
+# ---------------- logging ----------------
+sub _log_line {
+    my ($lvl, $msg) = @_;
+    my $ts = strftime('%Y-%m-%dT%H:%M:%S', gmtime());
+    my $line = "$ts $lvl $msg\n";
+    if ($foreground) {
+        print STDERR $line;
+    } else {
+        if (open(my $fh, '>>', $LOG_FILE)) {
+            print $fh $line;
+            close $fh;
+        }
+    }
+}
+sub linfo  { _log_line('INFO',  $_[0]); }
+sub lwarn  { _log_line('WARN',  $_[0]); }
+sub lerr   { _log_line('ERROR', $_[0]); }
+sub ldebug { _log_line('DEBUG', $_[0]) if $debug; }
+
+# ---------------- setup ----------------
+sub ensure_rundir {
+    my $dir = '/run/truenas-plugin';
+    mkdir($dir, 0700) unless -d $dir;
+    chmod 0700, $dir;
+}
+
+sub daemonize {
+    return if $foreground;
+    defined(my $pid = fork()) or die "fork failed: $!";
+    exit 0 if $pid;
+    setsid() or die "setsid failed: $!";
+    chdir('/') or die "chdir / failed: $!";
+    open(STDIN,  '<', '/dev/null');
+    open(STDOUT, '>>', '/dev/null');
+    open(STDERR, '>>', $LOG_FILE) or open(STDERR, '>>', '/dev/null');
+}
+
+sub write_pidfile {
+    open(my $fh, '>', $PIDFILE) or die "cannot write pidfile $PIDFILE: $!";
+    print $fh "$$\n";
+    close $fh;
+}
+
+# ---------------- WebSocket helpers (subset of plugin code) ----------------
+sub ws_open {
+    my ($scfg) = @_;
+    my $scheme = $scfg->{api_scheme} || 'wss';
+    my $host   = $scfg->{api_host} or die "ws_open: no api_host";
+    my $port   = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
+    my $peer   = $host;
+
+    my $sock;
+    if ($scheme eq 'wss') {
+        $sock = IO::Socket::SSL->new(
+            PeerHost => $peer, PeerPort => $port,
+            SSL_verify_mode => $scfg->{api_insecure} ? 0x00 : 0x02,
+            SSL_hostname    => $host,
+            Timeout => 15,
+        ) or die "TLS connect to $host:$port failed: $SSL_ERROR";
+    } else {
+        $sock = IO::Socket::INET->new(
+            PeerHost => $peer, PeerPort => $port, Proto => 'tcp', Timeout => 15,
+        ) or die "TCP connect to $host:$port failed: $!";
+    }
+
+    my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
+    my $key_b64 = encode_base64($key_raw, '');
+    my $req =
+      "GET $WS_PINNED_PATH HTTP/1.1\r\n".
+      "Host: $host:$port\r\n".
+      "Upgrade: websocket\r\n".
+      "Connection: Upgrade\r\n".
+      "Sec-WebSocket-Key: $key_b64\r\n".
+      "Sec-WebSocket-Version: 13\r\n".
+      "\r\n";
+    print $sock $req;
+    my $resp = '';
+    while ($sock->sysread(my $buf, 1024)) {
+        $resp .= $buf;
+        last if $resp =~ /\r\n\r\n/s;
+    }
+    die "WS handshake failed: no HTTP 101 response" if $resp !~ m#^HTTP/1\.([01]) 101#;
+    my ($accept) = $resp =~ /Sec-WebSocket-Accept:\s*(\S+)/i;
+    my $expect = encode_base64(sha1($key_b64 . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), '');
+    die "WS handshake invalid accept key" if ($accept // '') ne $expect;
+
+    my $conn = { sock => $sock, next_id => 1 };
+    my $auth = ws_rpc($conn, {
+        jsonrpc => "2.0", id => $conn->{next_id}++,
+        method  => "auth.login_with_api_key",
+        params  => [ $scfg->{api_key} ],
+    });
+    die "TrueNAS authentication failed" unless $auth;
+    return $conn;
+}
+
+sub xor_mask {
+    my ($data, $mask) = @_;
+    my $out = $data;
+    my $len = length($data);
+    for (my $i = 0; $i < $len; $i++) {
+        substr($out, $i, 1) = chr(ord(substr($data, $i, 1)) ^ ord(substr($mask, $i % 4, 1)));
+    }
+    return $out;
+}
+
+sub ws_read_exact {
+    my ($sock, $bufref, $len) = @_;
+    $$bufref = '';
+    while (length($$bufref) < $len) {
+        my $got = $sock->sysread(my $tmp, $len - length($$bufref));
+        return 0 unless defined $got && $got > 0;
+        $$bufref .= $tmp;
+    }
+    return 1;
+}
+
+sub ws_send_text {
+    my ($sock, $text) = @_;
+    my $len = length($text);
+    my $mask_key = join '', map { chr(int(rand(256))) } 1..4;
+    my $hdr = pack('C', 0x81);   # FIN=1, opcode=0x1 (text)
+    my $masked_flag = 0x80;
+    if    ($len <= 125)       { $hdr .= pack('C',   $masked_flag | $len); }
+    elsif ($len <= 0xFFFF)    { $hdr .= pack('C n', $masked_flag | 126, $len); }
+    else                      { $hdr .= pack('C Q>',$masked_flag | 127, $len); }
+    $sock->syswrite($hdr . $mask_key . xor_mask($text, $mask_key));
+}
+
+sub ws_recv_text {
+    my ($sock) = @_;
+    my $message = '';
+    while (1) {
+        my $hdr;
+        return undef unless ws_read_exact($sock, \$hdr, 2);
+        my ($b1, $b2) = unpack('CC', $hdr);
+        my $fin    = $b1 & 0x80;
+        my $opcode = $b1 & 0x0F;
+        my $masked = $b2 & 0x80;
+        my $len    = $b2 & 0x7F;
+        if ($len == 126) {
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 2);
+            $len = unpack('n', $ext);
+        } elsif ($len == 127) {
+            my $ext; return undef unless ws_read_exact($sock, \$ext, 8);
+            $len = unpack('Q>', $ext);
+        }
+        my $mask_key = '';
+        if ($masked) {
+            return undef unless ws_read_exact($sock, \$mask_key, 4);
+        }
+        my $payload = '';
+        if ($len > 0) {
+            return undef unless ws_read_exact($sock, \$payload, $len);
+            $payload = xor_mask($payload, $mask_key) if $masked;
+        }
+        if    ($opcode == 0x01) { $message  = $payload; return $message if $fin; }
+        elsif ($opcode == 0x00) { $message .= $payload; return $message if $fin; }
+        elsif ($opcode == 0x08) { return undef; }            # close
+        elsif ($opcode == 0x09) {                            # ping
+            my $pong = pack('C', 0x8A);
+            if ($len <= 125)       { $pong .= pack('C', $len); }
+            elsif ($len <= 0xFFFF) { $pong .= pack('C n', 126, $len); }
+            else                   { $pong .= pack('C Q>', 127, $len); }
+            $sock->syswrite($pong . $payload);
+        }
+        elsif ($opcode == 0x0A) { }                          # pong
+        else { return undef; }
+    }
+}
+
+sub ws_rpc {
+    my ($conn, $obj) = @_;
+    my $req_id = $obj->{id};
+    my $text = encode_json($obj);
+    ws_send_text($conn->{sock}, $text);
+    my $max_skip = 10;
+    for (my $skipped = 0; $skipped <= $max_skip; $skipped++) {
+        my $resp = ws_recv_text($conn->{sock});
+        return undef unless defined $resp;
+        my $decoded = eval { decode_json($resp) };
+        next if $@ || !$decoded;
+        if (defined($req_id) && ref($decoded) eq 'HASH'
+            && defined($decoded->{id}) && "$decoded->{id}" eq "$req_id")
+        {
+            return $decoded;
+        }
+    }
+    return undef;
+}
+
+# ---------------- per-(host,key) connection pool ----------------
+my %POOL;       # scfg_key -> { conn => $ws_conn, last_used => $epoch }
+
+sub scfg_key {
+    my ($scfg) = @_;
+    my $host = $scfg->{api_host} // '';
+    my $key  = $scfg->{api_key}  // '';
+    # Don't put raw api_key in memory key; hash it
+    return $host . ':' . sha1_hex($key);
+}
+
+sub get_or_open_ws {
+    my ($scfg) = @_;
+    my $sk = scfg_key($scfg);
+    my $entry = $POOL{$sk};
+    if ($entry && $entry->{conn} && $entry->{conn}->{sock}) {
+        # Quick liveness check: ping
+        my $ok = eval {
+            ws_rpc($entry->{conn}, {
+                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+            });
+        };
+        if ($ok) {
+            $entry->{last_used} = time();
+            return $entry->{conn};
+        }
+        # Dead; drop and reopen
+        eval { $entry->{conn}->{sock}->close(); };
+        delete $POOL{$sk};
+    }
+    my $conn = ws_open($scfg);
+    $POOL{$sk} = { conn => $conn, last_used => time() };
+    linfo("opened WS for $sk (pool size " . scalar(keys %POOL) . ")");
+    return $conn;
+}
+
+sub reap_idle {
+    my $now = time();
+    for my $sk (keys %POOL) {
+        my $e = $POOL{$sk};
+        next unless $e && $e->{conn};
+        if ($now - $e->{last_used} > $IDLE_REAP_SECS) {
+            linfo("reaping idle WS for $sk");
+            eval { $e->{conn}->{sock}->close(); };
+            delete $POOL{$sk};
+        }
+    }
+}
+
+# ---------------- Unix-socket server ----------------
+sub make_listener {
+    unlink $SOCKET_PATH if -e $SOCKET_PATH;
+    my $srv = IO::Socket::UNIX->new(
+        Local  => $SOCKET_PATH,
+        Listen => 32,
+        Type   => SOCK_STREAM,
+    ) or die "cannot bind $SOCKET_PATH: $!";
+    chmod 0600, $SOCKET_PATH;
+    return $srv;
+}
+
+# Read one line (ending in \n) from a non-blocking-ish client. Returns
+# undef on EOF/error, string (without trailing \n) on success.
+sub read_line_blocking {
+    my ($fh) = @_;
+    my $buf = '';
+    while (1) {
+        my $got = $fh->sysread(my $tmp, 4096);
+        return undef unless defined $got && $got > 0;
+        $buf .= $tmp;
+        if ((my $idx = index($buf, "\n")) >= 0) {
+            my $line = substr($buf, 0, $idx);
+            return $line;
+        }
+    }
+}
+
+sub handle_request {
+    my ($client) = @_;
+    my $line = read_line_blocking($client);
+    return unless defined $line;
+    my $req = eval { decode_json($line) };
+    if ($@ || !$req) {
+        my $err = encode_json({ error => "broker: bad request JSON: $@" });
+        $client->syswrite("$err\n");
+        return;
+    }
+    my $scfg = $req->{scfg};
+    if (!$scfg || !$scfg->{api_host} || !$scfg->{api_key}) {
+        my $err = encode_json({ error => "broker: scfg missing api_host/api_key" });
+        $client->syswrite("$err\n");
+        return;
+    }
+    my $method = $req->{method};
+    my $params = $req->{params} // [];
+    if (!$method) {
+        my $err = encode_json({ error => "broker: no method" });
+        $client->syswrite("$err\n");
+        return;
+    }
+
+    my $result_obj;
+    eval {
+        my $conn = get_or_open_ws($scfg);
+        my $rpc = {
+            jsonrpc => "2.0", id => $conn->{next_id}++,
+            method => $method, params => $params,
+        };
+        $result_obj = ws_rpc($conn, $rpc);
+    };
+    if (my $err = $@) {
+        # Drop the cached conn — likely dead
+        my $sk = scfg_key($scfg);
+        if (my $e = delete $POOL{$sk}) {
+            eval { $e->{conn}->{sock}->close(); };
+        }
+        my $msg = encode_json({ error => "broker: $err" });
+        $client->syswrite("$msg\n");
+        return;
+    }
+    if (!$result_obj) {
+        my $msg = encode_json({ error => "broker: no response from upstream" });
+        $client->syswrite("$msg\n");
+        return;
+    }
+
+    if (exists $result_obj->{error}) {
+        my $msg = encode_json({ error => encode_json($result_obj->{error}) });
+        $client->syswrite("$msg\n");
+    } else {
+        my $msg = encode_json({ result => $result_obj->{result} });
+        $client->syswrite("$msg\n");
+    }
+}
+
+# ---------------- main ----------------
+ensure_rundir();
+daemonize();
+write_pidfile();
+linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
+
+$SIG{TERM} = $SIG{INT} = sub {
+    linfo("shutting down");
+    for my $sk (keys %POOL) {
+        my $e = $POOL{$sk};
+        eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+    }
+    unlink $SOCKET_PATH;
+    unlink $PIDFILE;
+    exit 0;
+};
+$SIG{PIPE} = 'IGNORE';
+
+my $srv = make_listener();
+my $sel = IO::Select->new($srv);
+my $last_reap = time();
+
+while (1) {
+    my @ready = $sel->can_read(60);
+    for my $fh (@ready) {
+        if ($fh == $srv) {
+            my $c = $srv->accept();
+            next unless $c;
+            # Handle inline (single-threaded). Per-conn the round trip is
+            # microseconds; broker bottleneck is the upstream WS not us.
+            eval { handle_request($c); };
+            if ($@) { lerr("handle_request died: $@"); }
+            eval { $c->close(); };
+        }
+    }
+    if (time() - $last_reap > 60) {
+        reap_idle();
+        $last_reap = time();
+    }
+}
