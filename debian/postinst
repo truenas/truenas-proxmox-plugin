@@ -4,9 +4,30 @@ set -e
 
 PLUGIN_PATH="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 STORAGE_CFG="/etc/pve/storage.cfg"
+BROKER_BIN="/usr/sbin/truenas-plugin-broker"
+BROKER_UNIT="truenas-plugin-broker.service"
+
+have_systemd() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+enable_broker() {
+    if have_systemd; then
+        systemctl daemon-reload || true
+        systemctl enable "$BROKER_UNIT" >/dev/null 2>&1 || true
+        # Start the broker before restarting PVE services so the plugin
+        # finds /run/truenas-plugin/broker.sock on first call. try-restart
+        # picks up a new broker binary on upgrade without a separate stop.
+        if systemctl is-active --quiet "$BROKER_UNIT"; then
+            systemctl try-restart "$BROKER_UNIT" || true
+        else
+            systemctl start "$BROKER_UNIT" || true
+        fi
+    fi
+}
 
 restart_proxmox_services() {
-    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    if have_systemd; then
         systemctl try-restart pvedaemon pveproxy pvestatd || true
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
@@ -112,13 +133,19 @@ case "$1" in
             echo "ERROR: Missing plugin file: $PLUGIN_PATH" >&2
             exit 1
         fi
+        if [ ! -x "$BROKER_BIN" ]; then
+            echo "ERROR: Missing broker binary: $BROKER_BIN" >&2
+            exit 1
+        fi
 
         perl -c "$PLUGIN_PATH" >/dev/null
+        perl -c "$BROKER_BIN" >/dev/null
 
         if [ -n "$2" ]; then
             migrate_storage_cfg "$2"
         fi
 
+        enable_broker
         restart_proxmox_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure|triggered)

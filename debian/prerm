@@ -3,9 +3,22 @@
 set -e
 
 STORAGE_CFG="/etc/pve/storage.cfg"
+BROKER_UNIT="truenas-plugin-broker.service"
+
+have_systemd() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+stop_broker() {
+    if have_systemd; then
+        systemctl stop "$BROKER_UNIT" >/dev/null 2>&1 || true
+        systemctl disable "$BROKER_UNIT" >/dev/null 2>&1 || true
+    fi
+}
 
 case "$1" in
     remove)
+        stop_broker
         if [ -f "$STORAGE_CFG" ] && grep -Eq '^[[:space:]]*truenasplugin:' "$STORAGE_CFG"; then
             echo "WARNING: TrueNAS plugin storage entries remain in $STORAGE_CFG (truenasplugin:)." >&2
             echo "WARNING: They are not modified automatically during package removal." >&2

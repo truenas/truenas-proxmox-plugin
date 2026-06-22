@@ -1,3 +1,22 @@
+truenas-proxmox-plugin (2.1.6+deb1) unstable; urgency=medium
+
+  * Add node-local session broker daemon (truenas-plugin-broker) that holds
+    one authenticated WebSocket per (host, api_key) pair and proxies
+    JSON-RPC for every plugin invocation via /run/truenas-plugin/broker.sock.
+    Eliminates per-process re-authentication from forked qm, pvesh and
+    pveproxy workers (D2). When the broker socket is absent the plugin
+    falls back to the existing per-process persistent WebSocket path with
+    no behavioural change.
+  * Ship truenas-plugin-broker.service systemd unit, enabled and started
+    by postinst before pvedaemon/pveproxy/pvestatd restart.
+  * Map this branch's tn_*-prefixed scfg keys to the broker daemon's
+    stable api_* wire format inside the plugin client so the broker
+    binary serves both this branch and the legacy api_*-keyed branch
+    without modification.
+  * See wiki/D2-per-process-reauth.md for design notes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.5+deb1) unstable; urgency=low
 
   * Classify WS framing errors (WS read/len/payload) as connection errors so
