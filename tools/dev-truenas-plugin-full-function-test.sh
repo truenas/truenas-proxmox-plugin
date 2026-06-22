@@ -123,9 +123,20 @@ while [[ $# -gt 0 ]]; do
             STOP_PHASE="$2"  # When --phase is specified, stop after this phase
             shift 2
             ;;
+        --start)
+            # Begin execution at this phase (inclusive); run through end-of-suite
+            # unless --stop also given.
+            START_PHASE="$2"
+            shift 2
+            ;;
+        --stop)
+            # Stop after completing this phase.
+            STOP_PHASE="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 STORAGE_ID VMID_START [--backup-store BACKUP_STORAGE] [--phase PHASE_NUM]"
+            echo "Usage: $0 STORAGE_ID VMID_START [--backup-store BACKUP_STORAGE] [--phase N | --start N [--stop M]]"
             exit 1
             ;;
     esac
@@ -2148,8 +2159,37 @@ test_multidisk_advanced_operations() {
     # Create full clone
     log_info "Creating full clone with all 3 disks"
     local clone_start=$(date +%s)
-    if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" >/dev/null 2>&1; then
+    if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" 2>/tmp/clone-err.log; then
         log_error "Failed to create multi-disk clone"
+        log_error "stderr: $(cat /tmp/clone-err.log)"
+        # Diagnostic dump before teardown — capture state so the size mismatch
+        # can be inspected post-mortem.
+        log_error "--- diagnostic dump (pre-teardown) ---"
+        log_error "by-path symlinks:"
+        ls -l /dev/disk/by-path/ 2>&1 | grep -E 'proxmox-lun' | tee -a "$LOG_FILE" >&2
+        log_error "base VM ($base_clone_vmid) config:"
+        qm config "$base_clone_vmid" 2>&1 | tee -a "$LOG_FILE" >&2
+        log_error "clone VM ($clone_vmid) config (if present):"
+        qm config "$clone_vmid" 2>&1 | tee -a "$LOG_FILE" >&2
+        log_error "block device sizes for each lun:"
+        for lp in /dev/disk/by-path/ip-*-iscsi-iqn.*proxmox-lun-*; do
+            [ -e "$lp" ] || continue
+            printf '  %s -> %s : %s bytes\n' \
+                "$lp" "$(readlink -f "$lp")" "$(blockdev --getsize64 "$lp" 2>/dev/null || echo N/A)" \
+                | tee -a "$LOG_FILE" >&2
+        done
+        log_error "TrueNAS extents (filesize, naa):"
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "root@${TN_HOST:-${TN_API_HOST:-truenas}}" \
+            "midclt call iscsi.extent.query" 2>/dev/null \
+            | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(f"  id={e[\"id\"]} name={e[\"name\"]} disk={e.get(\"disk\")} filesize={e.get(\"filesize\")} naa={e.get(\"naa\")}") for e in d]' \
+            2>&1 | tee -a "$LOG_FILE" >&2 || true
+        log_error "--- end diagnostic dump ---"
+        if [ "${KEEP_ON_CLONE_FAIL:-0}" = "1" ]; then
+            log_error "KEEP_ON_CLONE_FAIL=1 set; leaving base/clone for manual inspection"
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Clone operation failed (state kept)")
+            return 1
+        fi
         pvesh delete "/nodes/$NODE/qemu/$base_clone_vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL: $test_name - Clone operation failed")
