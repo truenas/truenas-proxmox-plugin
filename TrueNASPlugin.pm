@@ -944,6 +944,14 @@ sub _ws_recv_text {
 }
 sub _ws_rpc {
     my ($conn, $obj) = @_;
+
+    # Broker-proxied connections: forward the JSON-RPC call over the
+    # Unix-socket round trip instead of doing WS framing locally. The
+    # broker daemon owns the upstream TLS+WS+auth and pools sessions
+    # across every PVE process on this node, eliminating per-process
+    # re-authentication (D2).
+    return _broker_rpc($conn, $obj) if $conn->{type} && $conn->{type} eq 'broker';
+
     my $request_id = $obj->{id};
     my $text = encode_json($obj);
     _ws_send_text($conn->{sock}, $text);
@@ -988,6 +996,100 @@ sub _ws_rpc {
         . "(request id=$request_id, method=$obj->{method})";
 }
 
+# ======== Session broker client (D2 mitigation) ========
+# When /run/truenas-plugin/broker.sock is present, every plugin process on
+# this node funnels JSON-RPC through the broker daemon. The broker holds a
+# single authenticated WebSocket per (host, api_key) pair, eliminating the
+# per-process re-auth that previously fed the TN login rate limiter.
+#
+# Wire protocol: newline-delimited JSON over Unix socket, ONE round trip
+# per connection. Request envelope keeps the broker's stable `api_*` field
+# names; we map this branch's `tn_api_*` scfg keys to that wire shape at
+# send time so the broker daemon never needs to know about the rename.
+use constant BROKER_SOCKET_PATH => '/run/truenas-plugin/broker.sock';
+
+sub _broker_open_socket {
+    return undef unless -S BROKER_SOCKET_PATH;
+    require IO::Socket::UNIX;
+    my $sock = IO::Socket::UNIX->new(
+        Peer => BROKER_SOCKET_PATH,
+        Type => 1,    # SOCK_STREAM
+    );
+    return $sock;
+}
+
+# Try to obtain a broker-proxied connection wrapper for this $scfg.
+# Returns a connection hashref with type=>'broker' on success, undef on
+# failure (caller falls back to direct WS).
+sub _broker_try_open($scfg) {
+    my $sock = _broker_open_socket() or return undef;
+    return { type => 'broker', sock => $sock, scfg => $scfg, next_id => 1 };
+}
+
+# Forward one JSON-RPC call through the broker. The broker reads a single
+# newline-terminated JSON request, performs the upstream RPC on its pooled
+# WS, and returns a single newline-terminated JSON response with either
+# `result` or `error`. We then translate to the same return/die contract
+# the rest of the plugin expects from _ws_rpc.
+sub _broker_rpc {
+    my ($conn, $obj) = @_;
+    my $scfg = $conn->{scfg};
+
+    # Map this branch's tn_*-prefixed scfg keys to the broker daemon's
+    # stable api_* wire field names. The daemon is shared with
+    # broker-service which still uses the old key names; keeping the wire
+    # form constant means a single broker binary serves both branches.
+    my $req = {
+        scfg => {
+            api_host     => $scfg->{tn_api_host},
+            api_key      => $scfg->{tn_api_key},
+            api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
+            api_port     => $scfg->{tn_api_port},
+            api_insecure => $scfg->{tn_api_insecure} // 0,
+            prefer_ipv4  => $scfg->{tn_prefer_ipv4}  // 1,
+        },
+        method => $obj->{method},
+        params => $obj->{params} // [],
+    };
+    my $payload = encode_json($req) . "\n";
+
+    my $sock = $conn->{sock};
+    my $result;
+    eval {
+        my $written = 0;
+        while ($written < length($payload)) {
+            my $n = $sock->syswrite(substr($payload, $written));
+            die "broker: write failed: $!" unless defined $n && $n > 0;
+            $written += $n;
+        }
+
+        my $buf = '';
+        while (1) {
+            my $got = $sock->sysread(my $chunk, 4096);
+            die "broker: read failed: $!" unless defined $got;
+            die "broker: EOF before complete response" if $got == 0;
+            $buf .= $chunk;
+            last if index($buf, "\n") >= 0;
+        }
+        my ($line) = split /\n/, $buf, 2;
+        my $decoded = eval { decode_json($line) };
+        die "broker: bad response: $@" if $@ || ref($decoded) ne 'HASH';
+
+        die "JSON-RPC error: $decoded->{error}" if exists $decoded->{error};
+        $result = $decoded->{result};
+    };
+    my $err = $@;
+    # One round trip per broker Unix-socket connection: close after use.
+    eval { $sock->close(); };
+    die $err if $err;
+    return $result;
+}
+
+sub _broker_close($conn) {
+    return unless $conn && $conn->{sock};
+    eval { $conn->{sock}->close(); };
+}
+
 # ======== Persistent WebSocket Connection Management ========
 my %_ws_connections; # Global connection cache
 my $_ws_creator_pid = $$; # Track PID to detect fork
@@ -1000,6 +1102,16 @@ sub _ws_connection_key($scfg) {
 }
 
 sub _ws_get_persistent($scfg) {
+    # Broker fast path: if /run/truenas-plugin/broker.sock exists, every call
+    # in this process gets a fresh broker-client wrapper. The broker holds
+    # the upstream WS so we never call auth.login_with_api_key here.
+    # Broker-conn objects are NOT cached in %_ws_connections — Unix socket
+    # connections are cheap (no auth round trip) and avoiding the cache
+    # sidesteps the fork-detection/SSL-DESTROY path that follows.
+    if (my $bconn = _broker_try_open($scfg)) {
+        return $bconn;
+    }
+
     # Fork detection: if we're in a child process, inherited connections are invalid
     # CRITICAL: When child exits, Perl's global destruction calls DESTROY on all objects,
     # including inherited IO::Socket::SSL sockets. DESTROY calls SSL_free() which corrupts
