@@ -2897,6 +2897,51 @@ sub _login_target_all_portals {
     }
 }
 
+sub _iscsi_rescan_sd_capacity($scfg) {
+    # `iscsiadm -m session -R` discovers new LUNs but does NOT refresh the
+    # capacity of existing sdX devices. When a LUN number is recycled
+    # (extent at lunid N deleted, new extent created at the same lunid),
+    # the kernel keeps the same sdX and reports the OLD capacity until
+    # something pokes /sys/block/sdX/device/rescan. qemu-img convert then
+    # sees a destination "smaller than input file" and aborts.
+    #
+    # Walk every iSCSI session for our configured target IQN and write 1
+    # to each backing sdX's rescan attribute. Each write is cheap (a
+    # single SCSI READ CAPACITY) and idempotent. Errors are logged and
+    # ignored — the only callers are deferred best-effort paths.
+    my $iqn = $scfg->{target_iqn} // '';
+    return unless length $iqn;
+
+    # Each session looks like /sys/class/iscsi_session/session*/
+    # We need to traverse session -> device -> target* -> LUN -> block/sdX
+    my @sessions = glob '/sys/class/iscsi_session/session*';
+    my $rescanned = 0;
+    for my $sdir (@sessions) {
+        # Filter by IQN: targetname file lists the target IQN
+        my $tgt = '';
+        if (open(my $fh, '<', "$sdir/targetname")) {
+            $tgt = <$fh>;
+            close $fh;
+            chomp $tgt if defined $tgt;
+        }
+        next if !defined $tgt || $tgt ne $iqn;
+
+        # Find block devices under this session
+        for my $blk (glob "$sdir/device/target*/*/block/sd*") {
+            next unless $blk =~ m{/block/(sd[a-z]+)$};
+            my $sd = $1;
+            my $rescan = "/sys/block/$sd/device/rescan";
+            if (open(my $rfh, '>', $rescan)) {
+                print $rfh "1\n";
+                close $rfh;
+                $rescanned++;
+            }
+        }
+    }
+    _log($scfg, 2, 'debug', "[TrueNAS] _iscsi_rescan_sd_capacity: rescanned $rescanned sd device(s) for $iqn");
+    return $rescanned;
+}
+
 sub _device_for_lun($scfg, $lun) {
     # Wait briefly for by-path to appear if needed
     my $by;
@@ -4633,6 +4678,9 @@ sub _alloc_image_iscsi {
 
         # Rescan to detect the new LUN (safe here — we just logged in, no existing I/O)
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+        # Force capacity re-read on existing sdX devices. Required when the
+        # new LUN number was recycled from a previously-deleted extent.
+        eval { _iscsi_rescan_sd_capacity($deferred_scfg); };
         if ($deferred_scfg->{tn_use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
         }
@@ -6183,6 +6231,12 @@ sub activate_volume {
 
     if ($mode eq 'iscsi') {
         _iscsi_login_all($scfg);
+        # Force capacity re-read on existing sdX devices in case the LUN
+        # we are about to activate was recycled from a previously-deleted
+        # extent. Cheap, idempotent — just issues SCSI READ CAPACITY per
+        # device. Without this, qemu-img on a recycled LUN sees the old
+        # (smaller) capacity and refuses to write.
+        eval { _iscsi_rescan_sd_capacity($scfg); };
         if ($scfg->{tn_use_multipath}) {
             run_command(['multipath','-r'], outfunc => sub {});
             eval { run_command(['udevadm','settle'], outfunc => sub {}) };
@@ -6394,6 +6448,11 @@ sub _clone_image_iscsi {
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_iscsi deferred: refreshing initiator view");
         eval { _try_run(['iscsiadm','-m','session','-R'], "iscsi session rescan failed"); };
+        # Force capacity re-read on existing sdX devices. Required when the
+        # new clone's LUN number was recycled from a previously-deleted
+        # extent — iscsiadm -R won't refresh capacity on its own and
+        # qemu-img convert will read the stale (smaller) size.
+        eval { _iscsi_rescan_sd_capacity($deferred_scfg); };
         if ($deferred_scfg->{tn_use_multipath}) {
             eval { _try_run(['multipath','-r'], "multipath reload failed"); };
         }
