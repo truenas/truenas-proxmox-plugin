@@ -1,3 +1,16 @@
+truenas-proxmox-plugin (2.1.8+deb1) unstable; urgency=medium
+
+  * Rename ZFS snapshot API calls from zfs.snapshot.* to pool.snapshot.*
+    to match TrueNAS 25.10 middleware. The legacy zfs.snapshot namespace
+    was removed in 25.10 and returns -32601 "Method does not exist",
+    breaking qm snapshot / qm rollback / volume_snapshot_delete /
+    bulk snapshot delete. Affects: pool.snapshot.query,
+    pool.snapshot.create, pool.snapshot.delete, pool.snapshot.clone,
+    pool.snapshot.rollback. Same fix already shipped on broker-service
+    via 35281fb; this commit ports it to fix/rate-limit-connection-reuse.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:00:00 +0000
+
 truenas-proxmox-plugin (2.1.7+deb1) unstable; urgency=medium
 
   * truenas-plugin-broker: log every error response (lwarn). Before this

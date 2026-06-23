@@ -1200,7 +1200,7 @@ sub _bulk_snapshot_delete($scfg, $snapshot_list) {
     # Prepare parameter arrays for each snapshot deletion
     my @params_array = map { [$_] } @$snapshot_list;
 
-    my $results = _api_bulk_call($scfg, 'zfs.snapshot.delete', \@params_array,
+    my $results = _api_bulk_call($scfg, 'pool.snapshot.delete', \@params_array,
         'Deleting snapshot {0}');
 
     # Check if results is actually an array reference or a job ID
@@ -1650,7 +1650,7 @@ sub _tn_extents($scfg) {
 }
 
 sub _tn_snapshots($scfg) {
-    return _api_call($scfg, 'zfs.snapshot.query', []);
+    return _api_call($scfg, 'pool.snapshot.query', []);
 }
 
 sub _tn_global($scfg) {
@@ -1733,7 +1733,7 @@ sub _tn_dataset_clone($scfg, $source_snapshot, $target_dataset) {
         snapshot => $source_snapshot,
         dataset_dst => $target_dataset,
     };
-    return _api_call_mutate($scfg, 'zfs.snapshot.clone', [ $payload ]);
+    return _api_call_mutate($scfg, 'pool.snapshot.clone', [ $payload ]);
 }
 
 # ---- WebSocket-only snapshot rollback (TrueNAS 25.10+) ----
@@ -1742,12 +1742,12 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     my $RECURSIVE = $recursive_bool ? JSON::PP::true  : JSON::PP::false;
 
     # WebSocket-only for snapshot rollback (requires TrueNAS 25.10+)
-    # TrueNAS 25.10+ uses: zfs.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
+    # TrueNAS 25.10+ uses: pool.snapshot.rollback(snapshot_name, {force: bool, recursive: bool})
     my $attempt_rollback = sub {
         my $conn = _ws_get_persistent($scfg);
         return _ws_rpc($conn, {
             jsonrpc => "2.0", id => $conn->{next_id}++,
-            method  => "zfs.snapshot.rollback",
+            method  => "pool.snapshot.rollback",
             params  => [ $snap_full, { force => $FORCE, recursive => $RECURSIVE } ],
         });
     };
@@ -1764,7 +1764,7 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
                     my $conn = _ws_get_persistent($scfg);
                     _ws_rpc($conn, {
                         jsonrpc => "2.0", id => $conn->{next_id}++,
-                        method  => "zfs.snapshot.rollback",
+                        method  => "pool.snapshot.rollback",
                         params  => [ $snap_full, { force => $FORCE, recursive => JSON::PP::true } ],
                     });
                 };
@@ -2015,7 +2015,7 @@ sub volume_snapshot {
     # Create ZFS snapshot for the disk
     my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
     my $result = _api_call_mutate(
-        $scfg, 'zfs.snapshot.create', [ $payload ],
+        $scfg, 'pool.snapshot.create', [ $payload ],
     );
 
     # Handle potential async job for snapshot creation
@@ -2059,7 +2059,7 @@ sub volume_snapshot_delete {
     }
 
     my $result = _api_call_mutate(
-        $scfg, 'zfs.snapshot.delete', [ $snap_full ],
+        $scfg, 'pool.snapshot.delete', [ $snap_full ],
     );
 
     # Handle potential async job for snapshot deletion
@@ -2141,7 +2141,7 @@ sub volume_snapshot_info {
 
     _log($scfg, 2, 'debug', "[TrueNAS] volume_snapshot_info: querying snapshots for $full");
 
-    my $list = _api_call($scfg, 'zfs.snapshot.query', []) // [];
+    my $list = _api_call($scfg, 'pool.snapshot.query', []) // [];
 
     my $snaps = {};
     for my $s (@$list) {
