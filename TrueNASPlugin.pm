@@ -1054,10 +1054,24 @@ sub _broker_rpc {
     my $payload = encode_json($req) . "\n";
 
     my $sock = $conn->{sock};
+    # Deadline-bounded round trip. Without this a wedged broker (stuck
+    # upstream WS, lost middlewared, hung systemd unit) blocks every PVE
+    # operation indefinitely. The deadline applies to the whole round
+    # trip, not per-call to sysread, so a slow-but-progressing TN won't
+    # falsely trip it. Tunable via tn_broker_timeout (seconds); default
+    # 30 s, the same envelope the rest of the plugin uses for WS I/O.
+    my $timeout = $scfg->{tn_broker_timeout} // 30;
+    my $deadline = time() + $timeout;
+    my $sel = IO::Select->new($sock);
+
     my $result;
     eval {
         my $written = 0;
         while ($written < length($payload)) {
+            my $remaining = $deadline - time();
+            die "broker: write timeout after ${timeout}s" if $remaining <= 0;
+            my @ready = $sel->can_write($remaining);
+            die "broker: write timeout after ${timeout}s" unless @ready;
             my $n = $sock->syswrite(substr($payload, $written));
             die "broker: write failed: $!" unless defined $n && $n > 0;
             $written += $n;
@@ -1065,6 +1079,10 @@ sub _broker_rpc {
 
         my $buf = '';
         while (1) {
+            my $remaining = $deadline - time();
+            die "broker: read timeout after ${timeout}s" if $remaining <= 0;
+            my @ready = $sel->can_read($remaining);
+            die "broker: read timeout after ${timeout}s" unless @ready;
             my $got = $sock->sysread(my $chunk, 4096);
             die "broker: read failed: $!" unless defined $got;
             die "broker: EOF before complete response" if $got == 0;
