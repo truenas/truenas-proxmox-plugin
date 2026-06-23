@@ -1755,8 +1755,13 @@ sub _tn_snapshot_rollback($scfg, $snap_full, $force_bool, $recursive_bool) {
     eval { $attempt_rollback->(); };
     if ($@) {
         my $err = $@;
-        # Check if it's a ZFS constraint error (newer snapshots exist)
-        if ($err =~ /more recent snapshots or bookmarks exist/ && $err =~ /use '-r' to force deletion/) {
+        # ZFS constraint: newer snapshots exist on the target dataset.
+        # TN < 25.10 surfaces the libzfs message:
+        #   "more recent snapshots or bookmarks exist [...] use '-r' to force deletion"
+        # TN 25.10+ wraps it via truenas_pylibzfs and surfaces a different string:
+        #   "Cannot rollback: more recent snapshots exist. Use recursive=True to destroy them."
+        # plus the underlying FileExistsError. Match either shape.
+        if ($err =~ /more recent snapshots/i || $err =~ /Failed to rollback.*File exists/i) {
             # If force=1 but recursive=0, and newer snapshots exist, we need recursive=1
             if ($force_bool && !$recursive_bool) {
                 # Retry with recursive=1 to delete newer snapshots
@@ -2091,8 +2096,17 @@ sub volume_snapshot_rollback {
         };
     }
 
-    # WS-first rollback with safe fallbacks; allow non-latest rollback (destroy newer snaps)
-    _tn_snapshot_rollback($scfg, $snap_full, 1, 0);
+    # PVE's snapshot-rollback contract: revert to the target snapshot's state.
+    # Anything taken AFTER the target is conceptually undone, so any newer
+    # snapshots on the same dataset must be destroyed. Pass recursive=1 so TN's
+    # rollback removes intermediate snapshots; otherwise TN 25.10 errors with
+    # "Cannot rollback: more recent snapshots exist. Use recursive=True to
+    # destroy them." and the rollback fails. Verified against TN 25.10
+    # snapshot_rollback_impl.py: recursive=True triggers
+    # _destroy_newer_snapshots() on the target dataset and does NOT touch
+    # clones (controlled by recursive_clones) or child datasets (controlled
+    # by recursive_rollback).
+    _tn_snapshot_rollback($scfg, $snap_full, 1, 1);
 
     # Note: vmstate restoration is handled automatically by Proxmox
 

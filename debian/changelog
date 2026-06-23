@@ -1,3 +1,23 @@
+truenas-proxmox-plugin (2.1.9+deb1) unstable; urgency=medium
+
+  * Fix snapshot rollback when intermediate snapshots exist. PVE's qm
+    rollback contract is to revert the disk to the target snapshot and
+    discard anything taken after. Plugin was passing recursive=0 to TN's
+    pool.snapshot.rollback, so any intermediate snapshot on the same
+    dataset blocked the rollback with TN 25.10's wrapped FileExistsError:
+      "Cannot rollback: more recent snapshots exist. Use recursive=True
+      to destroy them. [Errno 17] Failed to rollback ... File exists"
+    Two changes: volume_snapshot_rollback now passes recursive=1; the
+    _tn_snapshot_rollback fallback regex also matches the TN 25.10
+    wording (was matching only the old libzfs message). Verified against
+    TN 25.10 snapshot_rollback_impl.py: recursive=True triggers
+    _destroy_newer_snapshots on the target dataset and does not touch
+    clones (recursive_clones=False) or child datasets
+    (recursive_rollback=False). Matches PVE::Storage::ZFSPoolPlugin
+    semantics (which calls `zfs rollback -r`).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:30:00 +0000
+
 truenas-proxmox-plugin (2.1.8+deb1) unstable; urgency=medium
 
   * Rename ZFS snapshot API calls from zfs.snapshot.* to pool.snapshot.*
