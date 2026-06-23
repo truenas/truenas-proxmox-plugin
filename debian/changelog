@@ -1,3 +1,16 @@
+truenas-proxmox-plugin (2.1.10+deb1) unstable; urgency=low
+
+  * truenas-plugin-broker: when a request is rejected for missing
+    api_host/api_key, log the actual incoming shape - decoded scfg
+    field values (api_host literal; api_key redacted to length only),
+    method name, full list of scfg keys present, top-level request
+    keys, and the raw request line truncated to 600 bytes with any
+    "api_key":"..." pattern redacted. Helped diagnose a wrapper test
+    that was sending {api_host:null, api_key:null} scfg envelopes;
+    keep it in place for future debugging.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (2.1.9+deb1) unstable; urgency=medium
 
   * Fix snapshot rollback when intermediate snapshots exist. PVE's qm

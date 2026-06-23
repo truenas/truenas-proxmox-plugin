@@ -328,7 +328,31 @@ sub handle_request {
     }
     my $scfg = $req->{scfg};
     if (!$scfg || !$scfg->{api_host} || !$scfg->{api_key}) {
-        lwarn("scfg missing api_host/api_key in request");
+        my $h    = ref($scfg) eq 'HASH' && defined $scfg->{api_host} ? $scfg->{api_host} : '<undef>';
+        my $kraw = ref($scfg) eq 'HASH' ? $scfg->{api_key} : undef;
+        my $k    = !defined $kraw       ? '<undef>'
+                 : length($kraw) == 0   ? '<empty>'
+                                        : '<set len=' . length($kraw) . '>';
+        my $m    = $req->{method} // '<no method>';
+        lwarn("scfg missing api_host/api_key in request (api_host=$h api_key=$k method=$m)");
+        if (ref($scfg) eq 'HASH') {
+            lwarn("  scfg keys: " . join(",", sort keys %$scfg));
+        } else {
+            lwarn("  scfg is not a HASH (ref=" . ref($scfg) . ")");
+        }
+        # Dump the raw line so we can tell whether the client really
+        # sent a malformed envelope or whether our decode is at fault.
+        # Redact any api_key= occurrences before logging (defense in
+        # depth; the key shouldn't be in this code path but we still
+        # don't want it in journal). Truncate to 600 bytes.
+        my $raw = $line // '<undef>';
+        $raw =~ s/("api_key"\s*:\s*)"[^"]*"/$1"<redacted>"/g;
+        $raw = substr($raw, 0, 600) . (length($raw) > 600 ? "...[truncated]" : "");
+        lwarn("  raw request: $raw");
+        # Top-level keys of the decoded request envelope.
+        if (ref($req) eq 'HASH') {
+            lwarn("  request top-level keys: " . join(",", sort keys %$req));
+        }
         my $err = encode_json({ error => "broker: scfg missing api_host/api_key" });
         $client->syswrite("$err\n");
         return;
