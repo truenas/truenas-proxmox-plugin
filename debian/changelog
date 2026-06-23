@@ -1,3 +1,18 @@
+truenas-proxmox-plugin (2.1.12+deb1) unstable; urgency=low
+
+  * Add t/rate-limit/08-concurrent-alloc.t. Drives N (default 10)
+    concurrent qm-create-with-disk operations from independent forked
+    PVE-side processes, then verifies all succeed, every child
+    completed within a per-child wall-clock budget (default 120s), and
+    total upstream auth.login_with_api_key count stays at <=1. The
+    earlier concurrent test (07) only used cheap read RPCs; this one
+    drives the full alloc path (pool.dataset.create +
+    iscsi.extent.create + iscsi.targetextent.create + PVE-side iSCSI
+    login/multipath/udev). Tunable via RL_CONCURRENT_N and
+    RL_CONCURRENT_BUDGET env vars. No code changes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 13:00:00 +0000
+
 truenas-proxmox-plugin (2.1.11+deb1) unstable; urgency=medium
 
   * _broker_rpc now has a deadline-bounded round trip. Without this a
