@@ -17,7 +17,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - [Storage Shows as Inactive](#storage-shows-as-inactive)
 - [Connection and API Issues](#connection-and-api-issues)
   - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
-  - ["code: 1008, reason: You are not allowed to access this resource"] (#you-are-not-allowed-to-access-this-resource)
+  - ["You are not allowed to access this resource"](#you-are-not-allowed-to-access-this-resource)
   - [API Rate Limiting](#api-rate-limiting)
 - [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
   - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
@@ -769,7 +769,8 @@ api_insecure 1
 # Production: import TrueNAS cert or use valid CA cert
 ```
 
-### You are not allowed to access this resource
+### "You are not allowed to access this resource"
+
 **Symptom**: Error in pvedaemon - journalctl after accessing the datastore: "code: 1008, reason: You are not allowed to access this resource"
 
 **Explanation**: API key may be valid, but IP AllowList restriction in effect.
