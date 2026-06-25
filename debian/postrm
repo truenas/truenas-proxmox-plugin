@@ -4,11 +4,19 @@ set -e
 
 BACKUP_DIR="/var/lib/truenas-plugin-backups"
 LOG_FILE="/var/log/truenas-installer.log"
+BROKER_RUNDIR="/run/truenas-plugin"
+BROKER_LOG="/var/log/truenas-plugin-broker.log"
 
 case "$1" in
     purge)
         rm -rf "$BACKUP_DIR"
+        rm -rf "$BROKER_RUNDIR"
         rm -f "$LOG_FILE"
+        rm -f "$BROKER_LOG"
+
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
         ;;
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         ;;

@@ -441,12 +441,9 @@ show_cluster_warning() {
         echo
         warning "⚠️  Proxmox Cluster Detected (${node_count} nodes)"
         echo
-        info "This installer only updates the current node."
-        info "To update all cluster nodes, use the cluster update script:"
-        echo
-        echo "  wget https://raw.githubusercontent.com/${GITHUB_REPO}/main/tools/update-cluster.sh"
-        echo "  chmod +x update-cluster.sh"
-        echo "  ./update-cluster.sh node1 node2 node3"
+        info "Installation was performed on this node only."
+        info "To update all cluster nodes, re-run this installer and select:"
+        info "  'Update plugin' → 'Update all cluster nodes'"
         echo
         return 0
     fi
@@ -2693,7 +2690,7 @@ run_diagnostics_bundle() {
         # Section 3: Storage config (all TrueNAS storages, API keys redacted)
         echo "=== Storage Configuration (API keys redacted) ==="
         if [[ -f "$STORAGE_CFG" ]]; then
-            grep -A 20 "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | sed 's/api_key .*/api_key [REDACTED]/g' || echo "No TrueNAS storages configured"
+            grep -A 20 "^truenasplugin:" "$STORAGE_CFG" 2>/dev/null | sed 's/tn_api_key .*/tn_api_key [REDACTED]/g' || echo "No TrueNAS storages configured"
         else
             echo "Storage config not found at $STORAGE_CFG"
         fi
@@ -3772,7 +3769,7 @@ menu_cleanup_orphans() {
         local i=1
         for storage in "${storage_list[@]}"; do
             local mode
-            mode=$(get_storage_config_value "$storage" "transport_mode" || true)
+            mode=$(get_storage_config_value "$storage" "tn_transport_mode" || true)
             [[ -z "$mode" ]] && mode="iscsi"
             echo "  $i) $storage ($mode)"
             ((i++))
@@ -3808,11 +3805,13 @@ menu_cleanup_orphans() {
 
     # Get storage configuration
     local api_host api_key dataset api_insecure transport_mode
-    api_host=$(get_storage_config_value "$storage_name" "api_host" || true)
-    api_key=$(get_storage_config_value "$storage_name" "api_key" || true)
-    dataset=$(get_storage_config_value "$storage_name" "dataset" || true)
-    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure" || true)
-    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" || true)
+    api_host=$(get_storage_config_value "$storage_name" "tn_api_host" || true)
+    api_key=$(get_storage_config_value "$storage_name" "tn_api_key" || true)
+    dataset=$(get_storage_config_value "$storage_name" "tn_dataset" || true)
+    api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure" || true)
+    transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode" || true)
+    TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
+    TN_API_PORT="${TN_API_PORT:-443}"
 
     # Default to iscsi if not specified
     [[ -z "$transport_mode" ]] && transport_mode="iscsi"
@@ -4417,7 +4416,13 @@ detect_orphaned_resources() {
 
     else
         # NVMe/TCP mode - delegate to NVMe-specific detection
-        orphan_count=$(_detect_orphaned_resources_nvme "$api_host" "$api_key" "$dataset")
+        set +e
+        _detect_orphaned_resources_nvme "$api_host" "$api_key" "$dataset"
+        orphan_count=$?
+        set -e
+        if [[ $orphan_count -eq 255 ]]; then
+            return 1
+        fi
     fi
 
     echo "$orphan_count"
@@ -4551,7 +4556,7 @@ _detect_orphaned_resources_nvme() {
         local configured_nqns=()
         while IFS= read -r nqn; do
             [[ -n "$nqn" ]] && configured_nqns+=("$nqn")
-        done < <(grep -h "subsystem_nqn" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}')
+        done < <(grep -h "tn_subsystem_nqn" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}')
 
         log "INFO" "_detect_orphaned_resources_nvme: ${#configured_nqns[@]} subsystems configured in storage.cfg"
 
@@ -4708,20 +4713,21 @@ run_health_check() {
     # Check 4: Content type
     local content
     content=$(get_storage_config_value "$storage_name" "content")
-    if [[ "$content" == "images" ]]; then
-        check_result "Content type" "OK" "images"
+    if [[ "$content" == "images" || "$content" == "images,rootdir" || "$content" == "rootdir,images" ]]; then
+        check_result "Content type" "OK" "$content"
     elif [[ -n "$content" ]]; then
-        check_result "Content type" "WARNING" "$content (should be 'images')"
+        check_result "Content type" "WARNING" "$content (should include 'images' and optionally 'rootdir')"
     else
         check_result "Content type" "WARNING" "Not configured"
     fi
 
     # Check 5: TrueNAS API reachability
     local api_host
-    api_host=$(get_storage_config_value "$storage_name" "api_host")
+    api_host=$(get_storage_config_value "$storage_name" "tn_api_host")
     local api_port
-    api_port=$(get_storage_config_value "$storage_name" "api_port")
+    api_port=$(get_storage_config_value "$storage_name" "tn_api_port")
     api_port=${api_port:-443}
+    TN_API_PORT="$api_port"
 
     if [[ -n "$api_host" ]]; then
         printf "%-30s " "TrueNAS API:"
@@ -4741,9 +4747,68 @@ run_health_check() {
         check_result "TrueNAS API" "CRITICAL" "API host not configured"
     fi
 
+    # Check 5b: API authentication
+    local api_key_early
+    api_key_early=$(get_storage_config_value "$storage_name" "tn_api_key")
+    if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
+        printf "%-30s " "API authentication:"
+        start_spinner
+        local auth_result
+        if tn_api_call "$api_host" "$api_key_early" "system.info" '[]' >/dev/null 2>&1; then
+            auth_result="${COLOR_GREEN}✓${COLOR_RESET} Authenticated"
+            ((checks_passed++))
+        else
+            auth_result="${COLOR_RED}✗${COLOR_RESET} Authentication failed (check API key)"
+            ((errors++))
+        fi
+        stop_spinner
+        echo -e "\r\033[K$(printf "%-30s " "API authentication:")${auth_result}"
+        ((checks_total++))
+    else
+        check_result "API authentication" "SKIP" "Cannot check (missing API config)"
+    fi
+
+    # Detect transport mode (needed for service check and later checks)
+    local transport_mode
+    transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode")
+    transport_mode=${transport_mode:-iscsi}  # Default to iscsi if not specified
+
+    # Check 5c: TrueNAS target service status
+    if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
+        local service_name
+        if [[ "$transport_mode" == "nvme-tcp" ]]; then
+            service_name="nvmet"
+        else
+            service_name="iscsitarget"
+        fi
+        printf "%-30s " "TrueNAS $service_name service:"
+        start_spinner
+        local svc_result svc_response
+        svc_response=$(tn_api_call "$api_host" "$api_key_early" "service.query" "[[[\"service\",\"=\",\"$service_name\"]]]" 2>/dev/null)
+        if [[ -n "$svc_response" ]] && echo "$svc_response" | grep -q '"state"'; then
+            local svc_state
+            svc_state=$(echo "$svc_response" | grep -oP '"state"\s*:\s*"\K[^"]+' | head -1)
+            if [[ "$svc_state" == "RUNNING" ]]; then
+                svc_result="${COLOR_GREEN}✓${COLOR_RESET} Running"
+                ((checks_passed++))
+            else
+                svc_result="${COLOR_RED}✗${COLOR_RESET} Not running (state: $svc_state)"
+                ((errors++))
+            fi
+        else
+            svc_result="${COLOR_YELLOW}⚠${COLOR_RESET} Could not query service status"
+            ((warnings++))
+        fi
+        stop_spinner
+        echo -e "\r\033[K$(printf "%-30s " "TrueNAS $service_name service:")${svc_result}"
+        ((checks_total++))
+    else
+        check_result "TrueNAS service" "SKIP" "Cannot check (missing API config)"
+    fi
+
     # Check 6: Dataset configuration
     local dataset
-    dataset=$(get_storage_config_value "$storage_name" "dataset")
+    dataset=$(get_storage_config_value "$storage_name" "tn_dataset")
     if [[ -n "$dataset" ]]; then
         check_result "Dataset" "OK" "$dataset"
     else
@@ -4752,9 +4817,9 @@ run_health_check() {
 
     # Check 6.5: Dataset type validation (must be FILESYSTEM, not VOLUME)
     local api_key
-    api_key=$(get_storage_config_value "$storage_name" "api_key")
+    api_key=$(get_storage_config_value "$storage_name" "tn_api_key")
     local api_insecure
-    api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+    api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure")
 
     if [[ -n "$dataset" ]] && [[ -n "$api_host" ]] && [[ -n "$api_key" ]]; then
         printf "%-30s " "Dataset type:"
@@ -4762,7 +4827,7 @@ run_health_check() {
 
         # Make WebSocket API call to fetch dataset
         local dataset_info
-        dataset_info=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$dataset\"]]]" 2>/dev/null)
+        dataset_info=$(tn_api_call "$api_host" "$api_key" "pool.dataset.query" "[[[\"id\",\"=\",\"$dataset\"]],{\"extra\":{\"retrieve_children\":false}}]" 2>/dev/null)
         local api_status=$?
 
         stop_spinner
@@ -4800,11 +4865,6 @@ run_health_check() {
         check_result "Dataset type" "SKIP" "Missing dataset or API config"
     fi
 
-    # Detect transport mode
-    local transport_mode
-    transport_mode=$(get_storage_config_value "$storage_name" "transport_mode")
-    transport_mode=${transport_mode:-iscsi}  # Default to iscsi if not specified
-
     # Check 7: Transport-specific target/subsystem configuration
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         # Check for nvme-cli
@@ -4816,7 +4876,7 @@ run_health_check() {
 
         # Check subsystem NQN
         local subsystem_nqn
-        subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn")
+        subsystem_nqn=$(get_storage_config_value "$storage_name" "tn_subsystem_nqn")
         if [[ -n "$subsystem_nqn" ]]; then
             check_result "Subsystem NQN" "OK" "$subsystem_nqn"
         else
@@ -4825,7 +4885,7 @@ run_health_check() {
 
         # Check host NQN
         local hostnqn
-        hostnqn=$(get_storage_config_value "$storage_name" "hostnqn")
+        hostnqn=$(get_storage_config_value "$storage_name" "tn_hostnqn")
         if [[ -n "$hostnqn" ]]; then
             check_result "Host NQN" "OK" "$hostnqn"
         elif [[ -f /etc/nvme/hostnqn ]]; then
@@ -4835,10 +4895,20 @@ run_health_check() {
         else
             check_result "Host NQN" "WARNING" "Not configured (will use system default)"
         fi
+
+        # Check NVMe namespace conflict (shared subsystem)
+        if [[ -n "$subsystem_nqn" ]]; then
+            local conflicting_storage
+            if conflicting_storage=$(check_subsystem_in_use "$subsystem_nqn" "$storage_name"); then
+                check_result "Namespace conflict" "CRITICAL" "Shares subsystem NQN with '${conflicting_storage}'"
+            else
+                check_result "Namespace conflict" "OK" "No conflicts"
+            fi
+        fi
     else
         # iSCSI mode - check target IQN
         local target_iqn
-        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        target_iqn=$(get_storage_config_value "$storage_name" "tn_target_iqn")
         if [[ -n "$target_iqn" ]]; then
             check_result "Target IQN" "OK" "$target_iqn"
         else
@@ -4848,7 +4918,7 @@ run_health_check() {
 
     # Check 8: Discovery portal
     local discovery_portal
-    discovery_portal=$(get_storage_config_value "$storage_name" "discovery_portal")
+    discovery_portal=$(get_storage_config_value "$storage_name" "tn_discovery_portal")
     if [[ -n "$discovery_portal" ]]; then
         check_result "Discovery portal" "OK" "$discovery_portal"
     else
@@ -4879,6 +4949,26 @@ run_health_check() {
             ((checks_total++))
         else
             check_result "NVMe connections" "SKIP" "Cannot check (no subsystem NQN)"
+        fi
+
+        # Check 9b: NVMe device files
+        if [[ -n "$subsystem_nqn" ]]; then
+            printf "%-30s " "NVMe device files:"
+            start_spinner
+            local dev_result
+            local nvme_devs
+            nvme_devs=$(nvme list 2>/dev/null | grep -c "^/dev/nvme" || echo "0")
+            nvme_devs=$(echo "$nvme_devs" | head -1 | tr -d '\n ')
+            if [[ "$nvme_devs" -gt 0 ]]; then
+                dev_result="${COLOR_GREEN}✓${COLOR_RESET} $nvme_devs device(s) found"
+                ((checks_passed++))
+            else
+                dev_result="${COLOR_YELLOW}⚠${COLOR_RESET} No NVMe devices found (namespaces may not be published)"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r\033[K$(printf "%-30s " "NVMe device files:")${dev_result}"
+            ((checks_total++))
         fi
     else
         # iSCSI sessions check
@@ -4939,7 +5029,7 @@ run_health_check() {
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         # Check native NVMe multipath
         local portals
-        portals=$(get_storage_config_value "$storage_name" "portals")
+        portals=$(get_storage_config_value "$storage_name" "tn_portals")
         if [[ -n "$portals" ]]; then
             if [[ -f /sys/module/nvme_core/parameters/multipath ]]; then
                 local nvme_mp
@@ -4958,7 +5048,7 @@ run_health_check() {
     else
         # iSCSI multipath check
         local use_multipath
-        use_multipath=$(get_storage_config_value "$storage_name" "use_multipath")
+        use_multipath=$(get_storage_config_value "$storage_name" "tn_use_multipath")
         if [[ "$use_multipath" == "1" ]]; then
             if command -v multipath &> /dev/null; then
                 local mpath_count
@@ -4980,11 +5070,13 @@ run_health_check() {
     # Check 11: Orphaned resources (iSCSI only)
     if [[ "$transport_mode" == "iscsi" ]]; then
         local api_host
-        api_host=$(get_storage_config_value "$storage_name" "api_host")
+        api_host=$(get_storage_config_value "$storage_name" "tn_api_host")
         local api_key
-        api_key=$(get_storage_config_value "$storage_name" "api_key")
+        api_key=$(get_storage_config_value "$storage_name" "tn_api_key")
         local api_insecure
-        api_insecure=$(get_storage_config_value "$storage_name" "api_insecure")
+        api_insecure=$(get_storage_config_value "$storage_name" "tn_api_insecure")
+        TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
+        TN_API_PORT="${TN_API_PORT:-443}"
 
         if [[ -n "$api_host" ]] && [[ -n "$api_key" ]] && [[ -n "$dataset" ]]; then
             printf "%-30s " "Orphaned resources:"
@@ -5012,8 +5104,41 @@ run_health_check() {
             check_result "Orphaned resources" "SKIP" "Cannot check (missing API config)"
         fi
     else
-        # NVMe/TCP mode - skip orphan check (not yet supported)
-        check_result "Orphaned resources" "SKIP" "Not available for NVMe/TCP"
+        # NVMe/TCP mode - detect orphaned namespaces/zvols/subsystems
+        local api_host_nvme
+        api_host_nvme=$(get_storage_config_value "$storage_name" "tn_api_host")
+        local api_key_nvme
+        api_key_nvme=$(get_storage_config_value "$storage_name" "tn_api_key")
+        local api_insecure_nvme
+        api_insecure_nvme=$(get_storage_config_value "$storage_name" "tn_api_insecure")
+        TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
+        TN_API_PORT="${TN_API_PORT:-443}"
+
+        if [[ -n "$api_host_nvme" ]] && [[ -n "$api_key_nvme" ]] && [[ -n "$dataset" ]]; then
+            printf "%-30s " "Orphaned resources:"
+            start_spinner
+            local orphan_result
+            local orphan_count
+            orphan_count=$(detect_orphaned_resources "$storage_name" "$transport_mode" "$api_host_nvme" "$api_key_nvme" "$dataset" "$api_insecure_nvme" 2>/dev/null)
+
+            if [[ $? -eq 0 ]] && [[ -n "$orphan_count" ]]; then
+                if [[ "$orphan_count" -eq 0 ]]; then
+                    orphan_result="${COLOR_GREEN}✓${COLOR_RESET} None found"
+                    ((checks_passed++))
+                else
+                    orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Found $orphan_count orphan(s) (use Diagnostics > Cleanup orphans)"
+                    ((warnings++))
+                fi
+            else
+                orphan_result="${COLOR_YELLOW}⚠${COLOR_RESET} Check skipped (API error)"
+                ((warnings++))
+            fi
+            stop_spinner
+            echo -e "\r\033[K$(printf "%-30s " "Orphaned resources:")${orphan_result}"
+            ((checks_total++))
+        else
+            check_result "Orphaned resources" "SKIP" "Cannot check (missing API config)"
+        fi
     fi
 
     # Check 12: PVE daemon status
@@ -5023,6 +5148,13 @@ run_health_check() {
         check_result "PVE daemon" "CRITICAL" "Not running"
     fi
 
+    # Check 12b: pvestatd status
+    if systemctl is-active --quiet pvestatd; then
+        check_result "PVE stat daemon" "OK" "Running"
+    else
+        check_result "PVE stat daemon" "CRITICAL" "Not running"
+    fi
+
     # Check 13: Weight volume presence (iSCSI only)
     if [[ "$transport_mode" == "iscsi" ]]; then
         local weight_check_failed=0
@@ -5030,7 +5162,7 @@ run_health_check() {
 
         # Get target IQN to derive weight volume name
         local target_iqn
-        target_iqn=$(get_storage_config_value "$storage_name" "target_iqn")
+        target_iqn=$(get_storage_config_value "$storage_name" "tn_target_iqn")
 
         # Derive weight name from IQN (same logic as plugin)
         # Extract suffix from IQN (e.g., "iqn.2005-10.org.freenas.ctl:proxmox" -> "proxmox")
@@ -5396,11 +5528,17 @@ validate_ip() {
     return 1
 }
 
-# Validate storage name format
+# Validate storage name format (must match Proxmox PVE::JSONSchema::parse_id rules)
 validate_storage_name() {
     local name="$1"
-    # Storage name should be alphanumeric with hyphens/underscores, no spaces
-    if [[ $name =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    # Must start with a lowercase letter, contain only lowercase letters/numbers/hyphens/underscores/dots,
+    # end with a lowercase letter or number, and be at least 2 characters.
+    # Uppercase is rejected: TrueNAS SCALE enforces lowercase-only for iSCSI target and NVMe
+    # subsystem names, so an uppercase storage name would cause provisioning to fail at the API layer.
+    if [[ ${#name} -lt 2 ]]; then
+        return 1
+    fi
+    if [[ $name =~ ^[a-z][a-z0-9_.-]*[a-z0-9]$ ]]; then
         return 0
     fi
     return 1
@@ -5489,7 +5627,7 @@ check_subsystem_in_use() {
         if [[ "$line" =~ ^truenasplugin:\ (.+)$ ]]; then
             current_storage="${BASH_REMATCH[1]}"
             current_storage="$(echo "$current_storage" | xargs)"
-        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+subsystem_nqn[[:space:]]+(.+)$ ]]; then
+        elif [[ -n "$current_storage" && "$line" =~ ^[[:space:]]+tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
             local nqn="${BASH_REMATCH[1]}"
             nqn="$(echo "$nqn" | xargs)"
             if [[ "$nqn" == "$subsystem_nqn" && "$current_storage" != "$exclude_name" ]]; then
@@ -5608,7 +5746,9 @@ test_truenas_api() {
     local ip="$1"
     local apikey="$2"
 
-    printf "  Testing connection to TrueNAS at %s..." "$ip"
+    local port_suffix=""
+    [[ -n "${TN_API_PORT:-}" && "${TN_API_PORT:-}" != "443" ]] && port_suffix=":$TN_API_PORT"
+    printf "  Testing connection to TrueNAS at %s%s..." "$ip" "$port_suffix"
     start_spinner
 
     local response
@@ -6455,11 +6595,11 @@ tn_api_call() {
     result=$(perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_port) = @ARGV;
 
         # Build minimal scfg for API call
         my $scfg = {
@@ -6467,6 +6607,7 @@ tn_api_call() {
             api_key => $api_key,
             api_insecure => 1,
         };
+        $scfg->{api_port} = int($api_port) if $api_port;
 
         # Decode params
         my $params = eval { decode_json($params_json) } // [];
@@ -6483,7 +6624,7 @@ tn_api_call() {
 
         # Output result as JSON
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" 2>&1)
+    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" 2>&1)
     exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -6516,11 +6657,11 @@ tn_api_call_write() {
     result=$(perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_port) = @ARGV;
 
         # Build minimal scfg for API call
         my $scfg = {
@@ -6528,6 +6669,7 @@ tn_api_call_write() {
             api_key => $api_key,
             api_insecure => 1,
         };
+        $scfg->{api_port} = int($api_port) if $api_port;
 
         # Decode params - fail fast if JSON is invalid
         my $params = eval { decode_json($params_json) };
@@ -6549,7 +6691,7 @@ tn_api_call_write() {
 
         # Output result as JSON
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" 2>&1)
+    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" 2>&1)
     exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -6895,36 +7037,47 @@ tn_check_target() {
 
     log "INFO" "Checking if iSCSI target exists: $target_iqn"
 
-    local params
-    # Use Python to construct JSON with proper escaping
-    params=$(python3 -c "
-import json, sys
-data = [[['name', '=', sys.argv[1]]]]
-print(json.dumps(data))
-" "$target_iqn" 2>&1)
+    # Extract short name for query - TrueNAS stores the short suffix, not full IQN
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
 
-    if [[ $? -ne 0 ]]; then
-        log "ERROR" "Failed to construct target query params: $params"
-        return 1
+    # Search by short name first, then full IQN for backward compatibility
+    # with targets created by previous versions that stored full IQNs
+    local search_names=("$short_name")
+    if [[ "$short_name" != "$target_iqn" ]]; then
+        search_names+=("$target_iqn")
     fi
 
     local result
-    result=$(tn_api_call "$host" "$api_key" "iscsi.target.query" "$params" 2>&1)
-    local exit_code=$?
+    for name in "${search_names[@]}"; do
+        local params
+        # Use Python to construct JSON with proper escaping
+        params=$(python3 -c "
+import json, sys
+data = [[['name', '=', sys.argv[1]]]]
+print(json.dumps(data))
+" "$name" 2>&1)
 
-    if [[ $exit_code -ne 0 ]]; then
-        log "ERROR" "Target check failed: $result"
-        return 1
-    fi
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Failed to construct target query params: $params"
+            return 1
+        fi
 
-    if [[ "$result" == "[]" ]] || [[ -z "$result" ]]; then
-        log "INFO" "Target does not exist: $target_iqn"
-        return 1
-    fi
+        result=$(tn_api_call "$host" "$api_key" "iscsi.target.query" "$params" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            log "ERROR" "Target check failed: $result"
+            return 1
+        fi
 
-    log "INFO" "Target exists: $target_iqn"
-    echo "$result"
-    return 0
+        if [[ "$result" != "[]" ]] && [[ -n "$result" ]]; then
+            log "INFO" "Target exists: $target_iqn (matched by: $name)"
+            echo "$result"
+            return 0
+        fi
+    done
+
+    log "INFO" "Target does not exist: $target_iqn"
+    return 1
 }
 
 # Generate a standard IQN for iSCSI target
@@ -6936,7 +7089,61 @@ generate_iqn() {
     year_month=$(date +%Y-%m)
 
     # Format: iqn.YYYY-MM.org.freenas.ctl:storage-name
-    echo "iqn.${year_month}.org.freenas.ctl:${storage_name}"
+    # Lowercase the suffix: TrueNAS SCALE enforces lowercase-only target names
+    echo "iqn.${year_month}.org.freenas.ctl:${storage_name,,}"
+}
+
+# Extract the short target name from an IQN
+# TrueNAS expects just the suffix (after the last colon) as the target name,
+# not a full IQN. Passing a full IQN causes double-nesting when TrueNAS
+# prepends its base name.
+# e.g., iqn.2026-03.org.freenas.ctl:truenas-main -> truenas-main
+# e.g., truenas-main -> truenas-main (no change if already short)
+iqn_to_short_name() {
+    local iqn="$1"
+    echo "${iqn##*:}"
+}
+
+# Get the TrueNAS iSCSI base IQN name
+# Parameters: host, api_key
+# Returns: base IQN string (e.g., iqn.2005-10.org.freenas.ctl)
+tn_get_base_iqn() {
+    local host="$1"
+    local api_key="$2"
+
+    local result
+    result=$(tn_api_call "$host" "$api_key" "iscsi.global.config" "[]" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        log "WARNING" "Failed to get TrueNAS base IQN: $result"
+        echo ""
+        return 1
+    fi
+
+    echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('basename',''))" 2>/dev/null
+}
+
+# Construct the correct full IQN for storage.cfg by combining
+# TrueNAS's base IQN with the short target name extracted from user input.
+# Parameters: host, api_key, target_iqn (user-provided full IQN or short name)
+# Returns: correct full IQN (e.g., iqn.2005-10.org.freenas.ctl:truenas-main)
+# Exits with error if base IQN cannot be retrieved
+construct_full_iqn() {
+    local host="$1"
+    local api_key="$2"
+    local target_iqn="$3"
+
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
+
+    local base_iqn
+    base_iqn=$(tn_get_base_iqn "$host" "$api_key")
+    if [[ -z "$base_iqn" ]]; then
+        log "ERROR" "Cannot construct IQN: failed to retrieve TrueNAS base IQN"
+        echo "$target_iqn"  # Fallback to user-provided value
+        return 1
+    fi
+
+    echo "${base_iqn}:${short_name}"
 }
 
 # Create an iSCSI target with portal association
@@ -7001,6 +7208,11 @@ print(json.dumps(data))
     fi
 
     # Step 2: Create target with portal group association
+    # Extract short name - TrueNAS expects just the suffix, not a full IQN.
+    # Passing a full IQN causes double-nesting when TrueNAS prepends its base name.
+    local short_name
+    short_name=$(iqn_to_short_name "$target_iqn")
+
     local params
     # Use Python to construct JSON with proper escaping to prevent JSON injection
     params=$(python3 -c "
@@ -7014,7 +7226,7 @@ data = [{
     }]
 }]
 print(json.dumps(data))
-" "$target_iqn" "$portal_id" 2>&1)
+" "$short_name" "$portal_id" 2>&1)
 
     if [[ $? -ne 0 ]]; then
         log "ERROR" "Failed to construct target params JSON: $params"
@@ -7145,7 +7357,8 @@ generate_nqn() {
     year_month=$(date +%Y-%m)
 
     # Format: nqn.YYYY-MM.org.freenas.ctl:storage-name
-    echo "nqn.${year_month}.org.freenas.ctl:${storage_name}"
+    # Lowercase the suffix: TrueNAS SCALE enforces lowercase-only subsystem names
+    echo "nqn.${year_month}.org.freenas.ctl:${storage_name,,}"
 }
 
 # Create an NVMe subsystem
@@ -7913,14 +8126,11 @@ collect_provisioning_config() {
             local conflicting_nqn
             if conflicting_nqn=$(check_subsystem_in_use "$PROV_NQN" "$storage_name"); then
                 echo
-                printf "  ${c3}WARNING:${c0} Subsystem NQN is already in use by storage '${conflicting_nqn}'\n"
-                printf "  ${c3}Sharing subsystems between storage entries causes cross-visibility of all block devices.${c0}\n"
+                error "Subsystem NQN is already in use by storage '${conflicting_nqn}'"
+                printf "  Sharing subsystems between storage entries causes namespace conflicts.\n"
+                printf "  Please choose a different NQN.\n"
                 echo
-                read -rp "  Continue anyway? [y/N]: " confirm_nqn
-                if [[ ! "$confirm_nqn" =~ ^[Yy]$ ]]; then
-                    echo
-                    continue
-                fi
+                continue
             fi
 
             break
@@ -8460,7 +8670,8 @@ execute_provisioning() {
         # iSCSI provisioning
         if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
             echo -e "$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Using existing"
-            PROVISIONED_TARGET_IQN="$PROV_IQN"
+            # Construct correct IQN using TrueNAS base name + short suffix
+            PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$PROV_IQN")
         else
             printf "%-30s " "iSCSI target:"
             start_spinner
@@ -8471,7 +8682,8 @@ execute_provisioning() {
             if [[ $exit_code -eq 0 ]]; then
                 echo -e "\r$(printf "%-30s " "iSCSI target:")${c2}✓${c0} Created"
                 register_resource "target" "$PROV_IQN"
-                PROVISIONED_TARGET_IQN="$PROV_IQN"
+                # Construct correct IQN using TrueNAS base name + short suffix
+                PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$PROV_IQN")
                 PROVISIONED_PORTAL_IP="$PROV_PORTAL_IP"
                 PROVISIONED_PORTAL_PORT="$PROV_PORTAL_PORT"
             else
@@ -8513,8 +8725,8 @@ execute_provisioning() {
         start_spinner
         local weight_result
         weight_result=$(perl -e '
-            use lib "/usr/share/perl5/PVE/Storage/Custom";
-            use TrueNASPlugin;
+            use lib "/usr/share/perl5";
+            use PVE::Storage::Custom::TrueNASPlugin ();
 
             my $scfg = {
                 api_host => $ARGV[0],
@@ -8750,7 +8962,8 @@ provision_iscsi() {
                     ;;
                 1)
                     info "Using existing target: $target_iqn"
-                    PROVISIONED_TARGET_IQN="$target_iqn"
+                    # Construct correct IQN using TrueNAS base name + short suffix
+                    PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$target_iqn")
                     PROVISIONED_PORTAL_IP="$portal_ip"
                     PROVISIONED_PORTAL_PORT="$portal_port"
                     PROVISIONED_PORTAL_ID="$portal_id"
@@ -8789,7 +9002,8 @@ provision_iscsi() {
 
     success "Target created: $target_iqn"
 
-    PROVISIONED_TARGET_IQN="$target_iqn"
+    # Construct correct IQN using TrueNAS base name + short suffix
+    PROVISIONED_TARGET_IQN=$(construct_full_iqn "$host" "$api_key" "$target_iqn")
     PROVISIONED_PORTAL_IP="$portal_ip"
     PROVISIONED_PORTAL_PORT="$portal_port"
     PROVISIONED_PORTAL_ID="$portal_id"
@@ -9042,6 +9256,87 @@ backup_storage_cfg() {
     return 0
 }
 
+# Prompt user to select which cluster nodes can access this storage.
+# Sets the variable named by $1 (default: "nodes") to a comma-separated list
+# of node names, or empty string for all nodes.
+# Args: $1 = variable name to set (optional, default "nodes")
+#       $2 = current nodes value for edit mode (optional)
+prompt_node_selection() {
+    local _var_name="${1:-nodes}"
+    local _current="${2:-}"
+
+    # Detect cluster nodes
+    local -a cluster_entries=()
+    local -a node_names=()
+    mapfile -t cluster_entries < <(get_cluster_nodes 2>/dev/null)
+    if [[ ${#cluster_entries[@]} -gt 1 ]]; then
+        for entry in "${cluster_entries[@]}"; do
+            node_names+=("${entry%%:*}")
+        done
+    else
+        # Single node or no cluster - skip selection
+        eval "$_var_name=''"
+        return 0
+    fi
+
+    echo
+    info "Node Restriction (limit which cluster nodes can access this storage):"
+    if [[ -n "$_current" ]]; then
+        echo "  Current: $_current"
+    fi
+    echo
+    echo "  0) All nodes (no restriction) [default]"
+    local i=1
+    for name in "${node_names[@]}"; do
+        local marker=""
+        if [[ -n "$_current" ]] && [[ ",$_current," == *",$name,"* ]]; then
+            marker=" ${c2}(currently selected)${c0}"
+        fi
+        echo -e "  $i) $name$marker"
+        ((i++))
+    done
+    echo
+    info "Enter node numbers separated by spaces (e.g., 1 3) or 0 for all:"
+
+    local selection
+    while true; do
+        read -rp "Nodes [0]: " selection
+        selection="${selection:-0}"
+
+        if [[ "$selection" == "0" ]]; then
+            eval "$_var_name=''"
+            return 0
+        fi
+
+        # Parse space-separated numbers
+        local -a selected_names=()
+        local valid=true
+        read -ra nums <<< "$selection"
+        for num in "${nums[@]}"; do
+            if [[ ! "$num" =~ ^[0-9]+$ ]] || [[ "$num" -lt 1 ]] || [[ "$num" -gt ${#node_names[@]} ]]; then
+                error "Invalid selection: $num (must be 0-${#node_names[@]})"
+                valid=false
+                break
+            fi
+            selected_names+=("${node_names[$((num-1))]}")
+        done
+
+        if [[ "$valid" == "true" ]] && [[ ${#selected_names[@]} -gt 0 ]]; then
+            # Join with commas
+            local result=""
+            for name in "${selected_names[@]}"; do
+                if [[ -n "$result" ]]; then
+                    result="${result},${name}"
+                else
+                    result="$name"
+                fi
+            done
+            eval "$_var_name='$result'"
+            return 0
+        fi
+    done
+}
+
 # Generate storage configuration block
 generate_storage_config() {
     local name="$1"
@@ -9056,49 +9351,62 @@ generate_storage_config() {
     local portals="${10:-}"
     local transport_mode="${11:-iscsi}"  # Default to iscsi for backward compatibility
     local hostnqn="${12:-}"
+    local nodes="${13:-}"
+
+    local api_port="${TN_API_PORT:-443}"
 
     cat <<EOF
 truenasplugin: ${name}
-	api_host ${ip}
-	api_key ${apikey}
-	dataset ${dataset}
+	tn_api_host ${ip}
+	tn_api_key ${apikey}
+	tn_dataset ${dataset}
 EOF
+
+    # Add tn_api_port only when non-default
+    if [[ "$api_port" != "443" ]]; then
+        echo "	tn_api_port ${api_port}"
+    fi
 
     # Add transport mode if not default iSCSI
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        echo "	transport_mode nvme-tcp"
-        echo "	subsystem_nqn ${target_or_nqn}"
+        echo "	tn_transport_mode nvme-tcp"
+        echo "	tn_subsystem_nqn ${target_or_nqn}"
     else
-        echo "	target_iqn ${target_or_nqn}"
+        echo "	tn_target_iqn ${target_or_nqn}"
     fi
 
-    echo "	api_insecure 1"
+    echo "	tn_api_insecure 1"
     echo "	shared 1"
 
     if [[ -n "$portal" ]]; then
-        echo "	discovery_portal ${portal}"
+        echo "	tn_discovery_portal ${portal}"
     fi
 
     if [[ -n "$blocksize" ]]; then
-        echo "	zvol_blocksize ${blocksize}"
+        echo "	tn_zvol_blocksize ${blocksize}"
     fi
 
     if [[ -n "$sparse" ]]; then
         echo "	tn_sparse ${sparse}"
     fi
 
-    # Only add use_multipath for iSCSI (NVMe uses native multipath)
+    # Only add tn_use_multipath for iSCSI (NVMe uses native multipath)
     if [[ -n "$use_multipath" ]] && [[ "$transport_mode" == "iscsi" ]]; then
-        echo "	use_multipath ${use_multipath}"
+        echo "	tn_use_multipath ${use_multipath}"
     fi
 
     if [[ -n "$portals" ]]; then
-        echo "	portals ${portals}"
+        echo "	tn_portals ${portals}"
     fi
 
-    # Add hostnqn for NVMe if provided
+    # Add tn_hostnqn for NVMe if provided
     if [[ -n "$hostnqn" ]] && [[ "$transport_mode" == "nvme-tcp" ]]; then
-        echo "	hostnqn ${hostnqn}"
+        echo "	tn_hostnqn ${hostnqn}"
+    fi
+
+    # Add node restriction if specified (omit for all nodes)
+    if [[ -n "$nodes" ]]; then
+        echo "	nodes ${nodes}"
     fi
 
     # Always add content type
@@ -9232,6 +9540,17 @@ menu_edit_storage() {
         return 1
     fi
 
+    # API Port
+    local current_api_port="${config_values[api_port]:-443}"
+    local api_port
+    read -rp "API port [$current_api_port]: " api_port
+    api_port="${api_port:-$current_api_port}"
+    if [[ ! "$api_port" =~ ^[0-9]+$ ]] || [[ "$api_port" -lt 1 ]] || [[ "$api_port" -gt 65535 ]]; then
+        error "Invalid port number (must be 1-65535)"
+        return 1
+    fi
+    TN_API_PORT="$api_port"
+
     # API Key
     local current_api_key="${config_values[api_key]}"
     info "Current API key: ${current_api_key:0:20}... (hidden)"
@@ -9321,6 +9640,11 @@ menu_edit_storage() {
         fi
     fi
 
+    # Node restriction
+    local current_nodes="${config_values[nodes]:-}"
+    local nodes=""
+    prompt_node_selection nodes "$current_nodes"
+
     # Generate updated configuration
     echo
     info "Updated Configuration Summary:"
@@ -9328,10 +9652,10 @@ menu_edit_storage() {
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
         local subsystem_nqn="${config_values[subsystem_nqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
     else
         local target_iqn="${config_values[target_iqn]}"
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target_iqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
     fi
     echo "$config"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -9372,6 +9696,7 @@ WIZARD_CONFIG_MODE=""        # "create" or "existing"
 WIZARD_STORAGE_NAME=""
 WIZARD_TRUENAS_IP=""
 WIZARD_API_KEY=""
+WIZARD_API_PORT="443"        # API port (default 443)
 WIZARD_API_VALIDATED=""      # "true" if API connectivity confirmed
 WIZARD_TRANSPORT_MODE=""     # "iscsi" or "nvme-tcp"
 WIZARD_POOL=""               # ZFS pool name
@@ -9387,6 +9712,7 @@ WIZARD_USE_MULTIPATH=""      # "1" if multipath enabled
 WIZARD_BLOCKSIZE=""          # Block size (e.g., 16K)
 WIZARD_SPARSE=""             # Sparse volume (0 or 1)
 WIZARD_HOSTNQN=""            # Host NQN for NVMe/TCP
+WIZARD_NODES=""              # Comma-separated node names (empty = all nodes)
 
 # Display wizard progress summary with validated inputs
 # Shows checkmarks for validated items
@@ -9424,6 +9750,13 @@ show_wizard_summary() {
         echo -e "  ${c6}▸${c0} TrueNAS IP:          ${c6}(entering...)${c0}"
     elif [[ -n "$WIZARD_STORAGE_NAME" ]]; then
         echo -e "    TrueNAS IP:          ${c6}(pending)${c0}"
+    fi
+
+    # API Port (only show when non-default)
+    if [[ "$WIZARD_API_PORT" != "443" ]]; then
+        echo -e "  ${c2}✓${c0} API Port:            $WIZARD_API_PORT"
+    elif [[ "$current_step" == "port" ]]; then
+        echo -e "  ${c6}▸${c0} API Port:            ${c6}(entering...)${c0}"
     fi
 
     # API Key
@@ -9556,6 +9889,11 @@ show_wizard_summary() {
                 echo -e "    Host NQN:            ${c6}(pending)${c0}"
             fi
         fi
+
+        # Node Restriction (only shown when explicitly set)
+        if [[ -n "$WIZARD_NODES" ]]; then
+            echo -e "  ${c2}✓${c0} Node Restriction:    $WIZARD_NODES"
+        fi
     fi
 
     echo
@@ -9567,6 +9905,7 @@ reset_wizard_state() {
     WIZARD_STORAGE_NAME=""
     WIZARD_TRUENAS_IP=""
     WIZARD_API_KEY=""
+    WIZARD_API_PORT="443"
     WIZARD_API_VALIDATED=""
     WIZARD_TRANSPORT_MODE=""
     WIZARD_POOL=""
@@ -9582,6 +9921,7 @@ reset_wizard_state() {
     WIZARD_BLOCKSIZE=""
     WIZARD_SPARSE=""
     WIZARD_HOSTNQN=""
+    WIZARD_NODES=""
 }
 
 # Progressive wizard for adding new storage
@@ -9639,7 +9979,7 @@ wizard_add_storage() {
             continue
         fi
         if ! validate_storage_name "$WIZARD_STORAGE_NAME"; then
-            error "Invalid storage name. Use only letters, numbers, hyphens, and underscores"
+            error "Invalid storage name. Must start with a lowercase letter, end with a lowercase letter or number, and contain only lowercase letters, numbers, hyphens, underscores, or dots (min 2 characters)"
             continue
         fi
         if storage_name_exists "$WIZARD_STORAGE_NAME"; then
@@ -9667,6 +10007,26 @@ wizard_add_storage() {
             WIZARD_TRUENAS_IP=""
         fi
     done
+
+    # --- Step 3b: API Port (optional) ---
+    clear_screen
+    print_banner
+    echo
+    print_header "Storage Provisioning"
+    show_wizard_summary "port"
+
+    info "Enter the HTTPS port for the TrueNAS API (default 443):"
+    while true; do
+        read -rp "API port [443]: " WIZARD_API_PORT
+        WIZARD_API_PORT="${WIZARD_API_PORT:-443}"
+        if [[ "$WIZARD_API_PORT" =~ ^[0-9]+$ ]] && [[ "$WIZARD_API_PORT" -ge 1 ]] && [[ "$WIZARD_API_PORT" -le 65535 ]]; then
+            break
+        else
+            error "Invalid port number (must be 1-65535)"
+            WIZARD_API_PORT="443"
+        fi
+    done
+    TN_API_PORT="$WIZARD_API_PORT"
 
     # --- Step 4: API Key ---
     clear_screen
@@ -9895,10 +10255,12 @@ menu_configure_storage() {
 
                 # Read config values BEFORE deletion (config will be gone after)
                 local transport_mode api_host api_key subsystem_nqn
-                transport_mode=$(get_storage_config_value "$storage_name" "transport_mode" 2>/dev/null || echo "iscsi")
-                api_host=$(get_storage_config_value "$storage_name" "api_host" 2>/dev/null)
-                api_key=$(get_storage_config_value "$storage_name" "api_key" 2>/dev/null)
-                subsystem_nqn=$(get_storage_config_value "$storage_name" "subsystem_nqn" 2>/dev/null)
+                transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode" 2>/dev/null || echo "iscsi")
+                api_host=$(get_storage_config_value "$storage_name" "tn_api_host" 2>/dev/null)
+                api_key=$(get_storage_config_value "$storage_name" "tn_api_key" 2>/dev/null)
+                subsystem_nqn=$(get_storage_config_value "$storage_name" "tn_subsystem_nqn" 2>/dev/null)
+                TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
+                TN_API_PORT="${TN_API_PORT:-443}"
 
                 # Perform deletion
                 echo
@@ -10003,8 +10365,10 @@ menu_configure_storage() {
     local storage_name="$WIZARD_STORAGE_NAME"
     local truenas_ip="$WIZARD_TRUENAS_IP"
     local api_key="$WIZARD_API_KEY"
+    TN_API_PORT="$WIZARD_API_PORT"
     local provisioning_mode="$WIZARD_CONFIG_MODE"
     local transport_mode="$WIZARD_TRANSPORT_MODE"
+    local nodes="$WIZARD_NODES"
 
     # Handle automated provisioning mode
     if [[ "$provisioning_mode" == "create" ]]; then
@@ -10038,12 +10402,15 @@ menu_configure_storage() {
                 portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
             fi
 
+            # Node restriction (cluster only)
+            prompt_node_selection nodes
+
             # Generate configuration using wizard-collected values
             local config
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
-                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
             else
-                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+                config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
             fi
 
             # Show final configuration summary
@@ -10275,13 +10642,11 @@ menu_configure_storage() {
             local conflicting_nqn
             if conflicting_nqn=$(check_subsystem_in_use "$subsystem_nqn" "$storage_name"); then
                 echo
-                printf "  ${c3}WARNING:${c0} Subsystem NQN is already in use by storage '${conflicting_nqn}'\n"
-                printf "  ${c3}Sharing subsystems between storage entries causes cross-visibility of all block devices.${c0}\n"
+                error "Subsystem NQN is already in use by storage '${conflicting_nqn}'"
+                printf "  Sharing subsystems between storage entries causes namespace conflicts.\n"
+                printf "  Please choose a different NQN.\n"
                 echo
-                read -rp "  Continue anyway? [y/N]: " confirm_nqn
-                if [[ ! "$confirm_nqn" =~ ^[Yy]$ ]]; then
-                    continue
-                fi
+                continue
             fi
 
             break
@@ -10519,12 +10884,15 @@ menu_configure_storage() {
         use_multipath="0"
     fi
 
+    # Node restriction (cluster only)
+    prompt_node_selection nodes
+
     # Generate configuration
     local config
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$subsystem_nqn" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "$hostnqn" "$nodes")
     else
-        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "")
+        config=$(generate_storage_config "$storage_name" "$truenas_ip" "$api_key" "$dataset" "$target" "$portal" "$blocksize" "$sparse" "$use_multipath" "$portals" "$transport_mode" "" "$nodes")
     fi
 
     # Display summary with validation status
@@ -10570,6 +10938,10 @@ menu_configure_storage() {
     # Additional portals if configured
     if [[ -n "$portals" ]]; then
         printf "  ${c2}✓${c0} %-20s %s\n" "Additional Portals:" "$portals"
+    fi
+    # Node restriction if configured
+    if [[ -n "$nodes" ]]; then
+        printf "  ${c2}✓${c0} %-20s %s\n" "Node Restriction:" "$nodes"
     fi
     echo
     echo "  ${c2}✓${c0} = Validated    ${c4}○${c0} = User provided (not validated)"

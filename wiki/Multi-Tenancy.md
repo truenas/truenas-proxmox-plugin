@@ -37,21 +37,21 @@ Each Proxmox cluster (or standalone node) should use its own dedicated ZFS datas
 ```ini
 # Cluster A
 truenasplugin: cluster-a-storage
-    api_host 10.0.0.100
-    api_key 1-cluster-a-key
-    dataset tank/proxmox-cluster-a
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster-a
-    discovery_portal 10.0.0.100:3260
+    tn_api_host 10.0.0.100
+    tn_api_key 1-cluster-a-key
+    tn_dataset tank/proxmox-cluster-a
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-a
+    tn_discovery_portal 10.0.0.100:3260
     content images
     shared 1
 
 # Cluster B
 truenasplugin: cluster-b-storage
-    api_host 10.0.0.100
-    api_key 1-cluster-b-key
-    dataset tank/proxmox-cluster-b
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster-b
-    discovery_portal 10.0.0.100:3260
+    tn_api_host 10.0.0.100
+    tn_api_key 1-cluster-b-key
+    tn_dataset tank/proxmox-cluster-b
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-b
+    tn_discovery_portal 10.0.0.100:3260
     content images
     shared 1
 ```
@@ -198,11 +198,11 @@ Edit `/etc/pve/storage.cfg` on the cluster being migrated to point to the new da
 
 ```ini
 truenasplugin: cluster-b-storage
-    api_host 10.0.0.100
-    api_key 1-cluster-b-key
-    dataset tank/proxmox-cluster-b
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster-b
-    discovery_portal 10.0.0.100:3260
+    tn_api_host 10.0.0.100
+    tn_api_key 1-cluster-b-key
+    tn_dataset tank/proxmox-cluster-b
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-b
+    tn_discovery_portal 10.0.0.100:3260
     content images
     shared 1
 ```

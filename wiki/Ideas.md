@@ -104,8 +104,8 @@ See [Health Check Tool](Tools.md#health-check-tool) for detailed documentation.
 **Configuration Addition**:
 ```ini
 truenasplugin: storage
-    api_host 192.168.1.100
-    api_key xxx
+    tn_api_host 192.168.1.100
+    tn_api_key xxx
     # ... existing config ...
     snapshot_retention_days 7        # Delete snapshots older than 7 days
     snapshot_max_count 10            # Keep max 10 snapshots per volume
@@ -215,8 +215,7 @@ Overall Score      GOOD        BEST        FAIR
 **Tool Enhancement**:
 ```bash
 # Show what would be deployed without actually deploying
-cd tools/
-./update-cluster.sh --dry-run pve1 pve2 pve3
+./install.sh --dry-run  # (proposed feature)
 
 # Output:
 # Would copy TrueNASPlugin.pm to:
@@ -590,7 +589,7 @@ _audit_log('volume_create', {
     vmid => $vmid,
     volname => $volname,
     size => $size,
-    dataset => $scfg->{dataset}
+    tn_dataset => $scfg->{dataset}
 });
 
 _audit_log('volume_delete', {
@@ -1005,11 +1004,11 @@ fi
 TARGET_IQN="iqn.2005-10.org.freenas.ctl:$TARGET_NAME"
 cat > "/tmp/storage-$STORAGE_NAME.cfg" << EOF
 truenasplugin: $STORAGE_NAME
-    api_host $TRUENAS_IP
-    api_key $API_KEY
-    target_iqn $TARGET_IQN
-    dataset $DATASET
-    discovery_portal $TRUENAS_IP:3260
+    tn_api_host $TRUENAS_IP
+    tn_api_key $API_KEY
+    tn_target_iqn $TARGET_IQN
+    tn_dataset $DATASET
+    tn_discovery_portal $TRUENAS_IP:3260
     content images
     shared 1
 EOF
@@ -1157,8 +1156,8 @@ WARNING: Thin provisioning ratio on 'tank/proxmox' is 3.2:1
 **Configuration**:
 ```ini
 truenasplugin: auto-storage
-    api_host 192.168.1.100
-    api_key xxx
+    tn_api_host 192.168.1.100
+    tn_api_key xxx
     datasets tank/proxmox,pool2/proxmox,pool3/proxmox
     allocation_strategy round_robin  # or least_used, most_space
 ```
@@ -1193,12 +1192,12 @@ truenasplugin: auto-storage
 **Configuration Example**:
 ```ini
 truenasplugin: truenas-nvmeof
-    api_host 192.168.1.100
-    api_key xxx
+    tn_api_host 192.168.1.100
+    tn_api_key xxx
     transport nvme-tcp  # or nvme-rdma, nvme-fc
     target_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox-nvme
-    discovery_portal 192.168.1.100:4420  # NVMe/TCP default port
+    tn_dataset tank/proxmox-nvme
+    tn_discovery_portal 192.168.1.100:4420  # NVMe/TCP default port
     content images
     shared 1
 ```

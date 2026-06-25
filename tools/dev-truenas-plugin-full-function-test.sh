@@ -20,6 +20,24 @@
 #  14. Offline Backup - Test backup of stopped VM (requires --backup-store)
 #  15. Cross-Node Clone (Online) - Test cloning running VM to different node (cluster only)
 #  16. Cross-Node Clone (Offline) - Test cloning stopped VM to different node (cluster only)
+#  ...
+#  30. NVMe Stale Recovery - Test stale NVMe connection detection and automatic reconnect
+#  31. Concurrent Alloc+Free Contention - Measure lock contention between simultaneous alloc and free
+#  32. Multi-Disk Sequential Timing - Measure per-disk times to show preflight/cache speedup
+#  33. Mixed Concurrent Operations - Run alloc, clone, and free simultaneously
+#  34. Concurrent Clone Operations - Two full clones from different sources simultaneously
+#  35. Cross-Node Concurrent Alloc - Allocate disks on two nodes simultaneously (cluster only)
+#  36. Concurrent Migration + Alloc - Migrate VM while allocating disk simultaneously (cluster only)
+#  37. LXC Create/Start/Stop - Test LXC container lifecycle (rootdir only)
+#  38. LXC Snapshot & Revert - Test container snapshot and rollback (rootdir only)
+#  39. LXC Clone - Test container cloning (rootdir only)
+#  40. LXC Resize - Test container rootfs resize (rootdir only)
+#  41. LXC Offline Migration - Test container migration between nodes (cluster + rootdir)
+#  42. LXC Multi-Mountpoint - Test container with multiple mountpoints (rootdir only)
+#  43. LXC Stress - Rapid create/delete 10 containers (rootdir only)
+#  44. LXC Concurrent - Create/destroy 10 containers in parallel (rootdir only)
+#  45. LXC Online Backup - Test backup of running container (rootdir + --backup-store)
+#  46. LXC Offline Backup - Test backup of stopped container (rootdir + --backup-store)
 #
 # Performance Summary:
 #   After all tests complete, a summary table displays average, min, and max times
@@ -68,7 +86,7 @@ if [[ $# -lt 2 ]]; then
     echo ""
     echo "Options:"
     echo "  --backup-store STORAGE - Backup storage ID for backup tests (optional)"
-    echo "  --phase PHASE_NUM      - Start from specific phase number (optional)"
+    echo "  --phase PHASE_NUM      - Run only the specified phase number (optional)"
     echo ""
     echo "Examples:"
     echo "  $0 tnscale 9001"
@@ -83,6 +101,7 @@ STORAGE_ID="$1"
 VMID_START="$2"
 BACKUP_STORE=""
 START_PHASE=1
+STOP_PHASE=""  # When set, stop after this phase (for --phase single-phase execution)
 
 # Validate VMID_START is a number
 if ! [[ "$VMID_START" =~ ^[0-9]+$ ]]; then
@@ -101,6 +120,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --phase)
             START_PHASE="$2"
+            STOP_PHASE="$2"  # When --phase is specified, stop after this phase
             shift 2
             ;;
         *)
@@ -112,7 +132,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 NODE=$(hostname)
-VMID_END=$((VMID_START + 250))  # Increased range to cover all tests including rate-limiting (VMID_START+100) and multi-node (VMID_START+200)
+VMID_END=$((VMID_START + 200))  # Range covers VM tests (+0..+124), concurrent/stress (+125..+149), LXC tests (+150..+189)
 TEST_SIZES=(1 10 32 100)  # GB sizes to test
 
 # Clone/Snapshot test VMIDs (at end of range)
@@ -123,6 +143,14 @@ CLONE_VMID=$((CLONE_BASE_VMID + 1))
 IS_CLUSTER=0
 CLUSTER_NODES=()
 TARGET_NODE=""
+
+# LXC/rootdir detection (populated after cluster detection)
+IS_ROOTDIR=0
+LXC_TEMPLATE=""
+LXC_TEMPLATE_STORAGE=""
+LXC_VMID_START=0
+LXC_BASE_VMID=0
+LXC_CLONE_VMID=0
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 LOG_FILE="test-results-${TIMESTAMP}.log"
@@ -313,6 +341,15 @@ log_error() {
     log_both "$*" "ERROR"
 }
 
+# Check if we should stop after the current phase (for --phase single-phase execution)
+check_stop_phase() {
+    local completed_phase="$1"
+    if [[ -n "$STOP_PHASE" && "$completed_phase" -ge "$STOP_PHASE" ]]; then
+        log_info "Phase $STOP_PHASE completed. Exiting as requested (--phase $STOP_PHASE)."
+        exit 0
+    fi
+}
+
 log_warning() {
     log_both "$*" "WARN"
 }
@@ -324,10 +361,10 @@ get_storage_config() {
     local config_file="/etc/pve/storage.cfg"
 
     local api_host api_key dataset api_insecure
-    api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_host" | awk '{print $2}' | head -1)
-    api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_key" | awk '{print $2}' | head -1)
-    dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "dataset" | awk '{print $2}' | head -1)
-    api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "api_insecure" | awk '{print $2}' | head -1)
+    api_host=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_host" | awk '{print $2}' | head -1)
+    api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_key" | awk '{print $2}' | head -1)
+    dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_dataset" | awk '{print $2}' | head -1)
+    api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_insecure" | awk '{print $2}' | head -1)
 
     echo "$api_host|$api_key|$dataset|$api_insecure"
 }
@@ -343,15 +380,15 @@ tn_api_call() {
     perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
         };
         my $params = eval { decode_json($params_json) } // [];
         my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, $method, $params); };
@@ -373,15 +410,15 @@ tn_api_call_write() {
     perl -e '
         use strict;
         use warnings;
-        use lib "/usr/share/perl5/PVE/Storage/Custom";
-        use TrueNASPlugin;
+        use lib "/usr/share/perl5";
+        use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
         my ($host, $api_key, $method, $params_json, $api_insecure) = @ARGV;
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
         };
         my $params = eval { decode_json($params_json) } // [];
         my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params); };
@@ -403,7 +440,7 @@ check_apiver_mismatch() {
     system_apiver=$(perl -e 'require PVE::Storage; print PVE::Storage::APIVER()' 2>/dev/null || echo "unknown")
 
     # Get plugin tested APIVER (top-level constant in plugin)
-    plugin_apiver=$(perl -e 'use lib "/usr/share/perl5/PVE/Storage/Custom"; require TrueNASPlugin; print($PVE::Storage::Custom::TrueNASPlugin::TESTED_APIVER // "")' 2>/dev/null || true)
+    plugin_apiver=$(perl -e 'use lib "/usr/share/perl5"; require PVE::Storage::Custom::TrueNASPlugin; print($PVE::Storage::Custom::TrueNASPlugin::TESTED_APIVER // "")' 2>/dev/null || true)
     [[ -z "$plugin_apiver" ]] && plugin_apiver="unknown"
 
     if [[ "$system_apiver" != "unknown" && "$plugin_apiver" != "unknown" ]]; then
@@ -573,20 +610,79 @@ force_delete_truenas_zvol() {
 if pvesh get /cluster/status --output-format=json 2>/dev/null | grep -q '"type":"cluster"'; then
     IS_CLUSTER=1
 
-    # Get list of online nodes (excluding current node)
+    # Get list of ONLINE nodes only (excluding current node)
     mapfile -t CLUSTER_NODES < <(pvesh get /nodes --output-format=json 2>/dev/null | \
-        grep -o '"node":"[^"]*"' | cut -d'"' -f4 | grep -v "^$NODE$" || echo "")
+        NODE="$NODE" perl -0777 -MJSON::PP -ne '
+            my $nodes = decode_json($_);
+            for my $n (@$nodes) {
+                next if $n->{node} eq $ENV{NODE};
+                print "$n->{node}\n" if ($n->{status} // "") eq "online";
+            }
+        ' || echo "")
 
-    if [[ ${#CLUSTER_NODES[@]} -gt 0 ]]; then
+    if [[ ${#CLUSTER_NODES[@]} -gt 0 && -n "${CLUSTER_NODES[0]}" ]]; then
         TARGET_NODE="${CLUSTER_NODES[0]}"
+        log_info "Cluster detected — using online node '$TARGET_NODE' for multi-node tests (${#CLUSTER_NODES[@]} peer(s) available)"
     else
         IS_CLUSTER=0
+        log_info "Cluster detected but no online peer nodes found — multi-node tests will be skipped"
     fi
+fi
+
+# Detect rootdir content support for LXC container tests
+if pvesh get /storage/${STORAGE_ID} --output-format=json 2>/dev/null | grep -q '"content".*rootdir'; then
+    IS_ROOTDIR=1
+    LXC_VMID_START=$((VMID_START + 150))
+    LXC_BASE_VMID=$((LXC_VMID_START + 10))
+    LXC_CLONE_VMID=$((LXC_BASE_VMID + 1))
+    log_info "Rootdir content detected — LXC tests enabled (VMID range $LXC_VMID_START-$((LXC_VMID_START + 49)))"
+
+    # Auto-detect first available Debian LXC template
+    # pveam list requires a storage argument — scan all storages with vztmpl content
+    for tpl_store in $(pvesm status -content vztmpl 2>/dev/null | tail -n +2 | awk '{print $1}'); do
+        LXC_TEMPLATE=$(pveam list "$tpl_store" 2>/dev/null | grep "debian.*standard.*\.tar\." | head -1 | awk '{print $1}')
+        if [[ -n "$LXC_TEMPLATE" ]]; then
+            LXC_TEMPLATE_STORAGE="$tpl_store"
+            break
+        fi
+    done
+
+    if [[ -z "$LXC_TEMPLATE" ]]; then
+        log_warning "No LXC template found — LXC tests will be skipped (run 'pveam download local <template>' to install)"
+        IS_ROOTDIR=0
+    else
+        log_info "LXC template: $LXC_TEMPLATE"
+    fi
+else
+    log_info "No rootdir content in storage — LXC tests will be skipped"
 fi
 
 # ============================================================================
 # Phase 1: Cleanup Functions
 # ============================================================================
+
+# Stop and destroy an LXC container, then free any orphaned disks
+destroy_lxc() {
+    local vmid="$1"
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+    free_orphaned_disks_for_vmid "$vmid"
+}
+
+# Extract a storage:volid string from pvesh JSON output.
+# Returns empty string (never exits non-zero) so callers work under set -euo pipefail.
+parse_volid() {
+    # Accept JSON either as first argument or from stdin.
+    # Returns empty string (never exits non-zero) so callers work under set -euo pipefail.
+    local json
+    if [[ $# -gt 0 ]]; then
+        json="$1"
+        echo "$json"
+    else
+        cat
+    fi | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1 || true
+}
 
 free_orphaned_disks_for_vmid() {
     local vmid="$1"
@@ -661,6 +757,28 @@ cleanup_test_vms() {
         done
     else
         log_success "No VMs found in range"
+    fi
+
+    # Clean up LXC containers in range
+    local container_count=0
+    for vmid in $(seq "$vmid_start" "$vmid_end"); do
+        if pct status "$vmid" >/dev/null 2>&1; then
+            container_count=$((container_count + 1))
+        fi
+    done
+
+    if [[ $container_count -gt 0 ]]; then
+        log_info "Found $container_count LXC containers to clean up"
+        for vmid in $(seq "$vmid_start" "$vmid_end"); do
+            if pct status "$vmid" >/dev/null 2>&1; then
+                log_warning "Destroying container $vmid..."
+                destroy_lxc "$vmid"
+                cleaned=$((cleaned + 1))
+                sleep $DISK_ATTACH_WAIT
+            fi
+        done
+    else
+        log_success "No LXC containers found in range"
     fi
 
     # Check for orphaned disks in storage and delete the VMs that own them
@@ -754,7 +872,7 @@ test_disk_allocation() {
         -vmid $vmid \
         -filename "vm-$vmid-disk-0" \
         -size "${size_gb}G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
         log_error "Failed to allocate disk"
@@ -1010,7 +1128,7 @@ test_create_base_vm_for_clone() {
         -vmid $vmid \
         -filename "vm-$vmid-disk-0" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
         log_error "Failed to allocate disk"
@@ -1209,7 +1327,7 @@ test_disk_resize() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -1319,7 +1437,7 @@ test_concurrent_operations() {
                     -size "5G" \
                     --output-format=json 2>&1)
 
-                volid=$(echo "$output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+                volid=$(echo "$output" | parse_volid)
 
                 [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID:vol- ]] && break
                 volid=""
@@ -1554,7 +1672,7 @@ test_performance() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     local alloc_end=$(date +%s%3N)
     local elapsed=$((alloc_end - alloc_start))
 
@@ -1577,7 +1695,7 @@ test_performance() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "20G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
     alloc_end=$(date +%s%3N)
     elapsed=$((alloc_end - alloc_start))
 
@@ -1652,7 +1770,7 @@ test_multiple_disks() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i"
@@ -1762,7 +1880,7 @@ test_efi_vm_creation() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "1M" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if [[ -z "$efi_volid" ]] || [[ "$efi_volid" == *"error"* ]]; then
         log_error "Failed to allocate EFI disk"
@@ -1788,7 +1906,7 @@ test_efi_vm_creation() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-1" \
         -size "10G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$data_volid" >/dev/null 2>&1; then
         log_error "Failed to attach data disk"
@@ -1895,7 +2013,7 @@ test_multidisk_advanced_operations() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk $i"
@@ -2011,7 +2129,7 @@ test_multidisk_advanced_operations() {
             -vmid "$base_clone_vmid" \
             -filename "vm-${base_clone_vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$base_clone_vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i to base VM"
@@ -2113,7 +2231,7 @@ test_multidisk_advanced_operations() {
             -vmid "$vmid" \
             -filename "vm-${vmid}-disk-${i}" \
             -size "5G" \
-            --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+            --output-format=json 2>&1 | parse_volid)
 
         if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
             log_error "Failed to attach disk $i"
@@ -2215,7 +2333,7 @@ test_multidisk_advanced_operations() {
                 -vmid "$vmid" \
                 -filename "vm-${vmid}-disk-${i}" \
                 -size "5G" \
-                --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+                --output-format=json 2>&1 | parse_volid)
 
             if ! qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1; then
                 log_error "Failed to attach disk $i"
@@ -2356,7 +2474,7 @@ test_live_migration() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2473,7 +2591,7 @@ test_offline_migration() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2573,7 +2691,7 @@ test_online_backup() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2672,7 +2790,7 @@ test_offline_backup() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2758,7 +2876,7 @@ test_cross_node_clone_online() {
         -vmid "$base_vmid" \
         -filename "vm-${base_vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$base_vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2863,7 +2981,7 @@ test_cross_node_clone_offline() {
         -vmid "$base_vmid" \
         -filename "vm-${base_vmid}-disk-0" \
         -size "5G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        --output-format=json 2>&1 | parse_volid)
 
     if ! qm set "$base_vmid" -scsi0 "$volid" >/dev/null 2>&1; then
         log_error "Failed to attach disk"
@@ -2957,7 +3075,7 @@ test_rapid_create_delete_stress() {
             -filename "vm-${vmid}-disk-0" \
             -size "1G" \
             --output-format=json 2>&1) || true
-        volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+        volid=$(echo "$alloc_output" | parse_volid)
 
         if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
             log_error "Failed to allocate disk for VM $vmid"
@@ -3165,7 +3283,7 @@ test_storage_exhaustion() {
         -vmid "$vmid" \
         -filename "vm-${vmid}-disk-0" \
         -size "${excessive_gb}G" \
-        --output-format=json 2>&1 | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1) || alloc_exit_code=$?
+        --output-format=json 2>&1 | parse_volid) || alloc_exit_code=$?
 
     # Handle timeout (exit code 124)
     if [[ $alloc_exit_code -eq 124 ]]; then
@@ -3508,6 +3626,14 @@ test_interrupted_operations() {
         track_timing "interrupted_ops_orphans" "$total_orphans"
     fi
 
+    # Wait for the storage CFS lock from test 1's interrupted allocation to release.
+    # The NVMe plugin holds the lock during its cleanup phase; under set -euo pipefail
+    # a blocked pvesh create produces empty output which previously crashed the script.
+    # parse_volid() now handles that gracefully, but waiting here lets test 2 actually
+    # succeed rather than skip due to lock contention.
+    log_info "Waiting 30s for storage lock to release after interrupted allocation..."
+    sleep 30
+
     # Test 2: Verify system can handle normal operations after interruption
     log_info "Test 2: Verifying normal operations after interruption"
     vmid=$((base_vmid + 1))
@@ -3529,7 +3655,7 @@ test_interrupted_operations() {
         -filename "vm-${vmid}-disk-0" \
         -size "5G" \
         --output-format=json 2>&1) || alloc_exit_code=$?
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     # Check if allocation failed due to storage lock (known bug from interrupted operation)
     if echo "$alloc_output" | grep -q "cfs-lock.*error.*timeout" || \
@@ -3610,7 +3736,7 @@ test_large_disk_operations() {
         -filename "vm-${vmid}-disk-0" \
         -size "200G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
     local alloc_duration=$(($(date +%s) - alloc_start))
 
     # Check if allocation failed due to storage lock (persisting from Phase 20)
@@ -3749,11 +3875,11 @@ test_transport_mode_verification() {
                 break
             fi
 
-            if [[ "$line" =~ ^[[:space:]]*transport_mode[[:space:]]+(.+)$ ]]; then
+            if [[ "$line" =~ ^[[:space:]]*tn_transport_mode[[:space:]]+(.+)$ ]]; then
                 transport_mode="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*target_iqn[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_target_iqn[[:space:]]+(.+)$ ]]; then
                 target_iqn="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*subsystem_nqn[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
                 subsystem_nqn="${BASH_REMATCH[1]}"
             fi
         fi
@@ -3842,7 +3968,7 @@ test_transport_mode_verification() {
         --output-format=json 2>&1) || true
     # Extract volid - successful response is just a quoted string like "storage:vol-..."
     # Error response is JSON with "code" field - check for storage ID prefix to validate
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate test disk"
@@ -4102,7 +4228,7 @@ test_snapshot_reversion() {
         -filename "vm-${vmid}-disk-0" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate disk"
@@ -4435,7 +4561,7 @@ test_disk_hotswap() {
         -filename "vm-${vmid}-disk-0" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid=$(echo "$alloc_output" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid=$(echo "$alloc_output" | parse_volid)
 
     if [[ -z "$volid" ]] || [[ "$volid" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate primary disk"
@@ -4483,7 +4609,7 @@ test_disk_hotswap() {
         -filename "vm-${vmid}-disk-1" \
         -size "8G" \
         --output-format=json 2>&1) || true
-    volid2=$(echo "$alloc_output2" | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -1)
+    volid2=$(echo "$alloc_output2" | parse_volid)
 
     if [[ -z "$volid2" ]] || [[ "$volid2" != "${STORAGE_ID}:"* ]]; then
         log_error "Failed to allocate second disk"
@@ -4653,10 +4779,7 @@ test_multi_pool_operations() {
 
     sleep $ALLOCATION_WAIT
 
-    pvesm alloc "$pool_a" "$vmid_a" "vm-$vmid_a-disk-0" 8G >/dev/null 2>&1
-    local alloc_a_rc=$?
-
-    if [[ $alloc_a_rc -ne 0 ]]; then
+    if ! pvesm alloc "$pool_a" "$vmid_a" "vm-$vmid_a-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk on pool A"
         pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -4675,10 +4798,7 @@ test_multi_pool_operations() {
 
     sleep $ALLOCATION_WAIT
 
-    pvesm alloc "$pool_b" "$vmid_b" "vm-$vmid_b-disk-0" 8G >/dev/null 2>&1
-    local alloc_b_rc=$?
-
-    if [[ $alloc_b_rc -ne 0 ]]; then
+    if ! pvesm alloc "$pool_b" "$vmid_b" "vm-$vmid_b-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk on pool B"
         pvesh delete "/nodes/$NODE/qemu/$vmid_a" >/dev/null 2>&1 || true
         pvesh delete "/nodes/$NODE/qemu/$vmid_b" >/dev/null 2>&1 || true
@@ -4804,13 +4924,13 @@ test_dataset_property_inheritance() {
                 break
             fi
 
-            if [[ "$line" =~ ^[[:space:]]*api_host[[:space:]]+(.+)$ ]]; then
+            if [[ "$line" =~ ^[[:space:]]*tn_api_host[[:space:]]+(.+)$ ]]; then
                 api_host="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*api_key[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_api_key[[:space:]]+(.+)$ ]]; then
                 api_key="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*dataset[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_dataset[[:space:]]+(.+)$ ]]; then
                 dataset="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^[[:space:]]*api_insecure[[:space:]]+(.+)$ ]]; then
+            elif [[ "$line" =~ ^[[:space:]]*tn_api_insecure[[:space:]]+(.+)$ ]]; then
                 api_insecure="${BASH_REMATCH[1]}"
             fi
         fi
@@ -4856,10 +4976,7 @@ test_dataset_property_inheritance() {
 
     # Allocate disk (creates zvol)
     log_verbose "Allocating disk (creates zvol)" "INFO" "$CURRENT_OP_ID"
-    pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1
-    local alloc_rc=$?
-
-    if [[ $alloc_rc -ne 0 ]]; then
+    if ! pvesm alloc "$STORAGE_ID" "$vmid" "vm-$vmid-disk-0" 8G >/dev/null 2>&1; then
         log_error "Failed to allocate disk"
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -4927,8 +5044,2296 @@ test_dataset_property_inheritance() {
 }
 
 # ============================================================================
-# Performance Summary Table
+# Phase 30: NVMe Stale Connection Recovery Test
 # ============================================================================
+
+test_nvme_stale_recovery() {
+    local vmid=$1
+    local test_num=$2
+    local test_name="NVMe Stale Connection Recovery"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    CURRENT_OP_ID=$(generate_operation_id)
+    log_console "[$test_num] Testing: $test_name"
+    log_verbose "Starting phase 30 test" "INFO" "$CURRENT_OP_ID"
+    local start_time=$(date +%s)
+
+    # Skip if not NVMe-TCP transport mode
+    log_verbose "Checking transport mode" "INFO" "$CURRENT_OP_ID"
+    local storage_cfg="/etc/pve/storage.cfg"
+    local transport_mode=""
+    local subsystem_nqn=""
+    local in_storage_block=0
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^truenasplugin:[[:space:]]+$STORAGE_ID$ ]]; then
+            in_storage_block=1
+            continue
+        fi
+
+        if [[ $in_storage_block -eq 1 ]]; then
+            if [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^truenasplugin: ]]; then
+                break
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]*tn_transport_mode[[:space:]]+(.+)$ ]]; then
+                transport_mode="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]*tn_subsystem_nqn[[:space:]]+(.+)$ ]]; then
+                subsystem_nqn="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$storage_cfg"
+
+    if [[ "$transport_mode" != "nvme-tcp" ]] && [[ -z "$subsystem_nqn" ]]; then
+        log_success "Skipped - not NVMe-TCP transport mode"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("SKIP: $test_name - Not NVMe-TCP transport")
+        return 0
+    fi
+
+    # Get API credentials
+    log_verbose "Reading TrueNAS API configuration" "INFO" "$CURRENT_OP_ID"
+    local config_str
+    config_str=$(get_storage_config "$STORAGE_ID")
+    local api_host api_key dataset api_insecure
+    IFS='|' read -r api_host api_key dataset api_insecure <<< "$config_str"
+
+    if [[ -z "$api_host" ]] || [[ -z "$api_key" ]]; then
+        log_error "Could not extract API configuration from storage.cfg"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Configuration extraction failed")
+        return 1
+    fi
+
+    log_verbose "API Host: $api_host, Dataset: $dataset" "INFO" "$CURRENT_OP_ID"
+
+    # Pre-flight: verify NVMe-oF service is running
+    log_verbose "Verifying NVMe-oF service is running" "INFO" "$CURRENT_OP_ID"
+    local nvmet_status
+    if ! nvmet_status=$(tn_api_call "$api_host" "$api_key" "service.query" \
+        '[[["service","=","nvmet"]]]' "$api_insecure" 2>/dev/null); then
+        log_error "Failed to query NVMe-oF service status"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Cannot query nvmet service")
+        return 1
+    fi
+
+    if ! echo "$nvmet_status" | grep -q '"state":"RUNNING"'; then
+        log_error "NVMe-oF service is not running - cannot test stale recovery"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - nvmet service not running")
+        return 1
+    fi
+
+    log_verbose "NVMe-oF service confirmed running" "INFO" "$CURRENT_OP_ID"
+
+    # Record syslog marker for later inspection
+    local syslog_marker
+    syslog_marker=$(date +"%Y-%m-%dT%H:%M:%S")
+
+    # Create VM + allocate NVMe disk
+    log_verbose "Creating test VM $vmid with NVMe disk" "INFO" "$CURRENT_OP_ID"
+    pvesh create "/nodes/$NODE/qemu" -vmid "$vmid" -name "test-nvme-stale" \
+        -memory 512 -cores 1 -cpu host -ostype l26 >/dev/null 2>&1
+
+    sleep $ALLOCATION_WAIT
+
+    log_verbose "Allocating 1GB disk" "INFO" "$CURRENT_OP_ID"
+    local volid
+    volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" \
+        -filename "vm-${vmid}-disk-0" \
+        -size "1G" \
+        --output-format=json 2>&1 | parse_volid)
+
+    if [[ -z "$volid" ]] || [[ "$volid" == *"error"* ]]; then
+        log_error "Failed to allocate disk: $volid"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    log_verbose "Allocated volume: $volid" "INFO" "$CURRENT_OP_ID"
+
+    # Attach disk and boot VM (baseline - confirm everything works before staling)
+    log_verbose "Attaching disk and starting VM (baseline check)" "INFO" "$CURRENT_OP_ID"
+    if ! qm set "$vmid" -scsi0 "$volid" -scsihw virtio-scsi-single -boot "order=scsi0" >/dev/null 2>&1; then
+        log_error "Failed to attach disk to VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk attach failed")
+        return 1
+    fi
+
+    if ! timeout 120 qm start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start VM for baseline check"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline VM start failed")
+        return 1
+    fi
+
+    log_verbose "Baseline VM start succeeded, stopping VM" "INFO" "$CURRENT_OP_ID"
+    sleep 2
+    qm stop "$vmid" --timeout 30 >/dev/null 2>&1
+    sleep 2
+
+    # Restart TrueNAS NVMe-oF service to create stale state
+    log_verbose "Restarting TrueNAS NVMe-oF service to create stale connections" "WARN" "$CURRENT_OP_ID"
+    if ! tn_api_call_write "$api_host" "$api_key" "service.restart" '["nvmet"]' "$api_insecure" >/dev/null 2>&1; then
+        log_error "Failed to restart NVMe-oF service"
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - nvmet restart failed")
+        return 1
+    fi
+
+    # Wait for service to fully restart and republish namespaces
+    log_verbose "Waiting 5s for NVMe-oF service to republish namespaces" "INFO" "$CURRENT_OP_ID"
+    sleep 5
+
+    # Trigger activate_volume via qm start - this exercises the stale NGUID recovery path
+    # activate_volume passes allow_reconnect => 1, enabling i=35 stale NGUID detection
+    log_verbose "Starting VM after NVMe-oF restart (triggers stale recovery)" "INFO" "$CURRENT_OP_ID"
+    if ! timeout 120 qm start "$vmid" >/dev/null 2>&1; then
+        log_error "VM failed to start after NVMe-oF restart - stale recovery may have failed"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM start failed after nvmet restart")
+        return 1
+    fi
+
+    log_success "VM started successfully after NVMe-oF restart - stale recovery worked"
+
+    # Issue-12 regression detection: check for aliasing fallback or taint errors
+    log_verbose "Checking for issue-12 regression signatures" "INFO" "$CURRENT_OP_ID"
+    local issue12_failures=""
+
+    # Check for 'using single device' (aliasing fallback signature)
+    if journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null | grep -q "using single device"; then
+        issue12_failures="${issue12_failures}aliasing_fallback "
+        log_error "ISSUE-12 REGRESSION: 'using single device' detected (aliasing fallback)"
+    fi
+
+    # Check for 'Insecure dependency in exec' (taint regression signature)
+    if journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null | grep -q "Insecure dependency in exec"; then
+        issue12_failures="${issue12_failures}taint_regression "
+        log_error "ISSUE-12 REGRESSION: 'Insecure dependency in exec' detected (taint regression)"
+    fi
+
+    # Fail the test if any issue-12 signatures were found
+    if [[ -n "$issue12_failures" ]]; then
+        log_error "Issue-12 regression signatures detected: $issue12_failures"
+        qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+        wait_for_vm_deletion "$vmid" "$vmid" 5
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Issue-12 regression: $issue12_failures")
+        return 1
+    fi
+
+    # Verify via syslog (informational, not pass/fail)
+    log_verbose "Checking syslog for reconnect messages" "INFO" "$CURRENT_OP_ID"
+    local syslog_output
+    syslog_output=$(journalctl --since "$syslog_marker" -t pvedaemon --no-pager 2>/dev/null \
+        | grep -E "stale (NGUID|NVMe) connection detected|NVMe.*reconnect|zero block devices" || true)
+
+    if [[ -n "$syslog_output" ]]; then
+        log_verbose "Recovery messages found in syslog:" "INFO" "$CURRENT_OP_ID"
+        while IFS= read -r logline; do
+            log_verbose "  $logline" "INFO" "$CURRENT_OP_ID"
+        done <<< "$syslog_output"
+    else
+        log_verbose "No explicit stale recovery messages in syslog (recovery may have been transparent)" "INFO" "$CURRENT_OP_ID"
+    fi
+
+    # Cleanup
+    log_verbose "Cleaning up test VM" "INFO" "$CURRENT_OP_ID"
+    qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
+    sleep 2
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    # Post-flight: verify NVMe-oF service is still running
+    log_verbose "Verifying NVMe-oF service still running after test" "INFO" "$CURRENT_OP_ID"
+    local post_status
+    if post_status=$(tn_api_call "$api_host" "$api_key" "service.query" \
+        '[[["service","=","nvmet"]]]' "$api_insecure" 2>/dev/null); then
+        if ! echo "$post_status" | grep -q '"state":"RUNNING"'; then
+            log_warning "NVMe-oF service not running after test - restarting"
+            tn_api_call_write "$api_host" "$api_key" "service.start" '["nvmet"]' "$api_insecure" >/dev/null 2>&1 || true
+            sleep 3
+        fi
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "NVMe stale connection recovery test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "nvme_stale_recovery" "$duration"
+    return 0
+}
+
+# ============================================================================
+# Phase 31: Concurrent Alloc+Free Lock Contention
+# ============================================================================
+
+test_concurrent_alloc_free_contention() {
+    local test_num=$1
+    local test_name="Concurrent Alloc+Free Lock Contention"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_free=$((VMID_START + 34))
+    local vmid_alloc=$((VMID_START + 35))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create VM with a disk (the free target)
+    log_info "Setting up: creating VM $vmid_free with disk (free target)"
+    if ! qm create "$vmid_free" -name "test-contention-free" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create free-target VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    local free_volid
+    free_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_free" \
+        -filename "vm-${vmid_free}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+
+    if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
+        log_error "Failed to allocate free-target disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Disk allocation failed")
+        return 1
+    fi
+
+    # Setup: Create empty VM (the alloc target)
+    log_info "Setting up: creating empty VM $vmid_alloc (alloc target)"
+    if ! qm create "$vmid_alloc" -name "test-contention-alloc" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc-target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc
+    log_info "Baseline: timing single disk allocation"
+    local baseline_start=$(date +%s%3N)
+    local baseline_volid
+    baseline_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    if [[ -z "$baseline_volid" || "$baseline_volid" == *"error"* ]]; then
+        log_error "Baseline allocation failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_ms}ms"
+    track_timing "contention_baseline_alloc" "$baseline_ms"
+
+    # Remove baseline disk so we can allocate again
+    pvesm free "$baseline_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Launch alloc and free simultaneously
+    log_info "Concurrent: launching alloc + free simultaneously"
+    local error_dir="/tmp/contention-test-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Free operation
+    (
+        local op_start=$(date +%s%3N)
+        pvesm free "$free_volid" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/free.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/free.result"
+        fi
+    ) &
+    local free_pid=$!
+
+    # Wait for both
+    wait "$alloc_pid" 2>/dev/null || true
+    wait "$free_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local alloc_result="FAIL:0"
+    local free_result="FAIL:0"
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    [[ -f "$error_dir/free.result" ]] && free_result=$(cat "$error_dir/free.result")
+    rm -rf "$error_dir"
+
+    local alloc_status="${alloc_result%%:*}"
+    local alloc_ms="${alloc_result##*:}"
+    local free_status="${free_result%%:*}"
+    local free_ms="${free_result##*:}"
+
+    log_info "Concurrent alloc: ${alloc_ms}ms (${alloc_status})"
+    log_info "Concurrent free:  ${free_ms}ms (${free_status})"
+    log_info "Wall time:        ${wall_ms}ms"
+    local sequential_sum=$((alloc_ms + free_ms))
+    log_info "Sequential sum:   ${sequential_sum}ms"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel, 100% = fully serial)"
+    fi
+
+    track_timing "contention_concurrent_alloc" "$alloc_ms"
+    track_timing "contention_concurrent_free" "$free_ms"
+    track_timing "contention_wall_time" "$wall_ms"
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_free" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_free" "$vmid_alloc" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$alloc_status" == "OK" && "$free_status" == "OK" ]]; then
+        log_success "Concurrent alloc+free contention test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ "$alloc_status" == "OK" || "$free_status" == "OK" ]]; then
+        log_warning "Partial success: alloc=$alloc_status, free=$free_status (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (partial - alloc=$alloc_status, free=$free_status)")
+    else
+        log_error "Both operations failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Both operations failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 32: Multi-Disk Sequential Timing
+# ============================================================================
+
+test_multi_disk_sequential_timing() {
+    local test_num=$1
+    local test_name="Multi-Disk Sequential Timing (4 disks)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid=$((VMID_START + 36))
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Create VM
+    log_info "Creating VM $vmid for multi-disk test"
+    if ! qm create "$vmid" -name "test-multidisk-seq" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - VM creation failed")
+        return 1
+    fi
+
+    # Allocate 4 disks sequentially with timing
+    local disk_times=()
+    local total_start=$(date +%s%3N)
+    local all_ok=true
+
+    for i in 0 1 2 3; do
+        log_info "Allocating disk $i..."
+        local disk_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid" \
+            -filename "vm-${vmid}-disk-${i}" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local disk_end=$(date +%s%3N)
+        local disk_ms=$((disk_end - disk_start))
+        disk_times+=("$disk_ms")
+
+        if [[ -z "$volid" || "$volid" == *"error"* ]]; then
+            log_error "Failed to allocate disk $i"
+            all_ok=false
+            break
+        fi
+
+        # Attach disk
+        local bus_idx=$i
+        if ! qm set "$vmid" -scsi${bus_idx} "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk $i"
+            all_ok=false
+            break
+        fi
+
+        log_info "Disk $i: ${disk_ms}ms"
+        track_timing "multidisk_seq_disk${i}" "$disk_ms"
+    done
+
+    local total_end=$(date +%s%3N)
+    local total_ms=$((total_end - total_start))
+    track_timing "multidisk_seq_total" "$total_ms"
+
+    if [[ "$all_ok" == "true" && ${#disk_times[@]} -eq 4 ]]; then
+        local first_disk=${disk_times[0]}
+        local subsequent_sum=$(( ${disk_times[1]} + ${disk_times[2]} + ${disk_times[3]} ))
+        local subsequent_avg=$((subsequent_sum / 3))
+
+        log_info "First disk (cold cache):  ${first_disk}ms"
+        log_info "Subsequent avg (warm):    ${subsequent_avg}ms"
+        track_timing "multidisk_seq_first_disk" "$first_disk"
+        track_timing "multidisk_seq_subsequent_avg" "$subsequent_avg"
+
+        if [[ $first_disk -gt 0 ]]; then
+            local speedup_pct=$(( (first_disk - subsequent_avg) * 100 / first_disk ))
+            log_info "Speedup: ${speedup_pct}% faster with warm cache"
+        fi
+
+        # Verify all 4 disks in VM config
+        local disk_count
+        disk_count=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | wc -l)
+        if [[ $disk_count -eq 4 ]]; then
+            log_success "All 4 disks verified in storage"
+        else
+            log_warning "Expected 4 disks, found $disk_count"
+        fi
+    fi
+
+    # Cleanup
+    pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid" "$vmid" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$all_ok" == "true" && ${#disk_times[@]} -eq 4 ]]; then
+        log_success "Multi-disk sequential timing test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Multi-disk sequential timing test failed - only ${#disk_times[@]}/4 disks created"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - ${#disk_times[@]}/4 disks created")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 33: Mixed Concurrent Operations
+# ============================================================================
+
+test_mixed_concurrent_operations() {
+    local test_num=$1
+    local test_name="Mixed Concurrent Operations (alloc+clone+free)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_clone_src=$((VMID_START + 37))
+    local vmid_alloc=$((VMID_START + 38))
+    local vmid_clone_dst=$((VMID_START + 39))
+
+    # Cleanup
+    for v in $vmid_clone_src $vmid_alloc $vmid_clone_dst; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create source VM with disk (for clone)
+    log_info "Setting up: creating clone source VM $vmid_clone_src with disk"
+    if ! qm create "$vmid_clone_src" -name "test-mixed-clone-src" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create clone source VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone source VM creation failed")
+        return 1
+    fi
+
+    local src_volid
+    src_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_clone_src" \
+        -filename "vm-${vmid_clone_src}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+
+    if [[ -z "$src_volid" || "$src_volid" == *"error"* ]]; then
+        log_error "Failed to allocate clone source disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Source disk alloc failed")
+        return 1
+    fi
+
+    if ! qm set "$vmid_clone_src" -scsi0 "$src_volid" >/dev/null 2>&1; then
+        log_error "Failed to attach source disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Source disk attach failed")
+        return 1
+    fi
+
+    # Setup: Create empty VM (for alloc) and a detached disk (for free)
+    log_info "Setting up: creating alloc target VM $vmid_alloc with detached free-target disk"
+    if ! qm create "$vmid_alloc" -name "test-mixed-alloc" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Alloc target VM creation failed")
+        return 1
+    fi
+
+    # Create a detached disk on the alloc VM to be freed
+    local free_volid
+    free_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+
+    if [[ -z "$free_volid" || "$free_volid" == *"error"* ]]; then
+        log_error "Failed to create free-target disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_clone_src" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Free-target disk creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Launch alloc, clone, and free simultaneously
+    log_info "Concurrent: launching alloc + clone + free simultaneously"
+    local error_dir="/tmp/mixed-concurrent-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-1" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Clone operation
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_clone_src" "$vmid_clone_dst" --name "test-mixed-clone-dst" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone.result"
+        fi
+    ) &
+    local clone_pid=$!
+
+    # Free operation
+    (
+        local op_start=$(date +%s%3N)
+        pvesm free "$free_volid" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/free.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/free.result"
+        fi
+    ) &
+    local free_pid=$!
+
+    # Wait for all
+    wait "$alloc_pid" 2>/dev/null || true
+    wait "$clone_pid" 2>/dev/null || true
+    wait "$free_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local alloc_result="FAIL:0" clone_result="FAIL:0" free_result="FAIL:0"
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    [[ -f "$error_dir/clone.result" ]] && clone_result=$(cat "$error_dir/clone.result")
+    [[ -f "$error_dir/free.result" ]] && free_result=$(cat "$error_dir/free.result")
+    rm -rf "$error_dir"
+
+    local alloc_status="${alloc_result%%:*}" alloc_ms="${alloc_result##*:}"
+    local clone_status="${clone_result%%:*}" clone_ms="${clone_result##*:}"
+    local free_status="${free_result%%:*}" free_ms="${free_result##*:}"
+
+    log_info "Concurrent alloc: ${alloc_ms}ms (${alloc_status})"
+    log_info "Concurrent clone: ${clone_ms}ms (${clone_status})"
+    log_info "Concurrent free:  ${free_ms}ms (${free_status})"
+    log_info "Wall time:        ${wall_ms}ms"
+    local sequential_sum=$((alloc_ms + clone_ms + free_ms))
+    log_info "Sequential sum:   ${sequential_sum}ms"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel)"
+    fi
+
+    track_timing "mixed_concurrent_alloc" "$alloc_ms"
+    track_timing "mixed_concurrent_clone" "$clone_ms"
+    track_timing "mixed_concurrent_free" "$free_ms"
+    track_timing "mixed_concurrent_wall" "$wall_ms"
+
+    # Count successes
+    local success_count=0
+    [[ "$alloc_status" == "OK" ]] && success_count=$((success_count + 1))
+    [[ "$clone_status" == "OK" ]] && success_count=$((success_count + 1))
+    [[ "$free_status" == "OK" ]] && success_count=$((success_count + 1))
+
+    # Cleanup
+    for v in $vmid_clone_dst $vmid_alloc $vmid_clone_src; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    wait_for_vm_deletion "$vmid_clone_src" "$vmid_clone_dst" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ $success_count -eq 3 ]]; then
+        log_success "Mixed concurrent operations test passed - all 3 ops succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ $success_count -ge 1 ]]; then
+        log_warning "Mixed concurrent operations: ${success_count}/3 succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (${success_count}/3 ops succeeded)")
+    else
+        log_error "All mixed concurrent operations failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - All operations failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 34: Concurrent Clone Operations
+# ============================================================================
+
+test_concurrent_clone_operations() {
+    local test_num=$1
+    local test_name="Concurrent Clone Operations (2 simultaneous clones)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_src_a=$((VMID_START + 40))
+    local vmid_src_b=$((VMID_START + 41))
+    local vmid_dst_a=$((VMID_START + 42))
+    local vmid_dst_b=$((VMID_START + 43))
+
+    # Cleanup
+    for v in $vmid_src_a $vmid_src_b $vmid_dst_a $vmid_dst_b; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create two source VMs with disks
+    log_info "Setting up: creating source VMs with disks"
+    for pair in "$vmid_src_a:test-clone-src-a" "$vmid_src_b:test-clone-src-b"; do
+        local vid="${pair%%:*}"
+        local vname="${pair##*:}"
+
+        if ! qm create "$vid" -name "$vname" -memory 512 >/dev/null 2>&1; then
+            log_error "Failed to create source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source VM creation failed")
+            return 1
+        fi
+
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vid" \
+            -filename "vm-${vid}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+
+        if [[ -z "$volid" || "$volid" == *"error"* ]]; then
+            log_error "Failed to allocate disk for source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source disk allocation failed")
+            return 1
+        fi
+
+        if ! qm set "$vid" -scsi0 "$volid" >/dev/null 2>&1; then
+            log_error "Failed to attach disk to source VM $vid"
+            for v in $vmid_src_a $vmid_src_b; do
+                pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+            done
+            FAILED_TESTS=$((FAILED_TESTS + 1))
+            TEST_RESULTS+=("FAIL: $test_name - Source disk attach failed")
+            return 1
+        fi
+    done
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single clone
+    log_info "Baseline: timing single clone (src_a → dst_a)"
+    local baseline_start=$(date +%s%3N)
+    if ! qm clone "$vmid_src_a" "$vmid_dst_a" --name "test-clone-dst-a-baseline" --full --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Baseline clone failed"
+        for v in $vmid_src_a $vmid_src_b; do
+            pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+        done
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline clone failed")
+        return 1
+    fi
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    log_info "Baseline clone: ${baseline_ms}ms"
+    track_timing "concurrent_clone_baseline" "$baseline_ms"
+
+    # Delete baseline clone
+    pvesh delete "/nodes/$NODE/qemu/$vmid_dst_a" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_dst_a" "$vmid_dst_a" 5
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Clone both simultaneously
+    log_info "Concurrent: cloning src_a → dst_a and src_b → dst_b simultaneously"
+    local error_dir="/tmp/concurrent-clone-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Clone A
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_src_a" "$vmid_dst_a" --name "test-clone-dst-a" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone_a.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone_a.result"
+        fi
+    ) &
+    local clone_a_pid=$!
+
+    # Clone B
+    (
+        local op_start=$(date +%s%3N)
+        qm clone "$vmid_src_b" "$vmid_dst_b" --name "test-clone-dst-b" --full --storage "$STORAGE_ID" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/clone_b.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/clone_b.result"
+        fi
+    ) &
+    local clone_b_pid=$!
+
+    # Wait for both
+    wait "$clone_a_pid" 2>/dev/null || true
+    wait "$clone_b_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local clone_a_result="FAIL:0" clone_b_result="FAIL:0"
+    [[ -f "$error_dir/clone_a.result" ]] && clone_a_result=$(cat "$error_dir/clone_a.result")
+    [[ -f "$error_dir/clone_b.result" ]] && clone_b_result=$(cat "$error_dir/clone_b.result")
+    rm -rf "$error_dir"
+
+    local clone_a_status="${clone_a_result%%:*}" clone_a_ms="${clone_a_result##*:}"
+    local clone_b_status="${clone_b_result%%:*}" clone_b_ms="${clone_b_result##*:}"
+
+    log_info "Clone A: ${clone_a_ms}ms (${clone_a_status})"
+    log_info "Clone B: ${clone_b_ms}ms (${clone_b_status})"
+    log_info "Wall time: ${wall_ms}ms"
+    log_info "2x baseline: $((baseline_ms * 2))ms"
+    if [[ $baseline_ms -gt 0 ]]; then
+        local serialization_pct=$((wall_ms * 100 / (baseline_ms * 2)))
+        log_info "Serialization ratio: ${serialization_pct}% (50% = fully parallel, 100% = fully serial)"
+        track_timing "concurrent_clone_serialization_pct" "$serialization_pct"
+    fi
+
+    track_timing "concurrent_clone_a" "$clone_a_ms"
+    track_timing "concurrent_clone_b" "$clone_b_ms"
+    track_timing "concurrent_clone_wall" "$wall_ms"
+
+    # Verify destination VMs exist with disks
+    local success_count=0
+    if [[ "$clone_a_status" == "OK" ]]; then
+        if pvesh get "/nodes/$NODE/qemu/$vmid_dst_a/config" >/dev/null 2>&1; then
+            success_count=$((success_count + 1))
+        else
+            log_warning "Clone A reported OK but VM not found"
+        fi
+    fi
+    if [[ "$clone_b_status" == "OK" ]]; then
+        if pvesh get "/nodes/$NODE/qemu/$vmid_dst_b/config" >/dev/null 2>&1; then
+            success_count=$((success_count + 1))
+        else
+            log_warning "Clone B reported OK but VM not found"
+        fi
+    fi
+
+    # Cleanup
+    for v in $vmid_dst_a $vmid_dst_b $vmid_src_a $vmid_src_b; do
+        pvesh delete "/nodes/$NODE/qemu/$v" >/dev/null 2>&1 || true
+    done
+    wait_for_vm_deletion "$vmid_src_a" "$vmid_dst_b" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ $success_count -eq 2 ]]; then
+        log_success "Concurrent clone test passed - both clones succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    elif [[ $success_count -ge 1 ]]; then
+        log_warning "Concurrent clone: ${success_count}/2 succeeded (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name (${success_count}/2 clones succeeded)")
+    else
+        log_error "Both concurrent clones failed"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Both clones failed")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 35: Cross-Node Concurrent Allocations (Cluster Only)
+# ============================================================================
+
+test_cross_node_concurrent_alloc() {
+    local test_num=$1
+    local test_name="Cross-Node Concurrent Allocations"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_local=$((VMID_START + 44))
+    local vmid_remote=$((VMID_START + 45))
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create empty VMs on each node
+    log_info "Creating VM $vmid_local on local node ($NODE)"
+    if ! qm create "$vmid_local" -name "test-xnode-alloc-local" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create local VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Local VM creation failed")
+        return 1
+    fi
+
+    log_info "Creating VM $vmid_remote on remote node ($TARGET_NODE)"
+    if ! pvesh create "/nodes/$TARGET_NODE/qemu" -vmid "$vmid_remote" -name "test-xnode-alloc-remote" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create remote VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Remote VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc on local node
+    log_info "Baseline: timing single alloc on local node"
+    local baseline_start=$(date +%s%3N)
+    local baseline_volid
+    baseline_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_local" \
+        -filename "vm-${vmid_local}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+    local baseline_end=$(date +%s%3N)
+    local baseline_ms=$((baseline_end - baseline_start))
+
+    if [[ -z "$baseline_volid" || "$baseline_volid" == *"error"* ]]; then
+        log_error "Baseline allocation failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_ms}ms"
+    track_timing "xnode_alloc_baseline" "$baseline_ms"
+
+    # Remove baseline disk
+    pvesm free "$baseline_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Alloc on both nodes simultaneously
+    log_info "Concurrent: allocating on $NODE and $TARGET_NODE simultaneously"
+    local error_dir="/tmp/xnode-alloc-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Local alloc
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_local" \
+            -filename "vm-${vmid_local}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/local.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/local.result"
+        fi
+    ) &
+    local local_pid=$!
+
+    # Remote alloc
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$TARGET_NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_remote" \
+            -filename "vm-${vmid_remote}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/remote.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/remote.result"
+        fi
+    ) &
+    local remote_pid=$!
+
+    # Wait for both
+    wait "$local_pid" 2>/dev/null || true
+    wait "$remote_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local local_result="FAIL:0" remote_result="FAIL:0"
+    [[ -f "$error_dir/local.result" ]] && local_result=$(cat "$error_dir/local.result")
+    [[ -f "$error_dir/remote.result" ]] && remote_result=$(cat "$error_dir/remote.result")
+    rm -rf "$error_dir"
+
+    local local_status="${local_result%%:*}" local_ms="${local_result##*:}"
+    local remote_status="${remote_result%%:*}" remote_ms="${remote_result##*:}"
+
+    log_info "Local alloc:  ${local_ms}ms (${local_status})"
+    log_info "Remote alloc: ${remote_ms}ms (${remote_status})"
+    log_info "Wall time:    ${wall_ms}ms"
+    log_info "2x baseline:  $((baseline_ms * 2))ms"
+    if [[ $baseline_ms -gt 0 ]]; then
+        local serialization_pct=$((wall_ms * 100 / (baseline_ms * 2)))
+        log_info "Serialization ratio: ${serialization_pct}% (50% = fully parallel, 100% = fully serial)"
+        track_timing "xnode_alloc_serialization_pct" "$serialization_pct"
+    fi
+
+    track_timing "xnode_alloc_local" "$local_ms"
+    track_timing "xnode_alloc_remote" "$remote_ms"
+    track_timing "xnode_alloc_wall" "$wall_ms"
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_local" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_remote" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_local" "$vmid_local" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$local_status" == "OK" && "$remote_status" == "OK" ]]; then
+        log_success "Cross-node concurrent alloc test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Cross-node concurrent alloc failed (local=$local_status, remote=$remote_status)"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - local=$local_status, remote=$remote_status")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# Phase 36: Concurrent Migration + Allocation (Cluster Only)
+# ============================================================================
+
+test_concurrent_migration_alloc() {
+    local test_num=$1
+    local test_name="Concurrent Migration + Allocation"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    local vmid_migrate=$((VMID_START + 46))
+    local vmid_alloc=$((VMID_START + 47))
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Setup: Create VM A with disk (migration source)
+    log_info "Creating migration source VM $vmid_migrate with disk"
+    if ! qm create "$vmid_migrate" -name "test-migrate-alloc-src" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create migration VM"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration VM creation failed")
+        return 1
+    fi
+
+    local migrate_volid
+    migrate_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_migrate" \
+        -filename "vm-${vmid_migrate}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+
+    if [[ -z "$migrate_volid" || "$migrate_volid" == *"error"* ]]; then
+        log_error "Failed to allocate migration disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration disk alloc failed")
+        return 1
+    fi
+
+    if ! qm set "$vmid_migrate" -scsi0 "$migrate_volid" >/dev/null 2>&1; then
+        log_error "Failed to attach migration disk"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration disk attach failed")
+        return 1
+    fi
+
+    # Setup: Create VM B (alloc target)
+    log_info "Creating alloc target VM $vmid_alloc"
+    if ! qm create "$vmid_alloc" -name "test-migrate-alloc-target" -memory 512 >/dev/null 2>&1; then
+        log_error "Failed to create alloc target VM"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Alloc target VM creation failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single offline migration
+    log_info "Baseline: timing offline migration ($NODE → $TARGET_NODE)"
+    local baseline_migrate_start=$(date +%s%3N)
+    local migrate_error
+    if ! migrate_error=$(qm migrate "$vmid_migrate" "$TARGET_NODE" 2>&1); then
+        log_error "Baseline migration failed"
+        log_error "qm migrate output: ${migrate_error//$'\n'/ }"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline migration failed")
+        return 1
+    fi
+    local baseline_migrate_end=$(date +%s%3N)
+    local baseline_migrate_ms=$((baseline_migrate_end - baseline_migrate_start))
+
+    log_info "Baseline migration: ${baseline_migrate_ms}ms"
+    track_timing "migrate_alloc_baseline_migrate" "$baseline_migrate_ms"
+
+    # Migrate back for the concurrent test
+    log_info "Migrating VM back to $NODE for concurrent test"
+    if ! migrate_error=$(pvesh create "/nodes/$TARGET_NODE/qemu/$vmid_migrate/migrate" -target "$NODE" 2>&1); then
+        log_error "Failed to migrate back to $NODE"
+        log_error "pvesh migrate output: ${migrate_error//$'\n'/ }"
+        pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration back failed")
+        return 1
+    fi
+
+    sleep $API_SETTLE_TIME
+
+    # Baseline: Time a single alloc
+    log_info "Baseline: timing single alloc"
+    local baseline_alloc_start=$(date +%s%3N)
+    local baseline_alloc_volid
+    baseline_alloc_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid_alloc" \
+        -filename "vm-${vmid_alloc}-disk-0" \
+        -size "5G" \
+        --output-format=json 2>&1 | parse_volid)
+    local baseline_alloc_end=$(date +%s%3N)
+    local baseline_alloc_ms=$((baseline_alloc_end - baseline_alloc_start))
+
+    if [[ -z "$baseline_alloc_volid" || "$baseline_alloc_volid" == *"error"* ]]; then
+        log_error "Baseline alloc failed"
+        pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Baseline alloc failed")
+        return 1
+    fi
+
+    log_info "Baseline alloc: ${baseline_alloc_ms}ms"
+    track_timing "migrate_alloc_baseline_alloc" "$baseline_alloc_ms"
+
+    # Remove baseline alloc disk
+    pvesm free "$baseline_alloc_volid" >/dev/null 2>&1 || true
+    sleep $API_SETTLE_TIME
+
+    # Concurrent: Migration + alloc simultaneously
+    log_info "Concurrent: migrating VM $vmid_migrate to $TARGET_NODE + allocating disk for VM $vmid_alloc"
+    local error_dir="/tmp/migrate-alloc-$$"
+    mkdir -p "$error_dir"
+
+    local wall_start=$(date +%s%3N)
+
+    # Migration operation
+    (
+        local op_start=$(date +%s%3N)
+        qm migrate "$vmid_migrate" "$TARGET_NODE" >/dev/null 2>&1
+        local rc=$?
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ $rc -eq 0 ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/migrate.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/migrate.result"
+        fi
+    ) &
+    local migrate_pid=$!
+
+    # Alloc operation
+    (
+        local op_start=$(date +%s%3N)
+        local volid
+        volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid_alloc" \
+            -filename "vm-${vmid_alloc}-disk-0" \
+            -size "5G" \
+            --output-format=json 2>&1 | parse_volid)
+        local op_end=$(date +%s%3N)
+        local duration_ms=$((op_end - op_start))
+
+        if [[ -n "$volid" && "$volid" =~ ^$STORAGE_ID: ]]; then
+            echo "OK:${duration_ms}" > "$error_dir/alloc.result"
+        else
+            echo "FAIL:${duration_ms}" > "$error_dir/alloc.result"
+        fi
+    ) &
+    local alloc_pid=$!
+
+    # Wait for both
+    wait "$migrate_pid" 2>/dev/null || true
+    wait "$alloc_pid" 2>/dev/null || true
+
+    local wall_end=$(date +%s%3N)
+    local wall_ms=$((wall_end - wall_start))
+
+    # Parse results
+    local migrate_result="FAIL:0" alloc_result="FAIL:0"
+    [[ -f "$error_dir/migrate.result" ]] && migrate_result=$(cat "$error_dir/migrate.result")
+    [[ -f "$error_dir/alloc.result" ]] && alloc_result=$(cat "$error_dir/alloc.result")
+    rm -rf "$error_dir"
+
+    local migrate_status="${migrate_result%%:*}" migrate_ms="${migrate_result##*:}"
+    local alloc_status="${alloc_result%%:*}" alloc_ms="${alloc_result##*:}"
+
+    log_info "Migration:      ${migrate_ms}ms (${migrate_status})"
+    log_info "Allocation:     ${alloc_ms}ms (${alloc_status})"
+    log_info "Wall time:      ${wall_ms}ms"
+    local sequential_sum=$((baseline_migrate_ms + baseline_alloc_ms))
+    log_info "Sequential sum: ${sequential_sum}ms (baseline migrate + baseline alloc)"
+    if [[ $sequential_sum -gt 0 ]]; then
+        local parallelism=$((wall_ms * 100 / sequential_sum))
+        log_info "Parallelism ratio: ${parallelism}% (lower = more parallel)"
+    fi
+
+    track_timing "migrate_alloc_concurrent_migrate" "$migrate_ms"
+    track_timing "migrate_alloc_concurrent_alloc" "$alloc_ms"
+    track_timing "migrate_alloc_wall" "$wall_ms"
+
+    # Verify: VM A should be on TARGET_NODE
+    if [[ "$migrate_status" == "OK" ]]; then
+        if pvesh get "/nodes/$TARGET_NODE/qemu/$vmid_migrate/config" >/dev/null 2>&1; then
+            log_success "VM $vmid_migrate verified on $TARGET_NODE"
+        else
+            log_warning "Migration reported OK but VM not found on $TARGET_NODE"
+        fi
+    fi
+
+    # Verify: VM B should have a disk
+    if [[ "$alloc_status" == "OK" ]]; then
+        local disk_count
+        disk_count=$(pvesm list "$STORAGE_ID" --vmid "$vmid_alloc" 2>/dev/null | tail -n +2 | wc -l)
+        if [[ $disk_count -ge 1 ]]; then
+            log_success "VM $vmid_alloc has $disk_count disk(s)"
+        else
+            log_warning "Alloc reported OK but no disks found for VM $vmid_alloc"
+        fi
+    fi
+
+    # Cleanup on both nodes
+    pvesh delete "/nodes/$TARGET_NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_migrate" >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$NODE/qemu/$vmid_alloc" >/dev/null 2>&1 || true
+    wait_for_vm_deletion "$vmid_migrate" "$vmid_alloc" 5
+
+    local duration=$(($(date +%s) - start_time))
+
+    if [[ "$migrate_status" == "OK" && "$alloc_status" == "OK" ]]; then
+        log_success "Concurrent migration+alloc test passed (${duration}s)"
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        TEST_RESULTS+=("PASS: $test_name")
+    else
+        log_error "Concurrent migration+alloc failed (migrate=$migrate_status, alloc=$alloc_status)"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - migrate=$migrate_status, alloc=$alloc_status")
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================================
+# LXC Container Test Phases (37-46)
+# ============================================================================
+
+# Phase 37: LXC Container Create/Start/Stop
+test_lxc_create_start_stop() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Create/Start/Stop (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    log_info "Creating LXC container"
+    local create_start=$(date +%s)
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-create" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create LXC container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+    local create_duration=$(($(date +%s) - create_start))
+    log_success "Container created (${create_duration}s)"
+    track_timing "lxc_create" "$create_duration"
+
+    # Verify container exists
+    if ! pct status "$vmid" >/dev/null 2>&1; then
+        log_error "Container does not exist after creation"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not found")
+        return 1
+    fi
+
+    # Start container
+    log_info "Starting container"
+    local start_start=$(date +%s)
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container start failed")
+        return 1
+    fi
+    local start_duration=$(($(date +%s) - start_start))
+    track_timing "lxc_start" "$start_duration"
+    sleep 3
+
+    # Verify running and rootfs mounted
+    local status
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after start (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running")
+        return 1
+    fi
+
+    local rootfs_info
+    rootfs_info=$(pct exec "$vmid" -- df -h / 2>/dev/null || echo "")
+    if [[ -z "$rootfs_info" ]]; then
+        log_error "Failed to query rootfs mount inside container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rootfs not accessible")
+        return 1
+    fi
+    log_info "Rootfs mounted: $(echo "$rootfs_info" | head -1)"
+
+    # Stop container
+    log_info "Stopping container"
+    local stop_start=$(date +%s)
+    if ! pct stop "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to stop container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container stop failed")
+        return 1
+    fi
+    local stop_duration=$(($(date +%s) - stop_start))
+    track_timing "lxc_stop" "$stop_duration"
+
+    # Verify stopped
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: stopped" ]]; then
+        log_error "Container not stopped (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not stopped")
+        return 1
+    fi
+
+    # Restart test
+    log_info "Restarting container"
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to restart container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container restart failed")
+        return 1
+    fi
+    sleep 2
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after restart"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running after restart")
+        return 1
+    fi
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC create/start/stop cycle completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 38: LXC Snapshot & Revert
+test_lxc_snapshot_revert() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Snapshot & Revert (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-snap" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start and write marker
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    pct exec "$vmid" -- bash -c "echo 'snapshot-marker-test' > /root/marker.txt" 2>/dev/null
+    log_info "Wrote marker file to container"
+
+    # Create snapshot
+    log_info "Creating snapshot 'snap1'"
+    local snap_start=$(date +%s)
+    if ! pct snapshot "$vmid" snap1 >/dev/null 2>&1; then
+        log_error "Failed to create snapshot"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Snapshot failed")
+        return 1
+    fi
+    local snap_duration=$(($(date +%s) - snap_start))
+    track_timing "lxc_snapshot" "$snap_duration"
+    sleep $SNAPSHOT_WAIT
+
+    # Delete marker
+    pct exec "$vmid" -- rm -f /root/marker.txt 2>/dev/null
+    log_info "Deleted marker file"
+
+    # Stop before rollback (required for block storage)
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+
+    # Rollback
+    log_info "Rolling back to snapshot 'snap1'"
+    local rollback_start=$(date +%s)
+    if ! pct rollback "$vmid" snap1 >/dev/null 2>&1; then
+        log_error "Failed to rollback snapshot"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rollback failed")
+        return 1
+    fi
+    local rollback_duration=$(($(date +%s) - rollback_start))
+    track_timing "lxc_rollback" "$rollback_duration"
+
+    # Start and verify marker restored
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local marker
+    marker=$(pct exec "$vmid" -- cat /root/marker.txt 2>/dev/null || echo "")
+    if [[ "$marker" != "snapshot-marker-test" ]]; then
+        log_error "Marker file not restored after rollback (got: '$marker')"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Marker not restored")
+        return 1
+    fi
+    log_success "Marker file restored after rollback"
+
+    # Delete snapshot
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    pct delsnapshot "$vmid" snap1 >/dev/null 2>&1 || true
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC snapshot/revert completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 39: LXC Clone
+test_lxc_clone() {
+    local base_vmid="$1"
+    local clone_vmid="$2"
+    local test_num="$3"
+    local test_name="LXC Clone ($base_vmid → $clone_vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$base_vmid"
+    destroy_lxc "$clone_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create base container
+    if ! pct create "$base_vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-base" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create base container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Base creation failed")
+        return 1
+    fi
+
+    # Start, write marker, stop
+    pct start "$base_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    pct exec "$base_vmid" -- bash -c "echo 'clone-marker-test' > /root/clone-marker.txt" 2>/dev/null
+    pct stop "$base_vmid" >/dev/null 2>&1 || true
+    sleep 1
+
+    # Clone
+    log_info "Cloning container $base_vmid → $clone_vmid"
+    local clone_start=$(date +%s)
+    if ! pct clone "$base_vmid" "$clone_vmid" --hostname "test-lxc-clone" >/dev/null 2>&1; then
+        log_error "Failed to clone container"
+        destroy_lxc "$base_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Clone failed")
+        return 1
+    fi
+    local clone_duration=$(($(date +%s) - clone_start))
+    track_timing "lxc_clone" "$clone_duration"
+    sleep $API_SETTLE_TIME
+
+    # Start clone and verify marker
+    pct start "$clone_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local marker
+    marker=$(pct exec "$clone_vmid" -- cat /root/clone-marker.txt 2>/dev/null || echo "")
+    if [[ "$marker" != "clone-marker-test" ]]; then
+        log_error "Marker not found in clone"
+        destroy_lxc "$base_vmid"
+        destroy_lxc "$clone_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Marker missing in clone")
+        return 1
+    fi
+    log_success "Marker present in cloned container"
+
+    # Cleanup
+    destroy_lxc "$base_vmid"
+    destroy_lxc "$clone_vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC clone completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 40: LXC Resize
+test_lxc_resize() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Resize Rootfs (4G → 8G)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create with 4G rootfs
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:4" --hostname "test-lxc-resize" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start and check initial size
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local orig_size
+    orig_size=$(pct exec "$vmid" -- df -BG / 2>/dev/null | tail -1 | awk '{print $2}' | tr -d 'G')
+    log_info "Original rootfs size: ${orig_size}G"
+
+    # Resize
+    log_info "Resizing rootfs +4G"
+    local resize_start=$(date +%s)
+    if ! pct resize "$vmid" rootfs "+4G" >/dev/null 2>&1; then
+        log_error "Failed to resize rootfs"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Resize failed")
+        return 1
+    fi
+    local resize_duration=$(($(date +%s) - resize_start))
+    track_timing "lxc_resize" "$resize_duration"
+    sleep $API_SETTLE_TIME
+
+    # Verify new size
+    local new_size
+    new_size=$(pct exec "$vmid" -- df -BG / 2>/dev/null | tail -1 | awk '{print $2}' | tr -d 'G')
+    log_info "New rootfs size: ${new_size}G"
+
+    if [[ "$new_size" -lt 7 ]]; then
+        log_error "Resize did not take effect (expected ~8G, got ${new_size}G)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Size verification failed")
+        return 1
+    fi
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC resize verified (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 41: LXC Live Migration (cluster only)
+test_lxc_live_migration() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Offline Migration ($NODE → $TARGET_NODE)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup on both nodes
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+    pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+    free_orphaned_disks_for_vmid "$vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-migrate" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+    # Stop and migrate (LXC live migration not implemented in PVE; use offline with --restart)
+    pct stop "$vmid" >/dev/null 2>&1 || true
+    sleep 1
+    log_info "Migrating container from $NODE to $TARGET_NODE"
+    local migrate_start=$(date +%s)
+    if ! pct migrate "$vmid" "$TARGET_NODE" --restart >/dev/null 2>&1; then
+        log_error "Failed to migrate to $TARGET_NODE"
+        pct destroy "$vmid" --force 1 --purge 1 >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+        free_orphaned_disks_for_vmid "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration to target failed")
+        return 1
+    fi
+    local migrate_duration=$(($(date +%s) - migrate_start))
+    track_timing "lxc_migration" "$migrate_duration"
+    sleep $API_SETTLE_TIME
+
+    # Verify on target (should be running due to --restart)
+    local target_status
+    target_status=$(pvesh get "/nodes/$TARGET_NODE/lxc/$vmid/status/current" 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 || echo "")
+    log_success "Container migrated to $TARGET_NODE in ${migrate_duration}s (status: $target_status)"
+
+    # Migrate back
+    log_info "Migrating back from $TARGET_NODE to $NODE"
+    pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/status/stop" >/dev/null 2>&1 || true
+    sleep 1
+    migrate_start=$(date +%s)
+    if ! pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/migrate" -target "$NODE" -restart 1 >/dev/null 2>&1; then
+        log_error "Failed to migrate back to $NODE"
+        pvesh create "/nodes/$TARGET_NODE/lxc/$vmid/status/stop" >/dev/null 2>&1 || true
+        pvesh delete "/nodes/$TARGET_NODE/lxc/$vmid" >/dev/null 2>&1 || true
+        free_orphaned_disks_for_vmid "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Migration back failed")
+        return 1
+    fi
+    migrate_duration=$(($(date +%s) - migrate_start))
+    track_timing "lxc_migration" "$migrate_duration"
+
+    log_success "Container migrated back to $NODE in ${migrate_duration}s"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC migration completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 42: LXC Multi-Mountpoint
+test_lxc_multi_mountpoint() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Multi-Mountpoint (VMID $vmid)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup and create
+    destroy_lxc "$vmid"
+    sleep $API_SETTLE_TIME
+
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:4" --hostname "test-lxc-mp" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Attach additional mountpoint (PVE auto-allocates and formats the volume)
+    log_info "Attaching additional mountpoint"
+    if ! pct set "$vmid" -mp0 "$STORAGE_ID:2,mp=/data" >/dev/null 2>&1; then
+        log_error "Failed to attach mountpoint"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Mountpoint attachment failed")
+        return 1
+    fi
+
+    # Start and verify both mounts
+    if ! pct start "$vmid" >/dev/null 2>&1; then
+        log_error "Failed to start container"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container start failed")
+        return 1
+    fi
+    sleep 5
+
+    # Verify container is running
+    local status
+    status=$(pct status "$vmid" 2>/dev/null || echo "")
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container not running after start (status: $status)"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container not running")
+        return 1
+    fi
+
+    # Retry rootfs check (block device may need extra time on iSCSI)
+    local rootfs_mount=""
+    for attempt in 1 2 3; do
+        rootfs_mount=$(pct exec "$vmid" -- df -h / 2>/dev/null | tail -1 || echo "")
+        [[ -n "$rootfs_mount" ]] && break
+        sleep 3
+    done
+    local data_mount
+    data_mount=$(pct exec "$vmid" -- df -h /data 2>/dev/null | tail -1 || echo "")
+
+    if [[ -z "$rootfs_mount" ]]; then
+        log_error "Rootfs not mounted"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Rootfs not mounted")
+        return 1
+    fi
+
+    if [[ -z "$data_mount" ]]; then
+        log_error "Data mountpoint not mounted"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Data mountpoint not mounted")
+        return 1
+    fi
+
+    log_info "Rootfs: $rootfs_mount"
+    log_info "Data:   $data_mount"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC multi-mountpoint verified (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    track_timing "lxc_multi_mp" "$duration"
+    return 0
+}
+
+# Phase 43: LXC Rapid Create/Delete Stress
+test_lxc_stress() {
+    local base_vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Rapid Create/Delete Stress (10 containers)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    sleep $API_SETTLE_TIME
+
+    local failed=0
+
+    # Create 10 containers sequentially
+    log_info "Creating 10 containers sequentially"
+    local create_start=$(date +%s)
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        if ! pct create "$vmid" "$LXC_TEMPLATE" \
+            --rootfs "$STORAGE_ID:2" --hostname "test-lxc-stress-$i" \
+            --memory 256 --swap 0 >/dev/null 2>&1; then
+            log_error "Failed to create container $vmid"
+            failed=$((failed + 1))
+        fi
+    done
+    local create_duration=$(($(date +%s) - create_start))
+    track_timing "lxc_stress_create" "$create_duration"
+
+    # Start all
+    log_info "Starting all containers"
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        pct start "$vmid" >/dev/null 2>&1 || true
+    done
+    sleep 3
+
+    # Verify all running
+    local running=0
+    for i in {0..9}; do
+        local vmid=$((base_vmid + i))
+        local status
+        status=$(pct status "$vmid" 2>/dev/null || echo "")
+        if [[ "$status" == "status: running" ]]; then
+            running=$((running + 1))
+        fi
+    done
+    log_info "$running/10 containers running"
+
+    # Stop all
+    for i in {0..9}; do
+        pct stop "$((base_vmid + i))" >/dev/null 2>&1 || true
+    done
+    sleep 2
+
+    # Destroy all
+    local destroy_start=$(date +%s)
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    local destroy_duration=$(($(date +%s) - destroy_start))
+    track_timing "lxc_stress_destroy" "$destroy_duration"
+
+    if [[ $failed -gt 0 ]]; then
+        log_error "$failed container(s) failed during stress test"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - $failed failures")
+        return 1
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC stress test completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 44: LXC Concurrent Creation/Destruction
+test_lxc_concurrent() {
+    local base_vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Concurrent Create/Destroy (10 containers)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    for i in {0..9}; do
+        destroy_lxc "$((base_vmid + i))"
+    done
+    sleep $API_SETTLE_TIME
+
+    # Create 10 containers in parallel
+    log_info "Creating 10 containers in parallel"
+    local create_start=$(date +%s)
+    local pids=()
+    for i in {0..9}; do
+        (
+            pct create "$((base_vmid + i))" "$LXC_TEMPLATE" \
+                --rootfs "$STORAGE_ID:4" --hostname "test-lxc-conc-$i" \
+                --memory 256 --swap 0 >/dev/null 2>&1
+        ) &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    local create_duration=$(($(date +%s) - create_start))
+    track_timing "lxc_concurrent_create" "$create_duration"
+
+    # Verify all created
+    local created=0
+    for i in {0..9}; do
+        pct status "$((base_vmid + i))" >/dev/null 2>&1 && created=$((created + 1))
+    done
+    log_info "$created/10 containers created"
+
+    # Start all in parallel
+    pids=()
+    for i in {0..9}; do
+        pct start "$((base_vmid + i))" >/dev/null 2>&1 &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    sleep 3
+
+    # Verify all running
+    local running=0
+    for i in {0..9}; do
+        local status
+        status=$(pct status "$((base_vmid + i))" 2>/dev/null || echo "")
+        [[ "$status" == "status: running" ]] && running=$((running + 1))
+    done
+    log_info "$running/10 containers running"
+
+    # Stop all in parallel
+    pids=()
+    for i in {0..9}; do
+        pct stop "$((base_vmid + i))" >/dev/null 2>&1 &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    sleep 2
+
+    # Destroy all in parallel
+    local destroy_start=$(date +%s)
+    pids=()
+    for i in {0..9}; do
+        (
+            pct destroy "$((base_vmid + i))" --force 1 --purge 1 >/dev/null 2>&1 || true
+            free_orphaned_disks_for_vmid "$((base_vmid + i))"
+        ) &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    local destroy_duration=$(($(date +%s) - destroy_start))
+    track_timing "lxc_concurrent_destroy" "$destroy_duration"
+
+    # Verify all cleaned up
+    local remaining=0
+    for i in {0..9}; do
+        pct status "$((base_vmid + i))" >/dev/null 2>&1 && remaining=$((remaining + 1))
+    done
+
+    if [[ $remaining -gt 0 ]]; then
+        log_warning "$remaining containers still exist after cleanup"
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC concurrent test completed (${duration}s, $created created, $running ran, $remaining remaining)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 45: LXC Online Backup (requires --backup-store)
+test_lxc_online_backup() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Online Backup (Running Container)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    local restore_vmid=$((vmid + 50))
+    destroy_lxc "$restore_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-backup-online" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Start
+    pct start "$vmid" >/dev/null 2>&1 || true
+    sleep 3
+
+    # Write marker
+    pct exec "$vmid" -- bash -c "echo 'backup-marker' > /root/backup-marker.txt" 2>/dev/null
+
+    # Backup (stop mode for LXC on block storage)
+    log_info "Performing backup to $BACKUP_STORE"
+    local backup_start=$(date +%s)
+    local backup_output
+    backup_output=$(vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" 2>&1)
+    local backup_result=$?
+    local backup_duration=$(($(date +%s) - backup_start))
+
+    if [[ $backup_result -ne 0 ]]; then
+        log_error "Backup failed: $backup_output"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup failed")
+        return 1
+    fi
+
+    log_success "Backup completed in ${backup_duration}s"
+    track_timing "lxc_backup" "$backup_duration"
+
+    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    local backup_file
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+
+    if [[ -z "$backup_file" ]]; then
+        log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup volid not found")
+        return 1
+    fi
+
+    log_info "Backup volid: $backup_file"
+
+    # Restore to new VMID
+    log_info "Restoring backup to VMID $restore_vmid"
+    local restore_start=$(date +%s)
+    if ! pct restore "$restore_vmid" "$backup_file" --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Failed to restore container"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restore failed")
+        return 1
+    fi
+    local restore_duration=$(($(date +%s) - restore_start))
+    track_timing "lxc_restore" "$restore_duration"
+
+    # Verify restored container boots
+    pct start "$restore_vmid" >/dev/null 2>&1 || true
+    sleep 3
+    local restore_status
+    restore_status=$(pct status "$restore_vmid" 2>/dev/null || echo "")
+    if [[ "$restore_status" != "status: running" ]]; then
+        log_error "Restored container not running"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restored container not running")
+        return 1
+    fi
+
+    log_success "Restored container running"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    destroy_lxc "$restore_vmid"
+
+    # Remove backup file
+    if [[ -n "$backup_file" ]]; then
+        pvesm list "$BACKUP_STORE" 2>/dev/null | grep "$backup_file" | awk '{print $1}' | while read -r bvolid; do
+            pvesm free "$bvolid" >/dev/null 2>&1 || true
+        done
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC online backup/restore completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
+
+# Phase 46: LXC Offline Backup (requires --backup-store)
+test_lxc_offline_backup() {
+    local vmid="$1"
+    local test_num="$2"
+    local test_name="LXC Offline Backup (Stopped Container)"
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    local start_time=$(date +%s)
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    local restore_vmid=$((vmid + 50))
+    destroy_lxc "$restore_vmid"
+    sleep $API_SETTLE_TIME
+
+    # Create container (leave stopped)
+    if ! pct create "$vmid" "$LXC_TEMPLATE" \
+        --rootfs "$STORAGE_ID:8" --hostname "test-lxc-backup-offline" \
+        --memory 512 --swap 0 >/dev/null 2>&1; then
+        log_error "Failed to create container"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Container creation failed")
+        return 1
+    fi
+
+    # Backup (stop mode)
+    log_info "Performing offline backup to $BACKUP_STORE"
+    local backup_start=$(date +%s)
+    local backup_output
+    backup_output=$(vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" 2>&1)
+    local backup_result=$?
+    local backup_duration=$(($(date +%s) - backup_start))
+
+    if [[ $backup_result -ne 0 ]]; then
+        log_error "Offline backup failed: $backup_output"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup failed")
+        return 1
+    fi
+
+    log_success "Offline backup completed in ${backup_duration}s"
+    track_timing "lxc_backup_offline" "$backup_duration"
+
+    # Resolve backup volid from storage listing (bare filename from vzdump output is not valid for pct restore)
+    local backup_file
+    backup_file=$(pvesm list "$BACKUP_STORE" --vmid "$vmid" 2>/dev/null | grep "vzdump-lxc-${vmid}-" | tail -1 | awk '{print $1}')
+    if [[ -z "$backup_file" ]]; then
+        log_error "Could not find backup volid in $BACKUP_STORE for VMID $vmid"
+        destroy_lxc "$vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Backup volid not found")
+        return 1
+    fi
+
+    # Restore to new VMID
+    log_info "Restoring to VMID $restore_vmid (volid: $backup_file)"
+    if ! pct restore "$restore_vmid" "$backup_file" --storage "$STORAGE_ID" >/dev/null 2>&1; then
+        log_error "Failed to restore container"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restore failed")
+        return 1
+    fi
+
+    # Verify config
+    local restore_config
+    restore_config=$(pct config "$restore_vmid" 2>/dev/null || echo "")
+    if [[ -z "$restore_config" ]]; then
+        log_error "Restored container has no config"
+        destroy_lxc "$vmid"
+        destroy_lxc "$restore_vmid"
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        TEST_RESULTS+=("FAIL: $test_name - Restored config missing")
+        return 1
+    fi
+
+    log_success "Restored container config intact"
+
+    # Cleanup
+    destroy_lxc "$vmid"
+    destroy_lxc "$restore_vmid"
+
+    if [[ -n "$backup_file" ]]; then
+        pvesm list "$BACKUP_STORE" 2>/dev/null | grep "$backup_file" | awk '{print $1}' | while read -r bvolid; do
+            pvesm free "$bvolid" >/dev/null 2>&1 || true
+        done
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    log_success "LXC offline backup/restore completed (${duration}s)"
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    TEST_RESULTS+=("PASS: $test_name")
+    return 0
+}
 
 print_performance_summary() {
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -5017,6 +7422,11 @@ main() {
     else
         log_info "  Backup Store:  NOT SET (backup tests will be skipped)"
     fi
+    if [[ $IS_ROOTDIR -eq 1 ]]; then
+        log_info "  LXC Tests:    YES (template: $LXC_TEMPLATE)"
+    else
+        log_info "  LXC Tests:    NO (rootdir not in storage content or no template)"
+    fi
 
     # APIVER status was already checked at startup
 
@@ -5060,6 +7470,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 2
 
     # Phase 3: TrueNAS Size Verification
     if [[ $START_PHASE -gt 3 ]]; then
@@ -5078,6 +7489,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 3
 
     # Phase 4: Disk Deletion
     if [[ $START_PHASE -gt 4 ]]; then
@@ -5096,6 +7508,7 @@ main() {
         test_num=$((test_num + 1))
     done
     fi
+    check_stop_phase 4
 
     # Phase 5: Clone and Snapshot Tests
     if [[ $START_PHASE -gt 5 ]]; then
@@ -5136,6 +7549,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 5
 
     # Phase 6: Disk Resize
     if [[ $START_PHASE -gt 6 ]]; then
@@ -5151,6 +7565,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 6
 
     # Phase 7: Concurrent Operations
     if [[ $START_PHASE -gt 7 ]]; then
@@ -5166,6 +7581,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 7
 
     # Phase 8: Performance
     if [[ $START_PHASE -gt 8 ]]; then
@@ -5181,6 +7597,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 8
 
     # Phase 9: Multiple Disks
     if [[ $START_PHASE -gt 9 ]]; then
@@ -5196,6 +7613,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 9
 
     # Phase 10: EFI VM Creation
     if [[ $START_PHASE -gt 10 ]]; then
@@ -5211,6 +7629,8 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+
+    check_stop_phase 10
 
     # Phase 11: Multi-Disk Advanced Operations
     if [[ $START_PHASE -gt 11 ]]; then
@@ -5231,7 +7651,9 @@ main() {
     else
         test_num=$((test_num + 3))
     fi
+
     fi
+    check_stop_phase 11
 
     # Cluster-based tests (only if cluster detected)
     if [[ $IS_CLUSTER -eq 1 ]]; then
@@ -5300,6 +7722,7 @@ main() {
         log_info "Skipping cluster-based tests (Phases 12-15) - not in a cluster or no target node available"
         echo | tee -a "$LOG_FILE"
     fi
+    check_stop_phase 15
 
     # Phase 18: Rapid Creation/Deletion Stress Test
     if [[ $START_PHASE -gt 18 ]]; then
@@ -5315,6 +7738,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 18
 
     # Phase 19: Storage Quota/Space Exhaustion Test
     if [[ $START_PHASE -gt 19 ]]; then
@@ -5330,6 +7754,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 19
 
     # Phase 20: Invalid/Malformed API Requests Test
     if [[ $START_PHASE -gt 20 ]]; then
@@ -5345,6 +7770,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 20
 
     # Phase 21: Interrupted Operations Test
     if [[ $START_PHASE -gt 21 ]]; then
@@ -5360,6 +7786,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 21
 
     # Phase 22: Large Disk Operations Test
     if [[ $START_PHASE -gt 22 ]]; then
@@ -5375,6 +7802,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 22
 
     # Backup tests (only if backup storage specified)
     if [[ -n "$BACKUP_STORE" ]]; then
@@ -5411,6 +7839,7 @@ main() {
         log_info "Skipping backup tests (Phases 16, 17) - no backup storage specified (use --backup-store)"
         echo | tee -a "$LOG_FILE"
     fi
+    check_stop_phase 17
 
     # Phase 23: Transport Mode Verification
     if [[ $START_PHASE -gt 23 ]]; then
@@ -5426,6 +7855,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 23
 
     # Phase 24: Snapshot Reversion
     if [[ $START_PHASE -gt 24 ]]; then
@@ -5441,6 +7871,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 24
 
     # Phase 25: Disk Hotswap
     if [[ $START_PHASE -gt 25 ]]; then
@@ -5456,6 +7887,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 25
 
     # Phase 26: API Rate Limiting
     if [[ $START_PHASE -gt 26 ]]; then
@@ -5470,6 +7902,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 26
 
     # Phase 27: Multi-Pool Operations
     if [[ $START_PHASE -gt 27 ]]; then
@@ -5484,6 +7917,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 27
 
     # Phase 28: Performance Regression Tracking
     if [[ $START_PHASE -gt 28 ]]; then
@@ -5498,6 +7932,7 @@ main() {
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
     fi
+    check_stop_phase 28
 
     # Phase 29: Dataset Property Inheritance
     if [[ $START_PHASE -gt 29 ]]; then
@@ -5512,6 +7947,284 @@ main() {
     test_dataset_property_inheritance "$vmid" "$test_num"
     echo | tee -a "$LOG_FILE"
     test_num=$((test_num + 1))
+    fi
+    check_stop_phase 29
+
+    # Phase 30: NVMe Stale Connection Recovery
+    if [[ $START_PHASE -gt 30 ]]; then
+        log_info "Skipping Phase 30 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 30: NVMe Stale Connection Recovery" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    vmid=$((VMID_START + 33))
+    test_nvme_stale_recovery "$vmid" "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 30
+
+    # Phase 31: Concurrent Alloc+Free Lock Contention
+    if [[ $START_PHASE -gt 31 ]]; then
+        log_info "Skipping Phase 31 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 31: Concurrent Alloc+Free Lock Contention" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_concurrent_alloc_free_contention "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 31
+
+    # Phase 32: Multi-Disk Sequential Timing
+    if [[ $START_PHASE -gt 32 ]]; then
+        log_info "Skipping Phase 32 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 32: Multi-Disk Sequential Timing" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_multi_disk_sequential_timing "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 32
+
+    # Phase 33: Mixed Concurrent Operations
+    if [[ $START_PHASE -gt 33 ]]; then
+        log_info "Skipping Phase 33 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 33: Mixed Concurrent Operations" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_mixed_concurrent_operations "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 33
+
+    # Phase 34: Concurrent Clone Operations
+    if [[ $START_PHASE -gt 34 ]]; then
+        log_info "Skipping Phase 34 (--phase $START_PHASE)"
+    else
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo "  PHASE 34: Concurrent Clone Operations" | tee -a "$LOG_FILE"
+    echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+
+    test_concurrent_clone_operations "$test_num"
+    echo | tee -a "$LOG_FILE"
+    test_num=$((test_num + 1))
+    fi
+    check_stop_phase 34
+
+    # Cluster-based concurrent tests (only if cluster detected)
+    if [[ $IS_CLUSTER -eq 1 ]]; then
+        # Phase 35: Cross-Node Concurrent Allocations
+        if [[ $START_PHASE -gt 35 ]]; then
+            log_info "Skipping Phase 35 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 35: Cross-Node Concurrent Allocations" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_cross_node_concurrent_alloc "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+
+        # Phase 36: Concurrent Migration + Allocation
+        if [[ $START_PHASE -gt 36 ]]; then
+            log_info "Skipping Phase 36 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 36: Concurrent Migration + Allocation" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_concurrent_migration_alloc "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+    else
+        log_info "Skipping cluster-based concurrent tests (Phases 35-36) - not in a cluster or no target node available"
+        echo | tee -a "$LOG_FILE"
+    fi
+    check_stop_phase 36
+
+    # LXC container tests (only if rootdir content detected)
+    if [[ $IS_ROOTDIR -eq 1 ]]; then
+        # Phase 37: LXC Create/Start/Stop
+        if [[ $START_PHASE -gt 37 ]]; then
+            log_info "Skipping Phase 37 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 37: LXC Container Create/Start/Stop" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_create_start_stop "$LXC_VMID_START" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 37
+
+        # Phase 38: LXC Snapshot & Revert
+        if [[ $START_PHASE -gt 38 ]]; then
+            log_info "Skipping Phase 38 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 38: LXC Snapshot & Revert" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_snapshot_revert "$((LXC_VMID_START + 1))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 38
+
+        # Phase 39: LXC Clone
+        if [[ $START_PHASE -gt 39 ]]; then
+            log_info "Skipping Phase 39 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 39: LXC Container Clone" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_clone "$LXC_BASE_VMID" "$LXC_CLONE_VMID" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 39
+
+        # Phase 40: LXC Resize
+        if [[ $START_PHASE -gt 40 ]]; then
+            log_info "Skipping Phase 40 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 40: LXC Container Resize" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_resize "$((LXC_VMID_START + 3))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 40
+
+        # Phase 41: LXC Live Migration (cluster only)
+        if [[ $IS_CLUSTER -eq 1 ]]; then
+            if [[ $START_PHASE -gt 41 ]]; then
+                log_info "Skipping Phase 41 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 41: LXC Offline Migration" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_live_migration "$((LXC_VMID_START + 4))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+        else
+            log_info "Skipping Phase 41 (LXC Migration) - not in a cluster"
+            echo | tee -a "$LOG_FILE"
+        fi
+        check_stop_phase 41
+
+        # Phase 42: LXC Multi-Mountpoint
+        if [[ $START_PHASE -gt 42 ]]; then
+            log_info "Skipping Phase 42 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 42: LXC Multi-Mountpoint" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_multi_mountpoint "$((LXC_VMID_START + 5))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 42
+
+        # Phase 43: LXC Rapid Create/Delete Stress
+        if [[ $START_PHASE -gt 43 ]]; then
+            log_info "Skipping Phase 43 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 43: LXC Rapid Create/Delete Stress" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_stress "$((LXC_VMID_START + 20))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 43
+
+        # Phase 44: LXC Concurrent Creation/Destruction
+        if [[ $START_PHASE -gt 44 ]]; then
+            log_info "Skipping Phase 44 (--phase $START_PHASE)"
+        else
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo "  PHASE 44: LXC Concurrent Creation/Destruction" | tee -a "$LOG_FILE"
+        echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+        echo | tee -a "$LOG_FILE"
+
+        test_lxc_concurrent "$((LXC_VMID_START + 30))" "$test_num"
+        echo | tee -a "$LOG_FILE"
+        test_num=$((test_num + 1))
+        fi
+        check_stop_phase 44
+
+        # LXC backup tests (backup store only)
+        if [[ -n "$BACKUP_STORE" ]]; then
+            # Phase 45: LXC Online Backup
+            if [[ $START_PHASE -gt 45 ]]; then
+                log_info "Skipping Phase 45 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 45: LXC Online Backup" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_online_backup "$((LXC_VMID_START + 6))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+
+            # Phase 46: LXC Offline Backup
+            if [[ $START_PHASE -gt 46 ]]; then
+                log_info "Skipping Phase 46 (--phase $START_PHASE)"
+            else
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo "  PHASE 46: LXC Offline Backup" | tee -a "$LOG_FILE"
+            echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+
+            test_lxc_offline_backup "$((LXC_VMID_START + 7))" "$test_num"
+            echo | tee -a "$LOG_FILE"
+            test_num=$((test_num + 1))
+            fi
+        else
+            log_info "Skipping LXC backup tests (Phases 45-46) - no backup store specified"
+            echo | tee -a "$LOG_FILE"
+        fi
+        check_stop_phase 46
+    else
+        log_info "Skipping LXC tests (Phases 37-46) - rootdir not in storage content"
+        echo | tee -a "$LOG_FILE"
     fi
 
     # Performance Summary

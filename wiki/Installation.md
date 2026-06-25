@@ -98,11 +98,11 @@ After installation, the installer provides a full-featured management interface:
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║              TRUENAS PROXMOX VE PLUGIN                   ║
-║                  Installer v1.0.0                        ║
+║                  Installer v2.0.0                        ║
 ╚══════════════════════════════════════════════════════════╝
 
-Plugin Status: Installed (v1.0.6)
-Update Available: v1.0.7
+Plugin Status: Installed (v2.0.12)
+Update Available: v2.0.13
 
 Main Menu:
   1) Update plugin
@@ -140,7 +140,7 @@ Choose an option:
 
 **Diagnostics Menu**
 - Unified diagnostics menu for troubleshooting and maintenance
-- 12-point comprehensive health validation
+- 13-point comprehensive health validation
   - Transport-aware validation (iSCSI and NVMe/TCP)
   - Plugin file verification and syntax check
   - Storage configuration validation
@@ -227,11 +227,11 @@ Non-interactive mode will:
 wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
 
 # Installer will:
-# 1. Download and install plugin v1.0.7 (latest)
+# 1. Download and install plugin (latest)
 # 2. Prompt: "Would you like to configure storage now? (Y/n)"
 # 3. If yes: Launch configuration wizard
 # 4. Prompt: "Would you like to run a health check? (Y/n)"
-# 5. If yes: Run 11-point health validation
+# 5. If yes: Run 13-point health validation
 # 6. Display next steps and documentation links
 ```
 
@@ -241,8 +241,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 ./install.sh
 
 # Main menu will show:
-# "Plugin Status: Installed (v1.0.6)"
-# "Update Available: v1.0.7"
+# "Plugin Status: Installed (v2.0.12)"
+# "Update Available: v2.0.13"
 
 # Choose option 1: "Update plugin"
 # Sub-menu will present:
@@ -251,8 +251,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 #   0) Cancel
 
 # After selecting update target, installer will:
-# 1. Create backup of v1.0.6
-# 2. Download and install v1.0.7
+# 1. Create backup of v2.0.12
+# 2. Download and install v2.0.13
 # 3. Validate syntax
 # 4. Restart services
 # 5. Offer to run health check
@@ -426,9 +426,9 @@ Portal numbers (or press Enter to skip): 1 2
 
 # Displays available backups:
 Available Backups:
-  1) v1.0.7 - 2025-10-25 14:32:15 (2 hours ago) - 89.2 KB
-  2) v1.0.6 - 2025-10-24 09:15:42 (1 day ago) - 88.8 KB
-  3) v1.0.5 - 2025-10-20 11:22:03 (5 days ago) - 87.1 KB
+  1) v2.0.13 - 2026-03-31 14:32:15 (2 hours ago) - 89.2 KB
+  2) v2.0.12 - 2026-03-28 09:15:42 (3 days ago) - 88.8 KB
+  3) v2.0.11 - 2026-03-25 11:22:03 (6 days ago) - 87.1 KB
 
 Select backup to restore (1-3):
 ```
@@ -713,11 +713,11 @@ Add storage configuration to `/etc/pve/storage.cfg`:
 
 ```ini
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -754,15 +754,14 @@ Follow the single node installation steps above on your first cluster node.
 
 #### 2. Deploy to Cluster Nodes
 
-Use the included deployment script:
+Use the installer's cluster-wide deployment feature:
 
 ```bash
-# Make the script executable
-chmod +x update-cluster.sh
+# Run the installer on any cluster node
+./install.sh
 
-# Deploy to all nodes
-cd tools/
-./update-cluster.sh node1 node2 node3
+# Select "Install latest version (all cluster nodes)"
+# The installer will automatically discover and deploy to all nodes
 ```
 
 Or manually on each node:
@@ -780,15 +779,15 @@ The storage configuration in `/etc/pve/storage.cfg` is automatically shared acro
 
 ```ini
 truenasplugin: cluster-storage
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster
-    dataset tank/cluster/proxmox
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster
+    tn_dataset tank/cluster/proxmox
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
-    use_multipath 1
+    tn_use_multipath 1
 ```
 
 #### 4. Verify Cluster Installation
@@ -920,8 +919,8 @@ Navigate to **Shares** → **Block Shares (iSCSI)** → **Authorized Access**:
 ```ini
 truenasplugin: truenas-storage
     # ... other settings ...
-    chap_user your-chap-username
-    chap_password your-chap-password
+    tn_chap_user your-chap-username
+    tn_chap_password your-chap-password
 ```
 
 ### 7. Verify TrueNAS Configuration
@@ -1086,9 +1085,8 @@ systemctl restart pvedaemon pveproxy
 
 ### Cluster Update
 ```bash
-# Use the deployment script
-cd tools/
-./update-cluster.sh node1 node2 node3
+# Run the installer and select "Update plugin" → "Update all cluster nodes"
+./install.sh
 
 # Or manually on each node
 for node in node1 node2 node3; do

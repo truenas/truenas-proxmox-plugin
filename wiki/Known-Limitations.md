@@ -345,7 +345,7 @@ shared 1
 **Workaround**:
 ```ini
 # Use shared vmstate for environments requiring migration
-vmstate_storage shared
+tn_vmstate_storage shared
 
 # Or use local vmstate and delete snapshots before migration
 # Or use offline migration (stop VM, migrate, start)
@@ -369,11 +369,11 @@ vmstate_storage shared
 **User Mitigation**:
 ```ini
 # Increase retry tolerance
-api_retry_max 5
-api_retry_delay 2
+tn_api_retry_max 5
+tn_api_retry_delay 2
 
 # Enable bulk operations
-enable_bulk_operations 1
+tn_enable_bulk_operations 1
 ```
 
 **Manual Recovery**:
@@ -395,7 +395,7 @@ tail -f /var/log/middlewared.log | grep rate
 **Mitigation**:
 - Ensure reliable network path (avoid flaky links, check MTU consistency)
 - Use TLS (`api_scheme wss`) and valid certificates
-- Increase retry settings: `api_retry_max`, `api_retry_delay`
+- Increase retry settings: `tn_api_retry_max`, `tn_api_retry_delay`
 - Verify firewall allows TCP 443 from all Proxmox nodes
 
 ## Proxmox Specific Limitations
@@ -424,22 +424,22 @@ tail -f /var/log/middlewared.log | grep rate
 # Keep plugin source in safe location
 cp TrueNASPlugin.pm /root/truenas-plugin-backup/
 
-# Use cluster deployment script for easy reinstall
-./update-cluster.sh node1 node2 node3
+# Use installer for easy cluster-wide reinstall
+./install.sh  # Select "Install latest version (all cluster nodes)"
 ```
 
 ## Network Limitations
 
 ### No NFS/CIFS Support
 
-**Limitation**: Plugin only supports iSCSI block storage
+**Limitation**: Plugin only supports iSCSI and NVMe/TCP block storage
 
 **Not Supported**:
 - NFS file shares
 - SMB/CIFS file shares
 - Direct ZFS dataset mounting
 
-**Explanation**: Plugin architecture designed specifically for iSCSI
+**Explanation**: Plugin architecture designed specifically for block storage (iSCSI and NVMe/TCP)
 
 **Workaround**:
 ```bash
@@ -464,31 +464,34 @@ nfs: truenas-files
 
 **Required Settings**:
 ```ini
-prefer_ipv4 0
-ipv6_by_path 1
-use_by_path 1
+tn_prefer_ipv4 0
+tn_ipv6_by_path 1
+tn_use_by_path 1
 ```
 
 **Portal Format**:
 ```ini
 # Must use brackets for IPv6 addresses
-discovery_portal [2001:db8::100]:3260
-portals [2001:db8::101]:3260,[2001:db8::102]:3260
+tn_discovery_portal [2001:db8::100]:3260
+tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
 ```
 
 ## Security Limitations
 
-### No Mutual CHAP
+### No Mutual CHAP (iSCSI)
 
-**Limitation**: Only one-way CHAP authentication supported
+**Limitation**: Only one-way CHAP authentication supported for iSCSI transport
 
 **Explanation**:
-- Plugin supports CHAP authentication (initiator → target)
-- Mutual CHAP (target → initiator) not implemented
+- iSCSI transport supports CHAP authentication (initiator → target)
+- Mutual CHAP (target → initiator) not implemented for iSCSI
 
-**Impact**: Slightly reduced security in high-security environments
+**Note**: NVMe/TCP transport supports full bidirectional DH-HMAC-CHAP authentication (host + controller secrets). See [NVMe Setup Guide](NVMe-Setup.md#authentication) for details.
+
+**Impact**: Slightly reduced security in high-security iSCSI environments
 
 **Mitigation**:
+- Use NVMe/TCP transport for bidirectional authentication
 - Use network segmentation (VLANs)
 - Firewall rules restricting iSCSI access
 - Strong CHAP passwords

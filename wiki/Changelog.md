@@ -1,10 +1,377 @@
 # TrueNAS Plugin Changelog
 
-## Repository Migration Note (February 6, 2026)
+## Version 2.1.5 (June 16, 2026)
 
-- Official repository home moved to <https://github.com/truenas/truenas-proxmox-plugin>
-- Official issue tracker: <https://github.com/truenas/truenas-proxmox-plugin/issues>
-- Historical changelog references to prior issue URLs may remain for archival context
+### Bug Fixes
+
+- **Fix stale WebSocket connections not triggering reconnect**: WS framing errors (`WS read hdr failed`, `WS len16/64 read fail`, `WS payload read fail`) are now recognised as connection errors. They were previously not matched by `_is_connection_error`, so a stale persistent connection would fail permanently instead of being invalidated and reopened by the existing retry path. Under parallel load these appeared as intermittent "API is unreachable" failures even when TrueNAS was healthy.
+
+## Version 2.1.4 (June 15, 2026)
+
+### Maintenance
+
+- **Remove proactive `core.ping` health check from `_ws_get_persistent`**: The per-call liveness ping added one round-trip (~2.5ms) before every API call with no benefit on healthy connections. Dead connections are already detected and handled reactively in `_api_call`'s error path, which invalidates the cached connection and lets `_retry_with_backoff` reopen it.
+
+## Version 2.1.3 (June 13, 2026)
+
+### Bug Fixes
+
+- **Eliminate TrueNAS authentication rate-limit exhaustion under load**: Write operations and snapshot rollbacks now reuse the existing fork-safe persistent WebSocket connection instead of opening and authenticating a separate connection for every mutation. Dead cached connections are invalidated before retry, and the ineffective 100ms pre-connection delay has been removed. The allocation benchmark reduced `auth.login_with_api_key` sessions from 45 to 15 with no response corruption under concurrent load.
+- **Stop retrying rate-limit errors**: `Rate Limit Exceeded` responses are no longer classified as connection errors. They now fail immediately instead of entering exponential backoff and issuing more login attempts inside the 60-second lockout window.
+- **Report pre-flight target query failures accurately**: A failed `iscsi.target.query` no longer causes the misleading follow-up error that the target does not exist. Rate-limit failures receive a specific message, other query errors preserve their cause, and confirmed absence is reported only after a successful query.
+
+### Maintenance
+
+- Remove unused ephemeral WebSocket helpers, rename the mutation API wrapper, and collapse duplicated read/mutation API call paths.
+
+## Version 2.1.2 (June 6, 2026)
+
+### Features
+
+- **LXC vzdump snapshot mode support (GitHub issue #42)**: `activate_volume`, `path`, and `deactivate_volume` previously ignored `$snapname` and returned the live block device, so LXC `vzdump` snapshot-mode backups failed when mounting the snapshot read-only. The plugin now exposes a snapshot as its own idle device: when `$snapname` is set it creates an ephemeral clone zvol from `<zvol>@<snapname>` (deterministic name per source/snapshot pair) and exposes it as its own iSCSI LUN or NVMe-TCP namespace, returning that device. The clone is torn down — extent/LUN or namespace removed and the clone zvol destroyed — in `volume_snapshot_delete` (the LXC vzdump path does not call `deactivate_volume`) and also in `deactivate_volume` as a fallback for other flows. Works for both iSCSI and NVMe-TCP transports.
+
+### Bug Fixes
+
+- **Fix NVMe namespace lookup using the wrong query field**: `nvmet.namespace.query` results nest the subsystem under `subsys.id`, while `subsys_id` is only accepted as a create-time input. `_nvme_delete_namespace` filtered queries by `subsys_id`, so on some TrueNAS versions namespaces were never matched for deletion (which would also leave a snapshot clone's origin in place, blocking snapshot deletion). Namespace lookups now query by the unique `device_path` alone, and the active-namespace counter in `_free_image_nvme` now filters by `subsys.id`.
+- **Filter ephemeral vzdump clones from `list_images`**: Snapshot clone zvols are named `vzdump-*` and are not Proxmox-managed volumes. `_list_images_iscsi` and `_list_images_nvme` now skip them so they do not appear as phantom `vmid 0` volumes during a backup.
+- **Fix NVMe/TCP connect failure when CPUs are offlined (issue #48)**: When CPU threads are taken offline via `/sys/devices/system/cpu/cpuN/online`, the kernel NVMe-TCP driver maps I/O queues to CPUs by index. If any CPU in the possible range is offline, connecting with more queues than `floor(possible_cpus / 2)` causes `errno: -18 (EXDEV)` because at least one queue is assigned to an offline CPU with no online fallback. `_nvme_connect` now always passes `--nr-io-queues`: the online CPU count when all CPUs are online (matching the prior kernel default), or `floor(possible / 2)` when any CPU is offline (guarantees each queue has ≥2 possible CPUs in its affinity set). New optional `tn_nr_io_queues` storage.cfg key (1–256) allows manual override for environments with TrueNAS-side queue limits.
+
+---
+
+## Version 2.1.1 (May 29, 2026)
+
+- **Bump storage API version to 14 (GitHub issue #41)**: Updated `$TESTED_APIVER` from 13 to 14 to match `libpve-storage-perl` 9.1.3+ (Proxmox VE 9.2+), eliminating the "implementing an older storage API" warning logged at every plugin load. The APIVER 14 bump in PVE was backward compatible (added optional `get_identity()` method); no new plugin methods are required.
+
+---
+
+## Version 2.1.0 (May 7, 2026)
+
+### Breaking Change
+
+- **Rename all storage.cfg keys to tn_* prefix**: All plugin-defined option keys now carry a `tn_` prefix (e.g. `api_host` → `tn_api_host`, `dataset` → `tn_dataset`) to prevent namespace collisions with other PVE storage plugins. The `debian/postinst` migration script automatically renames keys in existing `truenasplugin:` stanzas on upgrade (with backup), or prompts for manual migration. Only `truenasplugin:` stanzas are touched — no other storage type is affected.
+
+---
+
+## Version 2.0.30 (April 18, 2026)
+
+### Performance
+
+- **Reduce idempotent status latency with bounded status caching (GitHub issue #30, phase 3)**: Added storage-scoped status capacity cache keys (`status-capacity:v1:<storeid>:<endpoint>:<dataset>`) with a short 10s TTL and status-only retry override (`retry_max => 0`) for `pool.dataset.get_instance` reads in `status()`. Failures now invalidate the status cache key immediately while preserving inactive + zeroed return semantics.
+- **Conservative preflight skip-throttle tuning**: Replaced the hardcoded 30s `_ensure_target_visible(... skip_discovery_probe => 1)` window with `TARGET_VISIBLE_SKIP_TTL_S = 60`, scoped by host + target identity to avoid cross-storage bleed during status polling.
+- **Mutation freshness hardening**: Ensured status-capacity cache invalidation runs only after successful create/update/delete/clone dataset mutations across helper and direct call paths, avoiding stale status after writes without invalidating on failed mutations.
+
+## Version 2.0.29 (April 17, 2026)
+
+### Performance
+
+- **Reduce `activate_storage` API round-trips (GitHub issue #30, phase 2)**: Added a 30s time-based throttle to `_ensure_target_visible` — repeated status queries within 30s of a successful preflight skip all TrueNAS API calls entirely. Cached `iscsi.target.query` results (previously the only uncached iSCSI query). Moved extent cache invalidation from unconditional (every call) to mutation-only paths (zvol/extent creation), eliminating a forced re-fetch on the happy path.
+
+## Version 2.0.28 (April 16, 2026)
+
+### Bug Fixes
+
+- **Fix storage status/summary load latency (GitHub issue #30)**: `activate_storage` now skips the expensive `iscsiadm` discovery probe in `_ensure_target_visible` by passing `skip_discovery_probe => 1`. The weight zvol, extent, and target mapping are still ensured — only the post-verification `sleep 2` + discovery roundtrip is skipped on the status path. The deferred self-healing caller in `free_image` retains full verification for correctness.
+
+---
+
+## Version 2.0.27 (April 13, 2026)
+
+### Bug Fixes
+
+- **Fix host-scoped cache key mismatches introduced during issue #27 follow-up hardening**: `_preflight_check_alloc`, `_resolve_target_id`, and `_nvme_sync_portals` now consistently use `_cache_host_key($scfg)` so per-host cache entries are invalidated correctly even when `api_host` is unset.
+- **Fix over-broad portal sync cache invalidation**: `_clear_cache($storage_id)` now clears `%_portal_sync_last_ok` only for the targeted host key instead of wiping all hosts, preventing unnecessary NVMe portal re-syncs across unrelated storages.
+- **Refactor duplicated FK stale-extent recovery path**: extracted `_handle_fk_stale_extent` helper and replaced duplicate in-branch blocks in `_ensure_target_visible` with shared logic.
+- **Fix VM migration size mismatch from zvol byte-rounding behavior (issue #25)**: `alloc_image` now preserves requested size exactly and steps `volblocksize` down by powers of two (to a 512-byte floor) when needed, instead of rounding zvol size up. This avoids QEMU drive-mirror size mismatches during migration.
+
+---
+
+## Version 2.0.26 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix duplicate weight zvol creation when upgrading from pre-v2.0.20 (GitHub issue #27 follow-up)**: When upgrading from a pre-v2.0.20 plugin that used legacy weight zvol names (e.g., `pve-weight-target-name`) to v2.0.20+ with hash-based names (e.g., `pve-weight-target-name-a3f7c2d1`), the plugin would create a new hash-named zvol even though the legacy zvol already existed. This caused: (1) duplicate 1GB zvols on TrueNAS, (2) orphaned legacy zvols that were never cleaned up, and (3) the legacy extent being deleted and recreated pointing to the new zvol. Step 2 of `_ensure_target_visible` now also checks for the legacy-named zvol; if found, it continues using it rather than creating a duplicate.
+
+---
+
+## Version 2.0.25 (April 12, 2026)
+
+### Code Quality
+
+- **Extract `_cache_host_key` helper**: Consolidated 19 occurrences of `$scfg->{api_host} || $scfg->{storeid} || 'unknown'` into a single helper function for consistency and maintainability.
+- **Extract `_invalidate_cache_key` helper**: Targeted cache invalidation now uses a helper instead of direct `%API_CACHE` manipulation.
+- **Fix `_api_call` vs `_api_call_write` inconsistency**: Extent creation in `_alloc_image_iscsi` and `_clone_image_iscsi` now uses `_api_call_write` (ephemeral connection) consistent with other write operations.
+- **Rename `$stale_delete_ok` to `$stale_cleared`**: Improved variable naming clarity in `_ensure_target_visible`.
+
+---
+
+## Version 2.0.24 (April 12, 2026)
+
+### Bug Fixes
+
+- **Fix FK/IntegrityError causing unnecessary 3 retries (7+ seconds) before failing (GitHub issue #27)**: The `_is_retryable_error` function's `/connection.*failed/i` pattern matched FK constraint errors because the JSON-encoded Python traceback contains file paths like `datastore/connection.py` and later "constraint **failed**". Since `encode_json` produces one long string (newlines become `\n` literals), the `.` bridged across everything. FK/IntegrityError patterns are now checked first before connection patterns, eliminating wasted retry cycles.
+- **Fix weight extent FK constraint failure only clearing cache instead of fixing TrueNAS state (GitHub issue #27)**: When `iscsi.extent.query` returned an extent ID that didn't exist in SQLite (TrueNAS configfs/DB desync), the pre-flight's FK handler only cleared the plugin's cache. On the next cycle, the same stale extent ID would be returned and fail again. The FK handler now attempts to delete the stale extent from TrueNAS to force a resync; the next cycle will recreate it cleanly.
+
+---
+
+## Version 2.0.23 (April 11, 2026)
+
+### Bug Fixes
+
+- **Fix extent delete in `_alloc_image_iscsi` and `_clone_image_iscsi` cleanup paths using read-path WebSocket connection**: The `eval { _api_call(..., 'iscsi.extent.delete', ...) }` cleanup calls on targetextent mapping failure used `_api_call` (persistent read-path connection) instead of `_api_call_write` (ephemeral write-path connection). On a persistent-connection setup this could fail silently, leaving an orphaned extent on TrueNAS. Both cleanup paths now use `_api_call_write`, consistent with `_tn_extent_delete`.
+- **Fix clone retry loop exhausting budget on cached "dataset already exists" collision**: `_clone_image_iscsi` and `_clone_image_nvme` retry loops called `_find_free_disk_name` without first clearing the 60s TTL dataset cache. If the cache was still warm, the same name could be returned on successive attempts, burning all retry attempts against the same collision. The cache is now invalidated before each `_find_free_disk_name` call in the retry branch.
+
+---
+
+## Version 2.0.22 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix orphaned zvol/extent when `_alloc_image_iscsi` fails mid-allocation (C1)**: `iscsi.extent.create` and `iscsi.targetextent.create` were bare unguarded calls — any API throw (network drop, retry exhaustion) left the zvol and/or extent on TrueNAS with no Proxmox record. Both calls are now wrapped in `eval` with cascading cleanup on failure (delete extent → delete zvol). The bare `_api_call` for targetextent has been replaced with `_tn_targetextent_create`, which handles idempotency and "Extent is already in use" recovery for concurrent-node races.
+- **Fix silent zvol leak when dataset deletion fails in `free_image` (C2)**: The `eval { _delete_dataset_with_retry }` block was followed by a `warn` on any error, causing `free_image` to return success to Proxmox even when the zvol was still present on TrueNAS. Non-"not found" errors now `die` so Proxmox surfaces the failure. Applies to both iSCSI and NVMe paths.
+- **Fix concurrent weight zvol create causing hard `die` in `_ensure_target_visible` step 2 (M1)**: On cluster startup, two nodes race to create the weight zvol. The loser hit an unconditional `die`, skipping extent creation and mapping for that node. "Dataset already exists" errors are now treated as success (the zvol is present — desired state achieved).
+- **Fix `_clone_image_iscsi` using bare `_api_call` for targetextent create (M2)**: Added `_clear_cache` after extent create so the targetextents lookup uses fresh data; replaced bare `_api_call` for targetextent create with `_tn_targetextent_create` for proper "already in use" recovery.
+- **Fix concurrent stale-mapping delete causing `$stale_delete_ok=0` (M3)**: When two nodes raced to delete the same stale wrong-target weight mapping (post cache-collision bug upgrade), the second node got a "not found" error which set `$stale_delete_ok = 0`, preventing the correct mapping from being created. "Not found" class errors from the stale delete are now treated as success (the mapping is gone — desired state).
+- **Fix weight extent pointing to dead zvol path after cross-dataset zvol re-create (L1)**: Two storages sharing the same IQN but different datasets could leave the weight extent pointing to a deleted zvol from one storage's dataset while the other storage created an orphan zvol at its own dataset path. Step 4 now checks the extent's disk path against the current storage's expected path when the zvol was just created, and deletes stale extents for re-creation.
+- **Fix orphaned zvol when `_alloc_image_nvme` namespace create fails (L2)**: `nvmet.namespace.create` was an unguarded call — any throw left the zvol orphaned. Now wrapped in `eval` with zvol cleanup on failure.
+- **Fix missing retry loop for "dataset already exists" in `clone_image` (L3)**: `_clone_image_iscsi` and `_clone_image_nvme` called `_find_free_disk_name` then immediately attempted the clone with no retry, unlike `alloc_image` which has a 5-attempt retry loop. Concurrent template deployments could fail permanently on the TOCTOU race. Both functions now retry up to 5 times with a fresh name on "dataset already exists".
+- **Fix `_resolve_target_id` using process-lifetime cache with no TTL (L4)**: The `%_target_id_cache` hash had no TTL — if a TrueNAS target was deleted and recreated with a new integer ID, all subsequent writes would use the stale ID and fail with FOREIGN KEY errors until the process restarted. Target ID lookups are now backed by `_get_cached`/`_set_cache` (60s TTL), consistent with all other API caches, and `_clear_cache` invalidates them automatically.
+- **Fix global iSCSI session rescan in `volume_snapshot_rollback` (L5)**: `iscsiadm -m session -R` rescanned all iSCSI sessions on the node, potentially disrupting I/O on unrelated volumes during a snapshot rollback. Now uses `iscsiadm -m node -T <iqn> -R` to rescan only the target IQN associated with the storage being rolled back.
+
+---
+
+## Version 2.0.21 (April 10, 2026)
+
+### Bug Fixes
+
+- **Fix FOREIGN KEY constraint failure when weight extent is deleted between cache population and mapping (GitHub issue #27 follow-up)**: `_ensure_target_visible` used a 60-second cached extent list in step 5 to look up the weight extent's numeric ID. If the weight extent was deleted from TrueNAS after step 4's (possibly cached) lookup — e.g., by a manual cleanup, a test cycle, or a TrueNAS service restart — step 5 would resolve a stale ID and `iscsi.targetextent.create` would fail with `sqlite3.IntegrityError: FOREIGN KEY constraint failed`. The extents cache is now force-invalidated before the step 5 ID lookup so we always resolve the current TrueNAS state. As defense in depth, FOREIGN KEY errors in the mapping path are also detected explicitly, the cache is cleared, and a recovery log message is emitted instead of a generic warning.
+
+---
+
+## Version 2.0.20 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent name collision across distinct iSCSI targets (GitHub issue #27 follow-up)**: The weight extent name was derived only from the sanitized IQN suffix (e.g., `iqn...ctl:target-foo-bar` → `pve-weight-target-foo-bar`). Two targets whose suffixes differ only in punctuation would produce the same name and, with the v2.0.19 name-only lookup, silently share a weight extent. The name now includes an 8-character SHA1 prefix of the full IQN (e.g., `pve-weight-target-foo-bar-a3f7c2d1`), making it cryptographically unique per target. Existing clusters with legacy-named weight extents continue to work via a fallback lookup that accepts the old format.
+
+---
+
+## Version 2.0.19 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix weight extent lookup failing when multiple storages share the same iSCSI target (GitHub issue #27 follow-up)**: `_ensure_target_visible` matched the weight extent by both name **and** disk path. When two storages use the same target IQN (e.g., `conexum-infrastructure`) but different datasets, the second storage could not find the weight extent created by the first (different disk path), attempted to create a duplicate, and hit TrueNAS's "Extent name must be unique" validation error. Weight extents are now matched by name only since they belong to the iSCSI target, not the dataset. The "Extent name must be unique" error during create is also handled gracefully as idempotent success.
+
+---
+
+## Version 2.0.18 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix `Extent is already in use` pre-flight failure in multi-node clusters (GitHub issue #27 follow-up)**: `_tn_targetextent_create` now handles the case where the weight extent is already correctly mapped but the in-memory cache was stale (e.g., another cluster node created the mapping after the local cache was last populated). When `Extent is already in use` is returned, the cache is force-refreshed and if the extent is found correctly mapped to the requested target, it returns the existing mapping as idempotent success instead of propagating an error
+
+---
+
+## Version 2.0.17 (April 8, 2026)
+
+### Bug Fixes
+
+- **Fix stale weight extent mapping left by cache-collision bug (GitHub issue #27 follow-up)**: After upgrading from the v2.0.16 cache-collision fix, users with a corrupted TrueNAS state (weight extent mapped to the wrong target by the old plugin) would hit `Extent is already in use` errors on every pre-flight. `_ensure_target_visible` now detects a weight extent mapped to any target other than the expected one, removes the stale mapping, and creates the correct one
+
+---
+
+## Version 2.0.16 (April 7, 2026)
+
+### Bug Fixes
+
+- **Fix extent/targetextent cache key collision across multiple TrueNAS hosts**: `_tn_extents` and `_tn_targetextents` now key the API result cache by `api_host` instead of `storeid`. Previously, two storage configurations pointing to different TrueNAS hosts but using the same `storeid` would share a single cache slot, causing one host's extents to be returned for the other
+
+- **Fix weight extent name-only lookup in `_ensure_target_visible`**: Both loops that check for and retrieve the weight extent ID now additionally match on the zvol disk path (`disk` field = `zvol/<dataset>/<weight_name>`). Previously, a same-named extent on a different dataset (e.g., from another storage sharing the same TrueNAS host) could be mistakenly matched, causing the wrong extent to be mapped to the target
+
+- **Fix target ID cache collision across multiple TrueNAS hosts in `_resolve_target_id`**: The in-process `%_target_id_cache` is now keyed by `"$api_host:$iqn"` instead of `$iqn` alone. Previously, identical IQNs configured against different TrueNAS hosts would share the same cache slot, returning a stale target ID from the wrong host. `_clear_cache` now removes only entries matching the given api_host prefix rather than wiping the entire hash
+
+- **Fix `$_preflight_last_ok` shared across all storages**: Converted the global scalar `$_preflight_last_ok` to a per-host hash `%_preflight_last_ok` keyed by `api_host`. Previously, a successful preflight on any one storage would suppress preflight checks on all other storages for 30 seconds, potentially masking service-down or misconfiguration on a different TrueNAS host. `_clear_cache` now deletes only the entry for the affected host
+
+---
+
+## Version 2.0.15 (April 3, 2026)
+
+### Bug Fixes
+
+- **Fix iSCSI extent deletion failing in cluster environments during disk moves (GitHub issue #24)**: Always pass `force=true` to `iscsi.targetextent.delete` and `iscsi.extent.delete` in `_free_image_iscsi`. Previously, the force flag was gated on local SCSI device teardown (`$scsi_teardown_done`), which stayed false when Proxmox had already deactivated the device before calling `free_image` (e.g., during disk moves). In cluster environments, other nodes maintain active iSCSI sessions to the shared target for their own VMs, causing TrueNAS to refuse deletion with "Associated target is in use". The force flag safely bypasses this check — TrueNAS logs a warning and proceeds, affecting only the specific LUN mapping being removed
+
+---
+
+## Version 2.0.14 (April 2, 2026)
+
+### Bug Fixes
+
+- **Fix disk move with multipath — orphaned iSCSI extents on TrueNAS (GitHub issue #15)**: When moving a stopped VM's disk between storages with `use_multipath=1`, the plugin now tears down the source LUN's SCSI block device before calling TrueNAS delete APIs, and passes `force=true` to `iscsi.targetextent.delete` and `iscsi.extent.delete` once the kernel confirms no active I/O against that LUN. Previously, persistent iSCSI sessions caused TrueNAS to refuse deletion ("target is in use"), leaving orphaned extent/targetextent records and zombie `##,##` multipath devices after every move
+
+- **Fix multipath flush destroying destination device mid-copy (GitHub issue #15)**: The multipath map flush in `_free_image_iscsi` now derives the WWID directly from the TrueNAS extent NAA record (already fetched for deletion) rather than calling `path()` + `scsi_id` on the device path. `scsi_id` does not work reliably on DM devices (`/dev/mapper/mpathX`) and was silently returning empty, leaving zombie `##,##` DM entries after every disk move. The new approach also prevents flushing the wrong (destination) device during a concurrent disk move
+
+- **Fix race window between `multipath -r` and device access in `activate_volume` (GitHub issue #15)**: Added `udevadm settle` + 250ms grace period after `multipath -r` in `activate_volume` to allow multipathd to complete its DM table reload before `_device_for_lun` accesses the device. Without this, the device could appear ready in `/dev/disk/by-path` while multipathd still held it exclusively, causing intermittent EBUSY on the first I/O
+
+- **Fix force-logout retry incorrectly skipped during disk moves (GitHub issue #15)**: When `force_delete_on_inuse=1` is configured and a disk move has already allocated the destination LUN (making `active_luns >= 2`), the retry branch no longer resets `$need_force_logout` to 0. The retry now fires without a full target logout, relying on the prior SCSI teardown having released the specific LUN's kernel reference
+
+---
+
+## Version 2.0.13 (March 31, 2026)
+
+### Bug Fixes
+
+- **Skip disruptive iSCSI rescan during allocation when sessions already active**: When iSCSI sessions are already established, `alloc_image` now skips the system-wide session rescan and multipath reload. These operations affect all active iSCSI devices and can cause I/O errors on unrelated disks during concurrent operations (GitHub issue #15)
+
+- **Invalidate targetextent cache in free_image**: The cache is now explicitly cleared before querying active LUNs during disk free operations, ensuring accurate counts when a destination LUN was created during a disk move (GitHub issue #15)
+
+---
+
+## Version 2.0.12 (March 27, 2026)
+
+### Bug Fixes
+
+- **Sync NVMe portals when subsystem already exists**: When `portals` are added to an existing NVMe/TCP storage configuration, the plugin now creates missing port bindings on TrueNAS during subsystem activation. Previously, portals added after initial storage setup were never registered on the TrueNAS side, causing `nvme connect` to silently fail for new paths and preventing multipath from activating (GitHub issue #20)
+
+### Performance
+
+- **Cache NVMe portal sync results**: Portal sync now caches its result per-storage for 60 seconds, avoiding a redundant `port_subsys.query` API call on every disk allocation when portals are already correctly bound
+
+---
+
+## Version 2.0.11 (March 25, 2026)
+
+### Bug Fixes
+
+- **Force NVMe subsystem configfs sync after namespace creation**: After creating an NVMe namespace, the plugin now calls `nvmet.subsys.update` to force TrueNAS to reapply the subsystem configuration to the kernel configfs. This works around a TrueNAS middleware bug (NAS-140266) where namespace creation succeeds at the API level but the namespace is not published to `/sys/kernel/config/nvmet/`, causing device discovery to fail and VMs to error with "stopped: unexpected status". Applied to all three namespace creation paths: `_alloc_image_nvme` (deferred), `_clone_image_nvme` (deferred), and `_nvme_create_namespace` (inline). The reapply is non-fatal — failure is logged as a warning but does not block the operation (ref: GitHub issues #7, #12)
+
+---
+
+## Version 2.0.10 (March 21, 2026)
+
+### NVMe Improvements
+
+- **Add ns-rescan to NVMe alloc deferred path**: `_alloc_image_nvme` now calls `_nvme_rescan_subsystem_controllers()` after connect and before device discovery, matching the existing clone path behavior. This explicitly asks the kernel to re-enumerate namespaces rather than relying solely on TrueNAS AEN (Asynchronous Event Notification). Improves namespace discovery reliability in environments where AEN may not fire, reducing discovery latency by ~1.5s in affected setups (ref: GitHub issue #12)
+
+---
+
+## Version 2.0.9 (March 20, 2026)
+
+### Bug Fixes
+
+- **Fix stale NVMe subsystem entry preventing connection**: `_nvme_is_connected()` now verifies a live TCP controller exists, not just the NQN string in `nvme list-subsys` output. A stale kernel subsystem entry (NQN present but no active TCP transport) previously caused `_nvme_connect()` to skip connection, leaving VMs unable to start with no visible block devices
+- **Handle "already connected" during NVMe reconnect**: When NVMe controllers are in connecting/resetting state (e.g., after NVMe-oF service restart), `nvme connect` returns "already connected". This is now treated as success instead of failure, allowing the plugin to proceed with device discovery
+- **Include stderr in NVMe connect failure logs**: Connection failure log messages now include the raw stderr output from `nvme connect` for easier production debugging
+
+## Version 2.0.8 (March 20, 2026)
+
+### Concurrency Improvements
+
+#### Deferred I/O after CFS lock release
+- **`cluster_lock_storage` now runs local I/O after lock release**: Storage operations (alloc, clone, free) previously held the Proxmox Cluster File System (CFS) lock while performing local I/O — iSCSI session login, SCSI rescan, device discovery polling, and `udevadm settle`. These operations now execute *after* the lock is released via a new `_defer_after_lock()` mechanism, allowing other nodes and processes to acquire the lock sooner. `activate_volume` still handles device discovery as a safety net if the deferred work doesn't complete in time
+- **Re-entrancy safe**: Deferred work queues are localized per lock invocation, so nested `cluster_lock_storage` calls (e.g., from bulk provisioning) each get their own independent queue
+
+#### Batch disk name finding
+- **Single-query disk name resolution**: `_find_free_disk_name()` replaces the previous loop that called `_tn_dataset_get()` per candidate name (vm-VMID-disk-0, disk-1, ...) with a single `pool.dataset.query` call using a regex filter, then checks candidates against the result set in memory. For VMs with existing disks, this eliminates N sequential API round-trips
+
+#### Target ID caching
+- **`_resolve_target_id` results cached per-process**: The iSCSI target ID lookup (which queries `iscsi.target.query`) is now cached in `%_target_id_cache`, avoiding redundant API calls when the same target is resolved multiple times within a single operation (e.g., preflight check + allocation both need the target ID). Cache is cleared alongside the main API cache via `_clear_cache()`
+
+#### LUN extraction from create response
+- **LUN ID extracted directly from `iscsi.targetextent.create` response**: Previously, after creating a target-extent mapping, the plugin re-fetched the full target-extent list to find the LUN ID. The create response already contains the assigned LUN, so it is now extracted directly, saving one API round-trip per allocation
+
+#### Preflight check caching
+- **30-second preflight cache**: `_preflight_check_alloc()` results are cached for 30 seconds. When creating multiple disks for the same VM in rapid succession (e.g., a 4-disk VM), only the first allocation runs the full 7-step preflight validation; subsequent allocations within the window skip it entirely
+
+### Concurrency Test Results
+
+Tested on Proxmox 3-node cluster with TrueNAS SCALE 25.10.0. Parallelism ratio = wall time / sequential sum (lower = more parallel, 50% = fully parallel, 100% = fully serial).
+
+| Test | iSCSI | NVMe/TCP |
+|------|:-----:|:--------:|
+| **Alloc + Free simultaneously** | **53%** parallelism (11.8s wall vs 22.1s sequential) | **60%** (8.5s vs 14.1s) |
+| **Alloc + Clone + Free simultaneously** | **46%** (23.5s vs 50.3s) | **53%** (27.3s vs 51.2s) |
+| **Two concurrent clones** | **65%** serialization (28.3s wall vs 2x21.7s baseline) | **73%** (17.0s vs 2x11.6s) |
+| **Cross-node concurrent alloc** | **70%** serialization (11.5s vs 2x8.1s) | **88%** (9.9s vs 2x5.6s) |
+| **Migration + alloc simultaneously** | **77%** parallelism (8.8s vs 11.3s sequential) | **66%** (5.5s vs 8.2s) |
+
+---
+
+## Version 2.0.7 (March 20, 2026)
+
+### Bug Fixes
+
+#### NVMe write operations use ephemeral WebSocket connections
+- **Subsystem, port, and namespace creation now use ephemeral connections**: `_nvme_ensure_subsystem()` and `_nvme_create_namespace()` previously used persistent WebSocket connections for write operations (`nvmet.subsys.create`, `nvmet.port.create`, `nvmet.namespace.create`), risking response desynchronization under concurrent operations. These now use `_api_call_write()` (ephemeral connections) matching the clone path which already used the correct pattern
+
+#### Controller-specific NVMe disconnect
+- **Targeted controller disconnect**: `_nvme_disconnect()` now disconnects individual controllers by device path (`nvme disconnect -d /dev/nvmeX`) instead of disconnecting all controllers for the entire subsystem NQN. This prevents recovery logic in `_nvme_device_for_uuid()` from disrupting other storages or multipath connections sharing the same subsystem. Falls back to NQN-wide disconnect if controller-specific disconnect is unavailable
+
+---
+
+## Version 2.0.6 (March 12, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale device NSID false-positive matching**
+- **NGUID cross-validation on NSID matches**: When the NGUID tier fails to match any device, the NSID tier now cross-validates candidates against the API-provided NGUID. If a device has a real (non-zero) NGUID that contradicts the API, it is rejected as stale rather than returned as an exact match. This prevents the plugin from selecting a wrong device when a stale subsystem connection has a device with a coincidentally matching NSID but a different NGUID
+- **Early stale NGUID reconnect (i=10)**: A new early detection trigger at iteration 10 (~1 second) fires when NGUID contradiction is detected, reducing stale connection recovery time from ~3.5 seconds to ~1.5 seconds. Uses the same safety gates as the existing i=35 trigger (fuser check, `allow_reconnect` flag)
+
+#### **NVMe namespace selector refactor**
+- **Structured selector results**: `_nvme_find_device_by_subsystem` now returns structured `_nvme_selector_result` objects with explicit outcome classification (`exact_match`, `legacy_single_namespace_fallback`, `publication_mismatch`, `metadata_failure`), linux/API namespace counts, and mismatch reason codes for better diagnostics
+- **Tighter legacy single-device fallback**: The single-device fallback now requires both `linux_device_count == 1` AND `api_namespace_count == 1`, and is blocked entirely when NGUID or NSID metadata was usable but failed to match, preventing wrong-device selection when metadata proves the device is stale
+- **Separated metadata queries**: Namespace metadata is now fetched through `_nvme_get_namespace_selector_metadata` which cross-references both the target UUID and the subsystem namespace count, enabling publication mismatch detection
+
+#### **NVMe error message improvements**
+- **Structured failure diagnostics**: When device discovery fails, the error message now includes linux-visible device count, API namespace count, selector mismatch reason, and a human-readable explanation instead of generic failure messages
+- **Detailed selector failure labels**: Mismatch reasons like `api_namespace_not_visible_in_linux`, `namespace_metadata_did_not_match_visible_devices`, and `subsystem_not_visible` provide actionable context for troubleshooting
+
+#### **WebSocket response desynchronization fix**
+- **JSON-RPC request ID matching in `_ws_rpc`**: The WebSocket RPC function now matches response frames to requests by JSON-RPC `id` field. Previously, unsolicited TrueNAS messages (event notifications) could desynchronize the send/receive pairing, causing a `core.ping` "pong" response to be returned as the result of a subsequent API call (e.g., `pool.dataset.get_instance`), leading to `Can't use string ("pong") as a HASH ref` crashes in `status()`. Non-matching frames are now logged and skipped (up to 10)
+
+### 🔒 **Security**
+
+#### **NVMe CLI input untainting**
+- **Untaint all values passed to NVMe CLI commands**: Portal hosts, ports, NQNs, and DH-HMAC-CHAP secrets are now validated and untainted through dedicated helpers (`_nvme_untaint_cli_host`, `_nvme_untaint_cli_port`, `_nvme_untaint_cli_nqn`, `_nvme_untaint_cli_secret`) before being passed to `nvme connect`/`nvme disconnect` commands, preventing potential command injection from storage.cfg values
+
+---
+
+## Version 2.0.5 (March 10, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale NGUID recovery**
+- **Auto-reconnect on stale NGUID data**: When the TrueNAS NVMe-oF service is restarted while Proxmox has an active connection, the kernel's cached NGUID values become stale, causing UUID-based device matching to fail. The plugin now detects this condition (devices exist but NGUID never matches across 35 iterations) and automatically disconnects/reconnects the subsystem to refresh kernel metadata. This complements the existing zero-device recovery (i=25) with a new stale-data recovery path (i=35)
+- **Safety-gated reconnect with fuser check**: The stale NGUID reconnect only triggers when `allow_reconnect` is set (via `activate_volume`) AND `fuser` confirms no running process has any subsystem device open, preventing disruption to running VMs
+
+#### **NVMe clone reliability**
+- **Pre-settle and rescan after namespace creation**: `_clone_image_nvme` now performs a 200ms settle, udev settle, and controller rescan before entering the device discovery loop, improving reliability for freshly created namespaces
+- **Enhanced clone failure diagnostics**: When a cloned namespace device fails to appear, the plugin now logs subsystem state (`nvme list-subsys`) and checks whether the namespace exists in the TrueNAS API, providing actionable diagnostics instead of a generic failure message
+
+#### **NVMe namespace clone uses ephemeral connection**
+- **Fixed `_clone_image_nvme` write operation**: Namespace creation (`nvmet.namespace.create`) now routes through `_api_call_write` (ephemeral WebSocket connection) instead of `_api_call` (persistent connection), preventing response interleaving during concurrent clone operations
+
+#### **NVMe free_image device path fix**
+- **Fixed incorrect hash key in `_free_image_nvme`**: Device path extraction after `_nvme_find_device_by_subsystem` now uses the correct `device` key instead of non-existent `path` key
+
+### 🔧 **Internal Improvements**
+- **Extracted `_nvme_rescan_subsystem_controllers` helper**: Controller rescan logic extracted from inline code in `_nvme_device_for_uuid` into a reusable function, used by both device discovery (i=15) and clone settle paths
+- **New `_nvme_get_subsystem_device_paths` helper**: Collects all `/dev/nvmeXnY` block device paths belonging to the configured subsystem NQN via `/sys/block` enumeration
+- **New `_nvme_check_devices_in_use` helper**: Uses `fuser` to verify whether any subsystem devices are held open by running processes, providing safety gating for reconnect operations
+- **Match tier tracking**: `_nvme_find_device_by_subsystem` now returns a `match_tier` field (`nguid`, `nsid`, or `single`) enabling callers to detect stale NGUID conditions
+- **`_nvme_device_for_uuid` accepts `allow_reconnect` option**: New keyword argument gates the stale NGUID reconnect path; passed by `activate_volume` and `_nvme_create_namespace` but not by `path()`, ensuring read-only lookups never trigger reconnects
+
+## Version 2.0.4 (March 2, 2026)
+
+### 🐛 **Bug Fixes**
+
+#### **NVMe stale connection recovery**
+- **Auto-reconnect on stale NVMe subsystem**: When the TrueNAS NVMe-oF target stops publishing namespaces over an existing connection (subsystem shows connected but zero block devices appear), the plugin now automatically disconnects and reconnects the subsystem to force re-enumeration. This resolves "Could not locate NVMe device" errors on VM start without manual intervention ([#10](https://github.com/truenas/truenas-proxmox-plugin/issues/10))
+- **Safety-guarded reconnect**: Reconnect only triggers when zero block devices have been seen across all discovery iterations AND the subsystem reports as connected, ensuring running VMs are never disrupted
+
+#### **Syslog priority fix**
+- **Fixed invalid syslog `error` priority**: The `_log()` helper now normalizes `'error'` to `'err'` (valid syslog level), preventing silent failures in error logging paths that could mask device matching diagnostics
+
+### 🔧 **Internal Improvements**
+- **Enhanced device discovery return values**: `_nvme_find_device_by_subsystem` now returns device count alongside the matched device path, enabling callers to distinguish between "zero devices" (stale connection) and "devices exist but no UUID match" (different issue)
 
 ## Version 2.0.3 (February 8, 2026)
 

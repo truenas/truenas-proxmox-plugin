@@ -1,12 +1,13 @@
 <h1 align="center">TrueNAS Proxmox VE Storage Plugin</h1>
 
-<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, ZFS integration, and cluster compatibility.</p>
+<p align="center">A high-performance storage plugin for Proxmox VE that integrates TrueNAS SCALE via iSCSI or NVMe/TCP, featuring live snapshots, LXC container storage, ZFS integration, and cluster compatibility.</p>
 
 ## Features
 
 - **Dual Transport Support** - iSCSI (traditional) or NVMe/TCP (lower latency) block storage
 - **iSCSI Block Storage** - Direct integration with TrueNAS SCALE via iSCSI targets
 - **NVMe/TCP Support** - Modern NVMe over TCP for reduced latency and CPU overhead (TrueNAS SCALE 25.10+)
+- **LXC Container Storage** - Block-backed container rootfs support alongside VM disk storage
 - **ZFS Snapshots** - Instant, space-efficient snapshots via TrueNAS ZFS
 - **Live Snapshots** - Full VM state snapshots including RAM (vmstate)
 - **Cluster Compatible** - Full support for Proxmox VE clusters with shared storage
@@ -35,7 +36,7 @@
 | **Pre-flight Checks** | ✅ | ❌ | ❌ |
 | **Multi-path I/O** | ✅ | ✅ | ❌ |
 | **ZFS Compression** | ✅ | ❌ | ❌ |
-| **Container Storage** | ❌ | ⚠️ | ✅ |
+| **Container Storage** | ✅ | ⚠️ | ✅ |
 | **Backup Storage** | ❌ | ❌ | ✅ |
 | **ISO Storage** | ❌ | ❌ | ✅ |
 | **Raw Image Format** | ✅ | ✅ | ✅ |
@@ -45,7 +46,7 @@
 **Notes**:
 - **Standard iSCSI**: Raw iSCSI lacks native snapshots/clones. Use LVM-thin on iSCSI for full snapshot/clone/thin-provisioning support, or volume chains (Proxmox VE 9+). Container storage available via LVM on iSCSI.
 - **NFS**: Snapshots/clones require qcow2 format (performance overhead vs raw). Supports backups, ISOs, and containers natively.
-- **TrueNAS Plugin**: Native ZFS features with raw image performance and automated zvol/iSCSI extent management via TrueNAS API.
+- **TrueNAS Plugin**: Native ZFS features with raw image performance and automated zvol/iSCSI extent management via TrueNAS API. Container (LXC) rootfs stored as ext4-formatted block devices.
 - **VM State Snapshots**: All storage types supporting the 'images' content type can store vmstate files for live snapshots with RAM.
 
 ## Quick Start
@@ -149,12 +150,12 @@ Add to `/etc/pve/storage.cfg`:
 
 ```ini
 truenasplugin: truenas-storage
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    api_insecure 1
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_api_insecure 1
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -170,12 +171,12 @@ For lower latency and reduced CPU overhead, use NVMe/TCP instead of iSCSI:
 
 ```ini
 truenasplugin: truenas-nvme
-    api_host 192.168.1.100
-    api_key 1-your-truenas-api-key-here
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:4420
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-truenas-api-key-here
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:4420
     content images
     shared 1
 ```
@@ -276,7 +277,7 @@ pvesm status
 The installer supports additional features:
 - **Version management** - Install, update, or rollback to specific versions
 - **Configuration wizard** - Interactive guided setup with validation
-- **Health checks** - 12-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
+- **Health checks** - 13-point system validation supporting both iSCSI and NVMe/TCP with consistent 30-character label formatting
 - **Plugin testing** - Integrated 8-test validation of core plugin operations with graceful interrupt handling and health-check style output
 - **Cluster support** - Automatic cluster detection and warnings
 - **Backup management** - Automatic backups with rollback capability
@@ -294,7 +295,12 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 - **[Troubleshooting Guide](wiki/Troubleshooting.md)** - Common issues and solutions
 - **[Advanced Features](wiki/Advanced-Features.md)** - Performance tuning, clustering, security
 - **[API Reference](wiki/API-Reference.md)** - Technical details on TrueNAS API integration
+- **[NVMe Setup Guide](wiki/NVMe-Setup.md)** - NVMe/TCP transport setup and authentication
+- **[Multi-Tenancy](wiki/Multi-Tenancy.md)** - Sharing TrueNAS across multiple Proxmox clusters
+- **[Testing Guide](wiki/Testing.md)** - Automated test suite for plugin validation
 - **[Known Limitations](wiki/Known-Limitations.md)** - Important limitations and workarounds
+- **[Ideas and Roadmap](wiki/Ideas.md)** - Feature ideas and development roadmap
+- **[Changelog](wiki/Changelog.md)** - Version history and release notes
 
 ## Important: TrueNAS API Changes
 
@@ -319,6 +325,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.0.3
-**Last Updated**: February 8, 2026
+**Version**: 2.1.5
+**Last Updated**: June 16, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

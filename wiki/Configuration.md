@@ -14,6 +14,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 - [Content Type](#content-type)
   - [content](#content)
   - [shared](#shared)
+  - [nodes](#nodes)
  - [API Configuration](#api-configuration)
   - [api_scheme](#api_scheme)
   - [api_port](#api_port)
@@ -71,16 +72,16 @@ All storage configurations are stored in `/etc/pve/storage.cfg`. This file is au
 
 These parameters must be specified for the plugin to function:
 
-### `api_host`
+### `tn_api_host`
 **Description**: TrueNAS hostname or IP address
 **Type**: String (hostname or IP)
 **Example**: `192.168.1.100` or `truenas.example.com`
 
 ```ini
-api_host 192.168.1.100
+tn_api_host 192.168.1.100
 ```
 
-### `api_key`
+### `tn_api_key`
 **Description**: TrueNAS API key for authentication
 **Type**: String (API key format: `1-xxx...`)
 **Example**: `1-abc123def456...`
@@ -88,10 +89,10 @@ api_host 192.168.1.100
 Generate in TrueNAS: **Credentials** → **Local Users** → **Edit User** → **API Key**
 
 ```ini
-api_key 1-your-api-key-here
+tn_api_key 1-your-api-key-here
 ```
 
-### `target_iqn`
+### `tn_target_iqn`
 **Description**: iSCSI target IQN (iSCSI Qualified Name)
 **Type**: String (IQN format)
 **Example**: `iqn.2005-10.org.freenas.ctl:proxmox`
@@ -100,12 +101,12 @@ api_key 1-your-api-key-here
 Configure in TrueNAS: **Shares** → **Block Shares (iSCSI)** → **Targets**
 
 ```ini
-target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
 ```
 
-**Note**: When using `transport_mode nvme-tcp`, use `subsystem_nqn` instead of `target_iqn`.
+**Note**: When using `transport_mode nvme-tcp`, use `tn_subsystem_nqn` instead of `tn_target_iqn`.
 
-### `dataset`
+### `tn_dataset`
 **Description**: Parent ZFS dataset path for Proxmox volumes
 **Type**: String (ZFS dataset path)
 **Validation**: Alphanumeric, `_`, `-`, `.`, `/` only. No leading/trailing `/`, no `//`
@@ -114,10 +115,10 @@ target_iqn iqn.2005-10.org.freenas.ctl:proxmox
 The plugin creates zvols as children of this dataset (e.g., `tank/proxmox/vm-100-disk-0`).
 
 ```ini
-dataset tank/proxmox
+tn_dataset tank/proxmox
 ```
 
-### `discovery_portal`
+### `tn_discovery_portal`
 **Description**: Primary portal for target/subsystem discovery
 **Type**: String (IP:PORT format)
 **Default Port**:
@@ -129,10 +130,10 @@ dataset tank/proxmox
 
 ```ini
 # iSCSI mode
-discovery_portal 192.168.1.100:3260
+tn_discovery_portal 192.168.1.100:3260
 
 # NVMe/TCP mode
-discovery_portal 192.168.1.100:4420
+tn_discovery_portal 192.168.1.100:4420
 ```
 
 ## Content Type
@@ -161,9 +162,23 @@ Set to `1` for cluster configurations to enable VM migration and HA.
 shared 1
 ```
 
+### `nodes`
+**Description**: Restrict storage visibility to specific cluster nodes
+**Type**: String (comma-separated node hostnames)
+**Default**: Empty (all nodes can access the storage)
+
+When set, only the listed nodes will see and be able to use this storage. Omit this parameter or leave it empty to allow all cluster nodes to access the storage. Node names must match the Proxmox hostnames exactly (as shown in `/etc/pve/nodes/`).
+
+```ini
+# Restrict to two specific nodes
+nodes pve01,pve02
+
+# Allow all nodes (default - omit the line entirely)
+```
+
 ## API Configuration
 
-### `api_scheme`
+### `tn_api_scheme`
 **Description**: API URL scheme
 **Type**: String
 **Valid Values**: `wss`, `ws`
@@ -172,29 +187,29 @@ shared 1
 Use `wss` in production for security.
 
 ```ini
-api_scheme wss
+tn_api_scheme wss
 ```
 
-### `api_port`
+### `tn_api_port`
 **Description**: TrueNAS API port
 **Type**: Integer
 **Default**: `443` for HTTPS/WSS, `80` for HTTP/WS
 
 ```ini
-api_port 443
+tn_api_port 443
 ```
 
-### `api_insecure`
+### `tn_api_insecure`
 **Description**: Skip TLS certificate verification
 **Type**: Boolean (0 or 1)
 **Default**: `0`
 **Warning**: Only use `1` for testing with self-signed certificates
 
 ```ini
-api_insecure 0
+tn_api_insecure 0
 ```
 
-### `api_retry_max`
+### `tn_api_retry_max`
 **Description**: Maximum number of API retry attempts
 **Type**: Integer (0-10)
 **Default**: `3`
@@ -203,10 +218,10 @@ api_insecure 0
 Automatic retry with exponential backoff for transient failures (network issues, rate limits).
 
 ```ini
-api_retry_max 5
+tn_api_retry_max 5
 ```
 
-### `api_retry_delay`
+### `tn_api_retry_delay`
 **Description**: Initial retry delay in seconds
 **Type**: Float (0.1-60.0)
 **Default**: `1`
@@ -215,10 +230,10 @@ api_retry_max 5
 Each retry doubles the delay: `delay * 2^(attempt-1)`. Example: 1s → 2s → 4s → 8s
 
 ```ini
-api_retry_delay 2
+tn_api_retry_delay 2
 ```
 
-### `storage_lock_timeout`
+### `tn_storage_lock_timeout`
 **Description**: Cluster lock timeout in seconds for storage operations
 **Type**: Integer (10-600)
 **Default**: `120`
@@ -234,17 +249,17 @@ Increase this value for:
 
 ```ini
 # Default (suitable for most deployments)
-storage_lock_timeout 120
+tn_storage_lock_timeout 120
 
 # Extended timeout for high-concurrency scenarios
-storage_lock_timeout 300
+tn_storage_lock_timeout 300
 ```
 
 **Technical Details**: This property controls the timeout for `PVE::Storage::lock_storage()` calls, which serialize access to the storage configuration file during write operations. When concurrent operations exceed this timeout, they fail with a "lock timeout" error. Typical disk allocation operations take 10-15 seconds on standard hardware, so the default 120-second timeout provides ample time for 8+ concurrent operations.
 
 ## Network Configuration
 
-### `prefer_ipv4`
+### `tn_prefer_ipv4`
 **Description**: Prefer IPv4 when resolving hostnames
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -252,10 +267,10 @@ storage_lock_timeout 300
 Useful when TrueNAS has both IPv4 and IPv6 addresses.
 
 ```ini
-prefer_ipv4 1
+tn_prefer_ipv4 1
 ```
 
-### `portals`
+### `tn_portals`
 **Description**: Additional iSCSI portals for redundancy
 **Type**: Comma-separated list of IP:PORT
 **Example**: `192.168.1.101:3260,192.168.1.102:3260`
@@ -267,10 +282,10 @@ Configure multiple portals for failover and multipath.
 - **Manual**: Add comma-separated IP:port pairs to `/etc/pve/storage.cfg`
 
 ```ini
-portals 192.168.1.101:3260,192.168.1.102:3260
+tn_portals 192.168.1.101:3260,192.168.1.102:3260
 ```
 
-### `use_multipath`
+### `tn_use_multipath`
 **Description**: Enable iSCSI multipath support
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -278,10 +293,10 @@ portals 192.168.1.101:3260,192.168.1.102:3260
 Requires multiple portals for redundancy and load balancing.
 
 ```ini
-use_multipath 1
+tn_use_multipath 1
 ```
 
-### `use_by_path`
+### `tn_use_by_path`
 **Description**: Use `/dev/disk/by-path/` device names
 **Type**: Boolean (0 or 1)
 **Default**: `0`
@@ -289,10 +304,10 @@ use_multipath 1
 Use persistent by-path device names instead of by-id.
 
 ```ini
-use_by_path 0
+tn_use_by_path 0
 ```
 
-### `ipv6_by_path`
+### `tn_ipv6_by_path`
 **Description**: Normalize IPv6 addresses in by-path device names
 **Type**: Boolean (0 or 1)
 **Default**: `0`
@@ -300,12 +315,12 @@ use_by_path 0
 Required for IPv6 iSCSI connections when using by-path.
 
 ```ini
-ipv6_by_path 0
+tn_ipv6_by_path 0
 ```
 
 ## Transport Mode Selection
 
-### `transport_mode`
+### `tn_transport_mode`
 **Description**: Storage transport protocol
 **Type**: String
 **Valid Values**: `iscsi`, `nvme-tcp`
@@ -318,17 +333,17 @@ Selects the protocol for communicating with TrueNAS storage:
 
 ```ini
 # iSCSI mode (default)
-transport_mode iscsi
+tn_transport_mode iscsi
 
 # NVMe/TCP mode
-transport_mode nvme-tcp
+tn_transport_mode nvme-tcp
 ```
 
 **Important Notes:**
-- `transport_mode` cannot be changed after storage creation (prevents volume orphaning)
+- `tn_transport_mode` cannot be changed after storage creation (prevents volume orphaning)
 - Different transport modes have different required parameters:
-  - **iSCSI mode**: Requires `target_iqn`, `discovery_portal` (port 3260)
-  - **NVMe/TCP mode**: Requires `subsystem_nqn`, `discovery_portal` (port 4420), TrueNAS SCALE 25.10+
+  - **iSCSI mode**: Requires `tn_target_iqn`, `tn_discovery_portal` (port 3260)
+  - **NVMe/TCP mode**: Requires `tn_subsystem_nqn`, `tn_discovery_portal` (port 4420), TrueNAS SCALE 25.10+
 - Volume naming formats differ between modes (incompatible for migration)
 - See [NVMe-Setup.md](NVMe-Setup.md) for complete NVMe/TCP setup guide
 
@@ -347,7 +362,7 @@ transport_mode nvme-tcp
 
 These parameters are only applicable when `transport_mode nvme-tcp` is set.
 
-### `subsystem_nqn`
+### `tn_subsystem_nqn`
 **Description**: NVMe subsystem NQN (NVMe Qualified Name)
 **Type**: String (NQN format)
 **Required**: Yes (when using NVMe/TCP transport)
@@ -358,7 +373,7 @@ These parameters are only applicable when `transport_mode nvme-tcp` is set.
 The NVMe subsystem identifier on TrueNAS. The plugin automatically creates the subsystem if it doesn't exist.
 
 ```ini
-subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
 ```
 
 **Format Requirements:**
@@ -375,7 +390,7 @@ subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
 ✗ Invalid: nqn.org.freenas.ctl:proxmox         (missing date)
 ```
 
-### `hostnqn`
+### `tn_hostnqn`
 **Description**: NVMe host NQN (initiator identifier)
 **Type**: String (NQN format)
 **Required**: No (auto-detected from `/etc/nvme/hostnqn`)
@@ -385,7 +400,7 @@ subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
 Override the default host NQN for custom host identification. By default, the plugin reads the host NQN from `/etc/nvme/hostnqn` on the Proxmox node.
 
 ```ini
-hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid-here
+tn_hostnqn nqn.2014-08.org.nvmexpress:uuid:custom-uuid-here
 ```
 
 **Use Cases:**
@@ -405,7 +420,7 @@ Generate a new hostnqn:
 nvme gen-hostnqn > /etc/nvme/hostnqn
 ```
 
-### `nvme_dhchap_secret`
+### `tn_nvme_dhchap_secret`
 **Description**: DH-HMAC-CHAP host authentication secret (unidirectional)
 **Type**: String
 **Format**: `DHHC-1:01:base64encodeddata...`
@@ -415,7 +430,7 @@ nvme gen-hostnqn > /etc/nvme/hostnqn
 Host authentication secret for authenticating the Proxmox host to the TrueNAS controller. Provides security by preventing unauthorized hosts from accessing the subsystem.
 
 ```ini
-nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
 ```
 
 **Secret Format:**
@@ -439,7 +454,7 @@ nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
 - Secrets are stored in `/etc/pve/storage.cfg` (cluster-wide sync)
 - See [NVMe-Setup.md - DH-CHAP Authentication](NVMe-Setup.md#dh-chap-authentication-setup) for complete setup
 
-### `nvme_dhchap_ctrl_secret`
+### `tn_nvme_dhchap_ctrl_secret`
 **Description**: DH-HMAC-CHAP controller authentication secret (bidirectional)
 **Type**: String
 **Format**: `DHHC-1:01:base64encodeddata...`
@@ -449,7 +464,7 @@ nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
 Controller authentication secret for authenticating the TrueNAS controller to the Proxmox host (mutual authentication). Prevents man-in-the-middle attacks.
 
 ```ini
-nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
 ```
 
 **Use Cases:**
@@ -459,7 +474,7 @@ nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEX
 
 **Setup:**
 1. Generate a separate controller secret (different from host secret)
-2. Configure on Proxmox as `nvme_dhchap_ctrl_secret`
+2. Configure on Proxmox as `tn_nvme_dhchap_ctrl_secret`
 3. Configure the same secret on TrueNAS as the controller secret
 
 **Security Model:**
@@ -468,7 +483,7 @@ nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEX
 
 ## iSCSI Behavior
 
-### `force_delete_on_inuse`
+### `tn_force_delete_on_inuse`
 **Description**: Force target logout when deleting in-use volumes
 **Type**: Boolean (0 or 1)
 **Default**: `0`
@@ -476,10 +491,10 @@ nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEX
 When enabled, forces iSCSI target logout if volume deletion fails due to "target in use" errors.
 
 ```ini
-force_delete_on_inuse 1
+tn_force_delete_on_inuse 1
 ```
 
-### `logout_on_free`
+### `tn_logout_on_free`
 **Description**: Logout from target when no LUNs remain
 **Type**: Boolean (0 or 1)
 **Default**: `0`
@@ -487,12 +502,12 @@ force_delete_on_inuse 1
 Automatically logout from iSCSI target when all volumes are freed.
 
 ```ini
-logout_on_free 0
+tn_logout_on_free 0
 ```
 
 ## ZFS Volume Options
 
-### `zvol_blocksize`
+### `tn_zvol_blocksize`
 **Description**: ZFS volume block size
 **Type**: String (power of 2 from 4K to 1M)
 **Valid Values**: `4K`, `8K`, `16K`, `32K`, `64K`, `128K`, `256K`, `512K`, `1M`
@@ -502,7 +517,7 @@ logout_on_free 0
 Larger block sizes improve sequential I/O performance but increase space overhead.
 
 ```ini
-zvol_blocksize 128K
+tn_zvol_blocksize 128K
 ```
 
 ### `tn_sparse`
@@ -518,7 +533,7 @@ tn_sparse 1
 
 ## Snapshot Configuration
 
-### `vmstate_storage`
+### `tn_vmstate_storage`
 **Description**: Storage location for VM state (RAM) during live snapshots
 **Type**: String
 **Valid Values**: `local`, `shared`
@@ -528,10 +543,10 @@ tn_sparse 1
 - `shared`: Store vmstate on TrueNAS storage (required for migration)
 
 ```ini
-vmstate_storage local
+tn_vmstate_storage local
 ```
 
-### `enable_live_snapshots`
+### `tn_enable_live_snapshots`
 **Description**: Enable live VM snapshots with vmstate
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -539,10 +554,10 @@ vmstate_storage local
 Allows creating snapshots of running VMs including RAM state.
 
 ```ini
-enable_live_snapshots 1
+tn_enable_live_snapshots 1
 ```
 
-### `snapshot_volume_chains`
+### `tn_snapshot_volume_chains`
 **Description**: Use volume snapshot chains (Proxmox 9+)
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -550,12 +565,12 @@ enable_live_snapshots 1
 Enables Proxmox 9.x+ volume chain feature for improved snapshot management.
 
 ```ini
-snapshot_volume_chains 1
+tn_snapshot_volume_chains 1
 ```
 
 ## Performance Options
 
-### `enable_bulk_operations`
+### `tn_enable_bulk_operations`
 **Description**: Use TrueNAS bulk API for multiple operations
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -563,12 +578,12 @@ snapshot_volume_chains 1
 Batch multiple API calls into single bulk request for better performance.
 
 ```ini
-enable_bulk_operations 1
+tn_enable_bulk_operations 1
 ```
 
 ## Security Options
 
-### `chap_user`
+### `tn_chap_user`
 **Description**: CHAP authentication username
 **Type**: String
 **Default**: None
@@ -576,10 +591,10 @@ enable_bulk_operations 1
 Configure in TrueNAS: **Shares** → **Block Shares (iSCSI)** → **Authorized Access**
 
 ```ini
-chap_user proxmox-chap
+tn_chap_user proxmox-chap
 ```
 
-### `chap_password`
+### `tn_chap_password`
 **Description**: CHAP authentication password
 **Type**: String
 **Default**: None
@@ -588,12 +603,12 @@ chap_user proxmox-chap
 Must match the CHAP secret configured in TrueNAS.
 
 ```ini
-chap_password your-secure-chap-password
+tn_chap_password your-secure-chap-password
 ```
 
 ## Diagnostics
 
-### `debug`
+### `tn_debug`
 **Description**: Debug logging verbosity level
 **Type**: Integer (0-2)
 **Default**: `0`
@@ -610,10 +625,10 @@ Enables debug logging with configurable verbosity. All log messages are prefixed
 
 ```ini
 # Light debugging (recommended for troubleshooting)
-debug 1
+tn_debug 1
 
 # Verbose debugging (API payload tracing)
-debug 2
+tn_debug 2
 ```
 
 **Viewing Debug Logs**:
@@ -634,11 +649,11 @@ See [Troubleshooting Guide - Enable Debug Logging](Troubleshooting.md#enable-deb
 ### Basic Single-Node Configuration (iSCSI)
 ```ini
 truenasplugin: truenas-basic
-    api_host 192.168.1.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:proxmox
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:3260
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:3260
     content images
     shared 1
 ```
@@ -646,12 +661,12 @@ truenasplugin: truenas-basic
 ### Basic NVMe/TCP Configuration
 ```ini
 truenasplugin: truenas-nvme
-    api_host 192.168.1.100
-    api_key 1-your-api-key
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
-    dataset tank/proxmox
-    discovery_portal 192.168.1.100:4420
+    tn_api_host 192.168.1.100
+    tn_api_key 1-your-api-key
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.1.100:4420
     content images
     shared 1
 ```
@@ -659,124 +674,124 @@ truenasplugin: truenas-nvme
 ### Production Cluster Configuration
 ```ini
 truenasplugin: truenas-cluster
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:cluster
-    dataset tank/cluster/proxmox
-    discovery_portal 192.168.10.100:3260
-    portals 192.168.10.101:3260,192.168.10.102:3260
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster
+    tn_dataset tank/cluster/proxmox
+    tn_discovery_portal 192.168.10.100:3260
+    tn_portals 192.168.10.101:3260,192.168.10.102:3260
     content images
     shared 1
     # Performance
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    use_multipath 1
-    vmstate_storage local
-    storage_lock_timeout 120
+    tn_use_multipath 1
+    tn_vmstate_storage local
+    tn_storage_lock_timeout 120
     # Security
-    chap_user proxmox-cluster
-    chap_password your-secure-password
+    tn_chap_user proxmox-cluster
+    tn_chap_password your-secure-password
     # Advanced
-    force_delete_on_inuse 1
-    logout_on_free 0
-    api_retry_max 5
-    api_retry_delay 2
+    tn_force_delete_on_inuse 1
+    tn_logout_on_free 0
+    tn_api_retry_max 5
+    tn_api_retry_delay 2
 ```
 
 ### High Availability Configuration
 ```ini
 truenasplugin: truenas-ha
-    api_host truenas-vip.company.com
-    api_key 1-your-api-key
-    api_scheme wss
-    api_port 443
-    api_insecure 0
-    target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
-    dataset tank/ha/proxmox
-    discovery_portal 192.168.100.10:3260
-    portals 192.168.100.11:3260,192.168.100.12:3260,192.168.101.10:3260
+    tn_api_host truenas-vip.company.com
+    tn_api_key 1-your-api-key
+    tn_api_scheme wss
+    tn_api_port 443
+    tn_api_insecure 0
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ha-cluster
+    tn_dataset tank/ha/proxmox
+    tn_discovery_portal 192.168.100.10:3260
+    tn_portals 192.168.100.11:3260,192.168.100.12:3260,192.168.101.10:3260
     content images
     shared 1
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    use_multipath 1
-    vmstate_storage local
-    storage_lock_timeout 180
-    chap_user proxmox-ha
-    chap_password very-secure-password
-    force_delete_on_inuse 1
-    api_retry_max 5
+    tn_use_multipath 1
+    tn_vmstate_storage local
+    tn_storage_lock_timeout 180
+    tn_chap_user proxmox-ha
+    tn_chap_password very-secure-password
+    tn_force_delete_on_inuse 1
+    tn_api_retry_max 5
 ```
 
 ### NVMe/TCP with DH-CHAP Authentication
 ```ini
 truenasplugin: truenas-nvme-secure
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
-    dataset tank/proxmox
-    discovery_portal 192.168.10.100:4420
-    nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
-    nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
-    api_scheme wss
-    api_port 443
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.10.100:4420
+    tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
+    tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
+    tn_api_scheme wss
+    tn_api_port 443
     content images
     shared 1
-    zvol_blocksize 64K
+    tn_zvol_blocksize 64K
 ```
 
 ### NVMe/TCP Multipath Configuration
 ```ini
 truenasplugin: truenas-nvme-multipath
-    api_host 192.168.10.100
-    api_key 1-your-api-key
-    transport_mode nvme-tcp
-    subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
-    dataset tank/proxmox
-    discovery_portal 192.168.10.100:4420
-    portals 192.168.10.101:4420,192.168.10.102:4420
+    tn_api_host 192.168.10.100
+    tn_api_key 1-your-api-key
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-ha
+    tn_dataset tank/proxmox
+    tn_discovery_portal 192.168.10.100:4420
+    tn_portals 192.168.10.101:4420,192.168.10.102:4420
     content images
     shared 1
-    zvol_blocksize 128K
+    tn_zvol_blocksize 128K
     tn_sparse 1
 ```
 
 ### IPv6 Configuration
 ```ini
 truenasplugin: truenas-ipv6
-    api_host 2001:db8::100
-    api_key 1-your-api-key
-    target_iqn iqn.2005-10.org.freenas.ctl:ipv6
-    dataset tank/ipv6/proxmox
-    discovery_portal [2001:db8::100]:3260
-    portals [2001:db8::101]:3260,[2001:db8::102]:3260
+    tn_api_host 2001:db8::100
+    tn_api_key 1-your-api-key
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:ipv6
+    tn_dataset tank/ipv6/proxmox
+    tn_discovery_portal [2001:db8::100]:3260
+    tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
     content images
     shared 1
-    prefer_ipv4 0
-    ipv6_by_path 1
-    use_by_path 1
-    zvol_blocksize 128K
-    use_multipath 1
+    tn_prefer_ipv4 0
+    tn_ipv6_by_path 1
+    tn_use_by_path 1
+    tn_zvol_blocksize 128K
+    tn_use_multipath 1
 ```
 
 ### Development/Testing Configuration
 ```ini
 truenasplugin: truenas-dev
-    api_host 192.168.1.50
-    api_key 1-dev-api-key
-    api_scheme ws
-    api_port 80
-    api_insecure 1
-    target_iqn iqn.2005-10.org.freenas.ctl:dev
-    dataset tank/development
-    discovery_portal 192.168.1.50:3260
+    tn_api_host 192.168.1.50
+    tn_api_key 1-dev-api-key
+    tn_api_scheme ws
+    tn_api_port 80
+    tn_api_insecure 1
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:dev
+    tn_dataset tank/development
+    tn_discovery_portal 192.168.1.50:3260
     content images
     shared 0
-    zvol_blocksize 64K
+    tn_zvol_blocksize 64K
     tn_sparse 1
-    use_multipath 0
-    vmstate_storage shared
+    tn_use_multipath 0
+    tn_vmstate_storage shared
 ```
 
 ### Enterprise Production Configuration (All Features)
@@ -786,48 +801,48 @@ Complete configuration showing all available features for enterprise production 
 ```ini
 truenasplugin: enterprise-storage
     # API Configuration
-    api_host truenas-ha-vip.corp.com
-    api_key 1-production-api-key-here
-    api_scheme wss
-    api_port 443
-    api_insecure 0
-    api_retry_max 5
-    api_retry_delay 2
-    prefer_ipv4 1
+    tn_api_host truenas-ha-vip.corp.com
+    tn_api_key 1-production-api-key-here
+    tn_api_scheme wss
+    tn_api_port 443
+    tn_api_insecure 0
+    tn_api_retry_max 5
+    tn_api_retry_delay 2
+    tn_prefer_ipv4 1
 
     # Storage Configuration
-    dataset tank/production/proxmox
-    zvol_blocksize 128K
+    tn_dataset tank/production/proxmox
+    tn_zvol_blocksize 128K
     tn_sparse 1
-    target_iqn iqn.2005-10.org.freenas.ctl:production-cluster
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:production-cluster
 
     # iSCSI Network Configuration
-    discovery_portal 10.10.100.10:3260
-    portals 10.10.100.11:3260,10.10.100.12:3260,10.10.101.10:3260,10.10.101.11:3260
-    use_multipath 1
-    use_by_path 0
-    ipv6_by_path 0
+    tn_discovery_portal 10.10.100.10:3260
+    tn_portals 10.10.100.11:3260,10.10.100.12:3260,10.10.101.10:3260,10.10.101.11:3260
+    tn_use_multipath 1
+    tn_use_by_path 0
+    tn_ipv6_by_path 0
 
     # Security
-    chap_user production-proxmox
-    chap_password very-long-secure-chap-password-here
+    tn_chap_user production-proxmox
+    tn_chap_password very-long-secure-chap-password-here
 
     # iSCSI Behavior
-    force_delete_on_inuse 1
-    logout_on_free 0
+    tn_force_delete_on_inuse 1
+    tn_logout_on_free 0
 
     # Cluster & HA
     content images
     shared 1
 
     # Snapshot Configuration
-    enable_live_snapshots 1
-    snapshot_volume_chains 1
-    vmstate_storage local
+    tn_enable_live_snapshots 1
+    tn_snapshot_volume_chains 1
+    tn_vmstate_storage local
 
     # Performance Optimization
-    storage_lock_timeout 180
-    enable_bulk_operations 1
+    tn_storage_lock_timeout 180
+    tn_enable_bulk_operations 1
 ```
 
 **Use Case**: Enterprise production environment with:
@@ -850,8 +865,8 @@ truenasplugin: enterprise-storage
 The plugin validates configuration at storage creation/modification time:
 
 ### Validation Rules
-- **Required Fields**: `api_host`, `api_key`, `dataset`, `target_iqn`, `discovery_portal` must be present
-- **Retry Limits**: `api_retry_max` must be 0-10, `api_retry_delay` must be 0.1-60
+- **Required Fields**: `tn_api_host`, `tn_api_key`, `tn_dataset`, `tn_target_iqn`, `tn_discovery_portal` must be present
+- **Retry Limits**: `tn_api_retry_max` must be 0-10, `tn_api_retry_delay` must be 0.1-60
 - **Dataset Naming**: Must follow ZFS naming rules (alphanumeric, `_`, `-`, `.`, `/`)
 - **Dataset Format**: No leading/trailing `/`, no `//`, no special characters
 - **Security**: Warns if using insecure HTTP/WS transport
@@ -859,14 +874,14 @@ The plugin validates configuration at storage creation/modification time:
 ### Example Validation Errors
 ```
 # Invalid retry value
-api_retry_max must be between 0 and 10 (got 15)
+tn_api_retry_max must be between 0 and 10 (got 15)
 
 # Invalid dataset name
-dataset name contains invalid characters: 'tank/my storage'
+tn_dataset name contains invalid characters: 'tank/my storage'
   Allowed characters: a-z A-Z 0-9 _ - . /
 
 # Missing required field
-api_host is required
+tn_api_host is required
 ```
 
 ## Modifying Configuration
