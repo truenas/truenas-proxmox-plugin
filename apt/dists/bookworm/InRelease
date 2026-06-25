@@ -5,36 +5,36 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: bookworm
 Codename: bookworm
-Date: Thu, 07 May 2026 14:49:43 UTC
+Date: Thu, 25 Jun 2026 15:47:34 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
 Description: TrueNAS Proxmox Plugin APT repository (bookworm)
 MD5Sum:
- 6ff09980c210de5651cb1a7a9fe2438a 921 main/binary-amd64/Packages
- 101e4428875c46fa043480f27ead19f6 579 main/binary-amd64/Packages.gz
+ 57f866457b83c25d22a39789e9d9fe44 921 main/binary-amd64/Packages
+ a6d651d1b4cfafb1a982f88530891c24 581 main/binary-amd64/Packages.gz
  d2c2d405ed3779a1ef71e99c7b7c2bb7 177 main/binary-amd64/Release
 SHA1:
- b1f031353875503eb03cec55590bfc5d5885d5c1 921 main/binary-amd64/Packages
- 3a2068a07052e9d513e5d9264620b4c152ac9d39 579 main/binary-amd64/Packages.gz
+ 0f615cff74b8bd321e26a635c7028758622f2b2e 921 main/binary-amd64/Packages
+ 2dcb83f1578b10df8f28920189f726937ad0c359 581 main/binary-amd64/Packages.gz
  4f10760dacd5360640ad9722eefc0fd604bb2d9e 177 main/binary-amd64/Release
 SHA256:
- d63dae48dbc929cfd4a279ef31fcb68ee5ec2d7ee5cceefb3b61f9d1aab8f216 921 main/binary-amd64/Packages
- f158cbbce0b717ddc0dec6a68d87a9d294c8ff391ffb73a2b9eaad48fc9a8f0b 579 main/binary-amd64/Packages.gz
+ bd1879205bef3d40eabb05b40b4ccb19e4cf211668d205553b87b6ce467151a9 921 main/binary-amd64/Packages
+ 42cbdacbd2212aea48e085fc058fc9b9035fbed3b7e6d566caf9a3ba5c49d5bc 581 main/binary-amd64/Packages.gz
  37d47fed05c8bc3e6591758f83441740dedd77dc3183b8e59fbc53b8e8e28f32 177 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmn8pocACgkQqX8sptOm
-79iBvQ/+JHRghfoT4aYZCHMfhzyMOqAILsO2T94Z5SPxrV/EStdQ9110WmZlbMU7
-YY8Ht8oRNyqJ5iqs0pXdzsaVZ+2GJcQ6m99F7QVtZkZIt93oHHjWuiyWXc02TBoL
-+ubf6q+qXpYfnBazvVIpsJdgdEPKGjcC9Tuuga/82eStWnBim6bZY+xhuSPtDH4U
-Cf2bF5gQa6lzCN+s9F2As13TfegomicFzUkk1PwgY2s12drQkVSeeplwU68Lt2wX
-82CBx22jOm8aGYRknnR/i8y0iNpvsEHyrZRIpIl5UfqyApjLyPUoMHZ9+dpfsJWe
-LEnvKENSAPV2ugr/dSSTsAH0wHLIUKnkgTmUhx6ZM8KiXl/TrGjo8BxbijD1VDcO
-6A+Pq/Zt4F3TyUgJHzRyXE8/Z/HhJX5WmE8+qtVZkAPU5HVKokD/zipFVJQAbuuf
-4gaUfqDZxw6EdWzLYge3IKlrEdPfSWBBsSpu8Wc34dNEkU9zWWPae+AkNpnLZVPT
-klugh1mxyUnZnhoBzS1ELxmNdhdd8lZcMlKDtgarNoGg5xMBSVbdN840O3DBHcHs
-/hGCI0yqHUG+pMkorC89mR2RfHdaoyGI00+SSactqcujgpW8dGcotBAzI6QWbkUR
-WU4ohIHnJem1FskK1NK5FHOuxe/g9IKpXLI0ZI1fr5KEdHY8G4Y=
-=NOJi
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo9TZYACgkQqX8sptOm
+79gSPw//QvFnX1w1AEs2VZXb7Kgl3Kn51XM4HHeDHNcdy14kWJ192jQXx492Mmyi
+OzqwbZi/0w2PSdOKYCX3U6yoOhwnUBengkBRZ/+Ghq7SdzJJHfr0VRX5es7CUsCv
+eEO9EKMras9MqO+IwPIdohSfFJ75Erz7lW+gQ/1IiQZ0B0RzmWuEmGN1pKm8qu/D
+sJ/avtP/j0XWacWAEManHvtTt6YUYVEwwZ3ja+vKGButAQYqVGtG4iaRSdzJ1ysC
+/8Qq78IaYqNIwmevdPfTR7j2jdFXqXw4oc9FursmRgppA2Cy8zyFDTNh8TJPH3eS
+SoKe0Ck1amUkjZT1gAWXJTrTw+NNYSwGP2D5kz8OiYJf77bFeiDenxKRDwwwqcOI
+DB/ZwoppIaUqLgMg6iMG6pbvhf6QovnWVfI5nhNqep6ZxRGstPzJGEi9cwfRbA3P
+XZIK+goZ9xal+TF9g9FRNEy9KMl/lQoZo+kqW7AA17nmTzg0ilB2JMvVNN7fG/IS
+caGFKA2+/8xjSYQexdM0Md60yS+3OKMGmj99EQGoPSVfwdKehM96NyKYclS9SUW1
+pm1TO8QvYYcIQ+/FqJxW6SFxAm+6eYso1VciW1yD0P2ip7sk1e12URJuKTYT6vVe
+wcryJnmVRgTmkvIvsQNKVgW/ynSOEs+T1uwTkbdSn+daGT6HOmk=
+=dl7s
 -----END PGP SIGNATURE-----

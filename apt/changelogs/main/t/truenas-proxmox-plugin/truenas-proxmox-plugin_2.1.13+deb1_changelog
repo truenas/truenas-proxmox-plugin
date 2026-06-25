@@ -1,3 +1,199 @@
+truenas-proxmox-plugin (2.1.13+deb1) unstable; urgency=low
+
+  * Drop the interactive Auto-migrate/Skip prompt from postinst. lintian
+    flagged the `read -r answer </dev/tty` call as
+    `read-in-maintainer-script` (Debian Policy 6.3 forbids interactive
+    prompts in maintainer scripts; the official channel is debconf).
+    Postinst now always auto-migrates with a timestamped backup; operators
+    who want to opt out can restore <STORAGE_CFG>.bak.<ts> by hand. No
+    behaviour change in non-interactive installs (which already
+    auto-migrated). This unblocks the GitHub Actions build job, which
+    fails the lintian step on errors.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 24 Jun 2026 09:00:00 +0000
+
+truenas-proxmox-plugin (2.1.12+deb1) unstable; urgency=low
+
+  * Add t/rate-limit/08-concurrent-alloc.t. Drives N (default 10)
+    concurrent qm-create-with-disk operations from independent forked
+    PVE-side processes, then verifies all succeed, every child
+    completed within a per-child wall-clock budget (default 120s), and
+    total upstream auth.login_with_api_key count stays at <=1. The
+    earlier concurrent test (07) only used cheap read RPCs; this one
+    drives the full alloc path (pool.dataset.create +
+    iscsi.extent.create + iscsi.targetextent.create + PVE-side iSCSI
+    login/multipath/udev). Tunable via RL_CONCURRENT_N and
+    RL_CONCURRENT_BUDGET env vars. No code changes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 13:00:00 +0000
+
+truenas-proxmox-plugin (2.1.11+deb1) unstable; urgency=medium
+
+  * _broker_rpc now has a deadline-bounded round trip. Without this a
+    wedged broker (stuck upstream WS, lost middlewared, hung systemd
+    unit) blocked every PVE operation indefinitely because sysread on
+    the Unix socket would never return. Per-call timeout is governed by
+    tn_broker_timeout (seconds, default 30) and applies to the entire
+    round trip, not per sysread, so a slow-but-progressing TN response
+    won't trip it. IO::Select's can_write/can_read with remaining time
+    is used between every syscall; on timeout we die with a clear
+    "broker: read|write timeout after Ns" message that bubbles through
+    the normal error path.
+  * Add t/rate-limit/06-broker-restart.t and
+    t/rate-limit/07-concurrent-broker.t to the regression suite to
+    exercise (a) plugin recovery after the broker is restarted out
+    from under it and (b) broker behaviour under concurrent
+    in-process load (5 forked children x 4 calls each, asserting <=1
+    upstream auth across the whole burst).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 12:30:00 +0000
+
+truenas-proxmox-plugin (2.1.10+deb1) unstable; urgency=low
+
+  * truenas-plugin-broker: when a request is rejected for missing
+    api_host/api_key, log the actual incoming shape - decoded scfg
+    field values (api_host literal; api_key redacted to length only),
+    method name, full list of scfg keys present, top-level request
+    keys, and the raw request line truncated to 600 bytes with any
+    "api_key":"..." pattern redacted. Helped diagnose a wrapper test
+    that was sending {api_host:null, api_key:null} scfg envelopes;
+    keep it in place for future debugging.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.9+deb1) unstable; urgency=medium
+
+  * Fix snapshot rollback when intermediate snapshots exist. PVE's qm
+    rollback contract is to revert the disk to the target snapshot and
+    discard anything taken after. Plugin was passing recursive=0 to TN's
+    pool.snapshot.rollback, so any intermediate snapshot on the same
+    dataset blocked the rollback with TN 25.10's wrapped FileExistsError:
+      "Cannot rollback: more recent snapshots exist. Use recursive=True
+      to destroy them. [Errno 17] Failed to rollback ... File exists"
+    Two changes: volume_snapshot_rollback now passes recursive=1; the
+    _tn_snapshot_rollback fallback regex also matches the TN 25.10
+    wording (was matching only the old libzfs message). Verified against
+    TN 25.10 snapshot_rollback_impl.py: recursive=True triggers
+    _destroy_newer_snapshots on the target dataset and does not touch
+    clones (recursive_clones=False) or child datasets
+    (recursive_rollback=False). Matches PVE::Storage::ZFSPoolPlugin
+    semantics (which calls `zfs rollback -r`).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:30:00 +0000
+
+truenas-proxmox-plugin (2.1.8+deb1) unstable; urgency=medium
+
+  * Rename ZFS snapshot API calls from zfs.snapshot.* to pool.snapshot.*
+    to match TrueNAS 25.10 middleware. The legacy zfs.snapshot namespace
+    was removed in 25.10 and returns -32601 "Method does not exist",
+    breaking qm snapshot / qm rollback / volume_snapshot_delete /
+    bulk snapshot delete. Affects: pool.snapshot.query,
+    pool.snapshot.create, pool.snapshot.delete, pool.snapshot.clone,
+    pool.snapshot.rollback. Same fix already shipped on broker-service
+    via 35281fb; this commit ports it to fix/rate-limit-connection-reuse.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:00:00 +0000
+
+truenas-proxmox-plugin (2.1.7+deb1) unstable; urgency=medium
+
+  * truenas-plugin-broker: log every error response (lwarn). Before this
+    change the daemon only logged WS lifecycle events (opened / reaping /
+    startup / shutdown) and was silent when upstream RPCs failed. After
+    a broker restart, the first upstream auth.login_with_api_key can be
+    rejected by TN's per-IP rate limiter from prior activity, and the
+    failure was invisible in the journal. Now broker logs bad request
+    JSON, missing scfg fields, no-method requests, upstream RPC
+    exceptions (including the dead-pool cleanup), no-response-from-
+    upstream conditions, and structured JSON-RPC errors returned by TN
+    (e.g. EBUSY / Rate Limit Exceeded). No behaviour change beyond logs.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.6+deb1) unstable; urgency=medium
+
+  * Add node-local session broker daemon (truenas-plugin-broker) that holds
+    one authenticated WebSocket per (host, api_key) pair and proxies
+    JSON-RPC for every plugin invocation via /run/truenas-plugin/broker.sock.
+    Eliminates per-process re-authentication from forked qm, pvesh and
+    pveproxy workers (D2). When the broker socket is absent the plugin
+    falls back to the existing per-process persistent WebSocket path with
+    no behavioural change.
+  * Ship truenas-plugin-broker.service systemd unit, enabled and started
+    by postinst before pvedaemon/pveproxy/pvestatd restart.
+  * Map this branch's tn_*-prefixed scfg keys to the broker daemon's
+    stable api_* wire format inside the plugin client so the broker
+    binary serves both this branch and the legacy api_*-keyed branch
+    without modification.
+  * See wiki/D2-per-process-reauth.md for design notes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.5+deb1) unstable; urgency=low
+
+  * Classify WS framing errors (WS read/len/payload) as connection errors so
+    stale persistent connections are invalidated and reopened by the existing
+    retry path instead of failing permanently.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 16 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.4+deb1) unstable; urgency=low
+
+  * Remove proactive core.ping health check from _ws_get_persistent; dead
+    connections are detected reactively in _api_call's existing error path.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sun, 15 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.3+deb1) unstable; urgency=medium
+
+  * Reuse the fork-safe persistent WebSocket connection for mutations and
+    snapshot rollbacks, reducing authentication sessions under burst load.
+  * Stop retrying TrueNAS rate-limit responses inside the 60-second lockout
+    window.
+  * Report failed pre-flight target queries separately from confirmed target
+    absence.
+  * Remove obsolete ephemeral WebSocket helpers and duplicate API call paths.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 13 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.2+deb1) unstable; urgency=medium
+
+  * Implement LXC vzdump snapshot mode support (issue #42): activate_volume,
+    path, and deactivate_volume previously ignored the snapshot name and
+    returned the live block device, failing snapshot-mode backups. The plugin
+    now clones <zvol>@<snapname> into an ephemeral zvol and exposes it as its
+    own iSCSI LUN / NVMe-TCP namespace, tearing it down in
+    volume_snapshot_delete (and deactivate_volume as a fallback).
+  * Fix NVMe namespace lookup using the wrong query field: nvmet.namespace.query
+    nests the subsystem under subsys.id (subsys_id is create-only input).
+    Namespace lookups now query by the unique device_path; the namespace
+    counter in _free_image_nvme filters by subsys.id.
+  * Filter ephemeral vzdump-* snapshot clones from list_images to avoid
+    phantom vmid 0 volumes during backups.
+  * Fix NVMe/TCP connect failure when CPUs are offlined (issue #48): pass
+    --nr-io-queues to nvme connect to avoid kernel queue-to-CPU mapping
+    failures (EXDEV/-18) when CPU topology has gaps. Uses online CPU count
+    when all CPUs are online; floor(possible/2) when any CPU is offline.
+    Adds optional tn_nr_io_queues storage.cfg key (1-256) for manual override.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 06 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.1+deb1) unstable; urgency=medium
+
+  * Bump storage API version to 14 to match libpve-storage-perl 9.1.3+
+    (Proxmox VE 9.2+); eliminates "implementing an older storage API" warning
+    on every plugin load (issue #41).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 29 May 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.0+deb1) unstable; urgency=medium
+
+  * Rename all storage.cfg option keys to tn_* prefix to avoid namespace
+    collisions with other PVE storage plugins; postinst migration script
+    handles existing configs automatically (with backup) or prompts for
+    manual migration when upgrading from versions prior to 2.1.0.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 07 May 2026 15:00:00 +0000
+
 truenas-proxmox-plugin (2.0.30+deb1) unstable; urgency=medium
 
   * Reduce status latency and preserve operation-path safety (issue #30 phase 3):
