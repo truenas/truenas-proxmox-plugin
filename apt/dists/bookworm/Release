@@ -2,20 +2,20 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: bookworm
 Codename: bookworm
-Date: Thu, 25 Jun 2026 15:47:34 UTC
+Date: Thu, 25 Jun 2026 17:51:43 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
 Description: TrueNAS Proxmox Plugin APT repository (bookworm)
 MD5Sum:
- 57f866457b83c25d22a39789e9d9fe44 921 main/binary-amd64/Packages
- a6d651d1b4cfafb1a982f88530891c24 581 main/binary-amd64/Packages.gz
+ 14daa12515e43d6cf9e8e39275776b46 921 main/binary-amd64/Packages
+ 608f4f5b1eb061d756ec8859dc7d328f 580 main/binary-amd64/Packages.gz
  d2c2d405ed3779a1ef71e99c7b7c2bb7 177 main/binary-amd64/Release
 SHA1:
- 0f615cff74b8bd321e26a635c7028758622f2b2e 921 main/binary-amd64/Packages
- 2dcb83f1578b10df8f28920189f726937ad0c359 581 main/binary-amd64/Packages.gz
+ bffe50685f37ab95ea560c2a25491f9ae230e150 921 main/binary-amd64/Packages
+ 368718afe15ebf5ea3788cfcbe98b4e0cdefabee 580 main/binary-amd64/Packages.gz
  4f10760dacd5360640ad9722eefc0fd604bb2d9e 177 main/binary-amd64/Release
 SHA256:
- bd1879205bef3d40eabb05b40b4ccb19e4cf211668d205553b87b6ce467151a9 921 main/binary-amd64/Packages
- 42cbdacbd2212aea48e085fc058fc9b9035fbed3b7e6d566caf9a3ba5c49d5bc 581 main/binary-amd64/Packages.gz
+ f54802d5ae1932fec5151448264768ccbb99e06396400972a1040db61fe46c47 921 main/binary-amd64/Packages
+ da5d681d1df097632331b643d8592a7f25a1b0f927b3ef4c8dc2a54c15c2005c 580 main/binary-amd64/Packages.gz
  37d47fed05c8bc3e6591758f83441740dedd77dc3183b8e59fbc53b8e8e28f32 177 main/binary-amd64/Release
