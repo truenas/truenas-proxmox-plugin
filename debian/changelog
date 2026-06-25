@@ -1,3 +1,26 @@
+truenas-proxmox-plugin (2.1.14+deb1) unstable; urgency=medium
+
+  * Force SCSI READ CAPACITY on iSCSI sdX devices when LUN numbers are
+    recycled. When an iSCSI extent is deleted and a new extent reuses
+    the same lunid, the kernel retains the same sdX block device with
+    the OLD (smaller) capacity. iscsiadm -m session -R discovers new
+    LUNs but does not refresh capacity on existing sdX entries. qemu-img
+    convert during a multi-disk full clone then sees a destination
+    smaller than the source and aborts with "output file is smaller
+    than input file". New _iscsi_rescan_sd_capacity helper writes 1 to
+    /sys/block/sdX/device/rescan for every iSCSI-backed sdX in the
+    plugin's target_iqn session. Wired into alloc_image's deferred
+    block, _clone_image_iscsi's deferred block, and activate_volume.
+    Cheap, idempotent. Cherry-picked from broker-service e9e8441.
+  * Add --start N / --stop M flags to the dev-truenas-plugin-full-
+    function-test.sh runner and a diagnostic dump on multi-disk clone
+    failure (by-path symlinks, base+clone VM config, blockdev sizes per
+    proxmox-lun-*, TN iscsi.extent.query). Optional KEEP_ON_CLONE_FAIL=1
+    leaves state for inspection. Cherry-picked from broker-service
+    50414b8.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 25 Jun 2026 12:30:00 +0000
+
 truenas-proxmox-plugin (2.1.13+deb1) unstable; urgency=low
 
   * Drop the interactive Auto-migrate/Skip prompt from postinst. lintian
