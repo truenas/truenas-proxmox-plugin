@@ -1,4 +1,4 @@
 TrueNASPlugin.pm usr/share/perl5/PVE/Storage/Custom/
 install.sh usr/share/truenas-proxmox-plugin/
 tools/truenas-plugin-broker usr/sbin/
-debian/truenas-plugin-broker.service lib/systemd/system/
+debian/truenas-plugin-broker.service usr/lib/systemd/system/

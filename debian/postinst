@@ -111,20 +111,12 @@ migrate_storage_cfg() {
     ' "$STORAGE_CFG"
     echo ""
 
-    if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
-        echo "Non-interactive mode: auto-migrating."
-        _do_migrate
-        return
-    fi
-
-    printf "  [A] Auto-migrate (backup created first)\n"
-    printf "  [M] Skip - I will update manually\n"
-    printf "Choice [A/m]: "
-    read -r answer </dev/tty || answer="a"
-    case "${answer:-a}" in
-        [Mm]) echo "Skipped. Edit $STORAGE_CFG manually before restarting pvedaemon." ;;
-        *)    _do_migrate ;;
-    esac
+    # Always auto-migrate. Maintainer scripts must not prompt the user
+    # interactively (Debian Policy 6.3, lintian: read-in-maintainer-script).
+    # A timestamped backup is created in _do_migrate before any edit, so
+    # operators who want to opt out can restore from <STORAGE_CFG>.bak.<ts>.
+    echo "Auto-migrating storage.cfg (backup will be created first)."
+    _do_migrate
 }
 
 case "$1" in
