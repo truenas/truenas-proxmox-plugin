@@ -5,36 +5,36 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: bookworm
 Codename: bookworm
-Date: Thu, 25 Jun 2026 17:51:43 UTC
+Date: Fri, 26 Jun 2026 15:45:44 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
 Description: TrueNAS Proxmox Plugin APT repository (bookworm)
 MD5Sum:
- 14daa12515e43d6cf9e8e39275776b46 921 main/binary-amd64/Packages
- 608f4f5b1eb061d756ec8859dc7d328f 580 main/binary-amd64/Packages.gz
+ 6f0edcd8510d0554c28527adca02ea88 921 main/binary-amd64/Packages
+ f43588b4dbd8632f8412ea29967c7401 578 main/binary-amd64/Packages.gz
  d2c2d405ed3779a1ef71e99c7b7c2bb7 177 main/binary-amd64/Release
 SHA1:
- bffe50685f37ab95ea560c2a25491f9ae230e150 921 main/binary-amd64/Packages
- 368718afe15ebf5ea3788cfcbe98b4e0cdefabee 580 main/binary-amd64/Packages.gz
+ 5849d4b5725d54f21b9cce9d62bb460aaa583b3b 921 main/binary-amd64/Packages
+ 6e70550686849974323b5519988fbc7febed5af2 578 main/binary-amd64/Packages.gz
  4f10760dacd5360640ad9722eefc0fd604bb2d9e 177 main/binary-amd64/Release
 SHA256:
- f54802d5ae1932fec5151448264768ccbb99e06396400972a1040db61fe46c47 921 main/binary-amd64/Packages
- da5d681d1df097632331b643d8592a7f25a1b0f927b3ef4c8dc2a54c15c2005c 580 main/binary-amd64/Packages.gz
+ fa2bc74a6adafa0c75f0ec0a128a69af109dd31ee257271cdecd66e80cd69c52 921 main/binary-amd64/Packages
+ 6d173e041f56c93b17560ed4f96e347393a1a1407caf44ae466a380367f5be6a 578 main/binary-amd64/Packages.gz
  37d47fed05c8bc3e6591758f83441740dedd77dc3183b8e59fbc53b8e8e28f32 177 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo9aq8ACgkQqX8sptOm
-79i2wA/7BZll0z+BOuwaTume4iT5PTTPB5z3Da+dOtFKmFT3CCNEjXeqQuT2VU20
-k2EPtQLAV4Ji/X04ZrvhetLPMY4fHuN8gSiTx5Jm0o2BHAIMbg7dI2sF1dHgkOUy
-mSBp2cfu2WXwxdyACezkICXNLdR3fYeCRtaoJk3boR1/L3Mg4X5ozXm2w+GEAUbm
-4TEJOIJ6RMzPI2ietgEDp5Rg1tm/644mMkRElnQaMDc2E36kZdK0vaWbjAyuxwZQ
-bWraPSUwncYxN2B+QFZzdp+l/yqot1CcGEPeH5E3fRKX2CsijeBRSSTr2+MdQkDG
-mUxoLnLQhAAJ672UhghKG6Gl9Dxebn6um3UC/eTUQdEkEq3NJU03u97pHyOjTVel
-vmVHBbIxL2bVi0zWDagimf7S0v35mEFalHeYSbxZ88cMLe0/7B793xDjhQQVQrAO
-C/uXaU9SXF6Zozr0EpUCRg1YHiPve8B/os4cebS7IytPb50NL6+25rJXmWAo1s/v
-rkjJLwEMKy8aGsXdv15o3porqCR3RuqJuCMLiHFQD/h/AyM8khgX4kLMLOhgqq/N
-dsJz9MQTuNcDcyigU77x6xvp1xdSdtdVCxfYQXT/sb8rmvce5RY+rnh9zw4ScXov
-3BR8A1mfyCjJgHTENgop0wVp+8xAdu62R/6O86YPLc6Fasgo6U0=
-=RUhk
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo+nqgACgkQqX8sptOm
+79j9sRAApJcihXt7ldZOQQsOvjxFvf8xecxJQhJ/IwGllFtDuNd1A61RzkYqpcZi
+nrwAsfOehGLnOj6McG5rR2FOTX61iDV4TeQApaizd0rskav6z3SszAdLnFDx1uXF
+aT8GvH64RaFVk4krSYAwChkYWd4iWAK76rzEV1brGHDCZV6CK+QslLEltaaDQwtr
+p+uSd2mm509qUh70qk8dPgfGm0tAfWJQEV3tE0PbXtp4AwPsrS5SvYBjwh4EiMW2
+3Jp1xImDhNFbwjF1oS1B4ZEnvrrfbXqFKEqawMs6YP1ZIR0CyLew4puVfEXAWyY+
+XC7rtFhkPXCl9K6Y0M6UuAma1nxY/M1vqNvZGyflzX0+9BLrUpTICKLS5SeutWUS
+neSOnxeVWblh7Kj52IvdozgZLI+Q0N9G7rR7pAUTJOq3HbdDjZvFDvpBVq8DGy70
+sYt8ZznOmBogFkGOB8lGO2GkrBERqK9lZkV0JIFCAB6kFdEvUhpiN10PB2ludPHC
+P0EDBs0CA678wvqPleIvEIKJrkUL29fZsYRVGs3ewYMgaf4HRwJEHu84LH+t97lv
+wz7n3GcCDGQViw7w8vq8nJa6c2h7ZtjuwydPIzry9ohs3ylQEqM5HyOdNlVQZhlu
+jgamWfUet+/bHFaxuksYk1C7uCPh7oqGjm2cL58WjIszZAk7o7A=
+=LJRY
 -----END PGP SIGNATURE-----
