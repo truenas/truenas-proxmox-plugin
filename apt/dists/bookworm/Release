@@ -2,7 +2,7 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: bookworm
 Codename: bookworm
-Date: Fri, 26 Jun 2026 16:22:13 UTC
+Date: Fri, 26 Jun 2026 17:20:57 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog

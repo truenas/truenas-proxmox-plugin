@@ -5,7 +5,7 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: bookworm
 Codename: bookworm
-Date: Fri, 26 Jun 2026 16:22:13 UTC
+Date: Fri, 26 Jun 2026 17:20:57 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
@@ -24,17 +24,17 @@ SHA256:
  37d47fed05c8bc3e6591758f83441740dedd77dc3183b8e59fbc53b8e8e28f32 177 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo+pzUACgkQqX8sptOm
-79herQ/9ECacYC3fNo+d15Rgwd79ay982wB+u5LJAx1DkRfZ0e1ZCG8doixGMqAE
-KzcsNx9A7PA64ThmSUEj+3Qz9keWpjAWbFScdxJFq9naTl2ToqIUISbVKYLoU9pG
-tMdQxvpdOok+AZbifFlQTfiAdXGnyzsYS1SYF8tyk+4kEaHG52y3aE2cxEpxHXyC
-zJAzDL3s7x+nKVh7HRvscUeLeh2djHYHH6jNq4P0TQP3mabaWpLEJzLDicjiP9rB
-vWUptKEaJ8MDrsbGlKXU8y4JHqGpO3jZ0GmMotNUJSk6pQ7mssnQGK4euYBC7j1v
-5slHpO+pQuP+SZyxwz96/SjbOt2b/ekA47GZ2qVms/IvkVLQ+25KfPA9Ll85gzoj
-XcjX6S4jviH/U2irvXF+QFWoRwWOiyxzWLYbo+WT3RPeuc9rNcRuLPxzAEUBRHI8
-U6clbVR/IpOsSw+erIV8v+nBQ9ZZ9+kuuA83QKkU5IdOibX0bL4aSkvpxx0QUfKa
-xHeCI/6eez+HvW3ZZGciK6Y943HOi0u0YzeVdUMPFLeunDgeQ8D4mpQMUYXc2lVN
-VBdFtNRmH5CFEMtPhgaSTpKvYt6Ll5GtRwrZYzLk6WywPNXWf8arhEhbnu0mM4T7
-dnony0kf818tZryNoR896jmwzkyx6XQzvwWf5/lHulQhq4c899k=
-=fnJD
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo+tPkACgkQqX8sptOm
+79hnZRAAqC5yh+QWU2JoGLZC8j7HgYviuzRbStc6yVL6obampApitmEc70vZkX1e
+h5jdaBD+G8Or/Nz5m/YvnhWQ/jgRs6BPEYNiZTwP0Qiw8T8W0HKMsVvlR6L8qj8d
+5mboWBR0wsOGCtsyK6VINZQy5ILwOPfKtmyXCSpI1/iNsIqdnyoaDuq3L+85Ghaq
+aIaNiVykBiGrxX9JmrwaccQYkQaRZh2sJwVySlICUbnse3asyj4hmyy640tECwyi
+VcxW61vhID2wKh+yGMIvHdTj4XKNugOMBe6enOLq9ftWh5LuXRVBsDDreGbmUS5K
+VOWLMWqkPAAYGy4YQO0W+lyECv8Ogm/xuviEydM4GoYi9Oc++ptYttpMSENt81/N
+uOEMGLLzLJv+IzvUNpUlhNASQcI7n8a5MCd5ctHbdUYKUAJJNbw9U66wCABP5V4o
+CpoY16/0QUVjl9qZiw/MMoZUA8iDdm/+RgrTUfYUrJAxW6VFMP5dmkfdZZdPve0X
+DO5xWNPTi+Db/3NkKfFcczDaR1UmcjF+tnjXKvY2eazvp2AVd3TWX7DB4xRYI+Ra
+30xjhotXDix2CpMz9TMsqaHNwgNxnG11uztALM2oWCrN4tfYA8ly80d875GebdSA
+1oH7G9n5wYsKsayU9pJ3pFb5tAOkUHaMszjR9SvKVe3n0IdYpWA=
+=XGsR
 -----END PGP SIGNATURE-----

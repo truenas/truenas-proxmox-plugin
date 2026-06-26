@@ -5,7 +5,7 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: trixie
 Codename: trixie
-Date: Fri, 26 Jun 2026 16:22:13 UTC
+Date: Fri, 26 Jun 2026 17:20:57 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
@@ -24,17 +24,17 @@ SHA256:
  6b03e33922db913500a68ebcfec689a61ddc300fe8e4cde30685d74d641a0398 173 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo+pzUACgkQqX8sptOm
-79jo0BAAqowxnvHkWRFix93NuZqgI1gSNEDpE+mLQsbigoNFkNHQqfm0UgmmPa1I
-/s8ShGwspgxsF5XmqHHO+8n8CDAL1RYsPETa6lZB2Fe//kiwTVHV+XsikTG/LKV5
-czb6rzjLxcZsO08rsqWqdpFgpVA0SfNta6xq1BSgxp6xtVB4+b5/4m9xm2rQPw1n
-vLQU8ovW9Je6fEp85x4XVDQ1SueW6XxPQ5XwuCSvG1P+LUTb4LtOUgUAx1h8eX3w
-4pt1xvzq9s0ng6Eg9Ug9pW3+g28vVMcoze5x6e2HA36hQDPZefnDw+eJ2wWHhRAO
-sJWwv2S3uimRX/3Vl8ABQ/mfRlSJMXS8MGvC7CNAbPSk0DYZ9h0RdMJJg/qyiYi6
-86PLbrRIrhAeS4R27/YMk0JmtU1XoM81iSLDl5Xz6mbym87RH4gIlmzgOPprUNwO
-yFaeCQdg+j312FIGm5PcLLqwIgaHhF5iS4iNWjnVwQBQByniuunnCSLkWylYrYop
-pal4DJmo4RPwz4/q74e2EkdzkAYX9bBj2yVzZu175f+kyIYLk2w7X/CE5tx7vBLO
-tgpw2uzEc6IKyj8bQuLoklJZ8S3dwvX9QuI4VBJ42iSFxlUoYb8yp434RVneaHx0
-8mRIr8XF2XnYnvv6Xf87/r0vv3cTwU/GACQlMPrsDZJu3oJ7qdY=
-=E7wt
+iQIzBAEBCgAdFiEE00Dip2kqxePfDkdpqX8sptOm79gFAmo+tPkACgkQqX8sptOm
+79htgA//SpKjVr7wJjwZsbCDgH063y4taW2c1KhrNnQ/tRuk6sTuMS4+nXdykiys
+4+kiirdnpaXZaXtppTPGdsiVUh7XGWsZDCjxJs7RT9PwryV++DHM68lrp88cQKiL
+jC5ZwIqLBw/ZjkmzvRwQuYRHVIh+SFOGMPmB/1P0bUG3jsgSGq77ZajSgs9r2CZE
+ukAdLLSvp8QXft27xfci/1fV2KlEuIGz1NPJjmM5hTr1Iplawj2Jkvo5k4vD7zSd
+sZmXsG0fUz+iZYgT1HYsUXzN1n2PDe2zyj8nn4lTTGONOuxmG9Y3oxJS23okR2iI
+hEQzpTh9cyqCoiETsDkmnYcZ61wCnW6VSLErcoxcUw9z+1gQJipzPmpWs9wd/Mft
+YmBHrkayUrzIg8OdBNTE7fE/7OEeHneM6qAVupzGtt0xLaPvQrzRP3ciouV8LSYv
+bVQ5IrwPTjrEZ/jF2sBB1vUM0g6PwVkYEu/GqjlMAKx55HRN389WbYZLQKoA7D6D
+FsPxWkCUHKFQRu2qky7gsGbcbKJ9JSdzqHZTSYPuNqNumDvxYNzhwF3gQnf+p89T
+bKUttziTtJBdSFBXs7d0Mg1VeLG8UItsNkb3q2kefKdaCRc77XeYxkPaMAxt8iq3
+S7zHNxnVKO7eZZ5aG1ijwUBw6QN7fVROW5QhpaSEA9U9CdRAo2w=
+=m/Qv
 -----END PGP SIGNATURE-----
