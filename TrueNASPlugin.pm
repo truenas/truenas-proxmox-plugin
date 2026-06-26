@@ -2912,7 +2912,7 @@ sub _iscsi_rescan_sd_capacity($scfg) {
     # to each backing sdX's rescan attribute. Each write is cheap (a
     # single SCSI READ CAPACITY) and idempotent. Errors are logged and
     # ignored — the only callers are deferred best-effort paths.
-    my $iqn = $scfg->{target_iqn} // '';
+    my $iqn = $scfg->{tn_target_iqn} // '';
     return unless length $iqn;
 
     # Each session looks like /sys/class/iscsi_session/session*/

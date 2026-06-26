@@ -1,3 +1,22 @@
+truenas-proxmox-plugin (2.1.16+deb1) unstable; urgency=high
+
+  * Critical fix in _iscsi_rescan_sd_capacity: was reading
+    $scfg->{target_iqn} instead of $scfg->{tn_target_iqn}. On this
+    branch the storage.cfg key is tn_target_iqn (the tn_ rename
+    landed in v2.1.0); the bare name returns undef, so the helper
+    fell through "return unless length $iqn" and did nothing. Every
+    call site wired into alloc_image / _clone_image_iscsi /
+    activate_volume since v2.1.14 has been hitting a no-op.
+    Multi-disk full clone failures with "qemu-img: output file is
+    smaller than input file" continued in v2.1.15 because the
+    intended SCSI READ CAPACITY rescan never ran on the recycled
+    sdX. Single-character fix.
+    Introduced by my cherry-pick of e9e8441 onto this branch: the
+    call-site conflicts were resolved to use tn_use_multipath but
+    the same rename inside the helper body was missed.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 26 Jun 2026 14:00:00 +0000
+
 truenas-proxmox-plugin (2.1.15+deb1) unstable; urgency=high
 
   * Critical fix to _is_connection_error: remove the /x regex flag that
