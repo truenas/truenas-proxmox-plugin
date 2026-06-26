@@ -2161,29 +2161,52 @@ test_multidisk_advanced_operations() {
     local clone_start=$(date +%s)
     if ! qm clone "$base_clone_vmid" "$clone_vmid" --name "test-multidisk-clone" --full --storage "$STORAGE_ID" 2>/tmp/clone-err.log; then
         log_error "Failed to create multi-disk clone"
-        log_error "stderr: $(cat /tmp/clone-err.log)"
+        log_error "stderr: $(cat /tmp/clone-err.log 2>/dev/null || true)"
         # Diagnostic dump before teardown — capture state so the size mismatch
         # can be inspected post-mortem.
-        log_error "--- diagnostic dump (pre-teardown) ---"
-        log_error "by-path symlinks:"
-        ls -l /dev/disk/by-path/ 2>&1 | grep -E 'proxmox-lun' | tee -a "$LOG_FILE" >&2
-        log_error "base VM ($base_clone_vmid) config:"
-        qm config "$base_clone_vmid" 2>&1 | tee -a "$LOG_FILE" >&2
-        log_error "clone VM ($clone_vmid) config (if present):"
-        qm config "$clone_vmid" 2>&1 | tee -a "$LOG_FILE" >&2
-        log_error "block device sizes for each lun:"
-        for lp in /dev/disk/by-path/ip-*-iscsi-iqn.*proxmox-lun-*; do
-            [ -e "$lp" ] || continue
-            printf '  %s -> %s : %s bytes\n' \
-                "$lp" "$(readlink -f "$lp")" "$(blockdev --getsize64 "$lp" 2>/dev/null || echo N/A)" \
-                | tee -a "$LOG_FILE" >&2
-        done
-        log_error "TrueNAS extents (filesize, naa):"
-        ssh -o BatchMode=yes -o ConnectTimeout=5 "root@${TN_HOST:-${TN_API_HOST:-truenas}}" \
-            "midclt call iscsi.extent.query" 2>/dev/null \
-            | python3 -c 'import json,sys;d=json.load(sys.stdin);[print(f"  id={e[\"id\"]} name={e[\"name\"]} disk={e.get(\"disk\")} filesize={e.get(\"filesize\")} naa={e.get(\"naa\")}") for e in d]' \
-            2>&1 | tee -a "$LOG_FILE" >&2 || true
-        log_error "--- end diagnostic dump ---"
+        #
+        # IMPORTANT: every command below is `|| true`-guarded because the
+        # dev script runs under `set -euo pipefail`. PVE's qm-clone error
+        # handler removes the clone (config + LUNs) BEFORE we see rc=1,
+        # so `qm config $clone_vmid` exits non-zero and would otherwise
+        # kill the dump mid-way. Same for blockdev on missing paths and
+        # ssh to TN if the host isn't reachable.
+        {
+            log_error "--- diagnostic dump (pre-teardown) ---"
+            log_error "by-path symlinks:"
+            { ls -l /dev/disk/by-path/ 2>&1 | grep -E 'proxmox-lun' || true; } \
+                | tee -a "$LOG_FILE" >&2 || true
+            log_error "base VM ($base_clone_vmid) config:"
+            { qm config "$base_clone_vmid" 2>&1 || true; } | tee -a "$LOG_FILE" >&2 || true
+            log_error "clone VM ($clone_vmid) config (if present):"
+            { qm config "$clone_vmid" 2>&1 || true; } | tee -a "$LOG_FILE" >&2 || true
+            log_error "block device sizes for each lun:"
+            for lp in /dev/disk/by-path/ip-*-iscsi-iqn.*proxmox-lun-*; do
+                [ -e "$lp" ] || continue
+                printf '  %s -> %s : %s bytes\n' \
+                    "$lp" \
+                    "$(readlink -f "$lp" 2>/dev/null || echo '?')" \
+                    "$(blockdev --getsize64 "$lp" 2>/dev/null || echo N/A)" \
+                    | tee -a "$LOG_FILE" >&2 || true
+            done
+            log_error "TrueNAS extents (filesize, naa):"
+            { ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                "root@${TN_HOST:-${TN_API_HOST:-truenas}}" \
+                "midclt call iscsi.extent.query" 2>/dev/null \
+                | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    for e in d:
+        print(f"  id={e[\"id\"]} name={e[\"name\"]} disk={e.get(\"disk\")} filesize={e.get(\"filesize\")} naa={e.get(\"naa\")}")
+except Exception as exc:
+    print(f"  (parse error: {exc})")' 2>&1 || true; } \
+                | tee -a "$LOG_FILE" >&2 || true
+            log_error "recent [TrueNAS] plugin log entries (last 60s):"
+            { journalctl --since "60 seconds ago" --no-pager 2>/dev/null \
+                | grep -E "\\[TrueNAS\\]" | tail -50 || true; } \
+                | tee -a "$LOG_FILE" >&2 || true
+            log_error "--- end diagnostic dump ---"
+        } || true
         if [ "${KEEP_ON_CLONE_FAIL:-0}" = "1" ]; then
             log_error "KEEP_ON_CLONE_FAIL=1 set; leaving base/clone for manual inspection"
             FAILED_TESTS=$((FAILED_TESTS + 1))
