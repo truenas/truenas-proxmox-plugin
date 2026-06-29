@@ -1866,8 +1866,18 @@ sub volume_has_feature {
 
     my $features = {
         snapshot => { current => 1 },
-        clone => { snap => 1, current => 1 },  # Support cloning from snapshots and current volumes
-        copy => { snap => 1, current => 1 },   # Support copying from snapshots and current volumes
+        # clone:
+        #   - snap => 1: clone from any snapshot (including __base__)
+        #   - base => 1: clone from a base image (uses its __base__ snapshot)
+        # NOT current => 1: we cannot clone a live volume without going
+        # through a snapshot. The previous "current => 1" advertisement
+        # was a lie that caused clone_image to die "clone not supported
+        # without snapshot" when PVE took us at our word.
+        clone => { snap => 1, base => 1 },
+        copy  => { snap => 1, current => 1, base => 1 },
+        # template => 1 enables `qm template <vmid>` which calls
+        # create_base on each disk.
+        template => { current => 1 },
         discard => { current => 1 },           # ZFS handles secure deletion when zvol is destroyed
         erase => { current => 1 },             # Alternative feature name for secure deletion
         wipe => { current => 1 },              # Another alternative feature name
@@ -4314,24 +4324,44 @@ sub _nvme_delete_namespace {
 sub parse_volname {
     my ($class, $volname) = @_;
 
+    # Slash-encoded linked-clone form (PVE convention):
+    #   <base_volid>/<clone_volid>
+    # where <base_volid> begins with "vol-base-<basevmid>-...". When this
+    # form is supplied, the second half is the live clone and the first
+    # half identifies its origin template. PVE stores this exact string
+    # in the cloned VM's .conf. Both halves can be iSCSI or NVMe.
+    if ($volname =~ m{^(vol-base-\d+-disk-\d+-(?:lun\d+|ns[a-f0-9\-]+))/(vol-vm-\d+-disk-\d+-(?:lun\d+|ns[a-f0-9\-]+))$}) {
+        my ($base_volid, $clone_volid) = ($1, $2);
+        # Recurse to extract details from each half. The clone half is the
+        # one PVE actually wants identifiers for; basename/basevmid come
+        # from the base half.
+        my (undef, $clone_zname, $clone_vmid, undef, undef, undef, $fmt, $clone_meta) =
+            $class->parse_volname($clone_volid);
+        my (undef, $base_zname,  $base_vmid,  undef, undef, undef, undef, undef) =
+            $class->parse_volname($base_volid);
+        return ('images', $clone_zname, $clone_vmid, $base_zname, $base_vmid, undef, $fmt, $clone_meta);
+    }
+
     # iSCSI format: vol-<zname>-lun<N>
     if ($volname =~ m/^vol-([A-Za-z0-9:_\.\-]+)-lun(\d+)$/) {
         my ($zname, $lun) = ($1, $2);
-        my $vmid;
-        $vmid = $1 if $zname =~ m/^vm-(\d+)-/; # derive owner if named vm-<vmid>-...
+        my ($vmid, $isBase);
+        if    ($zname =~ m/^vm-(\d+)-/)   { $vmid = $1; }
+        elsif ($zname =~ m/^base-(\d+)-/) { $vmid = $1; $isBase = 1; }
         # return shape mimics other block plugins:
         # ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format, $metadata)
         # For iSCSI, metadata = lun number
-        return ('images', $zname, $vmid, undef, undef, undef, 'raw', $lun);
+        return ('images', $zname, $vmid, undef, undef, $isBase, 'raw', $lun);
     }
 
     # NVMe format: vol-<zname>-ns<uuid>
     if ($volname =~ m/^vol-([A-Za-z0-9:_\.\-]+)-ns([a-f0-9\-]+)$/) {
         my ($zname, $uuid) = ($1, $2);
-        my $vmid;
-        $vmid = $1 if $zname =~ m/^vm-(\d+)-/; # derive owner if named vm-<vmid>-...
+        my ($vmid, $isBase);
+        if    ($zname =~ m/^vm-(\d+)-/)   { $vmid = $1; }
+        elsif ($zname =~ m/^base-(\d+)-/) { $vmid = $1; $isBase = 1; }
         # For NVMe, metadata = device_uuid
-        return ('images', $zname, $vmid, undef, undef, undef, 'raw', $uuid);
+        return ('images', $zname, $vmid, undef, undef, $isBase, 'raw', $uuid);
     }
 
     die "unable to parse volname '$volname'\n";
@@ -6298,8 +6328,23 @@ sub deactivate_volume {
 sub clone_image {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name, $format) = @_;
 
-    die "clone not supported without snapshot\n" unless $snapname;
     die "only raw format is supported\n" if defined($format) && $format ne 'raw';
+
+    # If source is a base image and no snapname was supplied, default to
+    # the immutable anchor snapshot created by create_base. ZFS cannot
+    # clone a live zvol — only snapshots — so this default closes the
+    # PVE qm-clone flow against a template (PVE does not always pass
+    # __base__ explicitly; it relies on volume_has_feature's `base => 1`
+    # advertisement to mean "this plugin knows how to clone bases").
+    if (!defined($snapname) || $snapname eq '') {
+        my (undef, undef, undef, undef, undef, $isBase, undef, undef) =
+            $class->parse_volname($volname);
+        if ($isBase) {
+            $snapname = '__base__';
+        } else {
+            die "clone not supported without snapshot for non-base volume '$volname'\n";
+        }
+    }
 
     _log($scfg, 1, 'info', "[TrueNAS] clone_image: volname=$volname, vmid=$vmid, snapname=$snapname");
 
@@ -6319,8 +6364,11 @@ sub clone_image {
 sub _clone_image_iscsi {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
 
-    # Parse source volume information
-    my (undef, $source_zname) = $class->parse_volname($volname);
+    # Parse source volume information. When source is a base / template,
+    # we need to return the slash-encoded volname "vol-<base>-lunB/vol-<clone>-lunM"
+    # so PVE records the parent relationship in the cloned VM's .conf.
+    my (undef, $source_zname, undef, undef, undef, $source_is_base, undef, $source_lun) =
+        $class->parse_volname($volname);
     my $source_full = $scfg->{tn_dataset} . '/' . $source_zname;
     my $source_snapshot = $source_full . '@' . $snapname;
 
@@ -6444,8 +6492,13 @@ sub _clone_image_iscsi {
 
     die "could not determine assigned LUN for clone $target_zname\n" if !defined $lun;
 
-    # 5) Return clone volume name — defer initiator rescan after lock release
+    # 5) Return clone volume name — defer initiator rescan after lock release.
+    # For a linked clone of a base, prefix with "<base>/" so PVE records
+    # the parent relationship; parse_volname recognizes the slash form.
     my $clone_volname = "vol-$target_zname-lun$lun";
+    if ($source_is_base) {
+        $clone_volname = "vol-$source_zname-lun$source_lun/$clone_volname";
+    }
 
     my $deferred_scfg = $scfg;
     _defer_after_lock(sub {
@@ -6599,7 +6652,128 @@ sub copy_image {
     return $class->clone_image($scfg, $storeid, $volname, $vmid, $snapname, $name, $format);
 }
 
-sub create_base { die "base images not supported"; }
+# Convert a regular VM disk volume into a base / template image.
+#
+# PVE invokes this once per VM disk when the user runs `qm template <vmid>`.
+# Contract: rename the underlying storage object to a "base-<vmid>-..."
+# form, take a base snapshot that linked clones will derive from, and
+# return the new volname so PVE updates the VM config.
+#
+# Implementation for this plugin:
+#   1. pool.dataset.rename tank/<dataset>/vm-<vmid>-disk-N
+#                      -> tank/<dataset>/base-<vmid>-disk-N
+#      with force=true (TN's rename rejects datasets referenced by an
+#      iSCSI extent without the override; verified safe on TN 26 BETA).
+#   2. iscsi.extent.update <id> {disk=>"zvol/<new_dataset>"} so the
+#      extent points at the renamed zvol. naa stays stable, so PVE's
+#      /dev/disk/by-id paths don't change and the kernel/multipath
+#      stack doesn't need to re-discover the device.
+#   3. pool.snapshot.create dataset=<new_dataset> name=__base__. This is
+#      the immutable anchor every linked clone's zvol will derive from.
+#
+# Returns the new volname "vol-base-<vmid>-disk-N-lun<M>". The lun
+# number is unchanged.
+#
+# Rollback: best-effort. On extent.update failure we try to rename
+# back. On snapshot.create failure the rename + extent.update stand
+# (the dataset is named correctly, just lacks the __base__ snap; PVE
+# will retry). create_base is otherwise idempotent if a previous
+# attempt left a renamed dataset without __base__.
+sub create_base {
+    my ($class, $storeid, $scfg, $volname) = @_;
+
+    my ($vtype, $zname, $vmid, $basename, $basevmid, $isBase, $format, $metadata) =
+        $class->parse_volname($volname);
+
+    die "create_base: not an image volume ($vtype)\n" if $vtype ne 'images';
+    die "create_base: $volname is already a base image\n" if $isBase;
+    die "create_base: $volname has no derivable VMID\n" if !defined $vmid;
+
+    my $mode = $scfg->{tn_transport_mode} // 'iscsi';
+    die "create_base: not yet supported on $mode transport (iscsi only for now)\n"
+        if $mode ne 'iscsi';
+
+    # zname is e.g. "vm-<vmid>-disk-N". Compute the new base name.
+    my $new_zname = $zname;
+    unless ($new_zname =~ s/^vm-/base-/) {
+        die "create_base: zname '$zname' does not start with 'vm-', cannot derive base name\n";
+    }
+
+    my $old_full = $scfg->{tn_dataset} . '/' . $zname;
+    my $new_full = $scfg->{tn_dataset} . '/' . $new_zname;
+    my $new_zvol_path = 'zvol/' . $new_full;
+
+    _log($scfg, 1, 'info',
+        "[TrueNAS] create_base: $old_full -> $new_full (vmid=$vmid lun=$metadata)");
+
+    # Locate the extent that currently maps to the old zvol so we can
+    # rewire it after the rename.
+    my $extents = _tn_extents($scfg) // [];
+    my ($extent) = grep { ($_->{disk} // '') eq "zvol/$old_full" } @$extents;
+    die "create_base: no iSCSI extent found for zvol/$old_full\n" unless $extent;
+    my $extent_id = $extent->{id};
+
+    # Step 1: pool.dataset.rename with force=true. force is required
+    # because TN's safety check refuses to rename a dataset that has an
+    # iSCSI extent referencing it; we override because we know we're
+    # about to update the extent in step 2.
+    eval {
+        _api_call_mutate(
+            $scfg,
+            'pool.dataset.rename',
+            [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
+        );
+    };
+    if ($@) {
+        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $@";
+    }
+
+    # Step 2: rewire the iSCSI extent to point at the new zvol path.
+    eval {
+        _api_call_mutate(
+            $scfg,
+            'iscsi.extent.update',
+            [ $extent_id, { disk => $new_zvol_path } ],
+        );
+    };
+    if ($@) {
+        my $err = $@;
+        _log($scfg, 0, 'err',
+            "[TrueNAS] create_base: iscsi.extent.update failed; rolling back rename: $err");
+        eval {
+            _api_call_mutate(
+                $scfg,
+                'pool.dataset.rename',
+                [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
+            );
+        };
+        die "create_base: iscsi.extent.update id=$extent_id disk=$new_zvol_path failed: $err";
+    }
+
+    # Step 3: take the __base__ snapshot. This is the anchor for every
+    # linked clone derived from this template.
+    eval {
+        _api_call_mutate(
+            $scfg,
+            'pool.snapshot.create',
+            [ { dataset => $new_full, name => '__base__', recursive => JSON::PP::false } ],
+        );
+    };
+    if ($@) {
+        # Don't roll back the rename here; the template is functionally
+        # complete from PVE's perspective (config will reference the new
+        # name). Surface the failure so the operator can re-snapshot.
+        die "create_base: pool.snapshot.create $new_full\@__base__ failed: $@";
+    }
+
+    _invalidate_status_capacity_cache($storeid, $scfg);
+    _clear_cache(_cache_host_key($scfg));
+
+    my $new_volname = "vol-${new_zname}-lun${metadata}";
+    _log($scfg, 1, 'info',
+        "[TrueNAS] create_base: $volname -> $new_volname (extent_id=$extent_id naa unchanged)");
+    return $new_volname;
+}
 
 # ======== Deferred Work & Extended Lock Timeout ========
 # Override cluster_lock_storage to:
