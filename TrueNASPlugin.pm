@@ -6731,8 +6731,8 @@ sub create_base {
     die "create_base: $volname has no derivable VMID\n" if !defined $vmid;
 
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
-    die "create_base: not yet supported on $mode transport (iscsi only for now)\n"
-        if $mode ne 'iscsi';
+    die "create_base: unknown transport mode '$mode'\n"
+        if $mode ne 'iscsi' && $mode ne 'nvme-tcp';
 
     # zname is e.g. "vm-<vmid>-disk-N". Compute the new base name.
     my $new_zname = $zname;
@@ -6742,22 +6742,38 @@ sub create_base {
 
     my $old_full = $scfg->{tn_dataset} . '/' . $zname;
     my $new_full = $scfg->{tn_dataset} . '/' . $new_zname;
+    my $old_zvol_path = 'zvol/' . $old_full;
     my $new_zvol_path = 'zvol/' . $new_full;
 
     _log($scfg, 1, 'info',
-        "[TrueNAS] create_base: $old_full -> $new_full (vmid=$vmid lun=$metadata)");
+        "[TrueNAS] create_base: $old_full -> $new_full (vmid=$vmid mode=$mode)");
 
-    # Locate the extent that currently maps to the old zvol so we can
-    # rewire it after the rename.
-    my $extents = _tn_extents($scfg) // [];
-    my ($extent) = grep { ($_->{disk} // '') eq "zvol/$old_full" } @$extents;
-    die "create_base: no iSCSI extent found for zvol/$old_full\n" unless $extent;
-    my $extent_id = $extent->{id};
+    # Locate the transport-side share that currently references the old
+    # zvol so we can rewire it after the rename.
+    my ($transport_id, $rewire_method, $rewire_payload);
+    my $share_label;
+    if ($mode eq 'iscsi') {
+        my $extents = _tn_extents($scfg) // [];
+        my ($extent) = grep { ($_->{disk} // '') eq $old_zvol_path } @$extents;
+        die "create_base: no iSCSI extent found for $old_zvol_path\n" unless $extent;
+        $transport_id   = $extent->{id};
+        $rewire_method  = 'iscsi.extent.update';
+        $rewire_payload = { disk => $new_zvol_path };
+        $share_label    = "iSCSI extent id=$transport_id";
+    } else {
+        # nvme-tcp
+        my $namespaces = _nvme_namespaces_for_device_path($scfg, $old_zvol_path) // [];
+        die "create_base: no nvmet namespace found for $old_zvol_path\n" unless @$namespaces;
+        $transport_id   = $namespaces->[0]->{id};
+        $rewire_method  = 'nvmet.namespace.update';
+        $rewire_payload = { device_path => $new_zvol_path };
+        $share_label    = "nvmet namespace id=$transport_id";
+    }
 
     # Step 1: pool.dataset.rename with force=true. force is required
-    # because TN's safety check refuses to rename a dataset that has an
-    # iSCSI extent referencing it; we override because we know we're
-    # about to update the extent in step 2.
+    # because TN's safety check refuses to rename a dataset that an
+    # iSCSI extent or nvmet namespace references; we override because
+    # we are about to update the share in step 2.
     eval {
         _api_call_mutate(
             $scfg,
@@ -6769,18 +6785,24 @@ sub create_base {
         die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $@";
     }
 
-    # Step 2: rewire the iSCSI extent to point at the new zvol path.
+    # Step 2: rewire the transport share to point at the new zvol path.
+    # For iSCSI this updates the extent's `disk` field. For NVMe-TCP
+    # this updates the namespace's `device_path`. In both cases the
+    # device identifier exposed to the initiator (naa for iSCSI,
+    # device_uuid/nguid for NVMe) is stored separately and stays
+    # stable across the rewire, so PVE's /dev/disk/by-id and
+    # /dev/disk/by-path entries don't change.
     eval {
         _api_call_mutate(
             $scfg,
-            'iscsi.extent.update',
-            [ $extent_id, { disk => $new_zvol_path } ],
+            $rewire_method,
+            [ $transport_id, $rewire_payload ],
         );
     };
     if ($@) {
         my $err = $@;
         _log($scfg, 0, 'err',
-            "[TrueNAS] create_base: iscsi.extent.update failed; rolling back rename: $err");
+            "[TrueNAS] create_base: $rewire_method failed; rolling back rename: $err");
         eval {
             _api_call_mutate(
                 $scfg,
@@ -6788,7 +6810,7 @@ sub create_base {
                 [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
             );
         };
-        die "create_base: iscsi.extent.update id=$extent_id disk=$new_zvol_path failed: $err";
+        die "create_base: $share_label rewire to $new_zvol_path failed: $err";
     }
 
     # Step 3: take the __base__ snapshot. This is the anchor for every
@@ -6810,9 +6832,17 @@ sub create_base {
     _invalidate_status_capacity_cache($storeid, $scfg);
     _clear_cache(_cache_host_key($scfg));
 
-    my $new_volname = "vol-${new_zname}-lun${metadata}";
+    # Reconstruct the new volname. For iSCSI metadata is the LUN, for
+    # NVMe it's the device UUID. The format is unchanged from the
+    # source; only the zname portion was renamed vm- -> base-.
+    my $new_volname;
+    if ($mode eq 'iscsi') {
+        $new_volname = "vol-${new_zname}-lun${metadata}";
+    } else {
+        $new_volname = "vol-${new_zname}-ns${metadata}";
+    }
     _log($scfg, 1, 'info',
-        "[TrueNAS] create_base: $volname -> $new_volname (extent_id=$extent_id naa unchanged)");
+        "[TrueNAS] create_base: $volname -> $new_volname ($share_label, identifier unchanged)");
     return $new_volname;
 }
 
