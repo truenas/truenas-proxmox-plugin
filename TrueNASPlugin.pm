@@ -4833,11 +4833,52 @@ sub free_image {
     # Level 1: Light - function entry
     _log($scfg, 1, 'info', "[TrueNAS] free_image: volname=$volname");
 
-    die "snapshots not supported on zvols\n" if $isBase;
     die "unsupported format '$format'\n" if defined($format) && $format ne 'raw';
 
-    my (undef, $zname, undef, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
+    my (undef, $zname, undef, undef, undef, $parsed_isBase, undef, $metadata) =
+        $class->parse_volname($volname);
     my $full_ds = $scfg->{tn_dataset} . '/' . $zname;
+
+    # If this is a base / template volume, refuse to delete it while any
+    # linked clone still derives from its __base__ snapshot. ZFS would
+    # already refuse the destroy at the libzfs level, but doing the
+    # check here gives PVE a clearer error message than the EBUSY
+    # rollup it would otherwise see.
+    #
+    # PVE may call free_image either with $isBase=1 explicitly (when it
+    # got the parse_volname result earlier), or with $isBase=undef but a
+    # zname matching the base-<vmid>-disk-N convention. Detect both.
+    if ($isBase || $parsed_isBase) {
+        my $snap_id = "$full_ds\@__base__";
+        my $snap = eval {
+            _api_call($scfg, 'pool.snapshot.query',
+                [ [ [ 'id', '=', $snap_id ] ],
+                  { select => [ 'id', 'name', 'properties' ] } ]);
+        };
+        my @clones;
+        if ($snap && ref($snap) eq 'ARRAY' && @$snap) {
+            my $clones_prop = $snap->[0]->{properties}->{clones} // {};
+            # clones property comes as { value => "ds1,ds2,...", parsed => [...], ... }
+            my $raw = ref($clones_prop) eq 'HASH'
+                ? ($clones_prop->{parsed} // $clones_prop->{value} // '')
+                : ($clones_prop // '');
+            if (ref($raw) eq 'ARRAY') {
+                @clones = grep { defined && length } @$raw;
+            } elsif (defined $raw && length $raw) {
+                @clones = grep { length } split /,\s*/, $raw;
+            }
+        }
+        if (@clones) {
+            die sprintf(
+                "Cannot delete base image '%s': %d linked clone(s) still " .
+                "derive from %s\@__base__ (%s). Destroy the clone(s) first " .
+                "or use `pool.dataset.promote` on one to break the dependency.\n",
+                $volname, scalar(@clones), $full_ds, join(', ', @clones),
+            );
+        }
+        _log($scfg, 1, 'info',
+            "[TrueNAS] free_image: deleting base image $full_ds (no live clones)");
+    }
 
     # Protect weight volume from deletion - it maintains target visibility
     # Match both old format (pve-plugin-weight) and new format (pve-weight-*)
