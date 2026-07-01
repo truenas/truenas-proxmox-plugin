@@ -432,7 +432,7 @@ tn_api_call_write() {
             tn_api_insecure => ($api_insecure && $api_insecure eq "1") ? 1 : 0,
         };
         my $params = eval { decode_json($params_json) } // [];
-        my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params); };
+        my $result = eval { PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, $method, $params); };
         if ($@) {
             print STDERR "ERROR: $@";
             exit 1;
@@ -5248,7 +5248,7 @@ test_nvme_stale_recovery() {
 
     # Restart TrueNAS NVMe-oF service to create stale state
     log_verbose "Restarting TrueNAS NVMe-oF service to create stale connections" "WARN" "$CURRENT_OP_ID"
-    if ! tn_api_call_write "$api_host" "$api_key" "service.restart" '["nvmet"]' "$api_insecure" >/dev/null 2>&1; then
+    if ! tn_api_call_write "$api_host" "$api_key" "service.restart" '["nvmet",{"timeout":30}]' "$api_insecure" >/dev/null 2>&1; then
         log_error "Failed to restart NVMe-oF service"
         pvesh delete "/nodes/$NODE/qemu/$vmid" >/dev/null 2>&1 || true
         wait_for_vm_deletion "$vmid" "$vmid" 5
@@ -5332,7 +5332,7 @@ test_nvme_stale_recovery() {
         '[[["service","=","nvmet"]]]' "$api_insecure" 2>/dev/null); then
         if ! echo "$post_status" | grep -q '"state":"RUNNING"'; then
             log_warning "NVMe-oF service not running after test - restarting"
-            tn_api_call_write "$api_host" "$api_key" "service.start" '["nvmet"]' "$api_insecure" >/dev/null 2>&1 || true
+            tn_api_call_write "$api_host" "$api_key" "service.start" '["nvmet",{"timeout":30}]' "$api_insecure" >/dev/null 2>&1 || true
             sleep 3
         fi
     fi
