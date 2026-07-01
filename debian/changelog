@@ -1,3 +1,53 @@
+truenas-proxmox-plugin (2.1.17+deb1) unstable; urgency=high
+
+  * Template / linked-clone support (plan C). Implements the PVE
+    template lifecycle end-to-end for both iSCSI and NVMe-TCP:
+      - parse_volname recognizes base-<vmid>-disk-N and the
+        slash-encoded "<base_volid>/<clone_volid>" form used by
+        linked clones.
+      - create_base renames vm-<vmid>-disk-N to base-<vmid>-disk-N
+        (pool.dataset.rename force=true), rewires the transport
+        share to the new zvol path, and snapshots the base as
+        @__base__. The iSCSI extent's naa and the NVMe namespace's
+        device_uuid/nguid stay stable across the rewire, so PVE's
+        /dev/disk/by-id and /dev/disk/by-path entries do not change.
+      - clone_image defaults snapname to __base__ when the source
+        is a base image, and both _clone_image_iscsi and
+        _clone_image_nvme now return the slash-encoded volname so
+        PVE records the parent relationship in the clone VM config.
+      - volume_has_feature advertises clone => {snap,base} and
+        template => {current}; the misleading clone => {current}
+        (which caused "clone not supported without snapshot") is
+        removed.
+      - free_image refuses to destroy a base while any linked clone
+        still derives from its @__base__ snapshot. The check queries
+        pool.dataset.query filtered by origin.parsed (TN's
+        pool.snapshot.query does not surface the ZFS `clones`
+        property in this release).
+
+  * NVMe create_base ordering fix. TN validates the current
+    device_path on every namespace.update, including {enabled:false}.
+    Renaming first invalidated the path and blocked the disable;
+    disabling first while the old path is still valid succeeds.
+    New order: disable → rename → rewire → re-enable, with
+    symmetric rollback paths that re-enable the namespace on failure.
+
+  * volume_rollback_is_possible: implement to refuse rollback to a
+    non-latest snapshot, matching ZFSPoolPlugin semantics. Previously
+    volume_snapshot_rollback silently destroyed newer snapshots via
+    recursive=1 (required by TN 25.10 rollback semantics), which
+    tripped disk_snapshot.pl test 9 ("snap1 and snap2 still present
+    after rollback"). PVE now blocks the request at the ORM layer.
+
+  * disk_purge.pl test 9 fix. After a purge, a different pvedaemon
+    worker's stale mapping cache still lists the vanished volume.
+    Two-part fix: clear the mapping cache on the purging worker
+    after delete, and in _list_images_iscsi treat the fresh
+    pool.dataset.query result as ground truth — skip any
+    targetextent mapping whose backing zvol no longer exists.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 29 Jun 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.16+deb1) unstable; urgency=high
 
   * Critical fix in _iscsi_rescan_sd_capacity: was reading
