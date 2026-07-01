@@ -2110,6 +2110,40 @@ sub volume_snapshot_delete {
 
 # Roll back the zvol to a specific ZFS snapshot and rescan iSCSI/multipath.
 # Now supports restoring VM state for live snapshots.
+sub volume_rollback_is_possible {
+    my ($class, $scfg, $storeid, $volname, $snap, $blockers) = @_;
+
+    # ZFS zvol snapshots form a strictly linear chain: a `zfs rollback` to an
+    # older snapshot can only proceed by destroying every snapshot taken after
+    # it. Mirror the built-in ZFSPoolPlugin and refuse a rollback unless $snap
+    # is the most recent snapshot, so PVE blocks it cleanly instead of letting
+    # volume_snapshot_rollback() silently delete newer snapshots.
+    my $snapshots = $class->volume_snapshot_info($scfg, $storeid, $volname);
+
+    $blockers //= []; # not guaranteed to be set by caller
+    my $found;
+    for my $snapid (
+        sort { $snapshots->{$a}{timestamp} <=> $snapshots->{$b}{timestamp} or $a cmp $b }
+        keys %$snapshots
+    ) {
+        if ($snapid eq $snap) {
+            $found = 1;
+        } elsif ($found) {
+            push @$blockers, $snapid;
+        }
+    }
+
+    my $volid = "${storeid}:${volname}";
+
+    die "can't rollback, snapshot '$snap' does not exist on '$volid'\n"
+        if !$found;
+
+    die "can't rollback, '$snap' is not most recent snapshot on '$volid'\n"
+        if scalar(@$blockers) > 0;
+
+    return 1;
+}
+
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
     my (undef, $zname, $vmid) = $class->parse_volname($volname);
@@ -4850,23 +4884,19 @@ sub free_image {
     # zname matching the base-<vmid>-disk-N convention. Detect both.
     if ($isBase || $parsed_isBase) {
         my $snap_id = "$full_ds\@__base__";
-        my $snap = eval {
-            _api_call($scfg, 'pool.snapshot.query',
-                [ [ [ 'id', '=', $snap_id ] ],
-                  { select => [ 'id', 'name', 'properties' ] } ]);
+        # TN's pool.snapshot.query does not surface the `clones` zfs
+        # property in this release (the properties object comes back
+        # empty regardless of extra.properties / retrieve_properties).
+        # Query the dataset side instead: any volume whose origin
+        # points at our @__base__ snapshot is a live linked clone.
+        my $children = eval {
+            _api_call($scfg, 'pool.dataset.query',
+                [ [ [ 'origin.parsed', '=', $snap_id ] ],
+                  { select => [ 'id' ] } ]);
         };
         my @clones;
-        if ($snap && ref($snap) eq 'ARRAY' && @$snap) {
-            my $clones_prop = $snap->[0]->{properties}->{clones} // {};
-            # clones property comes as { value => "ds1,ds2,...", parsed => [...], ... }
-            my $raw = ref($clones_prop) eq 'HASH'
-                ? ($clones_prop->{parsed} // $clones_prop->{value} // '')
-                : ($clones_prop // '');
-            if (ref($raw) eq 'ARRAY') {
-                @clones = grep { defined && length } @$raw;
-            } elsif (defined $raw && length $raw) {
-                @clones = grep { length } split /,\s*/, $raw;
-            }
+        if ($children && ref($children) eq 'ARRAY') {
+            @clones = map { $_->{id} } grep { defined $_->{id} } @$children;
         }
         if (@clones) {
             die sprintf(
@@ -5118,6 +5148,13 @@ sub _free_image_iscsi {
             die "Failed to delete dataset $full_ds: $err\n";
         }
     }
+
+    # Invalidate cached iSCSI extent/targetextent state now that the zvol and
+    # its mappings are destroyed. Without this, a list_images() served by the
+    # same pvedaemon worker within the 60s cache TTL keeps walking the stale
+    # mapping cache and reports the just-purged volume as still present
+    # (disk_purge.pl test 9).
+    _clear_cache(_cache_host_key($scfg));
 
     # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
     my $deferred_scfg = $scfg;
@@ -5375,6 +5412,7 @@ sub _list_images_iscsi {
     # PERFORMANCE OPTIMIZATION: Batch-fetch all child datasets once
     # instead of N individual API calls (fixes N+1 query pattern)
     my %dataset_cache;
+    my $datasets_ok = 0;
     eval {
         # Query TrueNAS for all child datasets under our storage dataset
         # This is significantly faster than individual _tn_dataset_get() calls per volume
@@ -5384,6 +5422,7 @@ sub _list_images_iscsi {
 
         # Build hash lookup table: dataset_id => dataset_info
         if ($datasets && ref($datasets) eq 'ARRAY') {
+            $datasets_ok = 1;
             for my $ds (@$datasets) {
                 my $id = $ds->{id} // next;
                 $dataset_cache{$id} = $ds;
@@ -5408,6 +5447,15 @@ sub _list_images_iscsi {
         # Extract zvol name from path, filtering by configured dataset
         next MAPPING unless $ds_full =~ m{^\Q$scfg->{tn_dataset}\E/(.+)$};
         my $zname = $1;
+
+        # The targetextent/extent mapping list can be served from a stale
+        # per-worker cache after a DIFFERENT worker purged the volume. The
+        # pool.dataset.query above is always fresh, so treat it as ground
+        # truth: if the backing zvol no longer exists, this mapping is a
+        # phantom from the stale cache and must not be listed
+        # (disk_purge.pl test 9). Only enforce when the batch query
+        # succeeded; otherwise fall through to the per-volume fallback.
+        next MAPPING if $datasets_ok && !exists $dataset_cache{$ds_full};
 
         # Skip ephemeral vzdump snapshot clones (issue #42). These are transient
         # devices exposed only for the duration of an LXC snapshot backup; they
@@ -6563,8 +6611,11 @@ sub _clone_image_iscsi {
 sub _clone_image_nvme {
     my ($class, $scfg, $storeid, $volname, $vmid, $snapname, $name) = @_;
 
-    # Parse source volume information
-    my (undef, $source_zname) = $class->parse_volname($volname);
+    # Parse source volume information. When source is a base / template,
+    # return slash-encoded volname "vol-<base>-ns<base_uuid>/vol-<clone>-ns<clone_uuid>"
+    # so PVE records the parent relationship in the cloned VM's .conf.
+    my (undef, $source_zname, undef, undef, undef, $source_is_base, undef, $source_uuid) =
+        $class->parse_volname($volname);
     my $source_full = $scfg->{tn_dataset} . '/' . $source_zname;
     my $source_snapshot = $source_full . '@' . $snapname;
 
@@ -6656,7 +6707,12 @@ sub _clone_image_nvme {
     # 3) Return clone volume name — defer device discovery after lock release.
     # The namespace and dataset are created successfully at this point.
     # activate_volume handles authoritative device discovery before any VM uses the disk.
+    # For a linked clone of a base, prefix with "<base>/" so PVE records
+    # the parent relationship; parse_volname recognizes the slash form.
     my $clone_volname = "vol-$target_zname-ns$device_uuid";
+    if ($source_is_base) {
+        $clone_volname = "vol-$source_zname-ns$source_uuid/$clone_volname";
+    }
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
@@ -6770,10 +6826,30 @@ sub create_base {
         $share_label    = "nvmet namespace id=$transport_id";
     }
 
-    # Step 1: pool.dataset.rename with force=true. force is required
+    # Step 1 (nvme-tcp only): disable namespace BEFORE rename. TN
+    # validates the current device_path on every namespace.update,
+    # including {enabled:false} — so if we rename first the validator
+    # fails because the old device_path no longer exists. Disabling
+    # while the old path is still valid sidesteps that. For iSCSI
+    # there is no equivalent restriction; extent.update happily
+    # rewrites `disk` on a live extent.
+    if ($mode eq 'nvme-tcp') {
+        eval {
+            _api_call_mutate(
+                $scfg,
+                'nvmet.namespace.update',
+                [ $transport_id, { enabled => JSON::PP::false } ],
+            );
+        };
+        if ($@) {
+            die "create_base: nvmet.namespace.update enabled=false (ns=$transport_id) failed: $@";
+        }
+    }
+
+    # Step 2: pool.dataset.rename with force=true. force is required
     # because TN's safety check refuses to rename a dataset that an
     # iSCSI extent or nvmet namespace references; we override because
-    # we are about to update the share in step 2.
+    # we are about to update the share in step 3.
     eval {
         _api_call_mutate(
             $scfg,
@@ -6782,15 +6858,26 @@ sub create_base {
         );
     };
     if ($@) {
-        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $@";
+        my $err = $@;
+        if ($mode eq 'nvme-tcp') {
+            # Re-enable namespace so we don't leave it disabled.
+            eval {
+                _api_call_mutate(
+                    $scfg,
+                    'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ],
+                );
+            };
+        }
+        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $err";
     }
 
-    # Step 2: rewire the transport share to point at the new zvol path.
+    # Step 3: rewire the transport share to point at the new zvol path.
     # For iSCSI this updates the extent's `disk` field. For NVMe-TCP
-    # this updates the namespace's `device_path`. In both cases the
-    # device identifier exposed to the initiator (naa for iSCSI,
-    # device_uuid/nguid for NVMe) is stored separately and stays
-    # stable across the rewire, so PVE's /dev/disk/by-id and
+    # this updates the namespace's `device_path` and re-enables it.
+    # In both cases the device identifier exposed to the initiator
+    # (naa for iSCSI, device_uuid/nguid for NVMe) is stored separately
+    # and stays stable across the rewire, so PVE's /dev/disk/by-id and
     # /dev/disk/by-path entries don't change.
     eval {
         _api_call_mutate(
@@ -6798,6 +6885,13 @@ sub create_base {
             $rewire_method,
             [ $transport_id, $rewire_payload ],
         );
+        if ($mode eq 'nvme-tcp') {
+            _api_call_mutate(
+                $scfg,
+                'nvmet.namespace.update',
+                [ $transport_id, { enabled => JSON::PP::true } ],
+            );
+        }
     };
     if ($@) {
         my $err = $@;
@@ -6810,6 +6904,17 @@ sub create_base {
                 [ $new_full, { new_name => $old_full, force => JSON::PP::true } ],
             );
         };
+        if ($mode eq 'nvme-tcp') {
+            # After rename rollback, old device_path is valid again. Try
+            # to re-enable the namespace so we don't leave it disabled.
+            eval {
+                _api_call_mutate(
+                    $scfg,
+                    'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ],
+                );
+            };
+        }
         die "create_base: $share_label rewire to $new_zvol_path failed: $err";
     }
 
