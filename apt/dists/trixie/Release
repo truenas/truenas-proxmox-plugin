@@ -2,20 +2,20 @@ Origin: TrueNAS Proxmox Plugin
 Label: TrueNAS Proxmox Plugin
 Suite: trixie
 Codename: trixie
-Date: Fri, 26 Jun 2026 17:20:57 UTC
+Date: Wed, 01 Jul 2026 12:49:18 UTC
 Architectures: amd64
 Components: main
 Changelogs: https://truenas.github.io/truenas-proxmox-plugin/apt/changelogs/@CHANGEPATH@_changelog
 Description: TrueNAS Proxmox Plugin APT repository (trixie)
 MD5Sum:
- 549c6237dafee8766b57265e523136cc 921 main/binary-amd64/Packages
- 0eebfb09782100ac398076b5e436e381 582 main/binary-amd64/Packages.gz
+ 9d57f6ad40b19820b43b244bf3b7643d 921 main/binary-amd64/Packages
+ a31a2d59eae5599c1511f44e673da0ba 581 main/binary-amd64/Packages.gz
  8bfa35b71784c004bfe73d60ac5c0af5 173 main/binary-amd64/Release
 SHA1:
- efcb5b6ca3bee6a7af4be2b9d010f26ace3356d7 921 main/binary-amd64/Packages
- fa741747eebd4b735d3a668127e8d8fa40b893d4 582 main/binary-amd64/Packages.gz
+ d7ec70af9f9b29c35018d55b5787c7c98739fee3 921 main/binary-amd64/Packages
+ a4a9edfb25eb59469004fd3214d05d43ccdee195 581 main/binary-amd64/Packages.gz
  040cac17066721581c8f72bd25e716e1db9a4ffc 173 main/binary-amd64/Release
 SHA256:
- 3915c3b01f2d193c7260d44e78378e9cfed0bd83152a37674d48aac50632ae56 921 main/binary-amd64/Packages
- 253bb3ceabaaf5aa2674a2938864a55e19ce27bcca5f678419cea0a3351fd9e7 582 main/binary-amd64/Packages.gz
+ 65b23239c3f36a87221acbd69e22a3de0f1bf9943915db48d850bfc7b387f077 921 main/binary-amd64/Packages
+ 1a50a178f10e34d74338f89d974114508381c11390f51638f60b73e3b52f0668 581 main/binary-amd64/Packages.gz
  6b03e33922db913500a68ebcfec689a61ddc300fe8e4cde30685d74d641a0398 173 main/binary-amd64/Release
