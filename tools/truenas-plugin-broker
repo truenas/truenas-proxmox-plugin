@@ -42,7 +42,7 @@ my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
 my $PIDFILE        = '/run/truenas-plugin/broker.pid';
 my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
-my $WS_PINNED_PATH = '/api/v25.10.2';
+my $WS_PINNED_PATH = '/websocket';
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
 my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
