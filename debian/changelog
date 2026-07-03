@@ -1,3 +1,16 @@
+truenas-proxmox-plugin (2.1.18+deb1) unstable; urgency=medium
+
+  * Relax NVMe host NQN validation to accept NQNs without :identifier
+    suffix (#44). Per NVMe-oF spec the :identifier segment is mandatory
+    for subsystem NQNs but optional for host NQNs. The Linux kernel
+    generates host NQNs as nqn.YYYY-MM.tld.domain with no further suffix;
+    the previous regex rejected them with "Invalid NVMe host NQN", making
+    NVMe-TCP completely non-functional for affected hosts. Fix makes the
+    :identifier block optional in _nvme_untaint_cli_nqn; malformed NQNs
+    and shell metacharacters are still rejected.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 03 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.17+deb1) unstable; urgency=high
 
   * Template / linked-clone support (plan C). Implements the PVE

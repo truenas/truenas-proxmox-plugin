@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.5';
+our $VERSION = '2.1.6';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -3129,7 +3129,7 @@ sub _nvme_untaint_cli_nqn {
     die "Invalid $label: missing value\n"
         if !defined($value) || $value eq '';
 
-    if ($value =~ /^(nqn\.\d{4}-\d{2}\.[A-Za-z0-9.-]+:[A-Za-z0-9][A-Za-z0-9._:-]*)$/) {
+    if ($value =~ /^(nqn\.\d{4}-\d{2}\.[A-Za-z0-9.-]+(?::[A-Za-z0-9][A-Za-z0-9._:-]*)?)$/) {
         return $1;
     }
 

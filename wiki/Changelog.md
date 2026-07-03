@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.6 (July 3, 2026)
+
+### Bug Fixes
+
+- **Fix NVMe-TCP failure for host NQNs without `:identifier` suffix** (#44): `_nvme_untaint_cli_nqn` required a `:identifier` segment on all NQNs. Per the NVMe-oF spec, the `:identifier` suffix is mandatory for subsystem NQNs but optional for host NQNs. The Linux kernel generates host NQNs in the form `nqn.YYYY-MM.tld.domain` (no further suffix), which the validator rejected with `Invalid NVMe host NQN`, making NVMe-TCP completely non-functional for these hosts. Fix makes the `:identifier` block optional; malformed NQNs and shell metacharacters are still rejected.
+
 ## Version 2.1.5 (June 16, 2026)
 
 ### Bug Fixes
