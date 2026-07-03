@@ -1,10 +1,130 @@
 # TrueNAS Plugin Changelog
 
-## Version 2.1.6 (July 3, 2026)
+## Version 2.1.18 (July 3, 2026)
 
 ### Bug Fixes
 
 - **Fix NVMe-TCP failure for host NQNs without `:identifier` suffix** (#44): `_nvme_untaint_cli_nqn` required a `:identifier` segment on all NQNs. Per the NVMe-oF spec, the `:identifier` suffix is mandatory for subsystem NQNs but optional for host NQNs. The Linux kernel generates host NQNs in the form `nqn.YYYY-MM.tld.domain` (no further suffix), which the validator rejected with `Invalid NVMe host NQN`, making NVMe-TCP completely non-functional for these hosts. Fix makes the `:identifier` block optional; malformed NQNs and shell metacharacters are still rejected.
+
+---
+
+## Version 2.1.17 (June 29, 2026)
+
+### Features
+
+- **Template / linked-clone support (plan C)**: Implements the PVE template lifecycle end-to-end for both iSCSI and NVMe-TCP:
+  - `parse_volname` recognises `base-<vmid>-disk-N` and the slash-encoded `<base_volid>/<clone_volid>` form used by linked clones.
+  - `create_base` renames `vm-<vmid>-disk-N` to `base-<vmid>-disk-N` (`pool.dataset.rename force=true`), rewires the transport share to the new zvol path, and snapshots the base as `@__base__`. The iSCSI extent's `naa` and the NVMe namespace's `device_uuid`/`nguid` stay stable across the rewire, so PVE's `/dev/disk/by-id` and `/dev/disk/by-path` entries do not change.
+  - `clone_image` defaults `snapname` to `__base__` when the source is a base image, and both `_clone_image_iscsi` and `_clone_image_nvme` now return the slash-encoded volname so PVE records the parent relationship in the clone VM config.
+  - `volume_has_feature` advertises `clone => {snap,base}` and `template => {current}`; the misleading `clone => {current}` (which caused "clone not supported without snapshot") is removed.
+  - `free_image` refuses to destroy a base while any linked clone still derives from its `@__base__` snapshot. The check queries `pool.dataset.query` filtered by `origin.parsed` (TN's `pool.snapshot.query` does not surface the ZFS `clones` property in this release).
+
+### Bug Fixes
+
+- **NVMe `create_base` ordering fix**: TN validates the current `device_path` on every `namespace.update`, including `{enabled:false}`. Renaming first invalidated the path and blocked the disable; disabling first while the old path is still valid succeeds. New order: disable → rename → rewire → re-enable, with symmetric rollback paths that re-enable the namespace on failure.
+- **Implement `volume_rollback_is_possible`**: Refuse rollback to a non-latest snapshot, matching `ZFSPoolPlugin` semantics. Previously `volume_snapshot_rollback` silently destroyed newer snapshots via `recursive=1` (required by TN 25.10 rollback semantics), which tripped `disk_snapshot.pl` test 9 ("snap1 and snap2 still present after rollback"). PVE now blocks the request at the ORM layer.
+- **Fix `disk_purge.pl` test 9 stale mapping cache**: After a purge, a different pvedaemon worker's stale mapping cache still listed the vanished volume. Two-part fix: clear the mapping cache on the purging worker after delete, and in `_list_images_iscsi` treat the fresh `pool.dataset.query` result as ground truth — skip any targetextent mapping whose backing zvol no longer exists.
+
+---
+
+## Version 2.1.16 (June 26, 2026)
+
+### Bug Fixes
+
+- **Critical fix in `_iscsi_rescan_sd_capacity`**: Was reading `$scfg->{target_iqn}` instead of `$scfg->{tn_target_iqn}`. The `tn_` rename landed in v2.1.0; the bare name returns `undef`, so the helper fell through `return unless length $iqn` and did nothing. Every call site wired into `alloc_image` / `_clone_image_iscsi` / `activate_volume` since v2.1.14 has been hitting a no-op. Multi-disk full clone failures with "qemu-img: output file is smaller than input file" continued in v2.1.15 because the intended SCSI READ CAPACITY rescan never ran on the recycled `sdX`. Single-character fix.
+
+---
+
+## Version 2.1.15 (June 26, 2026)
+
+### Bug Fixes
+
+- **Critical fix to `_is_connection_error`**: Remove the `/x` regex flag that silently turned every multi-word alternative in the connection-error pattern into a no-match. With `/x`, "broken pipe" compiled to "brokenpipe", "WS read" to "WSread", "connection reset" to "connectionreset", etc. None of the real-world errors matched, so: `_api_call` did NOT invalidate stale persistent WS connections on framing/EPIPE failures; `_is_retryable_error` returned 0 for connection errors so the retry-with-backoff path never fired; storage status mis-marked transient connectivity as non-recoverable. The `/x` flag was introduced by fe06ea1; fix is to drop `/x` and keep the pattern on one logical line. Also adds "WS write" to the alternation so write-side failures classify the same way.
+
+---
+
+## Version 2.1.14 (June 25, 2026)
+
+### Bug Fixes
+
+- **Force SCSI READ CAPACITY on iSCSI `sdX` devices when LUN numbers are recycled** (#59): When an iSCSI extent is deleted and a new extent reuses the same lunid, the kernel retains the same `sdX` block device with the old (smaller) capacity. `iscsiadm -m session -R` discovers new LUNs but does not refresh capacity on existing `sdX` entries. `qemu-img convert` during a multi-disk full clone then sees a destination smaller than the source and aborts. New `_iscsi_rescan_sd_capacity` helper writes `1` to `/sys/block/sdX/device/rescan` for every iSCSI-backed `sdX` in the plugin's target IQN session. Wired into `alloc_image`, `_clone_image_iscsi`, and `activate_volume`. Cheap, idempotent.
+
+### Maintenance
+
+- Add `--start N` / `--stop M` flags to the dev test runner and a diagnostic dump on multi-disk clone failure. Optional `KEEP_ON_CLONE_FAIL=1` leaves state for inspection.
+
+---
+
+## Version 2.1.13 (June 24, 2026)
+
+### Maintenance
+
+- **Drop interactive Auto-migrate/Skip prompt from `postinst`**: `lintian` flagged the `read -r answer </dev/tty` call as `read-in-maintainer-script` (Debian Policy 6.3 forbids interactive prompts in maintainer scripts). `postinst` now always auto-migrates with a timestamped backup; operators who want to opt out can restore `<STORAGE_CFG>.bak.<ts>` by hand. No behaviour change in non-interactive installs. Unblocks the GitHub Actions build job.
+
+---
+
+## Version 2.1.12 (June 23, 2026)
+
+### Maintenance
+
+- **Add `t/rate-limit/08-concurrent-alloc.t`**: Drives N (default 10) concurrent `qm`-create-with-disk operations from independent forked PVE-side processes, then verifies all succeed, every child completed within a per-child wall-clock budget (default 120s), and total upstream `auth.login_with_api_key` count stays at ≤1. The earlier concurrent test (07) only used cheap read RPCs; this one drives the full alloc path (`pool.dataset.create` + `iscsi.extent.create` + `iscsi.targetextent.create` + PVE-side iSCSI login/multipath/udev). No plugin code changes.
+
+---
+
+## Version 2.1.11 (June 23, 2026)
+
+### Bug Fixes
+
+- **`_broker_rpc` deadline-bounded round trip**: Without this, a wedged broker (stuck upstream WS, lost middlewared, hung systemd unit) blocked every PVE operation indefinitely because `sysread` on the Unix socket would never return. Per-call timeout governed by `tn_broker_timeout` (seconds, default 30) applies to the entire round trip. `IO::Select`'s `can_write`/`can_read` with remaining time is used between every syscall; on timeout the call dies with a clear "broker: read|write timeout after Ns" message.
+
+### Maintenance
+
+- Add `t/rate-limit/06-broker-restart.t` and `t/rate-limit/07-concurrent-broker.t` to exercise plugin recovery after broker restart and broker behaviour under concurrent in-process load.
+
+---
+
+## Version 2.1.10 (June 23, 2026)
+
+### Maintenance
+
+- **Broker diagnostic logging for rejected requests**: When a request is rejected for missing `api_host`/`api_key`, the broker now logs the actual incoming shape — decoded scfg field values (`api_host` literal; `api_key` redacted to length only), method name, full list of scfg keys present, top-level request keys, and the raw request line truncated to 600 bytes with any `"api_key":"..."` pattern redacted.
+
+---
+
+## Version 2.1.9 (June 23, 2026)
+
+### Bug Fixes
+
+- **Fix snapshot rollback when intermediate snapshots exist**: PVE's `qm rollback` contract is to revert the disk to the target snapshot and discard anything taken after. Plugin was passing `recursive=0` to TN's `pool.snapshot.rollback`, so any intermediate snapshot on the same dataset blocked the rollback with TN 25.10's wrapped `FileExistsError`. Two changes: `volume_snapshot_rollback` now passes `recursive=1`; the `_tn_snapshot_rollback` fallback regex also matches the TN 25.10 wording. Verified: `recursive=True` triggers `_destroy_newer_snapshots` on the target dataset only and does not touch clones or child datasets — matches `PVE::Storage::ZFSPoolPlugin` semantics.
+
+---
+
+## Version 2.1.8 (June 23, 2026)
+
+### Bug Fixes
+
+- **Rename ZFS snapshot API calls from `zfs.snapshot.*` to `pool.snapshot.*`**: The legacy `zfs.snapshot` namespace was removed in TrueNAS 25.10 and returns `-32601 "Method does not exist"`, breaking `qm snapshot` / `qm rollback` / `volume_snapshot_delete` / bulk snapshot delete. Affected calls: `pool.snapshot.query`, `pool.snapshot.create`, `pool.snapshot.delete`, `pool.snapshot.clone`, `pool.snapshot.rollback`.
+
+---
+
+## Version 2.1.7 (June 22, 2026)
+
+### Maintenance
+
+- **Broker error response logging**: The daemon now logs bad request JSON, missing scfg fields, no-method requests, upstream RPC exceptions (including dead-pool cleanup), no-response-from-upstream conditions, and structured JSON-RPC errors returned by TN (e.g. `EBUSY` / Rate Limit Exceeded). No behaviour change beyond logs.
+
+---
+
+## Version 2.1.6 (June 22, 2026)
+
+### Features
+
+- **Node-local session broker daemon (`truenas-plugin-broker`)**: Holds one authenticated WebSocket per `(host, api_key)` pair and proxies JSON-RPC for every plugin invocation via `/run/truenas-plugin/broker.sock`. Eliminates per-process re-authentication from forked `qm`, `pvesh`, and `pveproxy` workers (D2 defect). When the broker socket is absent the plugin falls back to the existing per-process persistent WebSocket path with no behavioural change.
+- Ships `truenas-plugin-broker.service` systemd unit, enabled and started by `postinst` before `pvedaemon`/`pveproxy`/`pvestatd` restart.
+- Maps this branch's `tn_*`-prefixed scfg keys to the broker daemon's stable `api_*` wire format inside the plugin client so the broker binary serves both this branch and the legacy `api_*`-keyed branch without modification.
+- See `wiki/D2-per-process-reauth.md` for design notes.
+
+---
 
 ## Version 2.1.5 (June 16, 2026)
 
