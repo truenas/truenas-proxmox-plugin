@@ -9496,10 +9496,12 @@ menu_edit_storage() {
     info "Loading existing configuration for '$storage_name'..."
     echo
 
-    # Load all existing configuration values
+    # Load all existing configuration values; strip tn_ prefix so keys
+    # match the short names used throughout this function (e.g. "dataset",
+    # "api_host"). Storage.cfg keys use tn_ since v2.1.0.
     declare -A config_values
     while IFS='=' read -r key value; do
-        config_values["$key"]="$value"
+        config_values["${key#tn_}"]="$value"
     done < <(get_all_storage_config_values "$storage_name")
 
     # Display immutable fields (read-only)
