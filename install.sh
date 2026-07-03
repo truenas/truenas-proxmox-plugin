@@ -5528,6 +5528,19 @@ validate_ip() {
     return 1
 }
 
+# Validate IP or hostname (for TrueNAS API host — may be FQDN or IP)
+validate_host() {
+    local host="$1"
+    # All-numeric dotted strings must be valid IPv4; otherwise reject.
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        validate_ip "$host" && return 0
+        return 1
+    fi
+    # Accept valid hostname: labels of [a-zA-Z0-9-], separated by dots, no leading/trailing hyphens
+    [[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && return 0
+    return 1
+}
+
 # Validate storage name format (must match Proxmox PVE::JSONSchema::parse_id rules)
 validate_storage_name() {
     local name="$1"
@@ -9527,7 +9540,7 @@ menu_edit_storage() {
     # TrueNAS API settings
     local current_api_host="${config_values[api_host]}"
     local truenas_ip
-    read -rp "TrueNAS IP address [$current_api_host]: " truenas_ip
+    read -rp "TrueNAS IP/hostname [$current_api_host]: " truenas_ip
     truenas_ip="${truenas_ip:-$current_api_host}"
 
     if [[ -z "$truenas_ip" ]]; then
@@ -9535,8 +9548,8 @@ menu_edit_storage() {
         return 1
     fi
 
-    if ! validate_ip "$truenas_ip"; then
-        error "Invalid IP address format"
+    if ! validate_host "$truenas_ip"; then
+        error "Invalid IP address or hostname"
         return 1
     fi
 
@@ -9990,20 +10003,20 @@ wizard_add_storage() {
         break
     done
 
-    # --- Step 3: TrueNAS IP ---
+    # --- Step 3: TrueNAS IP/hostname ---
     clear_screen
     print_banner
     echo
     print_header "Storage Provisioning"
     show_wizard_summary "ip"
 
-    info "Enter the IP address of your TrueNAS server:"
+    info "Enter the IP address or hostname of your TrueNAS server:"
     while true; do
-        read -rp "TrueNAS IP address: " WIZARD_TRUENAS_IP
-        if validate_ip "$WIZARD_TRUENAS_IP"; then
+        read -rp "TrueNAS IP/hostname: " WIZARD_TRUENAS_IP
+        if validate_host "$WIZARD_TRUENAS_IP"; then
             break
         else
-            error "Invalid IP address format"
+            error "Invalid IP address or hostname"
             WIZARD_TRUENAS_IP=""
         fi
     done
