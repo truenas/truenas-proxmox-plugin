@@ -6603,11 +6603,11 @@ tn_api_call() {
 
         # Build minimal scfg for API call
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => 1,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => 1,
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
 
         # Decode params
         my $params = eval { decode_json($params_json) } // [];
@@ -6665,11 +6665,11 @@ tn_api_call_write() {
 
         # Build minimal scfg for API call
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => 1,
+            tn_api_host => $host,
+            tn_api_key => $api_key,
+            tn_api_insecure => 1,
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
 
         # Decode params - fail fast if JSON is invalid
         my $params = eval { decode_json($params_json) };
@@ -8729,12 +8729,12 @@ execute_provisioning() {
             use PVE::Storage::Custom::TrueNASPlugin ();
 
             my $scfg = {
-                api_host => $ARGV[0],
-                api_key => $ARGV[1],
-                api_insecure => 1,
-                dataset => $ARGV[2],
-                target_iqn => $ARGV[3],
-                discovery_portal => $ARGV[4],
+                tn_api_host => $ARGV[0],
+                tn_api_key => $ARGV[1],
+                tn_api_insecure => 1,
+                tn_dataset => $ARGV[2],
+                tn_target_iqn => $ARGV[3],
+                tn_discovery_portal => $ARGV[4],
             };
 
             eval { PVE::Storage::Custom::TrueNASPlugin::_ensure_target_visible($scfg) };
