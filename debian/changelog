@@ -1,3 +1,14 @@
+truenas-proxmox-plugin (2.1.19+deb1) unstable; urgency=medium
+
+  * Restrict the relaxed :identifier suffix to host NQNs only (#44
+    follow-up). _nvme_untaint_cli_nqn is shared by both host and
+    subsystem NQN validation; making the suffix optional also silently
+    accepted suffix-less subsystem NQNs, which the NVMe-oF spec still
+    mandates. New require_identifier flag defaults to required; only
+    the host-NQN call site opts out.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.18+deb1) unstable; urgency=medium
 
   * Relax NVMe host NQN validation to accept NQNs without :identifier

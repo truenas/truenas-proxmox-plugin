@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.19 (July 4, 2026)
+
+### Bug Fixes
+
+- **Restrict the relaxed `:identifier` suffix to host NQNs only** (#44 follow-up): the previous fix made `_nvme_untaint_cli_nqn`'s `:identifier` suffix optional, but the validator is shared by both host and subsystem NQN validation, so subsystem NQNs without a suffix were now also silently accepted — contradicting the NVMe-oF spec, which still mandates the suffix for subsystem NQNs. `_nvme_untaint_cli_nqn` now takes a `require_identifier` flag; only the host-NQN call site passes `0`, so subsystem NQN validation is unchanged (suffix still required).
+
 ## Version 2.1.18 (July 3, 2026)
 
 ### Bug Fixes
