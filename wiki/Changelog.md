@@ -1,5 +1,13 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.20 (July 4, 2026)
+
+### Bug Fixes
+
+- **Fix installer health check auth false positive** (#57 bug 1): the installer's Perl-based health check built `$scfg` with bare (unprefixed) keys when calling the plugin's API helpers, so `tn_api_host`/`tn_api_key` were never seen and every health check reported "Authentication failed" even with a working API key. All inline-Perl `$scfg` builders now use `tn_`-prefixed keys.
+- **Fix installer hostname rejection** (#57 bug 2): the storage wizard only accepted a bare IP address for the TrueNAS host, rejecting valid hostnames/FQDNs that the plugin itself accepts for `tn_api_host`. Added `validate_host()` to accept either an IP or a hostname/FQDN.
+- **Fix unbound variable crash when editing existing storage** (#57 bug 3): `menu_edit_storage` read `config_values[dataset]` and other bare-named fields, but the loader stored raw `tn_`-prefixed keys, so `set -u` aborted with `config_values[dataset]: unbound variable`. The loader now strips the `tn_` prefix when populating `config_values`; a leftover `config_values[tn_sparse]` read (which would have silently ignored the stored sparse setting after the prefix strip) was corrected to `config_values[sparse]`.
+
 ## Version 2.1.19 (July 4, 2026)
 
 ### Bug Fixes

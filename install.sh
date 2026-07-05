@@ -9605,7 +9605,7 @@ menu_edit_storage() {
     fi
 
     # Sparse volumes
-    local current_sparse="${config_values[tn_sparse]:-1}"
+    local current_sparse="${config_values[sparse]:-1}"
     local sparse
     read -rp "Enable sparse volumes? (0/1) [$current_sparse]: " sparse
     sparse="${sparse:-$current_sparse}"

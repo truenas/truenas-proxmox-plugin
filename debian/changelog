@@ -1,3 +1,20 @@
+truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=medium
+
+  * Fix installer health check auth false positive (#57 bug 1): inline-Perl
+    $scfg builders used bare (unprefixed) keys, so tn_api_host/tn_api_key
+    were never seen and health checks always reported "Authentication
+    failed" regardless of key validity. Now use tn_-prefixed keys.
+  * Fix installer hostname rejection (#57 bug 2): storage wizard only
+    accepted a bare IP for the TrueNAS host. Added validate_host() to
+    accept a hostname/FQDN too, matching what tn_api_host already accepts.
+  * Fix unbound variable crash when editing existing storage (#57 bug 3):
+    menu_edit_storage read bare-named fields (e.g. config_values[dataset])
+    from a config_values array populated with tn_-prefixed keys, crashing
+    under set -u. Loader now strips the tn_ prefix on load; a leftover
+    config_values[tn_sparse] read was corrected to config_values[sparse].
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.19+deb1) unstable; urgency=medium
 
   * Restrict the relaxed :identifier suffix to host NQNs only (#44
