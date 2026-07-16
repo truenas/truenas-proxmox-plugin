@@ -61,12 +61,20 @@ my %_portal_sync_last_ok;
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
+#
+# Every value here is decoded from a WebSocket/broker socket read, so under
+# Perl taint mode (-T, active in pveproxy/pvedaemon workers) it is tainted no
+# matter how it's reshaped in between. Untaint it here via regex capture -
+# the one place all 13 call sites funnel through - instead of leaving a
+# tainted scalar to later blow up wherever PVE core happens to exec() with it
+# (e.g. qemu-img create during clone/move-disk to non-TrueNAS storage; see #71).
 sub _normalize_value {
     my ($v) = @_;
     return 0 if !defined $v;
-    return $v if !ref($v);
-    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-    return 0;
+    $v = ($v->{parsed} // $v->{raw} // 0) if ref($v) eq 'HASH';
+    return 0 if ref($v) || !defined($v) || $v eq '';
+    return $1 if $v =~ /^(\d+)$/;
+    die "_normalize_value: unexpected non-numeric value '$v'\n";
 }
 
 # Performance and timing constants
