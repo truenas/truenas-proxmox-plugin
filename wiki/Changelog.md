@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.20 (July 15, 2026)
+
+### Bug Fixes
+
+- **Fix tainted `volsize`/size values causing full clone and move-disk to fail under Perl taint mode** (#71): `_normalize_value`, the common helper used to pull byte-count fields (`volsize`, `volblocksize`, `available`, `quota`, `written`, `used`) out of TrueNAS API responses, passed the decoded JSON scalar straight through without untainting it. Every value decoded from a WebSocket/broker socket read is tainted under Perl's `-T` mode, which `pveproxy`/`pvedaemon` run under. When PVE core called `volume_size_info` during a full clone or move-disk to a non-TrueNAS storage (NFS, dir, LVM, etc.) and interpolated the tainted size into the `qemu-img create` argv, the operation died with `Insecure dependency in exec while running with -T switch`. `_normalize_value` now untaints the value via regex capture (matching the pattern already used elsewhere in the plugin for NVMe device/portal names) and dies loudly if a value is ever non-numeric, instead of silently forwarding a tainted or malformed scalar.
+
 ## Version 2.1.5 (June 16, 2026)
 
 ### Bug Fixes
