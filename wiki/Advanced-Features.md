@@ -1186,12 +1186,13 @@ qm rollback 100 backup-live
 qm start 100  # VM resumes exactly where it was
 ```
 
+> ⚠️ `tn_enable_live_snapshots` and `tn_vmstate_storage` are not currently implemented (see [Configuration Reference](Configuration.md#tn_enable_live_snapshots)) — live snapshots work regardless of these settings, since Proxmox core handles vmstate placement automatically.
+
 **Configuration**:
 ```ini
 tn_enable_live_snapshots 1
 tn_vmstate_storage local  # Or 'shared'
 ```
-> ⚠️ `tn_enable_live_snapshots` and `tn_vmstate_storage` are not currently implemented (see [Configuration Reference](Configuration.md#tn_enable_live_snapshots)) — live snapshots work regardless of these settings, since Proxmox core handles vmstate placement automatically.
 
 **Use Cases**:
 - Development snapshots - save exact working state
@@ -1202,10 +1203,11 @@ tn_vmstate_storage local  # Or 'shared'
 
 Proxmox 9.x+ supports volume-based snapshot chains:
 
+> ⚠️ `tn_snapshot_volume_chains` is not currently implemented (see [Configuration Reference](Configuration.md#tn_snapshot_volume_chains)) — this setting has no effect on plugin behavior.
+
 ```ini
 tn_snapshot_volume_chains 1
 ```
-> ⚠️ `tn_snapshot_volume_chains` is not currently implemented (see [Configuration Reference](Configuration.md#tn_snapshot_volume_chains)) — this setting has no effect on plugin behavior.
 
 **Benefits**:
 - Better snapshot management
