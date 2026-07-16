@@ -1028,7 +1028,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Should return ok if the call succeeds
 
 # Start service if not running using plugin API via STORAGE_ID
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
 ```
 
 In TrueNAS Web UI:

@@ -336,18 +336,20 @@ shared 1
 
 ### vmstate Storage Considerations
 
-**Limitation**: Live migration with existing snapshots requires `vmstate_storage shared`
+**Limitation**: Live migration with existing snapshots requires vmstate to be reachable from the target node.
 
 **Explanation**:
 - If VM has snapshots with vmstate on local storage
 - Live migration fails (vmstate not accessible from target node)
 
+> ⚠️ `tn_vmstate_storage` is not currently implemented by this plugin (see [Configuration Reference](Configuration.md#tn_vmstate_storage)) — vmstate placement is controlled entirely by Proxmox core, not by this setting.
+
 **Workaround**:
 ```ini
-# Use shared vmstate for environments requiring migration
-tn_vmstate_storage shared
+# Use shared storage for vmstate in environments requiring migration
+# (configure via Proxmox's own vmstate storage selection, not this plugin)
 
-# Or use local vmstate and delete snapshots before migration
+# Or delete snapshots before migration
 # Or use offline migration (stop VM, migrate, start)
 ```
 
@@ -465,7 +467,7 @@ nfs: truenas-files
 **Required Settings**:
 ```ini
 tn_prefer_ipv4 0
-tn_ipv6_by_path 1
+tn_ipv6_by_path 1  # not currently implemented, see Configuration.md#tn_ipv6_by_path
 tn_use_by_path 1
 ```
 

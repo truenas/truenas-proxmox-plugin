@@ -772,12 +772,14 @@ chmod +x /usr/local/bin/monitor-multipath.sh
 ```
 
 #### See Also
-- [Configuration Reference - use_multipath](Configuration.md#use_multipath)
-- [Configuration Reference - portals](Configuration.md#portals)
+- [Configuration Reference - tn_use_multipath](Configuration.md#tn_use_multipath)
+- [Configuration Reference - tn_portals](Configuration.md#tn_portals)
 - [Known Limitations - Multipath Read Performance](Known-Limitations.md#multipath-read-performance-limitation)
 - [Troubleshooting - Slow Multipath Read Performance](Troubleshooting.md#slow-multipath-read-performance)
 
 ### vmstate Storage Location
+
+> ⚠️ **`tn_vmstate_storage` is not currently implemented** — see [Configuration Reference](Configuration.md#tn_vmstate_storage). vmstate placement for live snapshots is handled automatically by Proxmox core, not by this plugin.
 
 Choose where to store VM memory state during live snapshots:
 
@@ -840,28 +842,19 @@ Jitter: Random 0-20% added to prevent thundering herd
 
 ### Concurrent Operations and Storage Lock Timeout
 
-The plugin is optimized to handle parallel disk allocations and bulk storage operations through a combination of ephemeral WebSocket connections and extended lock timeouts.
+The plugin is optimized to handle parallel disk allocations and bulk storage operations through a combination of connection routing (broker or persistent WebSocket) and extended lock timeouts.
 
-#### Ephemeral WebSocket Connections for Write Operations
+#### Connection Routing: Broker vs. Direct Mode
 
-All write operations (create, update, delete) use one-time WebSocket connections that are created, used, and immediately closed. This prevents response interleaving issues when multiple concurrent processes perform operations simultaneously.
+All API calls — reads and writes alike — go through `_api_call()` (writes route through `_api_call_mutate()`, a thin wrapper around the same function). There is no longer a separate ephemeral-connection path for write operations; both share the same routing logic below.
 
-**How it Works**:
-1. For each write operation, a new WebSocket connection is created via `_ws_open_ephemeral()`
-2. The operation is executed on this isolated connection
-3. Connection is immediately closed via `_ws_close_ephemeral()` with RFC 6455 compliant close frame
-4. Read operations continue using cached persistent connections for efficiency
+**Broker mode (preferred)**: when `/run/truenas-plugin/broker.sock` is present, every call from every plugin process on the node is forwarded to the `truenas-plugin-broker` daemon over that Unix socket — one newline-delimited JSON-RPC request per connection, closed immediately after the response. The broker itself holds a single persistent, authenticated WebSocket per `(host, api_key)` pair upstream to TrueNAS, so individual plugin processes never re-authenticate. This eliminates both per-process re-auth (see [D2](D2-per-process-reauth.md)) and the response-interleaving risk that per-write ephemeral connections used to guard against. Round-trip timeout is tunable via `tn_broker_timeout` (default 30s). See [Broker-Tests.md](Broker-Tests.md) for the full defect analysis.
 
-**Affected Write Operations**:
-- Dataset operations (create, delete, update, clone)
-- iSCSI extent and target-extent creation/deletion
-- Snapshot operations (create, delete, rollback)
-- NVMe namespace operations
-- Bulk operations via core.bulk API
+**Direct mode (fallback)**: when no broker socket is present, the plugin manages its own `%_ws_connections` cache, keyed by `host:api_key`, shared by both reads and writes.
 
-**Fork Safety for Persistent Connections**:
+**Fork Safety for Direct-Mode Connections**:
 
-Read operations use persistent (cached) connections for efficiency. These are protected against fork-related crashes through the NullDestructor pattern:
+Cached direct-mode connections are protected against fork-related crashes through the NullDestructor pattern:
 
 - Child processes (e.g., pvestatd workers) detect inherited connections via PID mismatch
 - Inherited sockets are reblessed into a `NullDestructor` class with empty `DESTROY` method
@@ -1198,6 +1191,7 @@ qm start 100  # VM resumes exactly where it was
 tn_enable_live_snapshots 1
 tn_vmstate_storage local  # Or 'shared'
 ```
+> ⚠️ `tn_enable_live_snapshots` and `tn_vmstate_storage` are not currently implemented (see [Configuration Reference](Configuration.md#tn_enable_live_snapshots)) — live snapshots work regardless of these settings, since Proxmox core handles vmstate placement automatically.
 
 **Use Cases**:
 - Development snapshots - save exact working state
@@ -1211,6 +1205,7 @@ Proxmox 9.x+ supports volume-based snapshot chains:
 ```ini
 tn_snapshot_volume_chains 1
 ```
+> ⚠️ `tn_snapshot_volume_chains` is not currently implemented (see [Configuration Reference](Configuration.md#tn_snapshot_volume_chains)) — this setting has no effect on plugin behavior.
 
 **Benefits**:
 - Better snapshot management
@@ -1581,9 +1576,9 @@ truenasplugin: ipv6-storage
 ```
 
 **Key Settings**:
-- `prefer_ipv4 0` - Disable IPv4 preference
-- `ipv6_by_path 1` - Normalize IPv6 in device paths
-- `use_by_path 1` - Required for IPv6
+- `tn_prefer_ipv4 0` - Disable IPv4 preference
+- `tn_ipv6_by_path 1` - Normalize IPv6 in device paths (⚠️ not currently implemented — see [Configuration Reference](Configuration.md#tn_ipv6_by_path))
+- `tn_use_by_path 1` - Required for IPv6
 
 ### Development Configuration
 
