@@ -786,6 +786,9 @@ sub _ws_defaults($scfg) {
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{tn_api_host};
+    # Normalize bare IPv6 literals to bracketed form (DNS names/IPv4 never contain ':').
+    # Keeps PeerHost/SNI-strip/Host-header all working from the same unambiguous form.
+    $host = "[$host]" if $host =~ /:/ && $host !~ /^\[/;
     my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
     (my $sni = $host) =~ s/^\[|\]$//g; # SNI/cert-name matching must not include IPv6 brackets

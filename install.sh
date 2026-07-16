@@ -4747,11 +4747,16 @@ run_health_check() {
         printf "%-30s " "TrueNAS API:"
         start_spinner
         local api_result
-        if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
-            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host:$api_port"
+        # bash's /dev/tcp does not understand bracketed IPv6 ("[::1]"); strip brackets for the probe
+        local api_host_bare="${api_host#\[}"
+        api_host_bare="${api_host_bare%\]}"
+        local api_host_display="$api_host"
+        [[ "$api_host_display" == *:* && "$api_host_display" != \[* ]] && api_host_display="[$api_host_display]"
+        if timeout 5 bash -c ">/dev/tcp/$api_host_bare/$api_port" 2>/dev/null; then
+            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host_display:$api_port"
             ((checks_passed++))
         else
-            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host:$api_port"
+            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host_display:$api_port"
             ((errors++))
         fi
         stop_spinner
@@ -5529,7 +5534,7 @@ get_all_storage_config_values() {
     awk '{print $1 "=" $2}'
 }
 
-# Validate IP address format
+# Validate IP address format (IPv4 dotted-quad, or IPv6 bare/bracketed literal)
 validate_ip() {
     local ip="$1"
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
@@ -5540,6 +5545,13 @@ validate_ip() {
                 return 1
             fi
         done
+        return 0
+    fi
+    # IPv6: strip optional brackets, then validate via Perl's inet_pton (avoids
+    # a hand-rolled regex for zone IDs/compression/embedded-IPv4 edge cases)
+    local ip6="${ip#\[}"
+    ip6="${ip6%\]}"
+    if [[ -n "$ip6" ]] && perl -MSocket -e 'exit(defined(Socket::inet_pton(Socket::AF_INET6(), $ARGV[0])) ? 0 : 1)' "$ip6" 2>/dev/null; then
         return 0
     fi
     return 1
@@ -5848,9 +5860,9 @@ discover_truenas_portals() {
     fi
 
     # Extract IP addresses from interfaces, excluding the primary IP
-    # Parse JSON to find all "address" fields with IPv4 addresses
+    # Parse JSON to find all "address" fields with IPv4 or IPv6 addresses
     local portals
-    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v -- "^${primary_ip}$" | sort -u)
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | grep -v -- "^${primary_ip}$" | sort -u)
 
     if [[ -z "$portals" ]]; then
         return 1
@@ -6187,6 +6199,11 @@ display_interface_table() {
     local api_host="$3"
     local apikey="$4"
 
+    # TrueNAS reports interface addresses bracket-free; strip brackets from a
+    # bracketed IPv6 api_host so the mgmt-interface match below compares like-for-like.
+    local api_host_bare="${api_host#\[}"
+    api_host_bare="${api_host_bare%\]}"
+
     # Initialize global arrays
     IFACE_NAMES=()
     IFACE_IPS=()
@@ -6227,7 +6244,7 @@ display_interface_table() {
         return ""
     }
 
-    # Helper function to find all IPv4 addresses in a block
+    # Helper function to find all IPv4/IPv6 addresses in a block
     function find_ipv4_addresses(block, ips,    count, pos, remainder, addr, i, c, in_addr) {
         count = 0
         # Look for "address": "X.X.X.X" patterns
@@ -6247,8 +6264,8 @@ display_interface_table() {
                 if (c == "\"") break
                 addr = addr c
             }
-            # Check if it looks like IPv4 (contains only digits and dots)
-            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            # Check if it looks like IPv4 (digits and dots) or IPv6 (hex and colons)
+            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (addr ~ /:/ && addr ~ /^[0-9a-fA-F:]+$/)) {
                 count++
                 ips[count] = addr
             }
@@ -6312,13 +6329,13 @@ display_interface_table() {
                     # Extract active_media_subtype from state object
                     current_speed = extract_value(iface_block, "active_media_subtype")
 
-                    # Extract all IPv4 addresses from aliases array
+                    # Extract all IPv4/IPv6 addresses from aliases array
                     delete ip_list
                     ip_count = find_ipv4_addresses(iface_block, ip_list)
                     for (k = 1; k <= ip_count; k++) {
                         ip = ip_list[k]
-                        # Skip localhost
-                        if (ip !~ /^127\./) {
+                        # Skip loopback/link-local (v4 127.x, v6 ::1 and fe80::/10 - unusable for portals)
+                        if (ip !~ /^127\./ && ip != "::1" && ip !~ /^[fF][eE]80:/) {
                             print current_name "|" ip "|" current_link "|" current_speed
                         }
                     }
@@ -6349,7 +6366,7 @@ display_interface_table() {
 
         # Check if this is the management interface
         local is_mgmt=""
-        if [[ "$ipv4" == "$api_host" ]]; then
+        if [[ "$ipv4" == "$api_host_bare" ]]; then
             is_mgmt="mgmt"
         fi
 
@@ -6363,14 +6380,14 @@ display_interface_table() {
     # Fallback: if awk parsing failed, try simple grep extraction
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
         local all_ips
-        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=")' | grep -v "^127\." | sort -u)
+        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+(?=")' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | sort -u)
         local idx=1
         for ipv4 in $all_ips; do
             IFACE_NAMES+=("if${idx}")
             IFACE_IPS+=("$ipv4")
             IFACE_SPEEDS+=("-")
             IFACE_STATES+=("UP")
-            if [[ "$ipv4" == "$api_host" ]]; then
+            if [[ "$ipv4" == "$api_host_bare" ]]; then
                 IFACE_MGMT+=("mgmt")
             else
                 IFACE_MGMT+=("")
@@ -6380,7 +6397,7 @@ display_interface_table() {
     fi
 
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
-        error "No network interfaces with IPv4 addresses found on TrueNAS"
+        error "No network interfaces with IPv4 or IPv6 addresses found on TrueNAS"
         return 1
     fi
 
@@ -6414,7 +6431,7 @@ display_interface_table() {
     # Display header
     echo
     printf '%b%b%s%b\n' "${c6}" "${c8}" "TrueNAS Network Interfaces" "${c0}"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     local portal_col
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
@@ -6422,8 +6439,8 @@ display_interface_table() {
     else
         portal_col="Portal"
     fi
-    printf "  %-3s %-14s %-17s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf "  %-3s %-14s %-30s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     # Display each interface
     for ((i=0; i<${#IFACE_IPS[@]}; i++)); do
@@ -6458,11 +6475,11 @@ display_interface_table() {
             done
         fi
 
-        printf "  %-3s %-14s %-17s %-8s %b%-6s%b %b\n" \
+        printf "  %-3s %-14s %-30s %-8s %b%-6s%b %b\n" \
             "$num" "$name" "$ip" "$speed" "$state_color" "$state" "${c0}" "$portal_status"
     done
 
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
     echo
 
     return 0
@@ -6572,7 +6589,7 @@ select_interfaces() {
     info "Selected interfaces:"
     for idx in "${SELECTED_IFACE_INDICES[@]}"; do
         local arr_idx=$((idx-1))
-        printf "  • %-14s %-17s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
+        printf "  • %-14s %-30s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
     done
 
     return 0
@@ -6716,7 +6733,7 @@ tn_api_call_write() {
 
         # Make the API call with ephemeral connection
         my $result = eval {
-            PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params);
+            PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, $method, $params);
         };
 
         if ($@) {
@@ -6991,6 +7008,11 @@ tn_create_portal() {
     local api_key="$2"
     local listen_ip="$3"
     local listen_port="${4:-3260}"
+
+    # TrueNAS's iscsi.portal.create 'ip' field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating iSCSI portal: $listen_ip:$listen_port"
 
@@ -7477,6 +7499,11 @@ tn_find_nvme_port() {
     local listen_ip="$3"
     local listen_port="${4:-4420}"
 
+    # TrueNAS stores addr_traddr as a bare address; strip brackets so the
+    # comparison below matches an IPv6 literal that arrived in [addr] form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
+
     log "INFO" "Searching for existing NVMe port: $listen_ip:$listen_port"
 
     # Query all ports
@@ -7526,6 +7553,11 @@ tn_create_nvme_port() {
     local subsystem_id="$3"
     local listen_ip="$4"
     local listen_port="${5:-4420}"
+
+    # TrueNAS's nvmet.port addr_traddr field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating/finding NVMe port for subsystem $subsystem_id: $listen_ip:$listen_port"
 
@@ -10717,25 +10749,47 @@ menu_configure_storage() {
     while true; do
         read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
         if [[ -z "$portal" ]]; then
-            portal="${truenas_ip}:${default_port}"
+            # Bracket a bare IPv6 truenas_ip before appending :port (plain ":" would be ambiguous)
+            local truenas_ip_disp="$truenas_ip"
+            [[ "$truenas_ip_disp" == *:* && "$truenas_ip_disp" != \[* ]] && truenas_ip_disp="[$truenas_ip_disp]"
+            portal="${truenas_ip_disp}:${default_port}"
             break
         else
-            # Extract IP part (may or may not have port)
-            local portal_ip="${portal%%:*}"
+            # Extract IP part and optional port. IPv6 addresses contain colons
+            # themselves, so a port suffix is only unambiguous in two forms:
+            # "[ipv6]:port" (bracketed) or "ipv4-or-host:port" (single colon).
+            # A bare IPv6 literal (multiple colons, no brackets) can't carry a
+            # port suffix at all - treat the whole string as the address.
+            local portal_ip portal_port
+            if [[ "$portal" =~ ^\[([0-9a-fA-F:]+)\](:([0-9]+))?$ ]]; then
+                portal_ip="[${BASH_REMATCH[1]}]"
+                portal_port="${BASH_REMATCH[3]}"
+            elif [[ "$portal" == *:*:* ]]; then
+                portal_ip="$portal"
+                portal_port=""
+            else
+                portal_ip="${portal%%:*}"
+                if [[ "$portal" == *:* ]]; then
+                    portal_port="${portal##*:}"
+                else
+                    portal_port=""
+                fi
+            fi
+
             if ! validate_ip "$portal_ip"; then
                 error "Invalid IP address format"
                 continue
             fi
-            if [[ ! "$portal" =~ : ]]; then
+            if [[ -z "$portal_port" ]]; then
                 # Add default port if not specified
-                portal="${portal}:${default_port}"
+                portal="${portal_ip}:${default_port}"
             else
                 # Validate port number
-                local portal_port="${portal##*:}"
                 if ! [[ "$portal_port" =~ ^[0-9]+$ ]] || [[ "$portal_port" -lt 1 ]] || [[ "$portal_port" -gt 65535 ]]; then
                     error "Invalid port number (must be 1-65535)"
                     continue
                 fi
+                portal="${portal_ip}:${portal_port}"
             fi
             break
         fi
