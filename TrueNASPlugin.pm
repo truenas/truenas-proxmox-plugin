@@ -352,8 +352,8 @@ sub properties {
     return {
         # Transport & connection
         tn_api_host => {
-            description => "TrueNAS hostname or IP.",
-            type => 'string', format => 'pve-storage-server',
+            description => "TrueNAS hostname or IP (IPv6 literals must be bracketed, e.g. [fd00:1::1]).",
+            type => 'string', format => 'pve-storage-portal-dns',
         },
         tn_api_key => {
             description => "TrueNAS user-linked API key.",
@@ -788,6 +788,7 @@ sub _ws_open($scfg) {
     my $host = $scfg->{tn_api_host};
     my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
+    (my $sni = $host) =~ s/^\[|\]$//g; # SNI/cert-name matching must not include IPv6 brackets
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -795,7 +796,7 @@ sub _ws_open($scfg) {
             PeerHost => $peer,
             PeerPort => $port,
             SSL_verify_mode => $scfg->{tn_api_insecure} ? 0x00 : 0x02,
-            SSL_hostname    => $host,
+            SSL_hostname    => $sni,
             Timeout => 15,
         ) or die "WebSocket secure connection failed (wss://): $SSL_ERROR\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     } else {

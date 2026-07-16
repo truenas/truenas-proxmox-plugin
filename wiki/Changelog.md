@@ -1,5 +1,14 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.21 (July 15, 2026)
+
+### Bug Fixes
+
+- **Fix IPv6 `tn_api_host` rejected by config schema (#68)**: `tn_api_host` used the `pve-storage-server` format, which only accepts a bare/unbracketed IP or DNS name and rejects bracketed IPv6 literals (`[fd00:1::1]`) with "value does not look like a valid server name or IP address". Switched to `pve-storage-portal-dns` (the same format PVE core's `ISCSIPlugin` uses for its `portal` field), which correctly parses bracketed IPv6.
+- **Fix IPv6 SNI/certificate-name mismatch in `_ws_open`**: Even with the schema fixed, `SSL_hostname` was set to the raw bracketed host string. `IO::Socket::SSL` uses an explicitly-set `SSL_hostname` verbatim for both the TLS SNI extension and certificate-name verification with no bracket stripping, so the literal `[fd00:1::1]` was sent as SNI and compared against certificate SAN `iPAddress` entries, which are never bracketed. `_ws_open` now strips `[`/`]` before assigning `SSL_hostname`, while `PeerHost` and the `Host:` header keep the original bracketed form.
+- **Fix malformed `Host:` header for bare IPv6 `tn_api_host`**: The plugin's own documented IPv6 config example uses a bare (unbracketed) literal like `2001:db8::100`. `_ws_open`'s `Host:` header (`$host.":".$port`) produced an ambiguous string like `2001:db8::100:443` for this form. Bare IPv6 literals are now normalized to bracketed form once at the top of `_ws_open`, so `PeerHost`, SNI, and the `Host:` header all get consistent, unambiguous input.
+- **install.sh: extend IPv6 support across the interactive installer**: `validate_ip()` was IPv4-only, blocking every interactive TrueNAS-host/portal-IP prompt from accepting IPv6. It now also validates bare/bracketed IPv6 via Perl's `inet_pton`. The `/dev/tcp` reachability probe (bash does not understand bracketed IPv6) now strips brackets before connecting. Manual portal `IP:port` entry now correctly distinguishes `[ipv6]:port`, bare IPv6 (no port suffix), and `ipv4-or-host:port` instead of naively splitting on the first colon. TrueNAS network-interface auto-discovery (used for portal setup) now captures IPv6 addresses alongside IPv4, skips `::1`/`fe80::` link-local same as `127.x`, and widens the IP-address table column to fit IPv6 literals. `tn_create_portal`/`tn_create_nvme_port`/`tn_find_nvme_port` now strip brackets before sending an address to TrueNAS's `iscsi.portal.create`/`nvmet.port` APIs, which expect a bare address.
+
 ## Version 2.1.20 (July 4, 2026)
 
 ### Bug Fixes

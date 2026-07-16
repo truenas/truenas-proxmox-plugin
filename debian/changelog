@@ -1,3 +1,38 @@
+truenas-proxmox-plugin (2.1.21+deb1) unstable; urgency=medium
+
+  * Fix IPv6 tn_api_host rejected by config schema (#68). tn_api_host
+    used format => 'pve-storage-server', which only accepts a bare
+    IP or DNS name and rejects bracketed IPv6 literals like
+    [fd00:1::1]. Switched to 'pve-storage-portal-dns' (same format
+    PVE core's ISCSIPlugin uses for its portal field), which
+    correctly parses bracketed IPv6 via PVE::Tools::parse_host_and_port.
+  * Fix IPv6 SNI/certificate-name mismatch in _ws_open. SSL_hostname
+    was set to the raw bracketed host string; IO::Socket::SSL uses an
+    explicitly-set SSL_hostname verbatim for both SNI and
+    certificate-name verification with no bracket stripping, so
+    [fd00:1::1] was sent as SNI and compared against unbracketed
+    certificate SAN iPAddress entries. _ws_open now strips brackets
+    before assigning SSL_hostname; PeerHost and the Host: header keep
+    the original bracketed form.
+  * Fix malformed Host: header for bare IPv6 tn_api_host. The
+    documented bare-literal form (e.g. 2001:db8::100) produced an
+    ambiguous "2001:db8::100:443" Host header. Bare IPv6 literals are
+    now normalized to bracketed form once at the top of _ws_open.
+  * install.sh: extend IPv6 support across the interactive installer.
+    validate_ip() now accepts bare/bracketed IPv6 via Perl's
+    inet_pton. The /dev/tcp reachability probe strips brackets before
+    connecting (bash doesn't understand bracket notation). Manual
+    portal IP:port entry now correctly distinguishes [ipv6]:port,
+    bare IPv6 (no port suffix), and ipv4-or-host:port instead of
+    splitting on the first colon. TrueNAS interface auto-discovery
+    now captures IPv6 addresses alongside IPv4 and skips ::1/fe80::
+    same as 127.x. tn_create_portal/tn_create_nvme_port/
+    tn_find_nvme_port strip brackets before sending an address to
+    TrueNAS's iscsi.portal.create/nvmet.port APIs, which expect a
+    bare address.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 15 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=medium
 
   * Fix installer health check auth false positive (#57 bug 1): inline-Perl
