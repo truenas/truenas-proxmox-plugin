@@ -5565,6 +5565,13 @@ validate_host() {
         validate_ip "$host" && return 0
         return 1
     fi
+    # A colon means an IPv6 literal (bare or bracketed) - never a valid
+    # hostname label, so validate as an IP rather than falling through
+    # to the hostname regex below (which would reject the colon/brackets).
+    if [[ "$host" == *:* ]]; then
+        validate_ip "$host" && return 0
+        return 1
+    fi
     # Accept valid hostname: labels of [a-zA-Z0-9-], separated by dots, no leading/trailing hyphens
     [[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && return 0
     return 1
