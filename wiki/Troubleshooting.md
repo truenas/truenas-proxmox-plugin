@@ -499,9 +499,9 @@ tn_api_scheme ws   # for insecure WebSocket (testing only)
 
 # Common mistake: Using http/https scheme instead of ws/wss
 # WRONG:
-# api_scheme https  # Not supported
+# tn_api_scheme https  # Not supported
 # CORRECT:
-# api_scheme wss    # This is for WebSocket
+# tn_api_scheme wss    # This is for WebSocket
 ```
 
 #### 6. Check WebSocket Port Configuration
@@ -1191,8 +1191,8 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 nano /etc/pve/storage.cfg
 
 # Comment out secrets:
-# nvme_dhchap_secret DHHC-1:01:...
-# nvme_dhchap_ctrl_secret DHHC-1:01:...
+# tn_nvme_dhchap_secret DHHC-1:01:...
+# tn_nvme_dhchap_ctrl_secret DHHC-1:01:...
 
 # Set subsystem allow_any_host = true in TrueNAS
 

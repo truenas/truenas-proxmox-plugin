@@ -1,5 +1,7 @@
 # D2 — per-process re-authentication
 
+> **Status: fixed.** The session broker described in option 1 below (`## What a real D2 fix looks like`) has since been merged directly into `TrueNASPlugin.pm` (`_broker_open_socket`/`_broker_try_open`/`_broker_rpc`, commit `b9c47d3`), not just the standalone `broker-service` branch this doc originally referenced. When `/run/truenas-plugin/broker.sock` is present, `_ws_get_persistent` routes through it automatically. The rest of this document is kept as-written for the problem analysis and rejected alternatives (options 2 and 3); treat any present-tense description of the broker as "implemented in mainline," not "proposed."
+
 ## Symptom
 
 Every short-lived Proxmox process that talks to TrueNAS does its own
