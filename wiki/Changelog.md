@@ -1,5 +1,18 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.22 (July 21, 2026)
+
+### Bug Fixes
+
+- **Fix `pool.dataset.create` crash on TrueNAS 25.10.4 (#58, #65, #78)**: Both dataset-create call sites (`_tn_dataset_create` and `alloc_image`'s inline payload) omitted six optional fields — `volblocksize` (when `tn_zvol_blocksize` was unset), `snapdev`, `reservation`, `refreservation`, `special_small_block_size`, `force_size`. TrueNAS 25.10.4's legacy API compatibility shim leaves omitted optional fields as unresolved `_NotRequired` sentinel objects instead of real defaults, which crashes `pool.dataset.create` — either during validation, or, even when validation passes, during audit-log JSON serialization afterward. The latter case is especially disruptive: it masks a create that actually succeeded server-side, leaving an orphaned zvol on TrueNAS while Proxmox reports total failure. All six fields are now sent explicitly at both call sites. `special_small_block_size` must be `'INHERIT'` specifically — `0` fails a ZFS-level check ("does not apply to datasets of this type"), `null` fails the Pydantic schema check, and `INHERIT` satisfies both, consistent with how every other inheritable property in the payload is already handled.
+
+## Version 2.1.21~alpha1 (July 20, 2026)
+
+### Bug Fixes
+
+- **Make `truenas-plugin-broker` mandatory** (fixes rate-limit cascade seen in `test_run4/truenas-2026-07-{13..15}`): Direct-WS fallback re-authenticated in every forked PVE process and reliably tripped the TrueNAS middlewared login rate limiter, cascading into pre-flight failures across snapshot, resize, clone, additional-disk, and backup paths. `_ws_get_persistent` now refuses to open a direct WS when `/run/truenas-plugin/broker.sock` is absent, dying with a message that points at the .deb install and the `truenas-plugin-broker.service` unit. Escape hatch: `TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1` in the environment for dev use. `postinst` now waits up to 5s for the broker socket after starting the service and prints a diagnostic if it never appears — the previous silent fallback let bad copies (`cp TrueNASPlugin.pm` without `dpkg -i`) look healthy until the first heavy test load.
+- **Preserve real error message in `alloc_image` and `clone_image` failure paths** (6 sites in create-extent / target-extent-mapping / namespace-create for both iSCSI and NVMe-oF): The cleanup `eval` that follows a failed create call clobbered `$@` before the outer `die`, so operators saw "Failed to create iSCSI extent for clone: " with an empty tail (see `test_run4/truenas-2026-07-13/run-01` template/linked-clone failures). Capture the create error into a lexical before the cleanup so the `die` carries the underlying diagnostic (e.g. the duplicate-extent-name or `EBUSY` that actually caused the failure).
+
 ## Version 2.1.20 (July 4, 2026)
 
 ### Bug Fixes
