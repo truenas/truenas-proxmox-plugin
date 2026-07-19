@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.5';
+our $VERSION = '2.1.20';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -1699,16 +1699,23 @@ sub _tn_pool_health($scfg) {
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
+    # All six of these must be sent explicitly, not omitted: TrueNAS 25.10.4's
+    # legacy API shim leaves omitted optional fields as unresolved _NotRequired
+    # sentinels instead of real defaults, crashing pool.dataset.create both in
+    # validation and in audit-log serialization (#58, #65, #78). special_small_block_size
+    # must be 'INHERIT' specifically - 0 fails a ZFS-level check, null fails Pydantic.
     my $payload = {
-        name   => $full,
-        type   => 'VOLUME',
-        volsize=> $bytes,
-        sparse => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        name                     => $full,
+        type                     => 'VOLUME',
+        volsize                  => $bytes,
+        sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        volblocksize             => _normalize_blocksize($blocksize) // '16K',
+        snapdev                  => 'INHERIT',
+        reservation              => 0,
+        refreservation           => 0,
+        special_small_block_size => 'INHERIT',
+        force_size               => JSON::PP::false,
     };
-    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-    if ($blocksize) {
-        $payload->{volblocksize} = _normalize_blocksize($blocksize);
-    }
     my $result = _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ]);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
@@ -4537,15 +4544,24 @@ sub alloc_image {
         $create_attempt++;
         $create_error = undef;
 
+        # All six of these must be sent explicitly, not omitted: TrueNAS 25.10.4's
+        # legacy API shim leaves omitted optional fields as unresolved _NotRequired
+        # sentinels instead of real defaults, crashing pool.dataset.create both in
+        # validation and in audit-log serialization (#58, #65, #78). special_small_block_size
+        # must be 'INHERIT' specifically - 0 fails a ZFS-level check, null fails Pydantic.
         my $create_payload = {
-            name     => $full_ds,
-            type     => 'VOLUME',
-            volsize  => $bytes,
-            sparse   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-            comments => 'Autocreated by Proxmox Plugin',
+            name                     => $full_ds,
+            type                     => 'VOLUME',
+            volsize                  => $bytes,
+            sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+            comments                 => 'Autocreated by Proxmox Plugin',
+            volblocksize             => _normalize_blocksize($blocksize) // '16K',
+            snapdev                  => 'INHERIT',
+            reservation              => 0,
+            refreservation           => 0,
+            special_small_block_size => 'INHERIT',
+            force_size               => JSON::PP::false,
         };
-        # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-        $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
         $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 

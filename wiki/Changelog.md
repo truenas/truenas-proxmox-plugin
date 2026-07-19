@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.20 (July 18, 2026)
+
+### Bug Fixes
+
+- **Fix `pool.dataset.create` crash on TrueNAS 25.10.4 (#58, #65, #78)**: Both dataset-create call sites (`_tn_dataset_create` and `alloc_image`'s inline payload) omitted six optional fields — `volblocksize` (when `tn_zvol_blocksize` was unset), `snapdev`, `reservation`, `refreservation`, `special_small_block_size`, `force_size`. TrueNAS 25.10.4's legacy API compatibility shim leaves omitted optional fields as unresolved `_NotRequired` sentinel objects instead of real defaults, which crashes `pool.dataset.create` — either during validation, or, even when validation passes, during audit-log JSON serialization afterward. The latter case is especially disruptive: it masks a create that actually succeeded server-side, leaving an orphaned zvol on TrueNAS while Proxmox reports total failure. All six fields are now sent explicitly at both call sites. `special_small_block_size` must be `'INHERIT'` specifically — `0` fails a ZFS-level check ("does not apply to datasets of this type"), `null` fails the Pydantic schema check, and `INHERIT` satisfies both, consistent with how every other inheritable property in the payload is already handled.
+
 ## Version 2.1.5 (June 16, 2026)
 
 ### Bug Fixes
