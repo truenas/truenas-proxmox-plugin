@@ -6,56 +6,62 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
 
 - [Configuration File](#configuration-file)
 - [Required Parameters](#required-parameters)
-  - [api_host](#api_host)
-  - [api_key](#api_key)
-  - [target_iqn](#target_iqn)
-  - [dataset](#dataset)
-  - [discovery_portal](#discovery_portal)
+  - [tn_api_host](#tn_api_host)
+  - [tn_api_key](#tn_api_key)
+  - [tn_target_iqn](#tn_target_iqn)
+  - [tn_dataset](#tn_dataset)
+  - [tn_discovery_portal](#tn_discovery_portal)
 - [Content Type](#content-type)
   - [content](#content)
   - [shared](#shared)
   - [nodes](#nodes)
- - [API Configuration](#api-configuration)
-  - [api_scheme](#api_scheme)
-  - [api_port](#api_port)
-  - [api_insecure](#api_insecure)
-  - [api_retry_max](#api_retry_max)
-  - [api_retry_delay](#api_retry_delay)
-  - [storage_lock_timeout](#storage_lock_timeout)
+- [API Configuration](#api-configuration)
+  - [tn_api_scheme](#tn_api_scheme)
+  - [tn_api_port](#tn_api_port)
+  - [tn_api_insecure](#tn_api_insecure)
+  - [tn_api_retry_max](#tn_api_retry_max)
+  - [tn_api_retry_delay](#tn_api_retry_delay)
+  - [tn_storage_lock_timeout](#tn_storage_lock_timeout)
 - [Network Configuration](#network-configuration)
-  - [prefer_ipv4](#prefer_ipv4)
-  - [portals](#portals)
-  - [use_multipath](#use_multipath)
-  - [use_by_path](#use_by_path)
-  - [ipv6_by_path](#ipv6_by_path)
+  - [tn_prefer_ipv4](#tn_prefer_ipv4)
+  - [tn_portals](#tn_portals)
+  - [tn_use_multipath](#tn_use_multipath)
+  - [tn_use_by_path](#tn_use_by_path)
+  - [tn_ipv6_by_path](#tn_ipv6_by_path) ⚠️ not implemented
 - [Transport Mode Selection](#transport-mode-selection)
-  - [transport_mode](#transport_mode)
+  - [tn_transport_mode](#tn_transport_mode)
 - [NVMe/TCP Configuration](#nvmetcp-configuration)
-  - [subsystem_nqn](#subsystem_nqn)
-  - [hostnqn](#hostnqn)
-  - [nvme_dhchap_secret](#nvme_dhchap_secret)
-  - [nvme_dhchap_ctrl_secret](#nvme_dhchap_ctrl_secret)
+  - [tn_subsystem_nqn](#tn_subsystem_nqn)
+  - [tn_hostnqn](#tn_hostnqn)
+  - [tn_nvme_dhchap_secret](#tn_nvme_dhchap_secret)
+  - [tn_nvme_dhchap_ctrl_secret](#tn_nvme_dhchap_ctrl_secret)
+  - [tn_nr_io_queues](#tn_nr_io_queues)
 - [iSCSI Behavior](#iscsi-behavior)
-  - [force_delete_on_inuse](#force_delete_on_inuse)
-  - [logout_on_free](#logout_on_free)
+  - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
+  - [tn_logout_on_free](#tn_logout_on_free)
 - [ZFS Volume Options](#zfs-volume-options)
-  - [zvol_blocksize](#zvol_blocksize)
+  - [tn_zvol_blocksize](#tn_zvol_blocksize)
   - [tn_sparse](#tn_sparse)
+  - [tn_compression](#tn_compression)
 - [Snapshot Configuration](#snapshot-configuration)
-  - [vmstate_storage](#vmstate_storage)
-  - [enable_live_snapshots](#enable_live_snapshots)
-  - [snapshot_volume_chains](#snapshot_volume_chains)
+  - [tn_vmstate_storage](#tn_vmstate_storage) ⚠️ not implemented
+  - [tn_enable_live_snapshots](#tn_enable_live_snapshots) ⚠️ not implemented
+  - [tn_snapshot_volume_chains](#tn_snapshot_volume_chains) ⚠️ not implemented
 - [Performance Options](#performance-options)
-  - [enable_bulk_operations](#enable_bulk_operations)
+  - [tn_enable_bulk_operations](#tn_enable_bulk_operations)
+  - [tn_device_ready_retries](#tn_device_ready_retries)
 - [Security Options](#security-options)
-  - [chap_user](#chap_user)
-  - [chap_password](#chap_password)
+  - [tn_chap_user](#tn_chap_user)
+  - [tn_chap_password](#tn_chap_password)
 - [Diagnostics](#diagnostics)
-  - [debug](#debug)
+  - [tn_debug](#tn_debug)
 - [Configuration Examples](#configuration-examples)
-  - [Basic Single-Node Configuration](#basic-single-node-configuration)
+  - [Basic Single-Node Configuration (iSCSI)](#basic-single-node-configuration-iscsi)
+  - [Basic NVMe/TCP Configuration](#basic-nvmetcp-configuration)
   - [Production Cluster Configuration](#production-cluster-configuration)
   - [High Availability Configuration](#high-availability-configuration)
+  - [NVMe/TCP with DH-CHAP Authentication](#nvmetcp-with-dh-chap-authentication)
+  - [NVMe/TCP Multipath Configuration](#nvmetcp-multipath-configuration)
   - [IPv6 Configuration](#ipv6-configuration)
   - [Development/Testing Configuration](#developmenttesting-configuration)
   - [Enterprise Production Configuration (All Features)](#enterprise-production-configuration-all-features)
@@ -308,6 +314,7 @@ tn_use_by_path 0
 ```
 
 ### `tn_ipv6_by_path`
+**Status**: ⚠️ Not currently implemented — accepted in `storage.cfg` but has no effect on plugin behavior
 **Description**: Normalize IPv6 addresses in by-path device names
 **Type**: Boolean (0 or 1)
 **Default**: `0`
@@ -481,6 +488,18 @@ tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2
 - **Unidirectional** (host secret only): Proxmox proves identity to TrueNAS
 - **Bidirectional** (host + controller secrets): Both sides prove identity (recommended)
 
+### `tn_nr_io_queues`
+**Description**: Number of NVMe/TCP I/O queues per controller
+**Type**: Integer
+**Valid Range**: 1-256
+**Default**: None (auto-detected)
+
+When unset, the plugin auto-detects a queue count: the online CPU count when all CPUs are online, or half of the possible CPU count when any CPU is offlined (avoids kernel queue-to-CPU mapping failures on gapped CPU topologies, e.g. `EXDEV` errors). Set explicitly to override auto-detection.
+
+```ini
+tn_nr_io_queues 8
+```
+
 ## iSCSI Behavior
 
 ### `tn_force_delete_on_inuse`
@@ -531,9 +550,24 @@ Sparse volumes only consume space as data is written, enabling overprovisioning.
 tn_sparse 1
 ```
 
+### `tn_compression`
+**Description**: ZFS compression algorithm for new volumes
+**Type**: String
+**Valid Values**: `OFF`, `LZ4`, `GZIP`, `GZIP-1`, `GZIP-9`, `ZSTD`, `ZSTD-1`, `ZSTD-3`, `ZSTD-5`, `ZSTD-7`, `ZSTD-9`, `ZLE`, `LZJB`
+**Default**: None (inherits from the parent dataset)
+
+Applied at zvol creation time. Existing volumes are unaffected by later changes to this setting.
+
+```ini
+tn_compression ZSTD
+```
+
 ## Snapshot Configuration
 
+> ⚠️ **The three options below (`tn_vmstate_storage`, `tn_enable_live_snapshots`, `tn_snapshot_volume_chains`) are not currently implemented.** They are declared in the plugin's `storage.cfg` schema (so setting them is accepted without error) but are never read anywhere in the plugin — they have no effect on runtime behavior. Live VM snapshots with vmstate are handled automatically by Proxmox core, not gated by these flags. Documented here for when/if the feature is implemented.
+
 ### `tn_vmstate_storage`
+**Status**: ⚠️ Not currently implemented — accepted in `storage.cfg` but has no effect on plugin behavior
 **Description**: Storage location for VM state (RAM) during live snapshots
 **Type**: String
 **Valid Values**: `local`, `shared`
@@ -547,6 +581,7 @@ tn_vmstate_storage local
 ```
 
 ### `tn_enable_live_snapshots`
+**Status**: ⚠️ Not currently implemented — accepted in `storage.cfg` but has no effect on plugin behavior
 **Description**: Enable live VM snapshots with vmstate
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -558,6 +593,7 @@ tn_enable_live_snapshots 1
 ```
 
 ### `tn_snapshot_volume_chains`
+**Status**: ⚠️ Not currently implemented — accepted in `storage.cfg` but has no effect on plugin behavior
 **Description**: Use volume snapshot chains (Proxmox 9+)
 **Type**: Boolean (0 or 1)
 **Default**: `1`
@@ -579,6 +615,18 @@ Batch multiple API calls into single bulk request for better performance.
 
 ```ini
 tn_enable_bulk_operations 1
+```
+
+### `tn_device_ready_retries`
+**Description**: Number of 100ms retries waiting for a block device to appear after connect
+**Type**: Integer
+**Valid Range**: 0-600
+**Default**: `200` (up to ~20s)
+
+Increase on slower storage backends or high-latency networks where the block device takes longer to appear after an iSCSI login or NVMe connect.
+
+```ini
+tn_device_ready_retries 200
 ```
 
 ## Security Options

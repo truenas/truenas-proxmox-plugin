@@ -3130,13 +3130,18 @@ sub _nvme_untaint_cli_port {
 }
 
 sub _nvme_untaint_cli_nqn {
-    my ($value, $label) = @_;
+    my ($value, $label, $require_identifier) = @_;
     $label //= 'NVMe NQN';
+    $require_identifier //= 1; # subsystem NQNs require it per NVMe-oF spec; host NQNs don't (#44)
 
     die "Invalid $label: missing value\n"
         if !defined($value) || $value eq '';
 
-    if ($value =~ /^(nqn\.\d{4}-\d{2}\.[A-Za-z0-9.-]+:[A-Za-z0-9][A-Za-z0-9._:-]*)$/) {
+    my $identifier = $require_identifier
+        ? qr/:[A-Za-z0-9][A-Za-z0-9._:-]*/
+        : qr/(?::[A-Za-z0-9][A-Za-z0-9._:-]*)?/;
+
+    if ($value =~ /^(nqn\.\d{4}-\d{2}\.[A-Za-z0-9.-]+(?:$identifier))$/) {
         return $1;
     }
 
@@ -3225,7 +3230,7 @@ sub _nvme_connect {
 
     die "No portals configured for NVMe/TCP storage\n" unless @portals;
 
-    my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN');
+    my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN', 0);
     my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
     my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;

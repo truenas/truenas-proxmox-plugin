@@ -42,7 +42,7 @@ my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
 my $PIDFILE        = '/run/truenas-plugin/broker.pid';
 my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
-my $WS_PINNED_PATH = '/api/v25.10.2';
+my $WS_PATH = '/api/current';
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
 my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
@@ -115,7 +115,7 @@ sub ws_open {
     my $key_raw = join '', map { chr(int(rand(256))) } 1..16;
     my $key_b64 = encode_base64($key_raw, '');
     my $req =
-      "GET $WS_PINNED_PATH HTTP/1.1\r\n".
+      "GET $WS_PATH HTTP/1.1\r\n".
       "Host: $host:$port\r\n".
       "Upgrade: websocket\r\n".
       "Connection: Upgrade\r\n".

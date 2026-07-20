@@ -64,7 +64,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 
 **Configuration**:
 - [Required Parameters](Configuration.md#required-parameters)
-- [Basic Configuration Example](Configuration.md#basic-single-node-configuration)
+- [Basic Configuration Example](Configuration.md#basic-single-node-configuration-iscsi)
 - [Production Cluster Example](Configuration.md#production-cluster-configuration)
 
 **Troubleshooting**:
