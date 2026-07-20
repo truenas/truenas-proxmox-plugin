@@ -193,7 +193,7 @@ WebSocket: pool.dataset.delete
 
 #### Create Snapshot
 ```
-WebSocket: zfs.snapshot.create
+WebSocket: pool.snapshot.create
 ```
 
 **Parameters**:
@@ -216,7 +216,7 @@ WebSocket: zfs.snapshot.create
 
 #### List Snapshots
 ```
-WebSocket: zfs.snapshot.query
+WebSocket: pool.snapshot.query
 ```
 
 **Parameters**:
@@ -228,12 +228,12 @@ WebSocket: zfs.snapshot.query
 
 #### Delete Snapshot
 ```
-WebSocket: zfs.snapshot.delete
+WebSocket: pool.snapshot.delete
 ```
 
 #### Rollback Snapshot
 ```
-WebSocket: zfs.snapshot.rollback
+WebSocket: pool.snapshot.rollback
 ```
 
 ### iSCSI Operations
@@ -584,31 +584,27 @@ WebSocket responses include rate limit information in error messages when limits
 
 ## Connection Management
 
-### WebSocket Connection Caching
+The plugin has two connection modes. Both are used transparently by `_api_call()` — reads and writes alike; `_api_call_mutate()` is a thin wrapper around the same function. See [Advanced-Features.md](Advanced-Features.md#connection-routing-broker-vs-direct-mode) for the concurrency rationale.
 
-**Cache Lifetime**: 60 seconds
+### Broker Mode (preferred)
+
+When `/run/truenas-plugin/broker.sock` is present, every call from every plugin process on the node is forwarded to the `truenas-plugin-broker` daemon over that Unix socket — one newline-delimited JSON-RPC request per connection, closed immediately after the response. The broker holds a single persistent, authenticated WebSocket per `(host, api_key)` pair upstream to TrueNAS, so plugin processes never re-authenticate individually. Round-trip timeout is tunable via `tn_broker_timeout` (default 30s). See [Broker-Tests.md](Broker-Tests.md).
+
+### Direct Mode (fallback)
 
 **Behavior**:
-- First API call creates WebSocket connection
-- Subsequent calls reuse connection (within 60s)
-- Connection auto-closed after 60s idle
-- Auto-reconnect on connection loss
+- First API call for a given `(host, api_key)` pair opens a WebSocket connection and caches it in-process (keyed on `host:api_key`)
+- Subsequent calls in the same process reuse that connection indefinitely — there is no idle timeout that proactively closes it
+- On a failed call, the dead connection is discarded and a fresh one opened on the next call
+- Connections are never shared across processes; each PVE daemon/worker keeps its own cache
 
 **Benefits**:
 - Reduced TLS handshake overhead
 - Lower API call count (no repeated auth)
-- Better performance (~20-30ms savings per call)
-
-### Connection Pooling
-
-Multiple simultaneous operations share connections:
-- One connection per `(host, port, scheme)` tuple
-- Thread-safe connection management
-- Automatic cleanup of stale connections
 
 ### Fork Safety
 
-Persistent WebSocket connections are protected against fork-related issues (common with pvestatd workers):
+Direct-mode connections are protected against fork-related issues (common with pvestatd workers):
 
 - **PID Tracking**: Connections track the process that created them
 - **Fork Detection**: Child processes detect inherited connections via PID mismatch
@@ -715,8 +711,8 @@ API keys stored in `/etc/pve/storage.cfg`:
 
 ### Snapshot Creation
 
-1. `zfs.snapshot.create` - Create snapshot
-2. `zfs.snapshot.query` - Verify created
+1. `pool.snapshot.create` - Create snapshot
+2. `pool.snapshot.query` - Verify created
 
 ### Status Check
 
