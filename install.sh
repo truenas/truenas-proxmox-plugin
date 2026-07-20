@@ -3812,6 +3812,10 @@ menu_cleanup_orphans() {
     transport_mode=$(get_storage_config_value "$storage_name" "tn_transport_mode" || true)
     TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
     TN_API_PORT="${TN_API_PORT:-443}"
+    # Honor the storage's configured tn_api_insecure (blank/unset means
+    # verify certs, matching the plugin's own default) for subsequent
+    # tn_api_call/tn_api_call_write invocations in this function.
+    TN_API_INSECURE="${api_insecure:-0}"
 
     # Default to iscsi if not specified
     [[ -z "$transport_mode" ]] && transport_mode="iscsi"
@@ -4367,6 +4371,11 @@ detect_orphaned_resources() {
     local dataset="$5"
     local api_insecure="$6"
 
+    # Honor the storage's configured tn_api_insecure (blank/unset means
+    # verify certs, matching the plugin's own default) for the
+    # tn_api_call invocations below.
+    TN_API_INSECURE="${api_insecure:-0}"
+
     local orphan_count=0
 
     if [[ "$transport_mode" == "iscsi" ]]; then
@@ -4728,6 +4737,11 @@ run_health_check() {
     api_port=$(get_storage_config_value "$storage_name" "tn_api_port")
     api_port=${api_port:-443}
     TN_API_PORT="$api_port"
+    # Honor the storage's configured tn_api_insecure (blank/unset means
+    # verify certs, matching the plugin's own default) for the
+    # tn_api_call invocations below.
+    TN_API_INSECURE="$(get_storage_config_value "$storage_name" "tn_api_insecure")"
+    TN_API_INSECURE="${TN_API_INSECURE:-0}"
 
     if [[ -n "$api_host" ]]; then
         printf "%-30s " "TrueNAS API:"
@@ -5113,6 +5127,9 @@ run_health_check() {
         api_insecure_nvme=$(get_storage_config_value "$storage_name" "tn_api_insecure")
         TN_API_PORT="$(get_storage_config_value "$storage_name" "tn_api_port" 2>/dev/null || true)"
         TN_API_PORT="${TN_API_PORT:-443}"
+        # Honor the storage's configured tn_api_insecure (blank/unset
+        # means verify certs, matching the plugin's own default).
+        TN_API_INSECURE="${api_insecure_nvme:-0}"
 
         if [[ -n "$api_host_nvme" ]] && [[ -n "$api_key_nvme" ]] && [[ -n "$dataset" ]]; then
             printf "%-30s " "Orphaned resources:"
@@ -5525,6 +5542,19 @@ validate_ip() {
         done
         return 0
     fi
+    return 1
+}
+
+# Validate IP or hostname (for TrueNAS API host — may be FQDN or IP)
+validate_host() {
+    local host="$1"
+    # All-numeric dotted strings must be valid IPv4; otherwise reject.
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        validate_ip "$host" && return 0
+        return 1
+    fi
+    # Accept valid hostname: labels of [a-zA-Z0-9-], separated by dots, no leading/trailing hyphens
+    [[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && return 0
     return 1
 }
 
@@ -6599,15 +6629,20 @@ tn_api_call() {
         use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json, $api_port) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_port, $api_insecure) = @ARGV;
 
-        # Build minimal scfg for API call
+        # Build minimal scfg — tn_ prefix required since v2.1.0
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => 1,
+            tn_api_host => $host,
+            tn_api_key  => $api_key,
+            # Default to insecure (skip TLS verification) for backward
+            # compatibility with self-signed TrueNAS certs, but honor an
+            # explicit "0" (e.g. from the configured storage.cfg entry or
+            # TN_API_INSECURE env var) so users with valid certs can opt
+            # into verification.
+            tn_api_insecure => (defined $api_insecure && $api_insecure eq '0') ? 0 : 1,
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
 
         # Decode params
         my $params = eval { decode_json($params_json) } // [];
@@ -6624,7 +6659,7 @@ tn_api_call() {
 
         # Output result as JSON
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" 2>&1)
+    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" "${TN_API_INSECURE:-1}" 2>&1)
     exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -6661,15 +6696,15 @@ tn_api_call_write() {
         use PVE::Storage::Custom::TrueNASPlugin ();
         use JSON::PP;
 
-        my ($host, $api_key, $method, $params_json, $api_port) = @ARGV;
+        my ($host, $api_key, $method, $params_json, $api_port, $api_insecure) = @ARGV;
 
-        # Build minimal scfg for API call
+        # Build minimal scfg — tn_ prefix required since v2.1.0
         my $scfg = {
-            api_host => $host,
-            api_key => $api_key,
-            api_insecure => 1,
+            tn_api_host => $host,
+            tn_api_key  => $api_key,
+            tn_api_insecure => (defined $api_insecure && $api_insecure eq '0') ? 0 : 1,
         };
-        $scfg->{api_port} = int($api_port) if $api_port;
+        $scfg->{tn_api_port} = int($api_port) if $api_port;
 
         # Decode params - fail fast if JSON is invalid
         my $params = eval { decode_json($params_json) };
@@ -6691,7 +6726,7 @@ tn_api_call_write() {
 
         # Output result as JSON
         print encode_json($result) if defined $result;
-    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" 2>&1)
+    ' "$host" "$api_key" "$method" "$params" "${TN_API_PORT:-}" "${TN_API_INSECURE:-1}" 2>&1)
     exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
@@ -8729,12 +8764,17 @@ execute_provisioning() {
             use PVE::Storage::Custom::TrueNASPlugin ();
 
             my $scfg = {
-                api_host => $ARGV[0],
-                api_key => $ARGV[1],
-                api_insecure => 1,
-                dataset => $ARGV[2],
-                target_iqn => $ARGV[3],
-                discovery_portal => $ARGV[4],
+                tn_api_host        => $ARGV[0],
+                tn_api_key         => $ARGV[1],
+                # Default to insecure (skip TLS verification) since the
+                # setup wizard does not yet collect a certificate-trust
+                # choice and new storage.cfg entries default to
+                # tn_api_insecure=1; honor an explicit "0" (e.g. from
+                # TN_API_INSECURE env var) so it can be overridden.
+                tn_api_insecure    => ($ARGV[5] // "1") eq "0" ? 0 : 1,
+                tn_dataset         => $ARGV[2],
+                tn_target_iqn      => $ARGV[3],
+                tn_discovery_portal => $ARGV[4],
             };
 
             eval { PVE::Storage::Custom::TrueNASPlugin::_ensure_target_visible($scfg) };
@@ -8743,7 +8783,7 @@ execute_provisioning() {
                 exit 1;
             }
             print "OK";
-        ' "$host" "$api_key" "$PROVISIONED_DATASET" "$PROVISIONED_TARGET_IQN" "${PROV_PORTAL_IP}:${PROV_PORTAL_PORT}" 2>&1)
+        ' "$host" "$api_key" "$PROVISIONED_DATASET" "$PROVISIONED_TARGET_IQN" "${PROV_PORTAL_IP}:${PROV_PORTAL_PORT}" "${TN_API_INSECURE:-1}" 2>&1)
         local weight_exit=$?
         stop_spinner
 
@@ -9483,10 +9523,12 @@ menu_edit_storage() {
     info "Loading existing configuration for '$storage_name'..."
     echo
 
-    # Load all existing configuration values
+    # Load all existing configuration values; strip tn_ prefix so keys
+    # match the short names used throughout this function (e.g. "dataset",
+    # "api_host"). Storage.cfg keys use tn_ since v2.1.0.
     declare -A config_values
     while IFS='=' read -r key value; do
-        config_values["$key"]="$value"
+        config_values["${key#tn_}"]="$value"
     done < <(get_all_storage_config_values "$storage_name")
 
     # Display immutable fields (read-only)
@@ -9527,7 +9569,7 @@ menu_edit_storage() {
     # TrueNAS API settings
     local current_api_host="${config_values[api_host]}"
     local truenas_ip
-    read -rp "TrueNAS IP address [$current_api_host]: " truenas_ip
+    read -rp "TrueNAS IP/hostname [$current_api_host]: " truenas_ip
     truenas_ip="${truenas_ip:-$current_api_host}"
 
     if [[ -z "$truenas_ip" ]]; then
@@ -9535,8 +9577,8 @@ menu_edit_storage() {
         return 1
     fi
 
-    if ! validate_ip "$truenas_ip"; then
-        error "Invalid IP address format"
+    if ! validate_host "$truenas_ip"; then
+        error "Invalid IP address or hostname"
         return 1
     fi
 
@@ -9590,7 +9632,7 @@ menu_edit_storage() {
     fi
 
     # Sparse volumes
-    local current_sparse="${config_values[tn_sparse]:-1}"
+    local current_sparse="${config_values[sparse]:-1}"
     local sparse
     read -rp "Enable sparse volumes? (0/1) [$current_sparse]: " sparse
     sparse="${sparse:-$current_sparse}"
@@ -9990,20 +10032,20 @@ wizard_add_storage() {
         break
     done
 
-    # --- Step 3: TrueNAS IP ---
+    # --- Step 3: TrueNAS IP/hostname ---
     clear_screen
     print_banner
     echo
     print_header "Storage Provisioning"
     show_wizard_summary "ip"
 
-    info "Enter the IP address of your TrueNAS server:"
+    info "Enter the IP address or hostname of your TrueNAS server:"
     while true; do
-        read -rp "TrueNAS IP address: " WIZARD_TRUENAS_IP
-        if validate_ip "$WIZARD_TRUENAS_IP"; then
+        read -rp "TrueNAS IP/hostname: " WIZARD_TRUENAS_IP
+        if validate_host "$WIZARD_TRUENAS_IP"; then
             break
         else
-            error "Invalid IP address format"
+            error "Invalid IP address or hostname"
             WIZARD_TRUENAS_IP=""
         fi
     done

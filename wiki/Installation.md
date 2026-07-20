@@ -1057,15 +1057,15 @@ telnet YOUR_TRUENAS_IP 3260
 # Valid: "tank/my-storage" or "tank/mystorage"
 
 # Check retry parameters
-# api_retry_max must be 0-10
-# api_retry_delay must be 0.1-60
+# tn_api_retry_max must be 0-10
+# tn_api_retry_delay must be 0.1-60
 
 # Verify all required parameters present:
-# - api_host
-# - api_key
-# - dataset
-# - target_iqn
-# - discovery_portal
+# - tn_api_host
+# - tn_api_key
+# - tn_dataset
+# - tn_target_iqn
+# - tn_discovery_portal
 ```
 
 ## Updating the Plugin

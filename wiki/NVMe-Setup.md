@@ -55,9 +55,9 @@ This guide covers setting up NVMe over TCP (NVMe/TCP) storage with the TrueNAS P
 
 2. **Via TrueNAS API (plugin call):**
    ```bash
-   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.update\", [\"nvmet\", { enable => 1 }]); print \"ok\\n\";'"
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"service.update\", [\"nvmet\", { enable => 1 }]); print \"ok\\n\";'"
 
-   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"service.start\", [\"nvmet\"]); print \"ok\\n\";'"
    ```
 
 3. **Verify service is running:**
@@ -84,7 +84,7 @@ The plugin automatically creates subsystems when needed, but you can create them
 
 2. **Via TrueNAS API (plugin call):**
    ```bash
-   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.subsys.create\", [{ name => \"proxmox-nvme\", subnqn => \"nqn.2005-10.org.freenas.ctl:proxmox-nvme\", allow_any_host => 1 }]); print \"ok\\n\";'"
+   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.subsys.create\", [{ name => \"proxmox-nvme\", subnqn => \"nqn.2005-10.org.freenas.ctl:proxmox-nvme\", allow_any_host => 1 }]); print \"ok\\n\";'"
    ```
 
 **Important Notes:**
@@ -324,7 +324,7 @@ Configure host authentication on TrueNAS:
 
 **Via TrueNAS API (plugin call):**
 ```bash
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.host.create\", [{ hostnqn => \"nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400\", dhchap_key => \"DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:\", dhchap_ctrl_key => \"DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:\", dhchap_hash => \"SHA-256\" }]); print \"ok\\n\";'"
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.host.create\", [{ hostnqn => \"nqn.2014-08.org.nvmexpress:uuid:81d0b800-0d47-11ea-a719-d0fedbf91400\", dhchap_key => \"DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:\", dhchap_ctrl_key => \"DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:\", dhchap_hash => \"SHA-256\" }]); print \"ok\\n\";'"
 ```
 
 **Parameters:**
@@ -339,7 +339,7 @@ To restrict access to specific hosts, disable `allow_any_host` and create host-s
 
 ```bash
 # Step 1: Disable allow_any_host on the subsystem
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.subsys.update\", [\"SUBSYS_ID\", { allow_any_host => 0 }]); print \"ok\\n\";'"
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.subsys.update\", [\"SUBSYS_ID\", { allow_any_host => 0 }]); print \"ok\\n\";'"
 
 # Step 2: Get the host ID (query existing hosts)
 ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
@@ -350,7 +350,7 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Returns: [{"id": 1, "name": "proxmox-nvme", "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme", ...}]
 
 # Step 4: Link the host to the subsystem
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, \"nvmet.host_subsys.create\", [{ host_id => 1, subsys_id => 1 }]); print \"ok\\n\";'"
+ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.host_subsys.create\", [{ host_id => 1, subsys_id => 1 }]); print \"ok\\n\";'"
 ```
 
 **Important**: When `allow_any_host: false`, ONLY explicitly linked hosts can connect to the subsystem. DH-CHAP authentication is an optional additional security layer.

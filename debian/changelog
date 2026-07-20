@@ -17,6 +17,53 @@ truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=high
     forwarding a tainted or malformed scalar.
 
  -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 15 Jul 2026 00:00:00 +0000
+truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=medium
+
+  * Fix installer health check auth false positive (#57 bug 1): inline-Perl
+    $scfg builders used bare (unprefixed) keys, so tn_api_host/tn_api_key
+    were never seen and health checks always reported "Authentication
+    failed" regardless of key validity. Now use tn_-prefixed keys.
+  * Fix installer hostname rejection (#57 bug 2): storage wizard only
+    accepted a bare IP for the TrueNAS host. Added validate_host() to
+    accept a hostname/FQDN too, matching what tn_api_host already accepts.
+  * Fix unbound variable crash when editing existing storage (#57 bug 3):
+    menu_edit_storage read bare-named fields (e.g. config_values[dataset])
+    from a config_values array populated with tn_-prefixed keys, crashing
+    under set -u. Loader now strips the tn_ prefix on load; a leftover
+    config_values[tn_sparse] read was corrected to config_values[sparse].
+  * Installer diagnostic calls always disabled TLS certificate verification
+    (community PR #63 follow-up): once bug 1 above fixed the tn_-prefixed
+    $scfg keys, the hardcoded tn_api_insecure => 1 became a real, always-on
+    TLS bypass regardless of a storage's configured tn_api_insecure. A
+    TN_API_INSECURE global (mirroring TN_API_PORT) now threads the
+    configured value through menu_cleanup_orphans, detect_orphaned_resources,
+    and run_health_check.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.19+deb1) unstable; urgency=medium
+
+  * Restrict the relaxed :identifier suffix to host NQNs only (#44
+    follow-up). _nvme_untaint_cli_nqn is shared by both host and
+    subsystem NQN validation; making the suffix optional also silently
+    accepted suffix-less subsystem NQNs, which the NVMe-oF spec still
+    mandates. New require_identifier flag defaults to required; only
+    the host-NQN call site opts out.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.18+deb1) unstable; urgency=medium
+
+  * Relax NVMe host NQN validation to accept NQNs without :identifier
+    suffix (#44). Per NVMe-oF spec the :identifier segment is mandatory
+    for subsystem NQNs but optional for host NQNs. The Linux kernel
+    generates host NQNs as nqn.YYYY-MM.tld.domain with no further suffix;
+    the previous regex rejected them with "Invalid NVMe host NQN", making
+    NVMe-TCP completely non-functional for affected hosts. Fix makes the
+    :identifier block optional in _nvme_untaint_cli_nqn; malformed NQNs
+    and shell metacharacters are still rejected.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 03 Jul 2026 00:00:00 +0000
 
 truenas-proxmox-plugin (2.1.17+deb1) unstable; urgency=high
 
