@@ -14,6 +14,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 ### Configuration
 - **[Configuration Reference](Configuration.md)** - Complete reference for all configuration parameters with examples for different use cases
 - **[NVMe Setup Guide](NVMe-Setup.md)** - NVMe/TCP transport configuration, DH-HMAC-CHAP authentication, and namespace management
+- **[Minimum API Permissions](API-Permissions.md)** - Least-privilege TrueNAS role set for the API user, verified method-by-method against TrueNAS RBAC
 
 ### Testing and Validation
 - **[Testing Guide](Testing.md)** - Comprehensive guide for using the automated test suite to validate plugin functionality
@@ -95,6 +96,7 @@ wiki/
 ├── Installation.md             # Installation and setup guide
 ├── Configuration.md            # Configuration reference
 ├── NVMe-Setup.md               # NVMe/TCP transport setup and authentication
+├── API-Permissions.md          # Least-privilege TrueNAS role set for the API user
 ├── Testing.md                  # Test suite usage and validation
 ├── Tools.md                    # Tools and utilities (test suite, health check, diagnostics bundle, orphan cleanup, cluster deployment)
 ├── Troubleshooting.md          # Common issues and solutions

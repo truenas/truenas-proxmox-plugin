@@ -896,6 +896,8 @@ Navigate to **Credentials** → **Local Users**:
 - Full access to iSCSI shares (create, modify, delete)
 - Read access to system information
 
+For security-conscious deployments, see [Minimum API Permissions](API-Permissions.md) for an explicit, least-privilege role set (verified method-by-method against TrueNAS RBAC) instead of granting a broad admin-level role.
+
 ### 6. Optional: Configure CHAP Authentication
 
 Navigate to **Shares** → **Block Shares (iSCSI)** → **Authorized Access**:
