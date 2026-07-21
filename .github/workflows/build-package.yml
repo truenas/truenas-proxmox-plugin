@@ -66,14 +66,41 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  release:
+    # Attach the built .deb to a GitHub release for ANY v* tag, including
+    # pre-releases. This is separate from the APT repo publish below so
+    # alpha/beta/rc tags still produce a downloadable release page for
+    # testers even though they must not enter the apt-repo.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: debian-package
+          path: artifacts
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.deb
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+
   publish:
     # Publish to the APT repo only for stable release tags. Pre-release
-    # tags (v*-alpha*, v*-beta*, v*-rc*) still build a .deb and attach it
-    # to a GitHub release, but they must never land in the apt-repo — end
-    # users who add the apt source would otherwise auto-upgrade into an
-    # alpha. Git forbids '~' in ref names, so the tag uses '-alphaN' even
-    # though the debian version in the changelog is '~alphaN' (which sorts
-    # before the eventual +debN stable via dpkg version comparison).
+    # tags (v*-alpha*, v*-beta*, v*-rc*) already got a GitHub release
+    # attachment from the release job above, but they must never land in
+    # the apt-repo — end users who add the apt source would otherwise
+    # auto-upgrade into an alpha. Git forbids '~' in ref names, so the tag
+    # uses '-alphaN' even though the debian version in the changelog is
+    # '~alphaN' (which sorts before the eventual +debN stable via dpkg
+    # version comparison).
     if: |
       startsWith(github.ref, 'refs/tags/v') &&
       !contains(github.ref, '-alpha') &&
@@ -207,14 +234,6 @@ jobs:
 
           mkdir -p "${changelog_dir}"
           cp debian/changelog "${changelog_path}"
-
-      - name: Create or update GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/*.deb
-            artifacts/SHA256SUMS
-          generate_release_notes: true
 
       - name: Stage GitHub Pages publish root
         shell: bash
