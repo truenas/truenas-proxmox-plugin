@@ -23,6 +23,20 @@ enable_broker() {
         else
             systemctl start "$BROKER_UNIT" || true
         fi
+
+        # Verify the socket appears; the plugin now refuses direct-WS mode
+        # and dies loudly if the socket is missing. Wait briefly for
+        # RuntimeDirectory + first accept() to settle.
+        i=0
+        while [ $i -lt 20 ] && [ ! -S /run/truenas-plugin/broker.sock ]; do
+            sleep 0.25
+            i=$((i + 1))
+        done
+        if [ ! -S /run/truenas-plugin/broker.sock ]; then
+            echo "WARNING: /run/truenas-plugin/broker.sock did not appear after starting $BROKER_UNIT." >&2
+            echo "  The plugin will fail with a broker-missing error until this is resolved." >&2
+            echo "  Check: systemctl status $BROKER_UNIT && journalctl -u $BROKER_UNIT -n 50" >&2
+        fi
     fi
 }
 

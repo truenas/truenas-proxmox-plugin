@@ -1,3 +1,30 @@
+truenas-proxmox-plugin (2.1.21~alpha1) unstable; urgency=medium
+
+  * Make truenas-plugin-broker mandatory (fixes rate-limit cascade seen in
+    test_run4/truenas-2026-07-{13..15}). Direct-WS fallback re-authenticated
+    in every forked PVE process and reliably tripped the TrueNAS middlewared
+    login rate limiter, cascading into pre-flight failures across snapshot,
+    resize, clone, additional-disk, and backup paths. _ws_get_persistent now
+    refuses to open a direct WS when /run/truenas-plugin/broker.sock is
+    absent, dying with a message that points at the .deb install and the
+    truenas-plugin-broker.service unit. Escape hatch:
+    TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1 in the environment for dev use.
+    postinst now waits up to 5 s for the broker socket after starting the
+    service and prints a diagnostic if it never appears — the previous
+    silent fallback let bad copies (cp TrueNASPlugin.pm without dpkg -i)
+    look healthy until the first heavy test load.
+  * Preserve real error message in alloc_image and clone_image failure
+    paths (6 sites in create-extent / target-extent-mapping / namespace-
+    create for both iSCSI and NVMe-oF). The cleanup eval that follows a
+    failed create call clobbered $@ before the outer die, so operators
+    saw "Failed to create iSCSI extent for clone: " with an empty tail
+    (see test_run4/truenas-2026-07-13/run-01 template/linked-clone
+    failures). Capture the create error into a lexical before the
+    cleanup so the die carries the underlying diagnostic (e.g. the
+    duplicate-extent-name or EBUSY that actually caused the failure).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 20 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=medium
 
   * Fix installer health check auth false positive (#57 bug 1): inline-Perl

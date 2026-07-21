@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.20';
+our $VERSION = '2.1.21~alpha1';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -1132,6 +1132,35 @@ sub _ws_get_persistent($scfg) {
     if (my $bconn = _broker_try_open($scfg)) {
         return $bconn;
     }
+
+    # Broker socket not present. In production, this means the broker service
+    # is stopped or was never installed (e.g. plugin copied by hand instead of
+    # installed from the .deb). Direct WS mode re-authenticates in every
+    # forked PVE process and trips the TN middlewared login rate limiter, so
+    # falling back silently produces the D2/D3 failure pattern we ship the
+    # broker to prevent (see test_run4 notes-2026-07-13.md).
+    #
+    # Refuse to proceed by default. The escape hatch is the
+    # TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1 env var, intended for developer use
+    # against a private TrueNAS where the login limiter is not a concern.
+    if (!$ENV{TRUENAS_PLUGIN_ALLOW_DIRECT_WS}) {
+        die "[TrueNAS] broker socket missing at " . BROKER_SOCKET_PATH . ".\n" .
+            "  The truenas-plugin-broker service is required — direct WS mode\n" .
+            "  re-authenticates in every forked PVE process and will trip the\n" .
+            "  TrueNAS API login rate limiter. Fix:\n" .
+            "    1. Install the plugin from the .deb (dpkg -i truenas-proxmox-plugin_*.deb),\n" .
+            "       do not copy TrueNASPlugin.pm by hand.\n" .
+            "    2. systemctl enable --now truenas-plugin-broker.service\n" .
+            "    3. Verify: ls -l " . BROKER_SOCKET_PATH . "\n" .
+            "  For development against a private TrueNAS, set\n" .
+            "  TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1 in the environment.\n";
+    }
+
+    _log($scfg, 0, 'warning',
+        "[TrueNAS] broker socket missing; TRUENAS_PLUGIN_ALLOW_DIRECT_WS is set, " .
+        "using direct WS. This bypasses D2/D3 rate-limit protection and is not " .
+        "supported in production."
+    );
 
     # Fork detection: if we're in a child process, inherited connections are invalid
     # CRITICAL: When child exits, Perl's global destruction calls DESTROY on all objects,
@@ -4641,10 +4670,11 @@ sub _alloc_image_iscsi {
                 [ $extent_payload ],
             );
         };
-        if ($@) {
-            # Cleanup: delete the zvol if extent creation failed
+        if (my $err = $@) {
+            # Cleanup: delete the zvol if extent creation failed. The nested
+            # eval clobbers $@, so capture the original error first.
             eval { _tn_dataset_delete($scfg, $full_ds) };
-            die "Failed to create iSCSI extent for disk '$zname': $@\n";
+            die "Failed to create iSCSI extent for disk '$zname': $err\n";
         }
         # normalize id from WebSocket result (hashref)
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
@@ -4680,11 +4710,12 @@ sub _alloc_image_iscsi {
     my $lun;
     {
         my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
-        if ($@) {
-            # Cleanup: delete extent and zvol if mapping creation failed
+        if (my $err = $@) {
+            # Cleanup: delete extent and zvol if mapping creation failed.
+            # Nested evals clobber $@, so capture the original error first.
             eval { _api_call_mutate($scfg, 'iscsi.extent.delete', [$extent_id]) };
             eval { _tn_dataset_delete($scfg, $full_ds) };
-            die "Failed to create target-extent mapping for disk '$zname': $@\n";
+            die "Failed to create target-extent mapping for disk '$zname': $err\n";
         }
 
         # Extract LUN from the returned mapping object
@@ -4799,10 +4830,11 @@ sub _alloc_image_nvme {
             enabled => JSON::PP::true,
         }]);
     };
-    if ($@) {
-        # Cleanup: delete the zvol if namespace creation failed
+    if (my $err = $@) {
+        # Cleanup: delete the zvol if namespace creation failed. The nested
+        # eval clobbers $@, so capture the original error first.
         eval { _tn_dataset_delete($scfg, $full_ds) };
-        die "Failed to create NVMe namespace for disk '$zname': $@\n";
+        die "Failed to create NVMe namespace for disk '$zname': $err\n";
     }
     my $device_uuid = $ns->{device_uuid};
     unless ($device_uuid) {
@@ -6542,10 +6574,11 @@ sub _clone_image_iscsi {
                 [ $extent_payload ],
             );
         };
-        if ($@) {
-            # Cleanup: delete the zvol clone if extent creation failed
+        if (my $err = $@) {
+            # Cleanup: delete the zvol clone if extent creation failed. The
+            # nested eval clobbers $@, so capture the original error first.
             eval { _tn_dataset_delete($scfg, $target_full) };
-            die "Failed to create iSCSI extent for clone: $@\n";
+            die "Failed to create iSCSI extent for clone: $err\n";
         }
         $extent_id = ref($ext) eq 'HASH' ? $ext->{id} : $ext;
         # Invalidate cache so the subsequent targetextents lookup sees current state
@@ -6561,11 +6594,12 @@ sub _clone_image_iscsi {
     my $lun;
     {
         my $tx = eval { _tn_targetextent_create($scfg, $target_id, $extent_id, undef) };
-        if ($@) {
-            # Cleanup: delete extent and zvol if mapping creation failed
+        if (my $err = $@) {
+            # Cleanup: delete extent and zvol if mapping creation failed.
+            # Nested evals clobber $@, so capture the original error first.
             eval { _api_call_mutate($scfg, 'iscsi.extent.delete', [$extent_id]) };
             eval { _tn_dataset_delete($scfg, $target_full) };
-            die "Failed to create target-extent mapping for clone: $@\n";
+            die "Failed to create target-extent mapping for clone: $err\n";
         }
 
         # Extract LUN from the returned mapping object
@@ -6701,10 +6735,11 @@ sub _clone_image_nvme {
     my $ns = eval {
         _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
     };
-    if ($@) {
-        # Cleanup: delete the zvol clone if namespace creation failed
+    if (my $err = $@) {
+        # Cleanup: delete the zvol clone if namespace creation failed. The
+        # nested eval clobbers $@, so capture the original error first.
         eval { _tn_dataset_delete($scfg, $target_full) };
-        die "Failed to create NVMe namespace for clone: $@\n";
+        die "Failed to create NVMe namespace for clone: $err\n";
     }
 
     my $device_uuid = $ns->{device_uuid} // die "No device_uuid returned from namespace creation\n";
