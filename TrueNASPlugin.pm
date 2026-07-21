@@ -3575,6 +3575,15 @@ sub _nvme_selector_failure_detail {
     return "Unrecognized selector outcome '$selector_outcome'.\n" . $common_detail;
 }
 
+# Extract the subsystem id from a namespace record. TrueNAS returns 'subsys'
+# either as a scalar id or as a nested object depending on version.
+sub _nvme_namespace_subsys_id {
+    my ($ns) = @_;
+    my $subsys = $ns->{subsys};
+    return undef if !defined $subsys;
+    return ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
+}
+
 sub _nvme_get_namespace_selector_metadata {
     my ($scfg, $device_uuid) = @_;
 
@@ -3600,20 +3609,24 @@ sub _nvme_get_namespace_selector_metadata {
         my $target_namespaces = _api_call($scfg, 'nvmet.namespace.query', [
             [["device_uuid", "=", $device_uuid]]
         ]) // [];
-        my $subsys_namespaces = _api_call($scfg, 'nvmet.namespace.query', [
-            [["subsys", "=", $subsys_id]]
-        ]) // [];
+        # Count subsystem namespaces client-side. TrueNAS may return 'subsys' as a
+        # nested object rather than a scalar id, in which case a server-side
+        # [["subsys", "=", $subsys_id]] filter matches nothing and yields a false
+        # zero count -- tripping linux_api_namespace_count_mismatch even though the
+        # namespaces exist and are visible in Linux.
+        my $all_namespaces = _api_call($scfg, 'nvmet.namespace.query', [[]]) // [];
 
         ($result->{namespace}) = grep {
-            my $ns_subsys = $_->{subsys};
-            my $ns_subsys_id = ref($ns_subsys) eq 'HASH' ? $ns_subsys->{id} : $ns_subsys;
             defined($_->{device_uuid})
                 && $_->{device_uuid} eq $device_uuid
-                && defined($ns_subsys_id)
-                && $ns_subsys_id == $subsys_id;
+                && defined(_nvme_namespace_subsys_id($_))
+                && _nvme_namespace_subsys_id($_) == $subsys_id;
         } @$target_namespaces;
 
-        $result->{api_namespace_count} = scalar(@$subsys_namespaces);
+        $result->{api_namespace_count} = scalar(grep {
+            my $id = _nvme_namespace_subsys_id($_);
+            defined($id) && $id == $subsys_id;
+        } @$all_namespaces);
 
         if (!$result->{namespace}) {
             $result->{metadata_state} = 'uuid_not_found';
