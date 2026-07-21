@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.21~alpha1';
+our $VERSION = '2.1.22~alpha1';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 14;
+our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
