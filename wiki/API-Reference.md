@@ -55,6 +55,8 @@ API user must have permissions for:
 - **iSCSI Sharing**: Create, modify, delete targets, extents, targetextents
 - **System Information**: Query system info, services status
 
+See [Minimum API Permissions](API-Permissions.md) for the exact TrueNAS role required per method, if configuring a least-privilege API user instead of an admin-level key.
+
 ## Core API Endpoints
 
 ### Dataset Operations
