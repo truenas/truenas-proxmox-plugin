@@ -109,7 +109,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugi
 
 Or download first, then run:
 ```bash
-wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
+wget -O install.sh https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
 chmod +x install.sh
 ./install.sh
 ```
@@ -131,7 +131,7 @@ If you prefer manual plugin file installation:
 
 ```bash
 # Download the plugin
-wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
+wget -O TrueNASPlugin.pm https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/TrueNASPlugin.pm
 
 # Copy to plugin directory
 cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
