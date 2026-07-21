@@ -6970,11 +6970,12 @@ sub copy_image {
 # Returns the new volname "vol-base-<vmid>-disk-N-lun<M>". The lun
 # number is unchanged.
 #
-# Rollback: best-effort. On extent.update failure we try to rename
-# back. On snapshot.create failure the rename + extent.update stand
-# (the dataset is named correctly, just lacks the __base__ snap; PVE
-# will retry). create_base is otherwise idempotent if a previous
-# attempt left a renamed dataset without __base__.
+# Rollback: best-effort, and full. On rewire failure we rename back. On
+# snapshot.create failure we ALSO roll back — reversing the rewire and the
+# rename — so a transient failure (e.g. a missing SNAPSHOT_WRITE role, a
+# network blip) leaves the disk exactly as it was, a usable vm-* volume,
+# rather than a half-converted base-* volume with no __base__ snapshot that
+# PVE can neither linked-clone nor easily un-template.
 sub create_base {
     my ($class, $storeid, $scfg, $volname) = @_;
 
@@ -7117,7 +7118,7 @@ sub create_base {
         die "create_base: $share_label rewire to $new_zvol_path failed: $err";
     }
 
-    # Step 3: take the __base__ snapshot. This is the anchor for every
+    # Step 4: take the __base__ snapshot. This is the anchor for every
     # linked clone derived from this template.
     eval {
         _api_call_mutate(
@@ -7127,10 +7128,48 @@ sub create_base {
         );
     };
     if ($@) {
-        # Don't roll back the rename here; the template is functionally
-        # complete from PVE's perspective (config will reference the new
-        # name). Surface the failure so the operator can re-snapshot.
-        die "create_base: pool.snapshot.create $new_full\@__base__ failed: $@";
+        my $err = $@;
+        # The __base__ snapshot IS the point of a base image, so a failure here
+        # leaves nothing usable — roll back Step 3 (rewire) and Step 2 (rename)
+        # so the disk returns to its original vm-* form and the operation is
+        # cleanly retryable, instead of stranding a base-* volume without a
+        # snapshot that can't be linked-cloned. The rename/rewire calls use the
+        # roles the key already has (snapshot.create is the only privileged gap),
+        # so the rollback itself should succeed even when the snapshot was denied.
+        _log($scfg, 0, 'err',
+            "[TrueNAS] create_base: __base__ snapshot failed; rolling back rename+rewire: $err");
+        my $rolled_back = eval {
+            if ($mode eq 'nvme-tcp') {
+                # Disable while device_path (=new) is still valid, rename back,
+                # then point the namespace at the original path and re-enable.
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::false } ]);
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ]);
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { device_path => $old_zvol_path } ]);
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ]);
+            } else {
+                # iSCSI: rename back (force covers the still-attached extent),
+                # then point the extent at the original zvol path.
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ]);
+                _api_call_mutate($scfg, 'iscsi.extent.update',
+                    [ $transport_id, { disk => $old_zvol_path } ]);
+            }
+            1;
+        };
+        if ($rolled_back) {
+            _clear_cache(_cache_host_key($scfg));
+            _log($scfg, 1, 'info',
+                "[TrueNAS] create_base: rolled back to $old_full after snapshot failure");
+        } else {
+            _log($scfg, 0, 'err',
+                "[TrueNAS] create_base: rollback did NOT complete ($@); disk may be "
+                . "left as $new_full without a \@__base__ snapshot — inspect manually");
+        }
+        die "create_base: pool.snapshot.create $new_full\@__base__ failed: $err";
     }
 
     _invalidate_status_capacity_cache($storeid, $scfg);
