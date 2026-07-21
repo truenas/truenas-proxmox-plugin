@@ -4614,6 +4614,21 @@ sub parse_volname {
     die "unable to parse volname '$volname'\n";
 }
 
+# Untaint a device path before handing it to Proxmox core. Device paths here are
+# derived from parsing nvme-cli / iscsiadm / sysfs output, so under Perl taint
+# mode (-T, which Proxmox runs plugins under) the values are tainted. Core
+# interpolates the device into run_command shell pipelines — notably the
+# cloud-init writer (genisoimage | qemu-img dd of=$dev) — which dies with
+# "Insecure dependency in exec while running with -T switch" on tainted input.
+# Validate the shape (absolute /dev path, no shell metacharacters) and untaint,
+# or die loudly rather than pass something unexpected to a shell.
+sub _untaint_dev($dev) {
+    die "no device path to untaint\n" if !defined($dev) || $dev eq '';
+    $dev =~ m{^(/dev/[A-Za-z0-9._:\@+/-]+)\z}
+        or die "refusing to return unexpected device path '$dev'\n";
+    return $1;
+}
+
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
@@ -4630,14 +4645,14 @@ sub path {
             my $lun = _current_lun_for_zname($scfg, $clone_zname);
             die "snapshot device not active for $volname\@$snapname\n" if !defined $lun;
             my $dev = _device_for_lun($scfg, $lun);
-            return ($dev, $vmid, 'images');
+            return (_untaint_dev($dev), $vmid, 'images');
         } elsif ($mode eq 'nvme-tcp') {
             _nvme_connect($scfg);
             my $ns = _nvme_namespaces_for_device_path($scfg, "zvol/$clone_full");
             my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
             die "snapshot namespace not active for $volname\@$snapname\n" if !$uuid;
             my $dev = _nvme_device_for_uuid($scfg, $uuid);
-            return ($dev, $vmid, 'images');
+            return (_untaint_dev($dev), $vmid, 'images');
         } else {
             die "Unknown transport mode: $mode\n";
         }
@@ -4659,14 +4674,14 @@ sub path {
                 die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
             }
         }
-        return ($dev, $vmid, 'images');
+        return (_untaint_dev($dev), $vmid, 'images');
 
     } elsif ($mode eq 'nvme-tcp') {
         # NVMe: metadata is device_uuid
         my $uuid = $metadata;
         _nvme_connect($scfg);
         my $dev = _nvme_device_for_uuid($scfg, $uuid);
-        return ($dev, $vmid, 'images');
+        return (_untaint_dev($dev), $vmid, 'images');
 
     } else {
         die "Unknown transport mode: $mode\n";
