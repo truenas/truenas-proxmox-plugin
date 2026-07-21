@@ -35,6 +35,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_hostnqn](#tn_hostnqn)
   - [tn_nvme_dhchap_secret](#tn_nvme_dhchap_secret)
   - [tn_nvme_dhchap_ctrl_secret](#tn_nvme_dhchap_ctrl_secret)
+  - [tn_nvme_allow_any_host](#tn_nvme_allow_any_host)
   - [tn_nr_io_queues](#tn_nr_io_queues)
 - [iSCSI Behavior](#iscsi-behavior)
   - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
@@ -457,8 +458,10 @@ nvme gen-dhchap-key /dev/nvme0 --key-length=32 --hmac=1
 - `64` bytes (512-bit)
 
 **Security Notes:**
-- The same secret must be configured on TrueNAS for the host NQN
-- Secrets are stored in `/etc/pve/storage.cfg` (cluster-wide sync)
+- In whitelist mode ([`tn_nvme_allow_any_host`](#tn_nvme_allow_any_host) `0`) the plugin
+  provisions this secret onto the TrueNAS host record automatically — no manual setup.
+- Only enforced in whitelist mode; with open access (the default) the secret is unused.
+- Secrets are stored in `/etc/pve/storage.cfg` (cluster-wide sync — a single shared key for all nodes)
 - See [NVMe-Setup.md - DH-CHAP Authentication](NVMe-Setup.md#dh-chap-authentication-setup) for complete setup
 
 ### `tn_nvme_dhchap_ctrl_secret`
@@ -487,6 +490,51 @@ tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2
 **Security Model:**
 - **Unidirectional** (host secret only): Proxmox proves identity to TrueNAS
 - **Bidirectional** (host + controller secrets): Both sides prove identity (recommended)
+
+### `tn_nvme_allow_any_host`
+**Description**: NVMe-oF subsystem host-access model
+**Type**: Boolean
+**Required**: No
+**Default**: `1` (open access — any host may attach)
+
+Controls whether the NVMe subsystem accepts connections from any host, or only
+from an explicit whitelist of registered host NQNs.
+
+```ini
+# Whitelist mode: only registered hosts may attach (recommended for production)
+tn_nvme_allow_any_host 0
+```
+
+**Open mode (`1`, default):** the subsystem is created with `allow_any_host=true`.
+Any initiator that can reach the portal and knows the subsystem NQN can attach.
+Simplest; only appropriate on an isolated storage network. Any DH-CHAP secret you
+set is **not enforced** in this mode (the target accepts every host regardless), so
+the plugin logs a warning if a secret is set while access is open.
+
+**Whitelist mode (`0`):** the plugin manages an explicit host whitelist for you.
+On each storage operation it will, idempotently:
+1. Register this node's host NQN (from `tn_hostnqn`, or `/etc/nvme/hostnqn`) as an
+   `nvmet.host` on TrueNAS — including the `tn_nvme_dhchap_secret` /
+   `tn_nvme_dhchap_ctrl_secret` keys if configured;
+2. Associate that host with the subsystem (`host_subsys`);
+3. Set the subsystem's `allow_any_host=false`.
+
+This is what makes DH-CHAP authentication actually enforced — in open mode the keys
+sit unused on the initiator. You no longer need to run the manual `nvmet.host` /
+`host_subsys` API calls previously documented in NVMe-Setup.md; the plugin does it.
+
+**Cluster note:** `storage.cfg` is shared cluster-wide, so `tn_nvme_dhchap_secret`
+is a **single shared key** across all nodes. Each node registers its **own** NQN
+(so leave `tn_hostnqn` unset on multi-node clusters — see [`tn_hostnqn`](#tn_hostnqn)),
+but all nodes authenticate with that one shared secret. Per-node distinct keys are
+not expressible in cluster-wide config. Switching an existing subsystem from open to
+whitelist mode is non-disruptive: the plugin registers the host before tightening
+access, so live connections are not dropped.
+
+**TrueNAS 26 note:** open mode's forced `allow_any_host=true` conflicts with a
+subsystem that already has explicit host links — the kernel rejects the change and
+the nvmet config fails to render, which can strand newly created namespaces. If you
+use host whitelisting, set this to `0` so the plugin and TrueNAS agree on the model.
 
 ### `tn_nr_io_queues`
 **Description**: Number of NVMe/TCP I/O queues per controller

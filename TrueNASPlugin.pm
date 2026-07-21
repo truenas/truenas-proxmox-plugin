@@ -463,6 +463,17 @@ sub properties {
             type => 'string',
             optional => 1,
         },
+        tn_nvme_allow_any_host => {
+            description => "Allow any NVMe host to attach (open access). Default 1 for "
+                . "backward compatibility. Set to 0 to use an explicit host whitelist: "
+                . "the plugin registers each node's host NQN (with DH-HMAC-CHAP keys if "
+                . "tn_nvme_dhchap_secret / tn_nvme_dhchap_ctrl_secret are set) on the "
+                . "subsystem and sets allow_any_host=false. Required for DHCHAP auth to "
+                . "actually be enforced by the target.",
+            type => 'boolean',
+            optional => 1,
+            default => 1,
+        },
 
         # ZFS compression algorithm for new volumes
         tn_compression => {
@@ -573,6 +584,7 @@ sub options {
         tn_hostnqn                => { optional => 1 },
         tn_nvme_dhchap_secret     => { optional => 1 },
         tn_nvme_dhchap_ctrl_secret => { optional => 1 },
+        tn_nvme_allow_any_host    => { optional => 1 },
 
         # ZFS tunables
         tn_compression => { optional => 1 },
@@ -736,6 +748,20 @@ sub check_config {
         # Validate hostnqn format if provided
         if ($opts->{tn_hostnqn} && $opts->{tn_hostnqn} !~ /^nqn\./) {
             die "tn_hostnqn must follow NVMe NQN format\n";
+        }
+
+        # DHCHAP secrets only take effect with an explicit host whitelist. With
+        # open access (the default), the target accepts any host regardless of
+        # any key, so authentication is not actually enforced.
+        my $open_access = !defined($opts->{tn_nvme_allow_any_host})
+            || $opts->{tn_nvme_allow_any_host};
+        if (($opts->{tn_nvme_dhchap_secret} || $opts->{tn_nvme_dhchap_ctrl_secret})
+            && $open_access) {
+            syslog('warning',
+                "[TrueNAS] Storage '$sectionId': DH-HMAC-CHAP secret is set but "
+                . "tn_nvme_allow_any_host is not 0 - authentication will NOT be "
+                . "enforced. Set tn_nvme_allow_any_host 0 to enable the host whitelist."
+            );
         }
 
         # Warn if iSCSI-specific parameters are set in NVMe mode
@@ -1728,16 +1754,23 @@ sub _tn_pool_health($scfg) {
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
+    # All six of these must be sent explicitly, not omitted: TrueNAS 25.10.4's
+    # legacy API shim leaves omitted optional fields as unresolved _NotRequired
+    # sentinels instead of real defaults, crashing pool.dataset.create both in
+    # validation and in audit-log serialization (#58, #65, #78). special_small_block_size
+    # must be 'INHERIT' specifically - 0 fails a ZFS-level check, null fails Pydantic.
     my $payload = {
-        name   => $full,
-        type   => 'VOLUME',
-        volsize=> $bytes,
-        sparse => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        name                     => $full,
+        type                     => 'VOLUME',
+        volsize                  => $bytes,
+        sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        volblocksize             => _normalize_blocksize($blocksize) // '16K',
+        snapdev                  => 'INHERIT',
+        reservation              => 0,
+        refreservation           => 0,
+        special_small_block_size => 'INHERIT',
+        force_size               => JSON::PP::false,
     };
-    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-    if ($blocksize) {
-        $payload->{volblocksize} = _normalize_blocksize($blocksize);
-    }
     my $result = _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ]);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
@@ -3089,6 +3122,96 @@ sub _nvme_get_hostnqn {
     die "Could not determine host NQN: /etc/nvme/hostnqn not found and hostnqn not configured\n";
 }
 
+# Whether the subsystem should use open access (allow_any_host=true) or an
+# explicit host whitelist. Defaults to open (1) for backward compatibility.
+# Set tn_nvme_allow_any_host=0 to opt into the whitelist model.
+sub _nvme_allow_any_host {
+    my ($scfg) = @_;
+    return 1 if !defined $scfg->{tn_nvme_allow_any_host};
+    return $scfg->{tn_nvme_allow_any_host} ? 1 : 0;
+}
+
+# JSON boolean form of _nvme_allow_any_host, for API payloads.
+sub _nvme_allow_any_host_json {
+    my ($scfg) = @_;
+    return _nvme_allow_any_host($scfg) ? JSON::PP::true : JSON::PP::false;
+}
+
+# In whitelist mode, ensure THIS node's host NQN is registered on TrueNAS
+# (with DH-HMAC-CHAP keys if configured) and associated with the subsystem.
+# Idempotent and safe to call from every cluster node on every subsystem
+# ensure: each node registers its own NQN, "already exists" is tolerated, and
+# DHCHAP keys are re-synced if the configured secret changes (rotation).
+sub _nvme_ensure_host_registered {
+    my ($scfg, $subsys_id) = @_;
+
+    my $hostnqn = _nvme_get_hostnqn($scfg);
+    die "nvme_ensure_host: could not determine host NQN\n" if !$hostnqn;
+
+    my $secret      = $scfg->{tn_nvme_dhchap_secret};
+    my $ctrl_secret = $scfg->{tn_nvme_dhchap_ctrl_secret};
+
+    # Find or create the host record for this node's NQN.
+    my $hosts = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
+    my $host_id;
+    if (@$hosts) {
+        my $cur = $hosts->[0];
+        $host_id = $cur->{id};
+        # Re-sync DHCHAP keys if the configured secret differs (rotation).
+        my %upd;
+        if (defined $secret      && ($cur->{dhchap_key}      // '') ne $secret)      { $upd{dhchap_key}      = $secret; }
+        if (defined $ctrl_secret && ($cur->{dhchap_ctrl_key} // '') ne $ctrl_secret) { $upd{dhchap_ctrl_key} = $ctrl_secret; }
+        if (%upd) {
+            eval { _api_call_mutate($scfg, 'nvmet.host.update', [$host_id, \%upd]) };
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] nvme_ensure_host: failed to update DHCHAP keys for $hostnqn: $@") if $@;
+        }
+    } else {
+        my $payload = { hostnqn => $hostnqn };
+        $payload->{dhchap_key}      = $secret      if defined $secret;
+        $payload->{dhchap_ctrl_key} = $ctrl_secret if defined $ctrl_secret;
+        my $h = eval { _api_call_mutate($scfg, 'nvmet.host.create', [ $payload ]) };
+        if ($@ && $@ =~ /already exists/i) {
+            # Concurrent create from another node; re-query.
+            my $again = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
+            $host_id = $again->[0]{id} if @$again;
+        } elsif ($@) {
+            die "nvme_ensure_host: failed to create host $hostnqn: $@";
+        } else {
+            $host_id = ref($h) eq 'HASH' ? $h->{id} : $h;
+        }
+    }
+    die "nvme_ensure_host: could not resolve host_id for $hostnqn\n" if !defined $host_id;
+
+    # Ensure the host <-> subsystem association exists.
+    my $assoc = _api_call($scfg, 'nvmet.host_subsys.query',
+        [[["host.id", "=", $host_id], ["subsys.id", "=", $subsys_id]]]) // [];
+    if (!@$assoc) {
+        eval { _api_call_mutate($scfg, 'nvmet.host_subsys.create',
+            [{ host_id => int($host_id), subsys_id => int($subsys_id) }]) };
+        if ($@ && $@ !~ /already exists/i) {
+            die "nvme_ensure_host: failed to authorize host $hostnqn on subsystem: $@";
+        }
+    }
+    _log($scfg, 2, 'debug',
+        "[TrueNAS] nvme_ensure_host: host $hostnqn (id=$host_id) authorized on subsys $subsys_id");
+    return $host_id;
+}
+
+# Reconcile a subsystem's host-access model with configuration. Open mode
+# (default) is left to subsystem creation; this only acts in whitelist mode,
+# where it registers this node's host first (avoiding a lockout window) and
+# then enforces allow_any_host=false. Idempotent; safe on every ensure.
+sub _nvme_reconcile_host_whitelist {
+    my ($scfg, $subsys_id) = @_;
+    return if _nvme_allow_any_host($scfg);   # open mode: nothing to reconcile
+    _nvme_ensure_host_registered($scfg, $subsys_id);
+    eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
+        [ $subsys_id, { allow_any_host => JSON::PP::false } ]) };
+    _log($scfg, 1, 'warning',
+        "[TrueNAS] nvme: failed to set allow_any_host=false on subsys $subsys_id: $@") if $@;
+}
+
 # Check if nvme-cli is installed
 sub _nvme_check_cli {
     eval {
@@ -4249,6 +4372,7 @@ sub _nvme_ensure_subsystem {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys_id, syncing portals");
 
         _nvme_sync_portals($scfg, $subsys_id);
+        _nvme_reconcile_host_whitelist($scfg, $subsys_id);
 
         return $subsys_id;
     }
@@ -4265,7 +4389,8 @@ sub _nvme_ensure_subsystem {
     my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
-        allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
+        # Open by default (back-compat); whitelist when tn_nvme_allow_any_host=0.
+        allow_any_host => _nvme_allow_any_host_json($scfg),
     }]);
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
@@ -4325,6 +4450,9 @@ sub _nvme_ensure_subsystem {
         }
     }
 
+    # In whitelist mode, register this node's host and enforce allow_any_host=false.
+    _nvme_reconcile_host_whitelist($scfg, $subsys_id);
+
     _log($scfg, 1, 'info', "[TrueNAS] nvme_ensure_subsystem: created subsystem with id=$subsys_id");
     return $subsys_id;
 }
@@ -4353,7 +4481,7 @@ sub _nvme_create_namespace {
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: created namespace with UUID $device_uuid");
 
     # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-    eval { _api_call_mutate($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+    eval { _api_call_mutate($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => _nvme_allow_any_host_json($scfg) }]) };
     if ($@) {
         _log($scfg, 1, 'warning', "[TrueNAS] nvme_create_namespace: subsystem reapply failed (non-fatal): $@");
     }
@@ -4584,15 +4712,24 @@ sub alloc_image {
         $create_attempt++;
         $create_error = undef;
 
+        # All six of these must be sent explicitly, not omitted: TrueNAS 25.10.4's
+        # legacy API shim leaves omitted optional fields as unresolved _NotRequired
+        # sentinels instead of real defaults, crashing pool.dataset.create both in
+        # validation and in audit-log serialization (#58, #65, #78). special_small_block_size
+        # must be 'INHERIT' specifically - 0 fails a ZFS-level check, null fails Pydantic.
         my $create_payload = {
-            name     => $full_ds,
-            type     => 'VOLUME',
-            volsize  => $bytes,
-            sparse   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-            comments => 'Autocreated by Proxmox Plugin',
+            name                     => $full_ds,
+            type                     => 'VOLUME',
+            volsize                  => $bytes,
+            sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+            comments                 => 'Autocreated by Proxmox Plugin',
+            volblocksize             => _normalize_blocksize($blocksize) // '16K',
+            snapdev                  => 'INHERIT',
+            reservation              => 0,
+            refreservation           => 0,
+            special_small_block_size => 'INHERIT',
+            force_size               => JSON::PP::false,
         };
-        # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-        $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
         $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 
@@ -4864,7 +5001,7 @@ sub _alloc_image_nvme {
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
         # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => _nvme_allow_any_host_json($deferred_scfg) }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }
@@ -6278,7 +6415,7 @@ sub _expose_snapshot_device {
                     // die "No device_uuid returned from namespace creation\n";
                 # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
                 eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
-                    [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+                    [$subsys_id, { allow_any_host => _nvme_allow_any_host_json($scfg) }]) };
             }
 
             _nvme_connect($scfg);
@@ -6772,7 +6909,7 @@ sub _clone_image_nvme {
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
         # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => _nvme_allow_any_host_json($deferred_scfg) }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] clone_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }

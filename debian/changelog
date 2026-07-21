@@ -1,3 +1,35 @@
+truenas-proxmox-plugin (2.1.22~alpha1) unstable; urgency=medium
+
+  * NVMe-oF: add host-whitelist + DH-CHAP support (tn_nvme_allow_any_host).
+    The plugin previously hardcoded allow_any_host=true in five places and
+    never registered host records, so it forced open access and DH-CHAP keys
+    were only ever applied to the initiator (never enforced by the target).
+    On TrueNAS 26 this actively broke NVMe: the kernel refuses to set
+    allow_any_host=1 on a subsystem that has explicit host links, so the
+    nvmet_kernel render aborted (OSError EINVAL on attr_allow_any_host) and
+    newly created namespaces never reached the running kernel target -- disk
+    creation appeared to succeed but the device was never exposed. New
+    tn_nvme_allow_any_host (default 1 = open, back-compat) opts into whitelist
+    mode when set to 0: the plugin registers each node's host NQN (with the
+    configured DH-CHAP keys) via nvmet.host + nvmet.host_subsys and sets
+    allow_any_host=false, registering the host before tightening access so
+    live connections are not dropped. The four allow_any_host reapply sites
+    now honour the configured value instead of forcing true.
+  * NVMe-oF: fix false zero namespace count from a server-side subsys filter
+    (cherry-picked). _nvme_get_namespace_selector_metadata counted namespaces
+    with [["subsys","=",id]], which matches nothing when TrueNAS returns
+    subsys as a nested object -- tripping linux_api_namespace_count_mismatch
+    and failing path()/activate on 26. Now counted client-side via a shared
+    _nvme_namespace_subsys_id helper accepting either shape.
+  * pool.dataset.create: send volblocksize, snapdev, reservation,
+    refreservation, special_small_block_size, and force_size explicitly at
+    both create sites (#58, #65, #78). TrueNAS 25.10.4's legacy shim left
+    omitted optional fields as unresolved _NotRequired sentinels, crashing
+    create in validation or audit-log serialization; verified accepted on
+    TrueNAS 26.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 21 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.21~alpha1) unstable; urgency=medium
 
   * Make truenas-plugin-broker mandatory (fixes rate-limit cascade seen in

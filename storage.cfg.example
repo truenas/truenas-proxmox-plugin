@@ -155,7 +155,17 @@ truenasplugin: truenas-websocket
 # =============================================================================
 # NVME/TCP WITH DH-CHAP AUTHENTICATION
 # =============================================================================
-# Secure NVMe/TCP setup with mutual authentication
+# Secure NVMe/TCP setup with mutual authentication.
+#
+# tn_nvme_allow_any_host 0 puts the subsystem in whitelist mode: the plugin
+# registers each node's host NQN (from /etc/nvme/hostnqn) plus the DH-CHAP keys
+# below onto TrueNAS, associates the host with the subsystem, and sets the
+# subsystem's allow_any_host=false. This is what makes DH-CHAP actually
+# enforced -- with open access (the default) the keys are ignored by the target.
+#
+# The DH-CHAP secret is cluster-wide (storage.cfg syncs across /etc/pve), so it
+# is a single shared key for every node. Do NOT set tn_hostnqn on a multi-node
+# cluster -- leave it unset so each node registers its own NQN.
 truenasplugin: truenas-nvme-secure
     tn_api_host 192.168.10.100
     tn_api_key 1-nvmesecure123456789abcdef123456789abcdef
@@ -163,6 +173,7 @@ truenasplugin: truenas-nvme-secure
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-secure
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.10.100:4420
+    tn_nvme_allow_any_host 0
     tn_nvme_dhchap_secret DHHC-1:01:l29rbM7waP9bX4gjmx0e6S6eK5sDb7a5c0jZJG2XxcwvDbY0:
     tn_nvme_dhchap_ctrl_secret DHHC-1:01:6Fk0dLGH1uPYPVKlyTNOWf4dk8FNOs9abL1p4cT0Qq2yEXLq:
     tn_api_scheme wss
