@@ -5077,6 +5077,12 @@ sub volume_size_info {
     }
     my $bytes = _normalize_value($ds->{volsize});
     die "volume_size_info: missing volsize for $full\n" if !$bytes;
+    # Untaint: this value comes from the TrueNAS API socket (tainted) and PVE's
+    # cloud-init writer interpolates it into a run_command pipeline as
+    # `qemu-img dd ... osize=$size`, which aborts under taint mode (-T) with
+    # "Insecure dependency in exec". volsize is always an integer byte count.
+    ($bytes) = ($bytes =~ /^(\d+)$/)
+        or die "volume_size_info: unexpected volsize '$bytes' for $full\n";
     return wantarray ? ($bytes, $fmt) : $bytes;
 }
 
