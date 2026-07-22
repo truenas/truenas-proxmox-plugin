@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.21~alpha1';
+our $VERSION = '2.1.22~alpha1';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 14;
+our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -57,6 +57,10 @@ my %_status_capacity_cache_stats = (
 
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
+
+# Per-storage cache for NVMe host-whitelist reconcile (avoids redundant host/
+# host_subsys queries on every alloc in whitelist mode)
+my %_host_whitelist_last_ok;
 
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
@@ -136,8 +140,10 @@ sub _clear_cache {
     # Keep portal sync cache aligned with the same host scoping
     if ($storage_id) {
         delete $_portal_sync_last_ok{$storage_id};
+        delete $_host_whitelist_last_ok{$storage_id};
     } else {
         %_portal_sync_last_ok = ();
+        %_host_whitelist_last_ok = ();
     }
 }
 
@@ -463,6 +469,17 @@ sub properties {
             type => 'string',
             optional => 1,
         },
+        tn_nvme_allow_any_host => {
+            description => "Allow any NVMe host to attach (open access). Default 1 for "
+                . "backward compatibility. Set to 0 to use an explicit host whitelist: "
+                . "the plugin registers each node's host NQN (with DH-HMAC-CHAP keys if "
+                . "tn_nvme_dhchap_secret / tn_nvme_dhchap_ctrl_secret are set) on the "
+                . "subsystem and sets allow_any_host=false. Required for DHCHAP auth to "
+                . "actually be enforced by the target.",
+            type => 'boolean',
+            optional => 1,
+            default => 1,
+        },
 
         # ZFS compression algorithm for new volumes
         tn_compression => {
@@ -573,6 +590,7 @@ sub options {
         tn_hostnqn                => { optional => 1 },
         tn_nvme_dhchap_secret     => { optional => 1 },
         tn_nvme_dhchap_ctrl_secret => { optional => 1 },
+        tn_nvme_allow_any_host    => { optional => 1 },
 
         # ZFS tunables
         tn_compression => { optional => 1 },
@@ -736,6 +754,18 @@ sub check_config {
         # Validate hostnqn format if provided
         if ($opts->{tn_hostnqn} && $opts->{tn_hostnqn} !~ /^nqn\./) {
             die "tn_hostnqn must follow NVMe NQN format\n";
+        }
+
+        # DHCHAP secrets only take effect with an explicit host whitelist. With
+        # open access (the default), the target accepts any host regardless of
+        # any key, so authentication is not actually enforced.
+        if (($opts->{tn_nvme_dhchap_secret} || $opts->{tn_nvme_dhchap_ctrl_secret})
+            && _nvme_allow_any_host($opts)) {
+            syslog('warning',
+                "[TrueNAS] Storage '$sectionId': DH-HMAC-CHAP secret is set but "
+                . "tn_nvme_allow_any_host is not 0 - authentication will NOT be "
+                . "enforced. Set tn_nvme_allow_any_host 0 to enable the host whitelist."
+            );
         }
 
         # Warn if iSCSI-specific parameters are set in NVMe mode
@@ -1725,19 +1755,33 @@ sub _tn_pool_health($scfg) {
     return _set_cache($host_key, "pool_health:$pool_name", $pools->[0]);
 }
 
+# Base payload for creating a zvol via pool.dataset.create. All six optional
+# fields are sent explicitly, not omitted: TrueNAS 25.10.4's legacy API shim
+# leaves omitted optional fields as unresolved _NotRequired sentinels instead of
+# real defaults, crashing pool.dataset.create both in validation and in audit-log
+# serialization (#58, #65, #78). special_small_block_size must be 'INHERIT'
+# specifically - 0 fails a ZFS-level check, null fails Pydantic. Callers may layer
+# on optional fields (comments, compression) after.
+sub _tn_zvol_create_payload {
+    my ($scfg, $full, $bytes, $blocksize) = @_;
+    return {
+        name                     => $full,
+        type                     => 'VOLUME',
+        volsize                  => $bytes,
+        sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
+        volblocksize             => _normalize_blocksize($blocksize) // '16K',
+        snapdev                  => 'INHERIT',
+        reservation              => 0,
+        refreservation           => 0,
+        special_small_block_size => 'INHERIT',
+        force_size               => JSON::PP::false,
+    };
+}
+
 # PVE passes size in KiB; TrueNAS expects bytes (volsize) and supports 'sparse'
 sub _tn_dataset_create($scfg, $full, $size_kib, $blocksize) {
     my $bytes = int($size_kib) * 1024;
-    my $payload = {
-        name   => $full,
-        type   => 'VOLUME',
-        volsize=> $bytes,
-        sparse => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-    };
-    # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-    if ($blocksize) {
-        $payload->{volblocksize} = _normalize_blocksize($blocksize);
-    }
+    my $payload = _tn_zvol_create_payload($scfg, $full, $bytes, $blocksize);
     my $result = _api_call_mutate($scfg, 'pool.dataset.create', [ $payload ]);
     _invalidate_status_capacity_cache(undef, $scfg);
     return $result;
@@ -3089,6 +3133,130 @@ sub _nvme_get_hostnqn {
     die "Could not determine host NQN: /etc/nvme/hostnqn not found and hostnqn not configured\n";
 }
 
+# Whether the subsystem should use open access (allow_any_host=true) or an
+# explicit host whitelist. Defaults to open (1) for backward compatibility.
+# Set tn_nvme_allow_any_host=0 to opt into the whitelist model.
+sub _nvme_allow_any_host {
+    my ($scfg) = @_;
+    return 1 if !defined $scfg->{tn_nvme_allow_any_host};
+    return $scfg->{tn_nvme_allow_any_host} ? 1 : 0;
+}
+
+# JSON boolean form of _nvme_allow_any_host, for API payloads.
+sub _nvme_allow_any_host_json {
+    my ($scfg) = @_;
+    return _nvme_allow_any_host($scfg) ? JSON::PP::true : JSON::PP::false;
+}
+
+# Force TrueNAS to re-render the subsystem's configfs after a namespace change.
+# Issue #12: nvmet.namespace.create did not always sync to the running kernel
+# target on 25.10; writing the subsystem pokes middleware into re-rendering.
+# allow_any_host is written to its *configured* value, so this is a no-op for
+# access control (never flips a whitelisted subsystem back to open). Non-fatal.
+sub _nvme_resync_configfs {
+    my ($scfg, $subsys_id, $label) = @_;
+    eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
+        [ $subsys_id, { allow_any_host => _nvme_allow_any_host_json($scfg) } ]) };
+    if ($@) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] " . ($label // 'nvme') . ": configfs resync failed (non-fatal): $@");
+    }
+}
+
+# In whitelist mode, ensure THIS node's host NQN is registered on TrueNAS
+# (with DH-HMAC-CHAP keys if configured) and associated with the subsystem.
+# Idempotent and safe to call from every cluster node on every subsystem
+# ensure: each node registers its own NQN, "already exists" is tolerated, and
+# DHCHAP keys are re-synced if the configured secret changes (rotation).
+sub _nvme_ensure_host_registered {
+    my ($scfg, $subsys_id) = @_;
+
+    my $hostnqn = _nvme_get_hostnqn($scfg);
+    die "nvme_ensure_host: could not determine host NQN\n" if !$hostnqn;
+
+    my $secret      = $scfg->{tn_nvme_dhchap_secret};
+    my $ctrl_secret = $scfg->{tn_nvme_dhchap_ctrl_secret};
+
+    # Find or create the host record for this node's NQN.
+    my $hosts = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
+    my $host_id;
+    if (@$hosts) {
+        my $cur = $hosts->[0];
+        $host_id = $cur->{id};
+        # Re-sync DHCHAP keys if the configured secret differs (rotation).
+        my %upd;
+        if (defined $secret      && ($cur->{dhchap_key}      // '') ne $secret)      { $upd{dhchap_key}      = $secret; }
+        if (defined $ctrl_secret && ($cur->{dhchap_ctrl_key} // '') ne $ctrl_secret) { $upd{dhchap_ctrl_key} = $ctrl_secret; }
+        if (%upd) {
+            eval { _api_call_mutate($scfg, 'nvmet.host.update', [$host_id, \%upd]) };
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] nvme_ensure_host: failed to update DHCHAP keys for $hostnqn: $@") if $@;
+        }
+    } else {
+        my $payload = { hostnqn => $hostnqn };
+        $payload->{dhchap_key}      = $secret      if defined $secret;
+        $payload->{dhchap_ctrl_key} = $ctrl_secret if defined $ctrl_secret;
+        my $h = eval { _api_call_mutate($scfg, 'nvmet.host.create', [ $payload ]) };
+        if ($@ && $@ =~ /already exists/i) {
+            # Concurrent create from another node; re-query.
+            my $again = _api_call($scfg, 'nvmet.host.query', [[["hostnqn", "=", $hostnqn]]]) // [];
+            $host_id = $again->[0]{id} if @$again;
+        } elsif ($@) {
+            die "nvme_ensure_host: failed to create host $hostnqn: $@";
+        } else {
+            $host_id = ref($h) eq 'HASH' ? $h->{id} : $h;
+        }
+    }
+    die "nvme_ensure_host: could not resolve host_id for $hostnqn\n" if !defined $host_id;
+
+    # Ensure the host <-> subsystem association exists.
+    my $assoc = _api_call($scfg, 'nvmet.host_subsys.query',
+        [[["host.id", "=", $host_id], ["subsys.id", "=", $subsys_id]]]) // [];
+    if (!@$assoc) {
+        eval { _api_call_mutate($scfg, 'nvmet.host_subsys.create',
+            [{ host_id => int($host_id), subsys_id => int($subsys_id) }]) };
+        if ($@ && $@ !~ /already exists/i) {
+            die "nvme_ensure_host: failed to authorize host $hostnqn on subsystem: $@";
+        }
+    }
+    _log($scfg, 2, 'debug',
+        "[TrueNAS] nvme_ensure_host: host $hostnqn (id=$host_id) authorized on subsys $subsys_id");
+    return $host_id;
+}
+
+# Reconcile a subsystem's host-access model with configuration. Open mode
+# (default) is left to subsystem creation; this only acts in whitelist mode,
+# where it registers this node's host first (avoiding a lockout window) and
+# then enforces allow_any_host=false. Idempotent; safe on every ensure.
+# $cur_allow_any_host, when known by the caller, lets us skip the subsys.update
+# round-trip if access is already tightened. TTL-cached per storage (mirrors
+# _nvme_sync_portals) so steady-state ensures cost zero round-trips.
+sub _nvme_reconcile_host_whitelist {
+    my ($scfg, $subsys_id, $cur_allow_any_host) = @_;
+    return if _nvme_allow_any_host($scfg);   # open mode: nothing to reconcile
+
+    my $sid = _cache_host_key($scfg);
+    if (time() - ($_host_whitelist_last_ok{$sid} // 0) < $CACHE_TTL) {
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_reconcile_host_whitelist: skipping (recently synced "
+            . (time() - $_host_whitelist_last_ok{$sid}) . "s ago)");
+        return;
+    }
+
+    _nvme_ensure_host_registered($scfg, $subsys_id);
+
+    # Only write allow_any_host=false when it isn't already (or state unknown).
+    if (!defined($cur_allow_any_host) || $cur_allow_any_host) {
+        eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
+            [ $subsys_id, { allow_any_host => JSON::PP::false } ]) };
+        if ($@) {
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] nvme: failed to set allow_any_host=false on subsys $subsys_id: $@");
+            return;   # don't cache a partial reconcile
+        }
+    }
+    $_host_whitelist_last_ok{$sid} = time();
+}
+
 # Check if nvme-cli is installed
 sub _nvme_check_cli {
     eval {
@@ -3575,6 +3743,15 @@ sub _nvme_selector_failure_detail {
     return "Unrecognized selector outcome '$selector_outcome'.\n" . $common_detail;
 }
 
+# Extract the subsystem id from a namespace record. TrueNAS returns 'subsys'
+# either as a scalar id or as a nested object depending on version.
+sub _nvme_namespace_subsys_id {
+    my ($ns) = @_;
+    my $subsys = $ns->{subsys};
+    return undef if !defined $subsys;
+    return ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
+}
+
 sub _nvme_get_namespace_selector_metadata {
     my ($scfg, $device_uuid) = @_;
 
@@ -3597,23 +3774,23 @@ sub _nvme_get_namespace_selector_metadata {
         }
 
         my $subsys_id = $subsystems->[0]{id};
-        my $target_namespaces = _api_call($scfg, 'nvmet.namespace.query', [
-            [["device_uuid", "=", $device_uuid]]
-        ]) // [];
-        my $subsys_namespaces = _api_call($scfg, 'nvmet.namespace.query', [
-            [["subsys", "=", $subsys_id]]
-        ]) // [];
+        # Fetch all namespaces once and derive both the subsystem count and the
+        # UUID match client-side. TrueNAS may return 'subsys' as a nested object
+        # rather than a scalar id, so a server-side [["subsys", "=", $subsys_id]]
+        # filter matches nothing and yields a false zero count -- tripping
+        # linux_api_namespace_count_mismatch even though the namespaces exist and
+        # are visible in Linux.
+        my $all_namespaces = _api_call($scfg, 'nvmet.namespace.query', [[]]) // [];
 
-        ($result->{namespace}) = grep {
-            my $ns_subsys = $_->{subsys};
-            my $ns_subsys_id = ref($ns_subsys) eq 'HASH' ? $ns_subsys->{id} : $ns_subsys;
-            defined($_->{device_uuid})
-                && $_->{device_uuid} eq $device_uuid
-                && defined($ns_subsys_id)
-                && $ns_subsys_id == $subsys_id;
-        } @$target_namespaces;
-
-        $result->{api_namespace_count} = scalar(@$subsys_namespaces);
+        my $count = 0;
+        for my $ns (@$all_namespaces) {
+            my $id = _nvme_namespace_subsys_id($ns);
+            next unless defined($id) && $id == $subsys_id;
+            $count++;
+            $result->{namespace} //= $ns
+                if defined($ns->{device_uuid}) && $ns->{device_uuid} eq $device_uuid;
+        }
+        $result->{api_namespace_count} = $count;
 
         if (!$result->{namespace}) {
             $result->{metadata_state} = 'uuid_not_found';
@@ -4236,6 +4413,7 @@ sub _nvme_ensure_subsystem {
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_ensure_subsystem: subsystem exists with id=$subsys_id, syncing portals");
 
         _nvme_sync_portals($scfg, $subsys_id);
+        _nvme_reconcile_host_whitelist($scfg, $subsys_id, $subsys->{allow_any_host});
 
         return $subsys_id;
     }
@@ -4252,7 +4430,8 @@ sub _nvme_ensure_subsystem {
     my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
-        allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
+        # Open by default (back-compat); whitelist when tn_nvme_allow_any_host=0.
+        allow_any_host => _nvme_allow_any_host_json($scfg),
     }]);
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
@@ -4312,6 +4491,10 @@ sub _nvme_ensure_subsystem {
         }
     }
 
+    # In whitelist mode, register this node's host and enforce allow_any_host=false.
+    # Created just above with the configured value, so pass it to skip a redundant update.
+    _nvme_reconcile_host_whitelist($scfg, $subsys_id, _nvme_allow_any_host($scfg));
+
     _log($scfg, 1, 'info', "[TrueNAS] nvme_ensure_subsystem: created subsystem with id=$subsys_id");
     return $subsys_id;
 }
@@ -4339,11 +4522,7 @@ sub _nvme_create_namespace {
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: created namespace with UUID $device_uuid");
 
-    # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-    eval { _api_call_mutate($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
-    if ($@) {
-        _log($scfg, 1, 'warning', "[TrueNAS] nvme_create_namespace: subsystem reapply failed (non-fatal): $@");
-    }
+    _nvme_resync_configfs($scfg, $subsys_id, 'nvme_create_namespace');
 
     # Connect to subsystem if not already connected
     _nvme_connect($scfg);
@@ -4435,6 +4614,21 @@ sub parse_volname {
     die "unable to parse volname '$volname'\n";
 }
 
+# Untaint a device path before handing it to Proxmox core. Device paths here are
+# derived from parsing nvme-cli / iscsiadm / sysfs output, so under Perl taint
+# mode (-T, which Proxmox runs plugins under) the values are tainted. Core
+# interpolates the device into run_command shell pipelines — notably the
+# cloud-init writer (genisoimage | qemu-img dd of=$dev) — which dies with
+# "Insecure dependency in exec while running with -T switch" on tainted input.
+# Validate the shape (absolute /dev path, no shell metacharacters) and untaint,
+# or die loudly rather than pass something unexpected to a shell.
+sub _untaint_dev($dev) {
+    die "no device path to untaint\n" if !defined($dev) || $dev eq '';
+    $dev =~ m{^(/dev/[A-Za-z0-9._:\@+/-]+)\z}
+        or die "refusing to return unexpected device path '$dev'\n";
+    return $1;
+}
+
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
@@ -4451,14 +4645,14 @@ sub path {
             my $lun = _current_lun_for_zname($scfg, $clone_zname);
             die "snapshot device not active for $volname\@$snapname\n" if !defined $lun;
             my $dev = _device_for_lun($scfg, $lun);
-            return ($dev, $vmid, 'images');
+            return (_untaint_dev($dev), $vmid, 'images');
         } elsif ($mode eq 'nvme-tcp') {
             _nvme_connect($scfg);
             my $ns = _nvme_namespaces_for_device_path($scfg, "zvol/$clone_full");
             my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
             die "snapshot namespace not active for $volname\@$snapname\n" if !$uuid;
             my $dev = _nvme_device_for_uuid($scfg, $uuid);
-            return ($dev, $vmid, 'images');
+            return (_untaint_dev($dev), $vmid, 'images');
         } else {
             die "Unknown transport mode: $mode\n";
         }
@@ -4480,14 +4674,14 @@ sub path {
                 die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
             }
         }
-        return ($dev, $vmid, 'images');
+        return (_untaint_dev($dev), $vmid, 'images');
 
     } elsif ($mode eq 'nvme-tcp') {
         # NVMe: metadata is device_uuid
         my $uuid = $metadata;
         _nvme_connect($scfg);
         my $dev = _nvme_device_for_uuid($scfg, $uuid);
-        return ($dev, $vmid, 'images');
+        return (_untaint_dev($dev), $vmid, 'images');
 
     } else {
         die "Unknown transport mode: $mode\n";
@@ -4571,15 +4765,8 @@ sub alloc_image {
         $create_attempt++;
         $create_error = undef;
 
-        my $create_payload = {
-            name     => $full_ds,
-            type     => 'VOLUME',
-            volsize  => $bytes,
-            sparse   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-            comments => 'Autocreated by Proxmox Plugin',
-        };
-        # Normalize blocksize to uppercase for TrueNAS 25.10+ compatibility
-        $create_payload->{volblocksize} = _normalize_blocksize($blocksize) if $blocksize;
+        my $create_payload = _tn_zvol_create_payload($scfg, $full_ds, $bytes, $blocksize);
+        $create_payload->{comments} = 'Autocreated by Proxmox Plugin';
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
         $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 
@@ -4850,11 +5037,7 @@ sub _alloc_image_nvme {
     my $deferred_uuid = $device_uuid;
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
-        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
-        if ($@) {
-            _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
-        }
+        _nvme_resync_configfs($deferred_scfg, $deferred_subsys_id, 'alloc_image_nvme deferred');
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image_nvme deferred: connecting and discovering device for UUID $deferred_uuid");
         eval { _nvme_connect($deferred_scfg); };
@@ -4894,6 +5077,12 @@ sub volume_size_info {
     }
     my $bytes = _normalize_value($ds->{volsize});
     die "volume_size_info: missing volsize for $full\n" if !$bytes;
+    # Untaint: this value comes from the TrueNAS API socket (tainted) and PVE's
+    # cloud-init writer interpolates it into a run_command pipeline as
+    # `qemu-img dd ... osize=$size`, which aborts under taint mode (-T) with
+    # "Insecure dependency in exec". volsize is always an integer byte count.
+    ($bytes) = ($bytes =~ /^(\d+)$/)
+        or die "volume_size_info: unexpected volsize '$bytes' for $full\n";
     return wantarray ? ($bytes, $fmt) : $bytes;
 }
 
@@ -5592,12 +5781,9 @@ sub _list_images_nvme {
         _api_call($scfg, 'nvmet.namespace.query', [[]]);
     } // [];
 
-    # Filter to only our subsystem
-    # Note: namespace has 'subsys' field which is a hash with 'id' field
+    # Filter to only our subsystem ('subsys' may be a scalar id or nested object)
     $namespaces = [ grep {
-        my $ns_subsys = $_->{subsys};
-        my $ns_subsys_id = ref($ns_subsys) eq 'HASH' ? $ns_subsys->{id} : $ns_subsys;
-        ($ns_subsys_id // -1) == $subsys_id
+        (_nvme_namespace_subsys_id($_) // -1) == $subsys_id
     } @$namespaces ];
 
     # Optional include filter
@@ -6263,9 +6449,7 @@ sub _expose_snapshot_device {
                 my $ns = _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
                 $device_uuid = $ns->{device_uuid}
                     // die "No device_uuid returned from namespace creation\n";
-                # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-                eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
-                    [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+                _nvme_resync_configfs($scfg, $subsys_id, 'expose_snapshot_device');
             }
 
             _nvme_connect($scfg);
@@ -6758,11 +6942,7 @@ sub _clone_image_nvme {
     my $deferred_uuid = $device_uuid;
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
-        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
-        if ($@) {
-            _log($deferred_scfg, 1, 'warning', "[TrueNAS] clone_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
-        }
+        _nvme_resync_configfs($deferred_scfg, $deferred_subsys_id, 'clone_image_nvme deferred');
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_nvme deferred: discovering device for UUID $deferred_uuid");
         usleep(200_000);  # 200ms initial settle
@@ -6811,11 +6991,12 @@ sub copy_image {
 # Returns the new volname "vol-base-<vmid>-disk-N-lun<M>". The lun
 # number is unchanged.
 #
-# Rollback: best-effort. On extent.update failure we try to rename
-# back. On snapshot.create failure the rename + extent.update stand
-# (the dataset is named correctly, just lacks the __base__ snap; PVE
-# will retry). create_base is otherwise idempotent if a previous
-# attempt left a renamed dataset without __base__.
+# Rollback: best-effort, and full. On rewire failure we rename back. On
+# snapshot.create failure we ALSO roll back — reversing the rewire and the
+# rename — so a transient failure (e.g. a missing SNAPSHOT_WRITE role, a
+# network blip) leaves the disk exactly as it was, a usable vm-* volume,
+# rather than a half-converted base-* volume with no __base__ snapshot that
+# PVE can neither linked-clone nor easily un-template.
 sub create_base {
     my ($class, $storeid, $scfg, $volname) = @_;
 
@@ -6958,7 +7139,7 @@ sub create_base {
         die "create_base: $share_label rewire to $new_zvol_path failed: $err";
     }
 
-    # Step 3: take the __base__ snapshot. This is the anchor for every
+    # Step 4: take the __base__ snapshot. This is the anchor for every
     # linked clone derived from this template.
     eval {
         _api_call_mutate(
@@ -6968,10 +7149,48 @@ sub create_base {
         );
     };
     if ($@) {
-        # Don't roll back the rename here; the template is functionally
-        # complete from PVE's perspective (config will reference the new
-        # name). Surface the failure so the operator can re-snapshot.
-        die "create_base: pool.snapshot.create $new_full\@__base__ failed: $@";
+        my $err = $@;
+        # The __base__ snapshot IS the point of a base image, so a failure here
+        # leaves nothing usable — roll back Step 3 (rewire) and Step 2 (rename)
+        # so the disk returns to its original vm-* form and the operation is
+        # cleanly retryable, instead of stranding a base-* volume without a
+        # snapshot that can't be linked-cloned. The rename/rewire calls use the
+        # roles the key already has (snapshot.create is the only privileged gap),
+        # so the rollback itself should succeed even when the snapshot was denied.
+        _log($scfg, 0, 'err',
+            "[TrueNAS] create_base: __base__ snapshot failed; rolling back rename+rewire: $err");
+        my $rolled_back = eval {
+            if ($mode eq 'nvme-tcp') {
+                # Disable while device_path (=new) is still valid, rename back,
+                # then point the namespace at the original path and re-enable.
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::false } ]);
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ]);
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { device_path => $old_zvol_path } ]);
+                _api_call_mutate($scfg, 'nvmet.namespace.update',
+                    [ $transport_id, { enabled => JSON::PP::true } ]);
+            } else {
+                # iSCSI: rename back (force covers the still-attached extent),
+                # then point the extent at the original zvol path.
+                _api_call_mutate($scfg, 'pool.dataset.rename',
+                    [ $new_full, { new_name => $old_full, force => JSON::PP::true } ]);
+                _api_call_mutate($scfg, 'iscsi.extent.update',
+                    [ $transport_id, { disk => $old_zvol_path } ]);
+            }
+            1;
+        };
+        if ($rolled_back) {
+            _clear_cache(_cache_host_key($scfg));
+            _log($scfg, 1, 'info',
+                "[TrueNAS] create_base: rolled back to $old_full after snapshot failure");
+        } else {
+            _log($scfg, 0, 'err',
+                "[TrueNAS] create_base: rollback did NOT complete ($@); disk may be "
+                . "left as $new_full without a \@__base__ snapshot — inspect manually");
+        }
+        die "create_base: pool.snapshot.create $new_full\@__base__ failed: $err";
     }
 
     _invalidate_status_capacity_cache($storeid, $scfg);

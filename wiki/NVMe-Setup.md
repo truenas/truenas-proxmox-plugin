@@ -191,8 +191,9 @@ truenasplugin: truenas-nvme
 | `tn_subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
 | `tn_hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
 | `tn_discovery_portal` | Yes | Primary portal IP:port | None |
-| `tn_nvme_dhchap_secret` | No | Host authentication secret | None |
-| `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
+| `tn_nvme_dhchap_secret` | No | Host authentication secret (enforced only in whitelist mode) | None |
+| `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret (bidirectional; whitelist mode) | None |
+| `tn_nvme_allow_any_host` | No | `1` = open access (any host). `0` = whitelist mode: the plugin registers each node's host NQN + DH-CHAP keys and sets `allow_any_host=false`. | `1` |
 | `tn_nr_io_queues` | No | Pin NVMe/TCP I/O queue count per controller (1–256). Auto-detected when unset: uses online CPU count normally, or `floor(possible/2)` when any CPU is offline. Set manually if TrueNAS reports queue limit errors. | Auto-detected |
 
 **Important Notes:**
@@ -333,27 +334,41 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 - `dhchap_ctrl_key`: Controller secret (TrueNAS authenticates to Proxmox) - optional
 - `dhchap_hash`: Hash algorithm (`SHA-256`, `SHA-384`, or `SHA-512`)
 
-**Link Host to Subsystem:**
+**Link Host to Subsystem (automatic):**
 
-To restrict access to specific hosts, disable `allow_any_host` and create host-subsystem associations:
+You no longer need to register hosts or link them to the subsystem by hand. Set
+`tn_nvme_allow_any_host 0` on the storage (whitelist mode) and the plugin does it
+for you on the next storage operation — for **every** node in the cluster:
 
-```bash
-# Step 1: Disable allow_any_host on the subsystem
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.subsys.update\", [\"SUBSYS_ID\", { allow_any_host => 0 }]); print \"ok\\n\";'"
+1. Registers this node's host NQN (from `/etc/nvme/hostnqn`, or `tn_hostnqn`) as an
+   `nvmet.host`, including the `tn_nvme_dhchap_secret` / `tn_nvme_dhchap_ctrl_secret`
+   keys if configured.
+2. Creates the `host_subsys` association linking the host to the subsystem.
+3. Sets the subsystem's `allow_any_host=false`.
 
-# Step 2: Get the host ID (query existing hosts)
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.host.query\", [[]]); print \"ok\\n\";'"
-# Returns: [{"id": 1, "hostnqn": "nqn.2014-08.org.nvmexpress:uuid:...", ...}]
-
-# Step 3: Get the subsystem ID (query existing subsystems)
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"nvmet.subsys.query\", [[]]); print \"ok\\n\";'"
-# Returns: [{"id": 1, "name": "proxmox-nvme", "subnqn": "nqn.2005-10.org.freenas.ctl:proxmox-nvme", ...}]
-
-# Step 4: Link the host to the subsystem
-ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, \"nvmet.host_subsys.create\", [{ host_id => 1, subsys_id => 1 }]); print \"ok\\n\";'"
+```ini
+truenasplugin: truenas-nvme-secure
+    ...
+    tn_nvme_allow_any_host 0
+    tn_nvme_dhchap_secret DHHC-1:01:...
+    tn_nvme_dhchap_ctrl_secret DHHC-1:01:...      # optional, bidirectional
 ```
 
-**Important**: When `allow_any_host: false`, ONLY explicitly linked hosts can connect to the subsystem. DH-CHAP authentication is an optional additional security layer.
+The registration is idempotent and safe to run concurrently from multiple nodes,
+and switching an existing (open) subsystem to whitelist mode is non-disruptive —
+the plugin registers the host **before** setting `allow_any_host=false`, so live
+connections are never dropped.
+
+**Important**: When `allow_any_host=false`, ONLY explicitly linked hosts can connect,
+and DH-CHAP keys are actually enforced. In open mode (`tn_nvme_allow_any_host 1`, the
+default) any host may attach and the DH-CHAP keys are **not** enforced. Because
+`storage.cfg` is cluster-wide, the DH-CHAP secret is a single shared key across all
+nodes; leave `tn_hostnqn` unset on multi-node clusters so each node uses its own NQN.
+
+> **TrueNAS 26:** if a subsystem has explicit host links, the kernel refuses to set
+> `allow_any_host=true`, and the nvmet render aborts — stranding newly created
+> namespaces. Use whitelist mode (`0`) so the plugin and TrueNAS agree, rather than
+> mixing open access with manually-added host links.
 
 ### Configure on Proxmox
 
