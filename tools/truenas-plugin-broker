@@ -91,12 +91,38 @@ sub write_pidfile {
 }
 
 # ---------------- WebSocket helpers (subset of plugin code) ----------------
+
+# Resolve $host to an IPv4 literal so IO::Socket::INET/SSL cannot pick the
+# AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
+# TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
+# IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+sub _host_ipv4 {
+    my ($host) = @_;
+    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/;
+    my @ent = Socket::gethostbyname($host);
+    if (@ent && defined $ent[4]) {
+        my $ip = inet_ntoa($ent[4]);
+        return $ip if $ip;
+    }
+    return $host;
+}
+
 sub ws_open {
     my ($scfg) = @_;
+    # Normalize scheme the same way TrueNASPlugin.pm::_ws_defaults does.
+    # Without this, an operator who set tn_api_scheme=https (rejected by the
+    # plugin's own validator only against the direct-WS path) would slip
+    # through the broker envelope raw, and the eq 'wss' check below would
+    # miss — the broker would open plain TCP and the handshake would 400.
     my $scheme = $scfg->{api_scheme} || 'wss';
+    if    ($scheme =~ /^https$/i) { $scheme = 'wss'; }
+    elsif ($scheme =~ /^http$/i)  { $scheme = 'ws';  }
     my $host   = $scfg->{api_host} or die "ws_open: no api_host";
     my $port   = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
-    my $peer   = $host;
+    # Honor prefer_ipv4 (default 1). The wire schema always listed this field
+    # but the earlier broker ignored it, so the OS resolver could pick AAAA
+    # on a dual-stack TN even though the plugin had resolved A already.
+    my $peer   = (($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host);
 
     my $sock;
     if ($scheme eq 'wss') {
