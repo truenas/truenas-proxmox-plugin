@@ -1,3 +1,68 @@
+truenas-proxmox-plugin (2.1.23) unstable; urgency=medium
+
+  * Fix disk-index collision moving a second template disk to this storage
+    (#85): _find_free_disk_name only queried TrueNAS for existing
+    vm-<vmid>-disk-* datasets when picking the next free index. Once a
+    template's first disk was moved here and renamed vm-<vmid>-disk-N ->
+    base-<vmid>-disk-N by create_base, that name vanished from the vm-
+    namespace the query checked, so moving a second disk of the same
+    template reused the same index and create_base's rename crashed with
+    "dataset already exists". The query now matches both vm- and base-
+    prefixes for the VMID. Also fixed the same gap in list_images' owner-
+    VMID detection (iSCSI and NVMe-TCP), which only recognized
+    vm-<vmid>-... names and silently excluded base-<vmid>-... volumes
+    from any VMID-scoped listing (used by PVE core's own
+    find_free_diskname/get_next_vm_diskname, disk-usage displays, etc.).
+    Reproduced live on the test cluster on both transports before and
+    after the fix.
+  * Fix cloud-init drive not regenerated on template clone (#84): the
+    plugin named every volume vol-<zname>-lun<N> / vol-<zname>-ns<uuid>,
+    including cloud-init disks. PVE core's drive_is_cloudinit() requires
+    the volid to end in "cloudinit" with no vol- prefix or metadata
+    suffix; since ours never matched, core treated cloud-init drives as
+    plain CD-ROMs and copied the drive reference verbatim on clone
+    instead of regenerating it, so a clone's user/password/SSH keys/
+    network config were silently never applied and it always pointed at
+    the template's own cloud-init volume. Cloud-init volumes are now
+    named exactly vm-<vmid>-cloudinit (alloc_image, list_images); since
+    that form can't carry embedded LUN/NVMe-UUID metadata, path() and
+    activate_volume resolve the transport device dynamically by zvol
+    path when no metadata is present (_resolve_iscsi_lun,
+    _resolve_nvme_uuid). Reproduced live on the test cluster on both
+    transports (including starting the clone and confirming path()
+    resolves a real device) before and after the fix.
+  * Fix cloud-init disk deletion skipping local SCSI device cleanup (#84
+    follow-up, found in code review): free_image passed the always-undef
+    cloud-init metadata straight through to _free_image_iscsi as the LUN,
+    silently skipping its pre-teardown SCSI-device cleanup. free_image
+    now resolves the LUN via _resolve_iscsi_lun (best-effort; a failed
+    resolve still falls back to prior behavior rather than blocking
+    deletion). Verified live: the SCSI-device pre-teardown log lines now
+    appear for a cloud-init disk delete on iSCSI, where they previously
+    did not.
+  * Fix path() losing detailed device-lookup diagnostics on failure (#84
+    follow-up, found in code review): the iSCSI branch's cloud-init
+    rewrite dropped the bubble-up of _device_for_lun's original error
+    (active sessions, by-path listing) when the LUN mapping was unchanged
+    but the local device genuinely wasn't appearing. Restored for both
+    iSCSI and NVMe-TCP.
+  * Fix path() doubling NVMe-TCP device-lookup latency on failure (#84
+    follow-up, found in code review): unlike the iSCSI branch, the
+    NVMe-TCP branch retried the full ~5s device-discovery loop
+    unconditionally even when the re-resolved device_uuid matched the one
+    that just failed, doubling worst-case latency and risking a duplicate
+    subsystem reconnect affecting other VMs sharing the connection. Now
+    only retries when the resolved UUID actually differs.
+  * Cache the NVMe-TCP namespace-by-path lookup (#84 follow-up, found in
+    code review): _resolve_nvme_uuid queried nvmet.namespace.query
+    uncached, so a cloud-init volume's activate_volume + path() pair
+    (called back-to-back on every VM start/migration/backup) cost 2 live
+    API round trips where the analogous iSCSI lookup cost at most 1
+    thanks to the plugin's existing extent/mapping cache. Now cached the
+    same way, cleared by the existing _clear_cache mutation hooks.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 06 Aug 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.22+deb1) unstable; urgency=high
 
   * Fix pool.dataset.create crash on TrueNAS 25.10.4 (#58, #65, #78).
@@ -34,6 +99,7 @@ truenas-proxmox-plugin (2.1.22+deb1) unstable; urgency=high
     forwarding a tainted or malformed scalar.
 
  -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 21 Jul 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.21~alpha2) unstable; urgency=medium
 
   * Untaint TrueNAS API scalars in _normalize_value (fixes disk-migration

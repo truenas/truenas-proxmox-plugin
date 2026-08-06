@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.22';
+our $VERSION = '2.1.23';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -2319,12 +2319,18 @@ sub _find_free_disk_name {
     my $dataset = $scfg->{tn_dataset};
     my $prefix = "vm-$vmid-disk-";
 
-    # Single query: fetch all children of the parent dataset matching our VM's prefix
+    # Single query: fetch all children of the parent dataset matching either
+    # the live (vm-) or templated (base-) disk-name prefix for this VMID.
+    # Templated disks are excluded from consideration here just as much as
+    # live ones do -- otherwise moving a second disk of the same template to
+    # this storage picks an index already used by a previously-moved
+    # (and by-then-renamed-to-base-) disk, and the later create_base rename
+    # collides with it (issue #85).
     # Escape regex special chars in dataset path (TrueNAS uses Python regex)
     (my $dataset_escaped = $dataset) =~ s/([.+*?^()\[\]{}|\\])/\\$1/g;
     my $children = eval {
         _api_call($scfg, 'pool.dataset.query', [
-            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/${prefix}"]]
+            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/(?:vm|base)-${vmid}-disk-"]]
         ]);
     };
     my %existing;
@@ -2334,9 +2340,8 @@ sub _find_free_disk_name {
 
     for (my $n = 0; $n < 1000; $n++) {
         my $candidate = "${prefix}$n";
-        if (!$existing{"$dataset/$candidate"}) {
-            return $candidate;
-        }
+        next if $existing{"$dataset/${prefix}$n"} || $existing{"$dataset/base-$vmid-disk-$n"};
+        return $candidate;
     }
 
     die sprintf(
@@ -2411,6 +2416,18 @@ sub _snapshot_clone_paths {
 sub _is_snapshot_clone_zname {
     my ($zname) = @_;
     return index($zname, SNAPSHOT_CLONE_PREFIX) == 0;
+}
+
+# Cloud-init disks must be named exactly "vm-<vmid>-cloudinit" with no
+# "vol-" prefix and no transport-metadata suffix (-lun<N> / -ns<uuid>) --
+# PVE core's drive_is_cloudinit() pattern-matches the volid and only
+# regenerates cloud-init drives on clone/template if it recognizes this
+# exact form (issue #84). Because the name can't carry embedded metadata,
+# these volumes resolve their transport device dynamically by zvol path
+# at path()/activate_volume time instead of from the volname.
+sub _is_cloudinit_zname {
+    my ($zname) = @_;
+    return $zname =~ /^vm-\d+-cloudinit$/;
 }
 
 # Resolve an iSCSI extent by its disk (zvol) path instead of by name.
@@ -2524,6 +2541,17 @@ sub _current_lun_for_zname($scfg, $zname) {
         && (($_->{extent} // -1) == $extent->{id})
     } @$maps;
     return defined($tx) ? $tx->{lunid} : undef;
+}
+
+# Resolve the LUN to use for a volume: the embedded one if the volname
+# carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+sub _resolve_iscsi_lun($scfg, $zname, $known_lun) {
+    return $known_lun if defined $known_lun;
+    my $lun = _current_lun_for_zname($scfg, $zname);
+    die "Could not locate iSCSI LUN for '$zname' (IQN " . ($scfg->{tn_target_iqn} // '') . ")\n"
+        if !defined $lun;
+    return $lun;
 }
 
 # Pre-flight validation checks before volume allocation
@@ -4413,6 +4441,27 @@ sub _nvme_namespaces_for_device_path {
     ]) // [];
 }
 
+# Resolve the NVMe device_uuid to use for a volume: the embedded one if the
+# volname carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+# Cached (short TTL, cleared by the normal _clear_cache mutation hooks) so
+# that path() and activate_volume back-to-back for the same cloud-init
+# volume don't each pay a separate nvmet.namespace.query round trip.
+sub _resolve_nvme_uuid($scfg, $zname, $known_uuid) {
+    return $known_uuid if defined $known_uuid;
+    my $device_path = "zvol/" . $scfg->{tn_dataset} . '/' . $zname;
+    my $storage_id = _cache_host_key($scfg);
+    my $cache_method = "ns_by_path:$device_path";
+    my $ns = _get_cached($storage_id, $cache_method);
+    if (!$ns) {
+        $ns = _nvme_namespaces_for_device_path($scfg, $device_path);
+        _set_cache($storage_id, $cache_method, $ns);
+    }
+    my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
+    die "Could not locate NVMe namespace for '$zname'\n" if !defined $uuid;
+    return $uuid;
+}
+
 # Delete NVMe namespace
 sub _nvme_delete_namespace {
     my ($scfg, $zname, $full_ds) = @_;
@@ -4436,10 +4485,24 @@ sub _nvme_delete_namespace {
 
 # ======== Required storage interface ========
 # volname format:
-#   iSCSI:    vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
-#   NVMe/TCP: vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   iSCSI:      vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
+#   NVMe/TCP:   vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   Cloud-init: vm-<vmid>-cloudinit, no "vol-" prefix and no metadata suffix --
+#               required verbatim by PVE core's drive_is_cloudinit() (issue #84).
+#               Device is resolved dynamically by zvol path, see
+#               _resolve_iscsi_lun / _resolve_nvme_uuid.
 sub parse_volname {
     my ($class, $volname) = @_;
+
+    # Cloud-init disk: plain "vm-<vmid>-cloudinit", no prefix/suffix. The
+    # classification goes through the same predicate alloc_image/list_images
+    # use, so the two can't drift on what counts as a cloud-init volname;
+    # the digit extraction below is safe because that predicate already
+    # guarantees the ^vm-\d+-cloudinit$ shape.
+    if (_is_cloudinit_zname($volname)) {
+        my ($vmid) = $volname =~ /^vm-(\d+)-cloudinit$/;
+        return ('images', $volname, $vmid, undef, undef, undef, 'raw', undef);
+    }
 
     # Slash-encoded linked-clone form (PVE convention):
     #   <base_volid>/<clone_volid>
@@ -4514,28 +4577,61 @@ sub path {
     }
 
     if ($mode eq 'iscsi') {
-        # iSCSI: metadata is LUN number
+        # iSCSI: metadata is LUN number. Cloud-init volumes (issue #84) carry
+        # no embedded metadata and always take the re-resolve path below.
         my $lun = $metadata;
         _iscsi_login_all($scfg);
         my $dev;
-        eval { $dev = _device_for_lun($scfg, $lun); };
-        if ($@ || !$dev) {
-            # try to re-resolve LUN mapping from TrueNAS
-            my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
-            if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
+        my $lookup_err;
+        if (defined $lun) {
+            eval { $dev = _device_for_lun($scfg, $lun); };
+            $lookup_err = $@;
+        }
+        if (!$dev) {
+            # No embedded LUN, or the embedded one may be stale: re-resolve
+            # the current mapping via the shared helper (also the sole path
+            # for cloud-init volumes, which have no embedded metadata at
+            # all -- issue #84). Dies with a clear message if unresolvable.
+            my $real_lun = _resolve_iscsi_lun($scfg, $zname, undef);
+            if (!defined($lun) || $real_lun != $lun) {
                 $dev = _device_for_lun($scfg, $real_lun);
             } else {
-                die $@ if $@; # bubble up original cause
+                # Mapping is unchanged: the original _device_for_lun failure
+                # already carries a detailed diagnostic (active sessions,
+                # by-path listing) that's more useful than a generic
+                # message, so bubble it up instead of re-deriving one.
+                die $lookup_err if $lookup_err;
                 die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
             }
         }
         return ($dev, $vmid, 'images');
 
     } elsif ($mode eq 'nvme-tcp') {
-        # NVMe: metadata is device_uuid
+        # NVMe: metadata is device_uuid. Cloud-init volumes (issue #84) carry
+        # no embedded metadata and always take the re-resolve path below.
         my $uuid = $metadata;
         _nvme_connect($scfg);
-        my $dev = _nvme_device_for_uuid($scfg, $uuid);
+        my $dev;
+        my $lookup_err;
+        if (defined $uuid) {
+            eval { $dev = _nvme_device_for_uuid($scfg, $uuid); };
+            $lookup_err = $@;
+        }
+        if (!$dev) {
+            # No embedded UUID, or the embedded one may be stale: re-resolve
+            # the current namespace via the shared helper (also the sole
+            # path for cloud-init volumes -- issue #84).
+            my $real_uuid = _resolve_nvme_uuid($scfg, $zname, undef);
+            if (!defined($uuid) || $real_uuid ne $uuid) {
+                $dev = _nvme_device_for_uuid($scfg, $real_uuid);
+            } else {
+                # UUID is unchanged: the original lookup already ran the
+                # full discovery/retry loop, so a second identical attempt
+                # would just repeat it. Bubble up the original diagnostic.
+                die $lookup_err if $lookup_err;
+                die "Could not locate NVMe device for UUID $uuid\n";
+            }
+        }
         return ($dev, $vmid, 'images');
 
     } else {
@@ -4829,7 +4925,9 @@ sub _alloc_image_iscsi {
 
     # 5) Return volname immediately — device discovery is deferred after lock release.
     # activate_volume handles authoritative device discovery before any VM uses the disk.
-    my $volname = "vol-$zname-lun$lun";
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
 
     # Defer local I/O operations (iSCSI login, rescan, device polling) to run after CFS lock release
     my $deferred_scfg = $scfg;  # capture for closure
@@ -4936,8 +5034,10 @@ sub _alloc_image_nvme {
     }
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
-    # Return volname immediately — defer connect + device discovery
-    my $volname = "vol-$zname-ns$device_uuid";
+    # Return volname immediately — defer connect + device discovery.
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
@@ -5048,13 +5148,19 @@ sub free_image {
     }
 
     # Level 2: Verbose - parsed details
-    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
+    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=" . ($metadata // 'none') . ", full_ds=$full_ds");
 
     # Dispatch to transport-specific deletion
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
-        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve one
+        # best-effort so _free_image_iscsi can still pre-clean the local
+        # SCSI device before the TrueNAS-side delete. Failure here must not
+        # block deletion (the zvol/extent lookup below is independent of
+        # LUN), so a failed resolve just leaves $lun undef as before.
+        my $lun = $metadata // eval { _resolve_iscsi_lun($scfg, $zname, undef) };
+        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun);
     } elsif ($mode eq 'nvme-tcp') {
         return _free_image_nvme($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
     } else {
@@ -5596,9 +5702,14 @@ sub _list_images_iscsi {
         my $lun = $tx->{lunid};
         next MAPPING if !defined $lun;
 
-        # Owner (vmid) from our naming convention
+        # Owner (vmid) from our naming convention. Must match both live
+        # disks (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
@@ -5606,8 +5717,9 @@ sub _list_images_iscsi {
             next MAPPING if !defined $owner || $owner != $vmid;
         }
 
-        # Compose plugin volname + volid
-        my $volname = "vol-$zname-lun$lun";
+        # Compose plugin volname + volid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
         my $volid   = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -5736,18 +5848,24 @@ sub _list_images_nvme {
         # are not Proxmox-managed volumes and must not appear in list_images.
         next if _is_snapshot_clone_zname($zname);
 
-        # Owner (vmid) from naming convention
+        # Owner (vmid) from naming convention. Must match both live disks
+        # (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
             next if !defined $owner || $owner != $vmid;
         }
 
-        # Compose volname using device_uuid
+        # Compose volname using device_uuid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
         my $device_uuid = $ns->{device_uuid} // next;
-        my $volname = "vol-$zname-ns$device_uuid";
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
         my $volid = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -6511,8 +6629,9 @@ sub activate_volume {
             usleep(UDEV_SETTLE_TIMEOUT_US);
         }
 
-        # Wait for the specific LUN device to appear (up to ~20s, configurable)
-        my $lun = $metadata;
+        # Wait for the specific LUN device to appear (up to ~20s, configurable).
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve by zname.
+        my $lun = _resolve_iscsi_lun($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for LUN $lun device");
         eval {
             my $dev = _device_for_lun($scfg, $lun);
@@ -6529,8 +6648,9 @@ sub activate_volume {
     } elsif ($mode eq 'nvme-tcp') {
         _nvme_connect($scfg);
 
-        # Wait for the specific namespace device to appear (up to 5s)
-        my $device_uuid = $metadata;
+        # Wait for the specific namespace device to appear (up to 5s).
+        # Cloud-init volumes (issue #84) carry no embedded UUID; resolve by zname.
+        my $device_uuid = _resolve_nvme_uuid($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
         eval {
             my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
