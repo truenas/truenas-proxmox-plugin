@@ -61,12 +61,21 @@ my %_portal_sync_last_ok;
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
+#
+# Every value here is decoded from a WebSocket/broker socket read, so under
+# Perl taint mode (-T, active in pveproxy/pvedaemon workers) it is tainted no
+# matter how it's reshaped in between. Untaint it here via regex capture --
+# the one place all call sites funnel through -- instead of leaving a tainted
+# scalar to later blow up wherever PVE core happens to exec() with it (e.g.
+# qemu-img create during clone/move-disk to non-TrueNAS storage; see #71,
+# and test_run5/truenas-2026-07-22 storage_plugin_disk_migration).
 sub _normalize_value {
     my ($v) = @_;
     return 0 if !defined $v;
-    return $v if !ref($v);
-    return $v->{parsed} // $v->{raw} // 0 if ref($v) eq 'HASH';
-    return 0;
+    $v = ($v->{parsed} // $v->{raw} // 0) if ref($v) eq 'HASH';
+    return 0 if ref($v) || !defined($v) || $v eq '';
+    return $1 if $v =~ /^(\d+)$/;
+    die "_normalize_value: unexpected non-numeric value '$v'\n";
 }
 
 # Performance and timing constants
@@ -227,6 +236,23 @@ sub _is_connection_error {
     # to be misclassified as non-retryable, which in turn cascaded into
     # preflight storms (see test_run3/truenas-2026-06-26).
     return $error =~ /timeout|timed out|connection refused|connection reset|broken pipe|network is unreachable|host is unreachable|temporary failure|service unavailable|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout|ssl.*error|connection.*failed|WS read|WS write|WS len|WS payload|WebSocket.*closed/i;
+}
+
+# TrueNAS validates the `disk` / `device_path` field on iscsi.extent.create
+# and nvmet.namespace.create by stat'ing the underlying /dev/zvol symlink.
+# Right after pool.snapshot.clone or pool.dataset.create returns success on
+# the ZFS side, that symlink may still be waiting on udev, so a same-call
+# create fails with either:
+#   [EINVAL] iscsi_extent_create.disk: Device '/dev/zvol/<ds>' ... does not exist
+#   [EINVAL] nvmet_namespace_create.device_path: ZVOL device_path must be a block device: zvol/<ds>
+# Both mean "come back in a moment". Match narrowly so a genuinely bad path
+# (typo in tn_dataset, deleted zvol) still fails fast.
+sub _is_zvol_not_ready_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return 1 if $error =~ /iscsi_extent_create\.disk.*does not exist/i;
+    return 1 if $error =~ /nvmet_namespace_create\.device_path.*must be a block device/i;
+    return 0;
 }
 
 sub _is_not_found_error {
@@ -2411,7 +2437,24 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
     my $payload = {
         name => $extent_name // $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
     };
-    my $result = _api_call_mutate($scfg, 'iscsi.extent.create', [ $payload ]);
+    # Zvol-visibility retry: TN validates iscsi.extent.create by stat'ing
+    # /dev/zvol/<ds>; right after pool.snapshot.clone or pool.dataset.create
+    # returns, udev may not have materialized the symlink yet. Poll-retry on
+    # that specific validator error only, up to ~3 s.
+    my $result;
+    my $err;
+    my $max_zvol_wait_attempts = 15;
+    for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+        $result = eval { _api_call_mutate($scfg, 'iscsi.extent.create', [ $payload ]) };
+        $err = $@;
+        last if !$err;
+        last if !_is_zvol_not_ready_error($err);
+        _log($scfg, 1, 'info',
+            "[TrueNAS] _tn_extent_create: /dev/zvol/$full not visible yet " .
+            "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+        select(undef, undef, undef, 0.2);
+    }
+    die $err if $err;
     # Invalidate cache since extents list has changed
     _clear_cache(_cache_host_key($scfg)) if $result;
     return $result;
@@ -4759,14 +4802,31 @@ sub _alloc_image_iscsi {
     };
     my $extent_id;
     {
-        my $ext = eval {
-            _api_call_mutate(
-                $scfg,
-                'iscsi.extent.create',
-                [ $extent_payload ],
-            );
-        };
-        if (my $err = $@) {
+        # pool.dataset.create returns as soon as ZFS finishes, but TN validates
+        # iscsi.extent.create by stat'ing /dev/zvol/<ds> which udev may still
+        # be creating. Poll-retry on that specific validator error only, up to
+        # ~3 s. Same shape as _clone_image_iscsi -- the alloc path races less
+        # in practice but the window is identical, so cover it too.
+        my $ext;
+        my $err;
+        my $max_zvol_wait_attempts = 15;
+        for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+            $ext = eval {
+                _api_call_mutate(
+                    $scfg,
+                    'iscsi.extent.create',
+                    [ $extent_payload ],
+                );
+            };
+            $err = $@;
+            last if !$err;
+            last if !_is_zvol_not_ready_error($err);
+            _log($scfg, 1, 'info',
+                "[TrueNAS] alloc_image_iscsi: /dev/zvol/$full_ds not visible yet " .
+                "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+            select(undef, undef, undef, 0.2);
+        }
+        if ($err) {
             # Cleanup: delete the zvol if extent creation failed. The nested
             # eval clobbers $@, so capture the original error first.
             eval { _tn_dataset_delete($scfg, $full_ds) };
@@ -4920,15 +4980,33 @@ sub _alloc_image_nvme {
 
     # Create namespace on TrueNAS (locked section — API calls only)
     my $subsys_id = _nvme_ensure_subsystem($scfg);
-    my $ns = eval {
-        _api_call_mutate($scfg, 'nvmet.namespace.create', [{
-            device_type => 'ZVOL',
-            device_path => $zvol_path,
-            subsys_id => $subsys_id,
-            enabled => JSON::PP::true,
-        }]);
+    my $ns_payload_alloc = {
+        device_type => 'ZVOL',
+        device_path => $zvol_path,
+        subsys_id => $subsys_id,
+        enabled => JSON::PP::true,
     };
-    if (my $err = $@) {
+
+    # pool.dataset.create returns as soon as ZFS finishes, but TN validates
+    # nvmet.namespace.create by checking that zvol/<ds> is a block device --
+    # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
+    # specific validator error only, up to ~3 s. Same shape as _clone_image_nvme.
+    my $ns;
+    my $ns_err;
+    my $max_zvol_wait_attempts = 15;
+    for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+        $ns = eval {
+            _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload_alloc ]);
+        };
+        $ns_err = $@;
+        last if !$ns_err;
+        last if !_is_zvol_not_ready_error($ns_err);
+        _log($scfg, 1, 'info',
+            "[TrueNAS] _alloc_image_nvme: $zvol_path not visible as block device yet " .
+            "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+        select(undef, undef, undef, 0.2);
+    }
+    if (my $err = $ns_err) {
         # Cleanup: delete the zvol if namespace creation failed. The nested
         # eval clobbers $@, so capture the original error first.
         eval { _tn_dataset_delete($scfg, $full_ds) };
@@ -6378,7 +6456,23 @@ sub _expose_snapshot_device {
                     device_path => $zvol_path,
                     device_type => 'ZVOL',
                 };
-                my $ns = _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+                # Zvol-visibility retry: right after _clone_snapshot_zvol
+                # returns, udev may not have created /dev/zvol/<ds> yet.
+                # Poll-retry on that specific validator error only, up to ~3 s.
+                my $ns;
+                my $ns_err;
+                my $max_zvol_wait_attempts = 15;
+                for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+                    $ns = eval { _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]) };
+                    $ns_err = $@;
+                    last if !$ns_err;
+                    last if !_is_zvol_not_ready_error($ns_err);
+                    _log($scfg, 1, 'info',
+                        "[TrueNAS] _expose_snapshot_device: $zvol_path not visible as block device yet " .
+                        "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+                    select(undef, undef, undef, 0.2);
+                }
+                die $ns_err if $ns_err;
                 $device_uuid = $ns->{device_uuid}
                     // die "No device_uuid returned from namespace creation\n";
                 # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
@@ -6687,14 +6781,31 @@ sub _clone_image_iscsi {
             insecure_tpc => JSON::PP::true,
         };
 
-        my $ext = eval {
-            _api_call_mutate(
-                $scfg,
-                'iscsi.extent.create',
-                [ $extent_payload ],
-            );
-        };
-        if (my $err = $@) {
+        # pool.snapshot.clone returns as soon as ZFS finishes the clone, but
+        # TN validates iscsi.extent.create by stat'ing /dev/zvol/<ds> which
+        # udev may still be creating. Poll-retry on that specific validator
+        # error only, up to ~3 s, so real errors still surface immediately.
+        # Observed at test_run5/truenas-2026-07-22 run-01 iteration 3.
+        my $ext;
+        my $err;
+        my $max_zvol_wait_attempts = 15;
+        for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+            $ext = eval {
+                _api_call_mutate(
+                    $scfg,
+                    'iscsi.extent.create',
+                    [ $extent_payload ],
+                );
+            };
+            $err = $@;
+            last if !$err;
+            last if !_is_zvol_not_ready_error($err);
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _clone_image_iscsi: /dev/zvol/$target_full not visible yet " .
+                "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+            select(undef, undef, undef, 0.2);
+        }
+        if ($err) {
             # Cleanup: delete the zvol clone if extent creation failed. The
             # nested eval clobbers $@, so capture the original error first.
             eval { _tn_dataset_delete($scfg, $target_full) };
@@ -6852,10 +6963,27 @@ sub _clone_image_nvme {
 
     _log($scfg, 1, 'info', "[TrueNAS] _clone_image_nvme: namespace payload = " . encode_json($ns_payload));
 
-    my $ns = eval {
-        _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
-    };
-    if (my $err = $@) {
+    # pool.snapshot.clone returns as soon as ZFS finishes, but TN validates
+    # nvmet.namespace.create by checking that zvol/<ds> is a block device --
+    # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
+    # specific validator error only, up to ~3 s, so real errors still surface
+    # immediately. Mirror of the iSCSI clone path.
+    my $ns;
+    my $ns_err;
+    my $max_zvol_wait_attempts = 15;
+    for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+        $ns = eval {
+            _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload ]);
+        };
+        $ns_err = $@;
+        last if !$ns_err;
+        last if !_is_zvol_not_ready_error($ns_err);
+        _log($scfg, 1, 'info',
+            "[TrueNAS] _clone_image_nvme: zvol/$target_full not visible as block device yet " .
+            "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+        select(undef, undef, undef, 0.2);
+    }
+    if (my $err = $ns_err) {
         # Cleanup: delete the zvol clone if namespace creation failed. The
         # nested eval clobbers $@, so capture the original error first.
         eval { _tn_dataset_delete($scfg, $target_full) };
