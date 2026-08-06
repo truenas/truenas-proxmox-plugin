@@ -2924,8 +2924,11 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
-    # attempt direct login for any extra portals not already in -m node
-    for my $p (@extra) {
+    # attempt direct login for any configured portal not already in -m node.
+    # $primary must get the same guaranteed fallback as @extra, otherwise it
+    # silently ends up with no session if sendtargets discovery from it alone
+    # doesn't produce a matching node record (issue #91).
+    for my $p ($primary, @extra) {
         # Skip login if this portal is already connected
         next if _portal_connected($scfg, $p, \@session_lines);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],

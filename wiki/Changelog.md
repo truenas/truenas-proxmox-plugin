@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.23 (August 5, 2026)
+
+### Bug Fixes
+
+- **Fix iSCSI discovery portal never establishing a session in multipath configs (#91)**: `_iscsi_login_all` gave every `tn_portals` entry a guaranteed fallback `--login` attempt, but `tn_discovery_portal` only got logged in if it happened to appear in the node list produced by sendtargets discovery. When discovery from the primary portal didn't yield a matching node record, the discovery portal silently ended up with no active session while the additional portals connected normally — reproduced live on the test cluster: with `tn_discovery_portal` and `tn_portals` set to distinct IPs (the documented multipath example), only the `tn_portals` IP connected. The fallback login loop now covers `$primary` the same as `@extra`, so both portals get the same guaranteed retry.
+
 ## Version 2.1.22 (July 21, 2026)
 
 ### Bug Fixes
