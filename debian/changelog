@@ -1,4 +1,4 @@
-truenas-proxmox-plugin (2.1.22) unstable; urgency=high
+truenas-proxmox-plugin (2.1.22+deb1) unstable; urgency=high
 
   * Fix pool.dataset.create crash on TrueNAS 25.10.4 (#58, #65, #78).
     Both create call sites (_tn_dataset_create and alloc_image's inline
@@ -34,6 +34,35 @@ truenas-proxmox-plugin (2.1.22) unstable; urgency=high
     forwarding a tainted or malformed scalar.
 
  -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 21 Jul 2026 00:00:00 +0000
+truenas-proxmox-plugin (2.1.21~alpha2) unstable; urgency=medium
+
+  * Untaint TrueNAS API scalars in _normalize_value (fixes disk-migration
+    regression seen in test_run5/truenas-2026-07-22, "Insecure dependency
+    in exec while running with -T switch at IPC/Open3.pm line 176"). Ports
+    the fix from #71 that never landed on the alpha lineage. Every value
+    decoded from a WS/broker read is tainted under -T, so volsize would
+    flow tainted into qemu-img create argv during any move-disk to a
+    non-TrueNAS target. Untaint via regex capture in the single funnel
+    point; die on non-numeric input instead of silently forwarding.
+  * Retry iscsi.extent.create and nvmet.namespace.create on the specific
+    zvol-not-ready validator errors (fixes the 1/20 linked-clone failure
+    in test_run5). pool.snapshot.clone / pool.dataset.create returns as
+    soon as ZFS is done, but TN validates the create call by stat'ing
+    /dev/zvol/<ds>, and udev may still be materializing the symlink.
+    New narrow classifier _is_zvol_not_ready_error matches only the two
+    validator strings so genuinely bad paths still fail immediately. Up
+    to 15 x 200 ms wait applied at every live create site: _tn_extent_create,
+    alloc_image (iSCSI + NVMe), _expose_snapshot_device NVMe, and both
+    _clone_image_* paths.
+  * Broker URL construction correctness: mirror TrueNASPlugin.pm's scheme
+    normalization (https -> wss, http -> ws) and honor prefer_ipv4 via a
+    new _host_ipv4 helper. Prior broker took api_scheme raw, so a config
+    with tn_api_scheme=https would silently fall through to plain TCP and
+    the WS handshake would 400; and although the wire schema always
+    listed prefer_ipv4 the broker never read it, so the OS resolver could
+    pick AAAA on a dual-stack TN even after the plugin resolved A.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 23 Jul 2026 00:00:00 +0000
 
 truenas-proxmox-plugin (2.1.21~alpha1) unstable; urgency=medium
 
