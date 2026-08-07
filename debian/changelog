@@ -1,3 +1,59 @@
+truenas-proxmox-plugin (2.1.23~alpha1) unstable; urgency=medium
+
+  * Idempotent iSCSI extent + NVMe namespace create in alloc_image
+    (Fix 1). _alloc_image_iscsi and _alloc_image_nvme now check whether
+    an extent / namespace already targets the same zvol path and reuse
+    its id instead of colliding on the deterministic
+    _generate_extent_name hash. Mirrors the reuse pattern the clone
+    paths already had.
+  * Post-hoc reuse on iSCSI extent name-conflict (Fix B, on top of Fix
+    1). New classifier _is_extent_name_conflict_error matches the TN
+    uniqueness rejection ("iscsi_extent_create.name: Extent name must
+    be unique"). At three iSCSI create sites -- alloc_image,
+    clone_image, and the _tn_extent_create helper used by the
+    snapshot-expose path -- if the create returns that specific error,
+    query iscsi.extent.query by disk path and reuse the extent id if a
+    match is found. Catches two failure modes Fix 1's up-front check
+    cannot handle: (1) a concurrent path that committed the same
+    extent between our pre-check and our create call, and (2) an
+    _api_call_mutate retry that fired on a connection failure whose
+    first attempt actually committed server-side (the retry then sees
+    "name must be unique" from its own prior commit). NVMe/TCP does
+    not need Fix B: TN's nvmet uniqueness is per-NSID (server-
+    assigned), not on device_path, so the analogous self-race does not
+    manifest as a "must be unique" error.
+  * Serialize volume_snapshot, volume_snapshot_delete, and
+    volume_snapshot_rollback via $class->cluster_lock_storage. PVE
+    core's Storage.pm wraps vdisk_alloc / vdisk_free / vdisk_clone /
+    vdisk_create_base in cluster_lock_storage (Storage.pm:1090, 1113,
+    1170, 1198) but dispatches the three snapshot methods directly
+    (Storage.pm:428, 443, 459). Two cluster nodes calling qm snapshot
+    on the same volume otherwise raced on the TN pool.snapshot.create
+    call, and rollback especially is dangerous unlocked because
+    recursive=1 destroys newer snapshots as a side effect. Closes the
+    fork()-or-similar-circumventing-locks gap Max R. Carrara (Proxmox)
+    flagged in the 2026-08-06 cluster-test writeup.
+  * Tests: t/rate-limit/11-alloc-extent-namespace-reuse.t seeds the
+    extent-orphan-past-zvol-delete scenario and verifies TN cascade-
+    deletes the extent (regression check on the TN behavior our fix
+    assumptions depend on). t/rate-limit/12-fix-b-extent-name-conflict.t
+    runs a two-tier verification of Fix B: classifier unit tests (no
+    TN needed) plus a real-TN uniqueness rejection + recovery lookup.
+  * Whether these fixes actually resolve the "Extent name must be
+    unique" cascade Max observed in test_run5/truenas-2026-08-06 is
+    unproven at ship time; his default tn_debug=0 level gates the
+    retry log lines that would otherwise confirm or deny the
+    _api_call_mutate self-retry theory. All three fixes ship as
+    tolerance / defense-in-depth regardless.
+  * An earlier iteration wrapped alloc_image / free_image /
+    clone_image / create_base themselves in cluster_lock_storage;
+    reverted after PVE core proved to already wrap them and
+    cfs_lock_storage is not re-entrant (the inner wrap deadlocked
+    every mutation with a 15 s "got lock request timeout"). The
+    current release only wraps the three snapshot methods.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 07 Aug 2026 15:00:00 +0000
+
 truenas-proxmox-plugin (2.1.22+deb1) unstable; urgency=high
 
   * Fix pool.dataset.create crash on TrueNAS 25.10.4 (#58, #65, #78).

@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.22';
+our $VERSION = '2.1.23~alpha1';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -252,6 +252,21 @@ sub _is_zvol_not_ready_error {
     return 1 if $error =~ /iscsi_extent_create\.disk.*does not exist/i;
     return 1 if $error =~ /nvmet_namespace_create\.device_path.*must be a block device/i;
     return 0;
+}
+
+# iSCSI extent name has a TN-side unique constraint. `iscsi.extent.create`
+# with a name that already exists returns:
+#   [EINVAL] iscsi_extent_create.name: Extent name must be unique
+# Callers that get this on a create for a zvol_path they own should look
+# up the existing extent by disk path and reuse it (idempotent recovery):
+# the collision can arise from a concurrent path that created it, or from
+# a retry that self-races with its own already-committed first attempt
+# (an _api_call_mutate retry fires on connection errors even when the
+# mutation succeeded server-side before the response was lost).
+sub _is_extent_name_conflict_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return $error =~ /iscsi_extent_create\.name.*must be unique/i;
 }
 
 sub _is_not_found_error {
@@ -2103,70 +2118,88 @@ sub volume_resize {
 # Note: vmstate is handled automatically by Proxmox through standard volume allocation
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snapname, $vmstate) = @_;
-    my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
-    my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: creating $snap_full");
+    # PVE's Storage.pm dispatches volume_snapshot, volume_snapshot_delete,
+    # and volume_snapshot_rollback WITHOUT wrapping in cluster_lock_storage
+    # (Storage.pm:428, 443, 459 -- unlike vdisk_alloc/free/clone/create_base
+    # which are wrapped at Storage.pm:1090, 1113, 1170, 1198). Two cluster
+    # nodes calling `qm snapshot` on the same volume otherwise race on the
+    # TN-side pool.snapshot.create -- name-uniqueness rejects one and can
+    # leave inconsistent state. Take a cfs cluster-wide lock here to close
+    # the gap Max R. Carrara (Proxmox) flagged in the 2026-08-06 cluster-
+    # test writeup ("if you fork() or similar somewhere, you might be
+    # circumventing some locks").
+    return $class->cluster_lock_storage($storeid, 1, undef, sub {
+        my (undef, $zname) = $class->parse_volname($volname);
+        my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+        my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
 
-    # Create ZFS snapshot for the disk
-    my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
-    my $result = _api_call_mutate(
-        $scfg, 'pool.snapshot.create', [ $payload ],
-    );
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: creating $snap_full");
 
-    # Handle potential async job for snapshot creation
-    my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot creation for $snap_full");
-    if (!$job_result->{success}) {
-        _log($scfg, 0, 'err', "[TrueNAS] volume_snapshot: failed to create $snap_full: " . $job_result->{error});
-        die $job_result->{error};
-    }
+        # Create ZFS snapshot for the disk
+        my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
+        my $result = _api_call_mutate(
+            $scfg, 'pool.snapshot.create', [ $payload ],
+        );
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: created $snap_full");
+        # Handle potential async job for snapshot creation
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "snapshot creation for $snap_full");
+        if (!$job_result->{success}) {
+            _log($scfg, 0, 'err', "[TrueNAS] volume_snapshot: failed to create $snap_full: " . $job_result->{error});
+            die $job_result->{error};
+        }
 
-    # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
-    # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage
-    # - If vmstate_storage is 'local': Proxmox stores vmstate on local filesystem
-    # Our plugin only needs to handle the disk snapshot creation
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: created $snap_full");
 
-    return undef;
+        # Note: vmstate ($vmstate parameter) is handled automatically by Proxmox:
+        # - If vmstate_storage is 'shared': Proxmox creates vmstate volumes on this storage
+        # - If vmstate_storage is 'local': Proxmox stores vmstate on local filesystem
+        # Our plugin only needs to handle the disk snapshot creation
+
+        return undef;
+    });
 }
 
 # Delete a ZFS snapshot on the zvol.
 # Note: vmstate cleanup is handled automatically by Proxmox
 sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    my (undef, $zname) = $class->parse_volname($volname);
-    my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
-    my $snap_full = $full . '@' . $snapname;    # full snapshot name
-    my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
+    # PVE core does not wrap volume_snapshot_delete in cluster_lock_storage;
+    # take the lock here. See the comment on volume_snapshot above.
+    return $class->cluster_lock_storage($storeid, 1, undef, sub {
+        my (undef, $zname) = $class->parse_volname($volname);
+        my $full = $scfg->{tn_dataset} . '/' . $zname; # pool/dataset/.../vm-<id>-disk-<n>
+        my $snap_full = $full . '@' . $snapname;    # full snapshot name
+        my $id = URI::Escape::uri_escape($snap_full); # '@' must be URL-encoded in path
 
-    # Tear down any ephemeral vzdump snapshot clone before deleting the ZFS
-    # snapshot (issue #42). PVE's LXC vzdump path unmounts then calls
-    # volume_snapshot_delete directly — it never calls deactivate_volume with a
-    # snapname — so the clone would otherwise be orphaned. A clone also holds the
-    # snapshot as its origin, blocking the snapshot delete below until removed.
-    # Best-effort: _teardown_snapshot_device is idempotent and no-ops when no
-    # clone exists.
-    if (defined($snapname) && $snapname ne '') {
-        eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
-        warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
-    }
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleting $snap_full");
 
-    my $result = _api_call_mutate(
-        $scfg, 'pool.snapshot.delete', [ $snap_full ],
-    );
+        # Tear down any ephemeral vzdump snapshot clone before deleting the ZFS
+        # snapshot (issue #42). PVE's LXC vzdump path unmounts then calls
+        # volume_snapshot_delete directly — it never calls deactivate_volume with a
+        # snapname — so the clone would otherwise be orphaned. A clone also holds the
+        # snapshot as its origin, blocking the snapshot delete below until removed.
+        # Best-effort: _teardown_snapshot_device is idempotent and no-ops when no
+        # clone exists.
+        if (defined($snapname) && $snapname ne '') {
+            eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+            warn "[TrueNAS] volume_snapshot_delete: snapshot clone teardown failed: $@\n" if $@;
+        }
 
-    # Handle potential async job for snapshot deletion
-    my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", SNAPSHOT_DELETE_TIMEOUT_S);
-    if (!$job_result->{success}) {
-        die $job_result->{error};
-    }
+        my $result = _api_call_mutate(
+            $scfg, 'pool.snapshot.delete', [ $snap_full ],
+        );
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleted $snap_full");
-    return undef;
+        # Handle potential async job for snapshot deletion
+        my $job_result = _handle_api_result_with_job_support($scfg, $result, "individual snapshot deletion for $snap_full", SNAPSHOT_DELETE_TIMEOUT_S);
+        if (!$job_result->{success}) {
+            die $job_result->{error};
+        }
+
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_delete: deleted $snap_full");
+        return undef;
+    });
 }
 
 # Roll back the zvol to a specific ZFS snapshot and rescan iSCSI/multipath.
@@ -2207,11 +2240,17 @@ sub volume_rollback_is_possible {
 
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snapname) = @_;
-    my (undef, $zname, $vmid) = $class->parse_volname($volname);
-    my $full = $scfg->{tn_dataset} . '/' . $zname;
-    my $snap_full = $full . '@' . $snapname;
 
-    _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolling back to $snap_full");
+    # PVE core does not wrap volume_snapshot_rollback in cluster_lock_storage;
+    # take the lock here. See the comment on volume_snapshot above. Rollback
+    # is especially sensitive to concurrent execution because it destroys
+    # newer snapshots as a side effect (recursive=1 below).
+    return $class->cluster_lock_storage($storeid, 1, undef, sub {
+        my (undef, $zname, $vmid) = $class->parse_volname($volname);
+        my $full = $scfg->{tn_dataset} . '/' . $zname;
+        my $snap_full = $full . '@' . $snapname;
+
+        _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolling back to $snap_full");
 
     # Get list of snapshots that exist BEFORE rollback
     my $pre_rollback_snaps = {};
@@ -2269,7 +2308,8 @@ sub volume_snapshot_rollback {
     eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
 
     _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot_rollback: rolled back to $snap_full");
-    return undef;
+        return undef;
+    });
 }
 
 # Return a hash describing available snapshots for this volume.
@@ -2423,8 +2463,9 @@ sub _resolve_extent_by_disk($scfg, $zname) {
 }
 
 sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
+    my $zvol_path = "zvol/$full";
     my $payload = {
-        name => $extent_name // $zname, type => 'DISK', disk => "zvol/$full", insecure_tpc => JSON::PP::true,
+        name => $extent_name // $zname, type => 'DISK', disk => $zvol_path, insecure_tpc => JSON::PP::true,
     };
     # Zvol-visibility retry: TN validates iscsi.extent.create by stat'ing
     # /dev/zvol/<ds>; right after pool.snapshot.clone or pool.dataset.create
@@ -2442,6 +2483,20 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
             "[TrueNAS] _tn_extent_create: /dev/zvol/$full not visible yet " .
             "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
         select(undef, undef, undef, 0.2);
+    }
+    # Fix B: post-hoc reuse on unique-name conflict. See classifier
+    # comment on _is_extent_name_conflict_error above.
+    if ($err && _is_extent_name_conflict_error($err)) {
+        _clear_cache(_cache_host_key($scfg));
+        my $extents_after = _tn_extents($scfg) // [];
+        my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
+        if ($hit) {
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _tn_extent_create: name-conflict resolved by reuse " .
+                "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
+            $result = $hit;
+            $err = '';
+        }
     }
     die $err if $err;
     # Invalidate cache since extents list has changed
@@ -4720,7 +4775,27 @@ sub _alloc_image_iscsi {
         insecure_tpc => JSON::PP::true, # typical default for modern OS initiators
     };
     my $extent_id;
+
+    # Idempotency: if an extent already points at this exact zvol path,
+    # reuse it instead of colliding on the deterministic extent name.
+    # Extent orphans from a prior failed free_image (or a concurrent
+    # cluster node that got there first) otherwise brick every retry --
+    # test_run5/truenas-2026-08-06 3-node cluster runs surfaced this as a
+    # cascade of "iscsi_extent_create.name: Extent name must be unique"
+    # failures that persisted across every subsequent iteration.
+    # _clone_image_iscsi already applies the same check; align the alloc
+    # path with it.
     {
+        my $extents_idx = _tn_extents($scfg) // [];
+        my ($existing_extent) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_idx;
+        if ($existing_extent) {
+            $extent_id = $existing_extent->{id};
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _alloc_image_iscsi: reusing existing extent id=$extent_id for $zvol_path");
+        }
+    }
+
+    if (!defined $extent_id) {
         # pool.dataset.create returns as soon as ZFS finishes, but TN validates
         # iscsi.extent.create by stat'ing /dev/zvol/<ds> which udev may still
         # be creating. Poll-retry on that specific validator error only, up to
@@ -4744,6 +4819,24 @@ sub _alloc_image_iscsi {
                 "[TrueNAS] alloc_image_iscsi: /dev/zvol/$full_ds not visible yet " .
                 "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
             select(undef, undef, undef, 0.2);
+        }
+        # Fix B: post-hoc reuse on unique-name conflict. If the create
+        # returned "name must be unique", the extent may already exist --
+        # either because a concurrent path won the race, or because our
+        # own _api_call_mutate retried a connection failure whose first
+        # attempt actually committed server-side. Look up by disk path;
+        # if it matches, reuse the id instead of dying.
+        if ($err && _is_extent_name_conflict_error($err)) {
+            _clear_cache(_cache_host_key($scfg));  # force fresh view
+            my $extents_after = _tn_extents($scfg) // [];
+            my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
+            if ($hit) {
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] _alloc_image_iscsi: name-conflict resolved by reuse " .
+                    "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
+                $ext = $hit;
+                $err = '';
+            }
         }
         if ($err) {
             # Cleanup: delete the zvol if extent creation failed. The nested
@@ -4904,30 +4997,45 @@ sub _alloc_image_nvme {
         enabled => JSON::PP::true,
     };
 
-    # pool.dataset.create returns as soon as ZFS finishes, but TN validates
-    # nvmet.namespace.create by checking that zvol/<ds> is a block device --
-    # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
-    # specific validator error only, up to ~3 s. Same shape as _clone_image_nvme.
     my $ns;
     my $ns_err;
-    my $max_zvol_wait_attempts = 15;
-    for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
-        $ns = eval {
-            _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload_alloc ]);
-        };
-        $ns_err = $@;
-        last if !$ns_err;
-        last if !_is_zvol_not_ready_error($ns_err);
+
+    # Idempotency: if a namespace already points at this exact zvol path,
+    # reuse it instead of creating a duplicate. Matches the extent-reuse
+    # check on the iSCSI side and defuses orphans left by a prior failed
+    # free_image (or a concurrent cluster node that got there first).
+    my $existing_ns = _nvme_namespaces_for_device_path($scfg, $zvol_path) // [];
+    if (@$existing_ns) {
+        $ns = $existing_ns->[0];
         _log($scfg, 1, 'info',
-            "[TrueNAS] _alloc_image_nvme: $zvol_path not visible as block device yet " .
-            "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
-        select(undef, undef, undef, 0.2);
+            "[TrueNAS] _alloc_image_nvme: reusing existing namespace uuid=" .
+            ($ns->{device_uuid} // '<unknown>') . " for $zvol_path");
     }
-    if (my $err = $ns_err) {
-        # Cleanup: delete the zvol if namespace creation failed. The nested
-        # eval clobbers $@, so capture the original error first.
-        eval { _tn_dataset_delete($scfg, $full_ds) };
-        die "Failed to create NVMe namespace for disk '$zname': $err\n";
+
+    if (!$ns) {
+        # pool.dataset.create returns as soon as ZFS finishes, but TN validates
+        # nvmet.namespace.create by checking that zvol/<ds> is a block device --
+        # the /dev/zvol symlink may still be waiting on udev. Poll-retry on that
+        # specific validator error only, up to ~3 s. Same shape as _clone_image_nvme.
+        my $max_zvol_wait_attempts = 15;
+        for (my $attempt = 1; $attempt <= $max_zvol_wait_attempts; $attempt++) {
+            $ns = eval {
+                _api_call_mutate($scfg, 'nvmet.namespace.create', [ $ns_payload_alloc ]);
+            };
+            $ns_err = $@;
+            last if !$ns_err;
+            last if !_is_zvol_not_ready_error($ns_err);
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _alloc_image_nvme: $zvol_path not visible as block device yet " .
+                "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
+            select(undef, undef, undef, 0.2);
+        }
+        if (my $err = $ns_err) {
+            # Cleanup: delete the zvol if namespace creation failed. The nested
+            # eval clobbers $@, so capture the original error first.
+            eval { _tn_dataset_delete($scfg, $full_ds) };
+            die "Failed to create NVMe namespace for disk '$zname': $err\n";
+        }
     }
     my $device_uuid = $ns->{device_uuid};
     unless ($device_uuid) {
@@ -6699,6 +6807,22 @@ sub _clone_image_iscsi {
                 "[TrueNAS] _clone_image_iscsi: /dev/zvol/$target_full not visible yet " .
                 "(attempt $attempt/$max_zvol_wait_attempts), waiting for udev");
             select(undef, undef, undef, 0.2);
+        }
+        # Fix B: post-hoc reuse on unique-name conflict; see the same
+        # pattern in _alloc_image_iscsi. Defuses both concurrent-path
+        # races and _api_call_mutate self-retry-after-committed-first-
+        # attempt for the linked-clone path.
+        if ($err && _is_extent_name_conflict_error($err)) {
+            _clear_cache(_cache_host_key($scfg));
+            my $extents_after = _tn_extents($scfg) // [];
+            my ($hit) = grep { ($_->{disk} // '') eq $zvol_path } @$extents_after;
+            if ($hit) {
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] _clone_image_iscsi: name-conflict resolved by reuse " .
+                    "id=$hit->{id} for $zvol_path (Fix B post-hoc)");
+                $ext = $hit;
+                $err = '';
+            }
         }
         if ($err) {
             # Cleanup: delete the zvol clone if extent creation failed. The
