@@ -13,6 +13,7 @@ Official wiki home: <https://github.com/truenas/truenas-proxmox-plugin/wiki>
 
 ### Configuration
 - **[Configuration Reference](Configuration.md)** - Complete reference for all configuration parameters with examples for different use cases
+- **[Best Practices](Best-Practices.md)** - Prescriptive operational guidance: install path, broker requirement, ZFS layout, transport choice, HA tuning, templates, security, worked storage.cfg examples
 - **[NVMe Setup Guide](NVMe-Setup.md)** - NVMe/TCP transport configuration, DH-HMAC-CHAP authentication, and namespace management
 - **[Minimum API Permissions](API-Permissions.md)** - Least-privilege TrueNAS role set for the API user, verified method-by-method against TrueNAS RBAC
 
