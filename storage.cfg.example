@@ -183,6 +183,10 @@ truenasplugin: truenas-nvme-multipath
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.10.100:4420
     tn_portals 192.168.10.101:4420,192.168.10.102:4420
+    # Hand path maintenance to the kernel: retry a lost controller forever rather
+    # than letting the 600s default remove it after a long outage.
+    tn_nvme_ctrl_loss_tmo -1
+    tn_nvme_reconnect_delay 5
     content images
     shared 1
     tn_zvol_blocksize 128K

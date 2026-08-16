@@ -22,6 +22,17 @@ The test suite is included in the plugin repository:
 tools/dev-truenas-plugin-full-function-test.sh
 ```
 
+Two smaller suites live alongside it:
+
+```
+t/rate-limit/    # regression tests for the rate-limit defects; needs a real
+                 # TrueNAS and a configured storage (see t/rate-limit/README.md)
+t/nvme/          # offline unit tests; needs neither. Run with: prove -v t/nvme/
+```
+
+`t/nvme/` builds a fixture sysfs tree rather than talking to any hardware, so it
+runs anywhere the plugin's Perl dependencies are present.
+
 ## Prerequisites
 
 ### Required

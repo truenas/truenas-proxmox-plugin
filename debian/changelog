@@ -1,3 +1,99 @@
+truenas-proxmox-plugin (2.1.24~alpha1) unstable; urgency=medium
+
+  * NVMe/TCP: restore missing portals instead of stopping at the first live
+    path. _nvme_connect() returned as soon as any live controller existed for
+    the subsystem, so with more than one portal configured, a portal that was
+    down during the initial connect was never re-added while another stayed
+    up: the node ran on a single path indefinitely with nothing reporting it.
+    Reconciliation now runs from status(), on pvestatd's timer, so it can
+    never delay a VM start; the eleven hot call sites keep the original cheap
+    behaviour and, while any path is live, only report a missing portal
+    instead of reconnecting it.
+  * NVMe/TCP: controller state is read from sysfs rather than parsed out of
+    `nvme list-subsys`. The subsystem is matched with eq against each
+    controller's subsysnqn, so "...:pve" no longer claims the controllers of
+    "...:pve-backup" - with a common prefix that silently reproduced the bug
+    above. No process is forked on the healthy path.
+  * NVMe/TCP: new tn_nvme_ctrl_loss_tmo, tn_nvme_reconnect_delay and
+    tn_nvme_keep_alive_tmo options, all optional and unset by default. With
+    tn_nvme_ctrl_loss_tmo -1 the kernel maintains paths itself; the kernel
+    default of 600 otherwise removes a controller after a ten-minute outage.
+    A value of 0 is rejected in check_config: it removes the controller on the
+    first error without retrying, which is worse than the default it overrides.
+  * NVMe/TCP: _nvme_find_controllers_for_subsystem() compared the raw
+    configured host against the numeric traddr sysfs reports, so a storage
+    configured by hostname matched nothing and the function returned an empty
+    list. It now uses the same key machinery as the reconciler.
+  * NVMe/TCP: canonicalise IPv4 as well as IPv6 when building portal keys; a
+    config entry such as 192.000.002.010 previously keyed differently from the
+    identical address in sysfs, leaving a phantom portal reconnected on every
+    poll.
+  * NVMe/TCP: anchor traddr= with a word boundary so host_traddr= is not
+    matched as the target address.
+  * NVMe/TCP: a hard timeout on `nvme connect`, and udevadm settle is only
+    paid when something actually attached.
+  * _nvme_sync_portals() stamped its cache TTL even when a port create had
+    failed, hiding the failure for a full window - exactly when the initiator
+    is retrying a portal the target has not published yet.
+  * Empty portal entries (a trailing comma in tn_portals) and ports with
+    leading zeros no longer reach the untainters and abort the connect.
+  * Repair mode always honours the per-portal backoff, including when nothing
+    is live at all. Bypassing it there meant a target that was entirely down had
+    every status() poll attempt every portal, each bounded by the connect
+    timeout, indefinitely - stalling pvestatd for every storage on the node. The
+    hot path keeps the bypass, since that call decides whether a VM gets a disk.
+  * A portal configured by name that cannot currently be resolved is tracked
+    separately from one whose controller the kernel is retrying. It cannot be
+    matched against the numeric traddr sysfs reports, so treating it as absent
+    fired a connect at a healthy subsystem from the hot path - but treating it
+    as recovering was worse, since with no controller at all the reconciler then
+    neither connected nor failed, turning a total outage into a silent success.
+    _nvme_connect() now fails when the subsystem has no controller whatsoever,
+    whatever the portals resolve to, which the callers that are not wrapped in
+    eval depend on.
+  * The hot path no longer resolves names at all: it answers from the memo or
+    treats the portal as unknown. getaddrinfo is synchronous, and a wedged
+    resolver costs more than the connect this code deliberately refuses to make
+    there - and resolver failures correlate with the outage being diagnosed.
+    Failed lookups are memoized for 10s rather than the full 300s.
+  * The redundancy count is taken per configured portal, matching its
+    denominator. Counting every live controller of the subsystem instead
+    included ones belonging to a portal since removed from tn_portals, and
+    reported two of two with a single usable path.
+  * Portal addresses with a leading-zero octet are rejected in check_config,
+    in NVMe/TCP mode only so that existing iSCSI configurations keep parsing.
+    This plugin normalises 192.000.002.010 to 192.0.2.10 for key matching while
+    nvme connect hands the raw string to inet_aton, where 010 is octal eight - a
+    different host, whose controller could never match its own configuration.
+  * The reduced-redundancy warnings are emitted at log level 0. tn_debug
+    defaults to 0 and _log drops anything above it, so a level 1 warning was
+    invisible on a default install - which would have left the path loss this
+    change exists to surface just as silent as before. The throttle is what
+    keeps level 0 from being noisy, and the two warnings no longer share a
+    throttle key: storage_info() calls activate_storage and then status in one
+    process, so a shared key let one demote the other to debug.
+  * A resolution memo entry that has been failing for a full TTL drops its last
+    known addresses instead of keeping them forever, so a portal that changed
+    address while the resolver was down stops being matched against an address
+    it no longer has.
+  * Per-portal backoff and the degraded-redundancy throttle are keyed by
+    subsystem rather than by API host, so one storage cannot suppress another
+    sharing the same NAS, and both survive a clock step backwards.
+  * The redundancy summary recounts live controllers from sysfs instead of
+    adding up connect attempts. `nvme connect` returns as soon as the controller
+    exists, which may be in connecting, so counting attempts could report all
+    portals live with one controller - and suppress the very warning this change
+    adds.
+  * Repair attempts are rate limited per portal (60s) and the reduced-redundancy
+    warning is throttled (300s); a failed connect also drops the target-side
+    portal-sync TTL so the next activation re-syncs instead of trusting it.
+  * Portals configured by hostname are resolved for key matching only, memoized
+    for 300s. The address passed to nvme connect is still the configured one.
+  * Add t/nvme/, offline unit tests that build a fixture sysfs tree and need
+    neither TrueNAS nor a configured storage.
+
+ -- Alfonso Kuen <alfonsok@gmail.com>  Sun, 16 Aug 2026 20:30:00 +0000
+
 truenas-proxmox-plugin (2.1.23~alpha1) unstable; urgency=medium
 
   * Idempotent iSCSI extent + NVMe namespace create in alloc_image
