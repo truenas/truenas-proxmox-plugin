@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23~alpha1';
+our $VERSION = '2.1.24~alpha1';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -566,6 +566,26 @@ sub properties {
                           "see issue #48). Set manually if TrueNAS reports queue limit errors.",
             type => 'integer', optional => 1, minimum => 1, maximum => 256,
         },
+        tn_nvme_ctrl_loss_tmo => {
+            description => "Seconds the kernel keeps retrying a failed NVMe/TCP controller " .
+                          "before giving up and removing it (nvme connect --ctrl-loss-tmo). " .
+                          "Use -1 to retry forever. When unset the kernel default of 600 applies, " .
+                          "which permanently drops a path whose fabric stays down for over ten " .
+                          "minutes. Recommended for multi-portal setups, where silently losing a " .
+                          "path is worse than retrying indefinitely.",
+            type => 'integer', optional => 1, minimum => -1, maximum => 3600,
+        },
+        tn_nvme_reconnect_delay => {
+            description => "Seconds between reconnect attempts for a failed NVMe/TCP controller " .
+                          "(nvme connect --reconnect-delay). Kernel default is 10.",
+            type => 'integer', optional => 1, minimum => 1, maximum => 3600,
+        },
+        tn_nvme_keep_alive_tmo => {
+            description => "NVMe/TCP keep-alive timeout in seconds " .
+                          "(nvme connect --keep-alive-tmo). Lower values detect a dead path " .
+                          "sooner, at the cost of more keep-alive traffic.",
+            type => 'integer', optional => 1, minimum => 1, maximum => 3600,
+        },
     };
 }
 sub options {
@@ -641,6 +661,9 @@ sub options {
 
         # NVMe/TCP queue tuning
         tn_nr_io_queues => { optional => 1 },
+        tn_nvme_ctrl_loss_tmo   => { optional => 1 },
+        tn_nvme_reconnect_delay => { optional => 1 },
+        tn_nvme_keep_alive_tmo  => { optional => 1 },
     };
 }
 
@@ -686,6 +709,42 @@ sub check_config {
     }
 
     # Validate retry configuration parameters
+    # ctrl_loss_tmo 0 means "give up on the first error": the controller is
+    # removed without a single retry, which is strictly worse than the kernel
+    # default of 600 that this option exists to override. -1 (retry forever) and
+    # any positive value are the useful settings, so the schema minimum of -1
+    # alone is not enough to express it.
+    # A dotted quad with a leading-zero octet is read two different ways by the
+    # two layers that see it: this plugin normalises 192.000.002.010 to
+    # 192.0.2.10 for key matching, while nvme connect hands the raw string to
+    # inet_aton, where 010 is octal eight - a different host. The connection
+    # would then never match its own configuration and be reconnected forever.
+    # Rejecting is right; picking one of the two readings is not.
+    for my $portal_key (($opts->{tn_transport_mode} // '') eq 'nvme-tcp'
+                        ? qw(tn_discovery_portal tn_portals) : ()) {
+        next if !defined $opts->{$portal_key};
+        for my $portal (split(/\s*,\s*/, $opts->{$portal_key})) {
+            # Trim as _nvme_configured_portals() does, or a leading space on the
+            # whole list hides the first entry from this check while the runtime
+            # still uses it.
+            $portal =~ s/^\s+|\s+$//g;
+            next if $portal eq '';
+            my ($portal_host) = _nvme_parse_portal($portal);
+            next if !defined($portal_host);
+            next if $portal_host !~ /^[0-9]+(?:\.[0-9]+){3}$/;
+            die "$portal_key: portal '$portal' has a leading-zero octet; write "
+              . "the address in plain decimal, since nvme connect would read it "
+              . "as octal\n"
+                if $portal_host =~ /(?:^|\.)0[0-9]/;
+        }
+    }
+
+    if (defined($opts->{tn_nvme_ctrl_loss_tmo}) && $opts->{tn_nvme_ctrl_loss_tmo} == 0) {
+        die "tn_nvme_ctrl_loss_tmo must be -1 (retry forever) or a positive "
+          . "number of seconds; 0 disables reconnection entirely
+";
+    }
+
     if (defined $opts->{tn_api_retry_max}) {
         die "tn_api_retry_max must be between 0 and 10 (got $opts->{tn_api_retry_max})\n"
             if $opts->{tn_api_retry_max} < 0 || $opts->{tn_api_retry_max} > 10;
@@ -3255,6 +3314,24 @@ sub _nvme_untaint_cli_port {
     die "Invalid NVMe portal port '$value'\n";
 }
 
+# Untaint a signed integer destined for the nvme(1) command line. $min bounds the
+# value: ctrl-loss-tmo accepts -1 (retry forever), the other options do not.
+sub _nvme_untaint_cli_int {
+    my ($value, $label, $min) = @_;
+    $label //= 'NVMe integer option';
+    $min   //= 0;
+
+    die "Invalid $label: missing value\n"
+        if !defined($value) || $value eq '';
+
+    if ($value =~ /^(-?\d{1,7})$/) {
+        my $n = $1;
+        return $n if $n >= $min;
+    }
+
+    die "Invalid $label '$value' (minimum $min)\n";
+}
+
 sub _nvme_untaint_cli_nqn {
     my ($value, $label, $require_identifier) = @_;
     $label //= 'NVMe NQN';
@@ -3287,30 +3364,13 @@ sub _nvme_untaint_cli_secret {
     die "Invalid $label\n";
 }
 
-# Check if connected to a subsystem
+# Check if connected to a subsystem (any live path at all).
+# Thin view over _nvme_controller_portals(), so controller state is read from
+# sysfs in exactly one place in this file.
 sub _nvme_is_connected {
     my ($scfg) = @_;
-    my $nqn = $scfg->{tn_subsystem_nqn};
-
-    my $in_our_subsys = 0;
-    my $connected = 0;
-    eval {
-        run_command(['nvme', 'list-subsys'],
-            outfunc => sub {
-                my $line = shift;
-                if ($line =~ /NQN=/) {
-                    # New subsystem section — check if it's ours
-                    $in_our_subsys = ($line =~ /\Q$nqn\E/) ? 1 : 0;
-                } elsif ($in_our_subsys && $line =~ /tcp\s.*\blive\b/) {
-                    # Found a live TCP transport controller for our subsystem
-                    $connected = 1;
-                }
-            },
-            errfunc => sub {}
-        );
-    };
-
-    return $connected;
+    my $ctrl = _nvme_controller_portals($scfg);
+    return (grep { $_ eq 'live' } values %$ctrl) ? 1 : 0;
 }
 
 # Count CPUs listed in a sysfs range file (e.g. /sys/devices/system/cpu/online).
@@ -3334,37 +3394,462 @@ sub _read_cpu_count {
     return $count || undef;
 }
 
-# Connect to NVMe/TCP subsystem (all portals)
-sub _nvme_connect {
-    my ($scfg) = @_;
+# ======== NVMe/TCP portal reconciliation ========
+#
+# Reconciling per portal means we can end up talking to a portal that is down.
+# Two things make that expensive, and both have to be defused before any hot
+# call site is allowed to reconcile:
+#
+#   * talking to a portal that is black-holing packets costs a real round trip.
+#     Measured on 6.8 with nvme-cli 2.8, the write to /dev/nvme-fabrics gives up
+#     on its own after roughly three seconds with ETIMEDOUT - nvme-tcp applies
+#     its own connect timeout well before the TCP SYN retry window would expire.
+#     Three seconds is cheap next to a stalled connect, but it is not free, and
+#     a VM start is the wrong place to spend it.
+#   * a controller that exists but is not 'live' is already being retried by the
+#     kernel. Issuing a second connect for it achieves nothing.
+#
+# Per-portal backoff: "<host key>|<portal>" => epoch of the last failed attempt.
+# In-process only, deliberately. pvestatd is long-lived and is what drives the
+# repeated repair attempts, so that is where suppression actually matters. PVE
+# task workers are forked per operation and start from an inherited copy, which
+# is harmless here: these are plain timestamps, unlike %_ws_connections which
+# holds file descriptors and therefore needs its PID guard. The worst a fresh
+# worker can pay is one bounded connect attempt per dead portal.
+my %_nvme_portal_backoff;
+my %_nvme_degraded_last_log;
+my %_nvme_host_addr_cache;
 
-    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: connecting to subsystem $scfg->{tn_subsystem_nqn}");
+use constant {
+    NVME_PORTAL_BACKOFF_S     => 60,   # do not retry a dead portal faster than this
+    NVME_CONNECT_TMO_S        => 15,   # hard cap on `nvme connect`. Measured:
+                                       # a black-holed portal fails on its own
+                                       # in ~3s (ETIMEDOUT from the fabrics
+                                       # write), so this only ever fires if the
+                                       # TCP handshake succeeds and the NVMe one
+                                       # then hangs.
+    NVME_DEGRADED_LOG_S       => 300,  # throttle for the "reduced redundancy" warning
+    NVME_HOST_ADDR_TTL_S      => 300,  # memoize portal hostname lookups
+    NVME_HOST_ADDR_FAIL_TTL_S => 10,   # ...but do not cache a failure that long
+};
 
-    # Check if already connected
-    return if _nvme_is_connected($scfg);
+# Canonical form of a transport address, for use as a hash key only.
+# IPv6 gets pton/ntop'd because the kernel's textual form need not match the one
+# in storage.cfg (2001:db8:0:0:0:0:0:1 vs 2001:db8::1).
+sub _nvme_normalize_addr {
+    my ($addr) = @_;
+    return undef if !defined($addr) || $addr eq '';
+    $addr =~ s/^\[//;
+    $addr =~ s/\]$//;
+    $addr =~ s/%.*$//;                       # drop IPv6 zone index
+    # Order matters: the /:/ test must come first, a second successful match
+    # would clobber $1.
+    if (index($addr, ':') >= 0 && $addr =~ /^([0-9A-Fa-f:]+)$/) {
+        my $packed = eval { Socket::inet_pton(Socket::AF_INET6(), $1) };
+        if ($packed) {
+            my $canon = eval { Socket::inet_ntop(Socket::AF_INET6(), $packed) };
+            return lc($canon) if defined $canon;
+        }
+    }
+    # IPv4 needs canonicalising too: the kernel only ever writes the canonical
+    # dotted quad, so a config entry like 192.000.002.010 would otherwise key
+    # differently from the identical address in sysfs, leaving a phantom portal
+    # reconnected on every poll.
+    #
+    # Done by hand rather than through inet_aton/inet_pton. inet_pton rejects
+    # leading zeros outright; inet_aton is strict on some platforms (undef, so
+    # the address falls through unnormalised) and lenient-but-octal on others,
+    # where 010 becomes 8 - a different host entirely. Decimal, octet by octet,
+    # is the only reading that matches what an operator writing 010 meant.
+    if (my @octets = $addr =~ /^0*(\d{1,3})\.0*(\d{1,3})\.0*(\d{1,3})\.0*(\d{1,3})$/) {
+        return join('.', map { 0 + $_ } @octets)
+            if !grep { $_ > 255 } @octets;
+    }
+    return lc($addr);
+}
 
-    my $nqn = _nvme_untaint_cli_nqn($scfg->{tn_subsystem_nqn}, 'NVMe subsystem NQN');
-    my @portals = ();
+sub _nvme_portal_key {
+    my ($addr, $port) = @_;
+    my $norm = _nvme_normalize_addr($addr);
+    return undef if !defined $norm;
+    return $norm . ':' . (0 + ($port // 4420));
+}
 
-    # Primary portal
-    push @portals, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
+# Every key a configured portal may legitimately appear under in sysfs. The
+# kernel only ever stores a numeric traddr - nvme-cli resolves
+# a hostname (libnvme hostname2traddr()) before writing to /dev/nvme-fabrics -
+# so a portal configured by name never matches its own config string and the
+# reconciler reconnects it forever. Resolve here and accept any address the
+# resolver returns, which is as close as we can get to what nvme-cli picked.
+#
+# Resolution feeds MATCHING ONLY. The connect command keeps the configured host
+# string, so nothing here reaches exec() and _nvme_untaint_cli_host() remains the
+# sole guard on the command line.
+sub _nvme_portal_keys {
+    my ($host, $port, $may_resolve) = @_;
 
-    # Additional portals
-    if ($scfg->{tn_portals}) {
-        push @portals, split(/\s*,\s*/, $scfg->{tn_portals});
+    my @keys;
+    my $raw = _nvme_portal_key($host, $port);
+    push @keys, $raw if defined $raw;
+
+    # Literals need no lookup, and must not pay for a failing one.
+    return \@keys if _nvme_addr_is_literal($host);
+
+    my $now = time();
+    my $entry = $_nvme_host_addr_cache{lc $host};
+    # A clock step backwards would otherwise freeze the entry until the wall
+    # clock caught up again.
+    $entry = undef if $entry && $now < $entry->{t};
+    my $ttl = ($entry && $entry->{failed})
+        ? NVME_HOST_ADDR_FAIL_TTL_S : NVME_HOST_ADDR_TTL_S;
+
+    # $may_resolve is false on the hot path. getaddrinfo is synchronous, and a
+    # wedged resolver costs whatever resolv.conf says - typically five seconds
+    # per nameserver, which is worse than the connect this code refuses to make
+    # here. DNS failure is also correlated with the outage being diagnosed. So
+    # the hot path answers from the memo or not at all.
+    return \@keys if !$may_resolve && (!$entry || ($now - $entry->{t}) >= $ttl);
+
+    if (!$entry || ($now - $entry->{t}) >= $ttl) {
+        my @addrs;
+        my ($err, @res) = Socket::getaddrinfo($host, undef,
+            { socktype => Socket::SOCK_STREAM() });
+        if (!$err) {
+            for my $ai (@res) {
+                my ($gerr, $a) = Socket::getnameinfo($ai->{addr},
+                    Socket::NI_NUMERICHOST(), Socket::NIx_NOSERV());
+                next if $gerr || !defined($a);
+                push @addrs, $1 if $a =~ /^([0-9A-Fa-f:.%]+)$/;
+            }
+        }
+        # A failed lookup is cached too, or a wedged resolver would be re-queried
+        # on every call - but for far less time than a successful one. Caching a
+        # transient failure for the full TTL would keep a perfectly live portal
+        # unmatchable for five minutes.
+        #
+        # The last good answer is kept across a failure, because the hot path no
+        # longer resolves and would otherwise go blind on a blip. It is not kept
+        # forever: once lookups have been failing for a full TTL the address is
+        # treated as stale and dropped, so a portal that changed address while
+        # the resolver was down stops being matched against an address it no
+        # longer has.
+        my $failing_since = @addrs ? undef
+            : ($entry && $entry->{failing_since} ? $entry->{failing_since} : $now);
+        my $keep_stale = defined($failing_since)
+            && ($now - $failing_since) < NVME_HOST_ADDR_TTL_S;
+        $entry = $_nvme_host_addr_cache{lc $host} =
+            { t => $now,
+              addrs => (@addrs ? \@addrs
+                               : ($keep_stale && $entry ? $entry->{addrs} : [])),
+              failing_since => $failing_since,
+              failed => (@addrs ? 0 : 1) };
     }
 
+    for my $a (@{$entry->{addrs}}) {
+        my $k = _nvme_portal_key($a, $port);
+        push @keys, $k if defined $k;
+    }
+
+    return \@keys;
+}
+
+# Root of the NVMe controller class in sysfs. Overridable so the offline tests
+# can point at a fixture tree.
+our $NVME_SYSFS_CLASS = '/sys/class/nvme';
+
+# All TCP controllers of our subsystem, keyed "addr:port" => state string.
+#
+# Read straight from sysfs rather than parsed out of `nvme list-subsys`. That
+# buys two things: the subsystem is matched with eq against each controller's
+# own subsysnqn attribute, so "...:pve" can never claim the controllers of
+# "...:pve-backup"; and nothing is forked, which matters because this runs on
+# pvestatd's timer. _nvme_find_controllers_for_subsystem() already reads the
+# same tree, so this is the file's established pattern.
+#
+# Callers need three answers, not two: a portal with a live controller is done;
+# a portal whose controller is in any other state is already being retried by
+# the kernel and must NOT get a second connect (this is what makes the
+# recommended tn_nvme_ctrl_loss_tmo=-1 safe - by design it parks controllers in
+# 'connecting' indefinitely); only a portal with no controller at all needs one.
+sub _nvme_controller_portals {
+    my ($scfg) = @_;
+    my $nqn = $scfg->{tn_subsystem_nqn};
+
+    my %ctrl;
+    return \%ctrl if !defined($nqn) || $nqn eq '';
+
+    my $slurp = sub {
+        my ($path) = @_;
+        open(my $fh, '<', $path) or return undef;
+        my $val = <$fh>;
+        close($fh);
+        return undef if !defined $val;
+        chomp $val;
+        return $val;
+    };
+
+    opendir(my $dh, $NVME_SYSFS_CLASS) or return \%ctrl;
+    my @entries = grep { /^nvme\d+$/ } readdir($dh);
+    closedir($dh);
+
+    for my $entry (@entries) {
+        next unless $entry =~ /^(nvme\d+)$/;
+        my $ctrl_name = $1;  # untaint
+        my $base = "$NVME_SYSFS_CLASS/$ctrl_name";
+
+        # eq, not a regex: this is the whole point of reading sysfs.
+        my $ctrl_nqn = $slurp->("$base/subsysnqn");
+        next if !defined($ctrl_nqn) || $ctrl_nqn ne $nqn;
+        next if ($slurp->("$base/transport") // '') ne 'tcp';
+
+        # The address attribute observed on 6.8 is
+        # "traddr=<ip>,trsvcid=<port>,src_addr=<ip>", where src_addr cannot be
+        # confused with traddr. \b is defensive: host_traddr= appears when a
+        # controller was created with --host-traddr, and would otherwise match
+        # here as the target address.
+        my $address = $slurp->("$base/address") // '';
+        my ($addr) = $address =~ /\btraddr=([^,\s]+)/;
+        next if !defined $addr;
+        my ($port) = $address =~ /\btrsvcid=(\d+)/;
+
+        my $key = _nvme_portal_key($addr, $port);
+        next if !defined $key;
+
+        # Any state other than live still means a controller exists, so no
+        # duplicate connect. Portals with no controller at all are absent from
+        # this map entirely - that is the case the original bug is about.
+        my $state = $slurp->("$base/state") // 'unknown';
+        $ctrl{$key} = $state unless ($ctrl{$key} // '') eq 'live';
+    }
+
+    return \%ctrl;
+}
+
+# One definition of "this is an address, not a name", used by everything that
+# has to decide whether a lookup is even meaningful. Two slightly different
+# predicates used to disagree on malformed input such as "192.168.1".
+sub _nvme_addr_is_literal {
+    my ($host) = @_;
+    return 0 if !defined($host) || $host eq '';
+    return 1 if index($host, ':') >= 0;                  # IPv6
+    return 1 if $host =~ /^[0-9]+(?:\.[0-9]+){3}$/;       # dotted quad
+    return 0;
+}
+
+# True when a portal is configured by name and that name cannot currently be
+# turned into an address. Distinguishes "this portal has no controller" from
+# "we cannot tell whether it has one".
+sub _nvme_portal_unresolved {
+    my ($host, $may_resolve) = @_;
+    return 0 if !defined($host) || $host eq '';
+    return 0 if _nvme_addr_is_literal($host);
+    my $keys = _nvme_portal_keys($host, 4420, $may_resolve);
+    return scalar(@$keys) <= 1 ? 1 : 0;   # only the raw name, no resolved address
+}
+
+# State of the controller serving a configured portal, or undef when that portal
+# has no controller at all.
+sub _nvme_portal_state {
+    my ($ctrl, $host, $port, $may_resolve) = @_;
+    for my $key (@{_nvme_portal_keys($host, $port, $may_resolve)}) {
+        return $ctrl->{$key} if exists $ctrl->{$key};
+    }
+    return undef;
+}
+
+# Configured portals, de-duplicated and with empty entries dropped (a trailing
+# or doubled comma in tn_portals otherwise reaches _nvme_untaint_cli_host and
+# kills the whole connect).
+sub _nvme_configured_portals {
+    my ($scfg) = @_;
+    my @raw;
+    push @raw, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
+    push @raw, split(/\s*,\s*/, $scfg->{tn_portals}) if $scfg->{tn_portals};
+
+    # Deduplicate on the normalised key rather than the raw string: "10.0.0.1"
+    # and "10.0.0.1:4420" are one portal, and keeping both would connect to it
+    # twice and keep two backoff entries for it.
+    my (@portals, %seen);
+    for my $p (@raw) {
+        next if !defined($p);
+        $p =~ s/^\s+|\s+$//g;
+        next if $p eq '';
+        my ($dedup_host, $dedup_port) = _nvme_parse_portal($p);
+        my $key = _nvme_portal_key($dedup_host, $dedup_port) // lc($p);
+        next if $seen{$key}++;
+        push @portals, $p;
+    }
+    return @portals;
+}
+
+# Connect to NVMe/TCP subsystem.
+#
+# Two modes, because the eleven call sites are not equally hot:
+#
+#   default (path(), activate_volume(), the recovery paths): make sure the
+#       subsystem is usable. If any configured portal has a live controller we
+#       are done - one sysfs scan and out. A missing portal is
+#       reported, not repaired: re-adding it means an `nvme connect` to a fabric
+#       that may be black-holing packets, and a VM start is the wrong place to
+#       find that out.
+#
+#   repair => 1 (status(), i.e. every pvestatd storage poll): actually
+#       reconcile portal by portal. Failure there is already non-fatal and
+#       logged, and the poll recurs, so a portal that comes back is picked up
+#       within one poll interval instead of never - which was the bug this whole
+#       change exists to fix.
+sub _nvme_connect {
+    my ($scfg, %opts) = @_;
+    my $repair = $opts{repair} ? 1 : 0;
+
+    _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: checking subsystem $scfg->{tn_subsystem_nqn}"
+        . ($repair ? ' (reconcile)' : ''));
+
+    my $nqn = _nvme_untaint_cli_nqn($scfg->{tn_subsystem_nqn}, 'NVMe subsystem NQN');
+    my @portals = _nvme_configured_portals($scfg);
+
     die "No portals configured for NVMe/TCP storage\n" unless @portals;
+
+    # Pure sysfs read: no process is forked on the healthy path.
+    my $ctrl = _nvme_controller_portals($scfg);
+
+    # Only resolve names when reconciling. On the hot path a lookup is answered
+    # from the memo or not at all - see _nvme_portal_keys.
+    my $may_resolve = $repair;
+
+    my (@missing, @recovering, @unknown);
+    my $live = 0;
+    for my $portal (@portals) {
+        my ($h, $p) = _nvme_parse_portal($portal);
+        my $state = _nvme_portal_state($ctrl, $h, $p, $may_resolve);
+        if (defined $state) {
+            $state eq 'live' ? $live++ : push @recovering, "$portal ($state)";
+            next;
+        }
+        # No controller matched. For a portal configured by name whose lookup we
+        # could not make, that is not evidence of absence: it cannot be compared
+        # against the numeric traddr sysfs reports at all. Kept separate from
+        # @recovering, which means "a controller exists and the kernel is
+        # retrying it" - conflating the two turns a total outage into a silent
+        # success, since neither would ever be connected.
+        if (_nvme_portal_unresolved($h, $may_resolve)) {
+            push @unknown, $portal;
+            next;
+        }
+        push @missing, $portal;
+    }
+
+    # Healthy: every configured portal has a live controller.
+    if (!@missing && !@recovering && !@unknown) {
+        _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: all $live configured portal(s) live");
+        return;
+    }
+
+    # Keyed by subsystem, not by API host: several storages can share one NAS,
+    # and one subsystem's failures must not suppress another's repair.
+    my $hostkey = $nqn;
+    my $now = time();
+
+    # Degraded but usable, and we are not the reconciler. Say so - throttled,
+    # because path() runs once per disk per VM start - and get out of the way.
+    if (!$repair && $live) {
+        # Keyed per mode: storage_info() calls activate_storage and then status
+        # in one process, so a shared key let the hot path's warning demote the
+        # reconciler's to debug for the whole window.
+        my $logkey = "$hostkey|hot";
+        my $last_log = $_nvme_degraded_last_log{$logkey} // 0;
+        # A clock step backwards would otherwise suppress the warning for the
+        # whole difference.
+        $last_log = 0 if $now < $last_log;
+        # "live" counts controllers the kernel holds, which is not the same as
+        # paths usable for I/O: a controller reports live while its ANA group is
+        # inaccessible. Path selection is the kernel's job, so that does not change
+        # what needs reconnecting - but this count is controllers, not
+        # ANA-accessible paths.
+        # Level 0: tn_debug defaults to 0 and _log drops anything above it, so a
+        # level 1 warning is invisible on a default install - which would make
+        # the loss of redundancy this change exists to surface silent again. The
+        # throttle keeps level 0 from being noisy, though note it is per process,
+        # not wall-clock: outside pvestatd the effective rate is one warning per
+        # operation, since each task worker starts with an empty window.
+        #
+        # Only warn about portals that could actually be accounted for. The hot
+        # path does not resolve, so a portal configured by name always lands in
+        # @unknown here - warning on that alone would cry wolf on every VM start
+        # of a perfectly healthy storage.
+        my $level = (($now - $last_log) >= NVME_DEGRADED_LOG_S
+                     && (@missing || @recovering)) ? 0 : 2;
+        $_nvme_degraded_last_log{$logkey} = $now if $level == 0;
+        _log($scfg, $level, $level == 0 ? 'warning' : 'debug',
+            "[TrueNAS] nvme_connect: $live of " . scalar(@portals) . " portal(s) live"
+            . (@missing    ? '; missing: '    . join(', ', @missing)    : '')
+            . (@recovering ? '; recovering: ' . join(', ', @recovering) : '')
+            . (@unknown    ? '; unresolved: ' . join(', ', @unknown)    : '')
+            . ' - reduced path redundancy, repair deferred to the status() poll');
+        return;
+    }
+
+    # Only portals with no controller at all are candidates. A controller in
+    # 'connecting'/'resetting' is the kernel already doing this job; a second
+    # connect for it is simply refused ("already connected").
+    my @connect_list;
+    for my $portal (@missing) {
+        my $last_fail = $_nvme_portal_backoff{"$hostkey|$portal"};
+        # Backoff is bypassed only on the hot path with nothing live: that call
+        # is the one deciding whether a VM gets its disk, and it must always try.
+        # In repair mode it always applies. status() runs on pvestatd's timer,
+        # so without this a target that is entirely down would have every poll
+        # attempt every portal, each bounded by NVME_CONNECT_TMO_S, forever -
+        # stalling the poll loop for every storage on the node, not just this one.
+        # A clock step backwards would otherwise hold the portal off until the
+        # wall clock caught up.
+        if (defined($last_fail) && $now < $last_fail) {
+            delete $_nvme_portal_backoff{"$hostkey|$portal"};
+            $last_fail = undef;
+        }
+        # Bypassed only on the hot path, where this call decides whether a VM
+        # gets its disk. In repair mode it always applies.
+        if ($repair
+            && defined($last_fail) && ($now - $last_fail) < NVME_PORTAL_BACKOFF_S) {
+            _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: portal $portal in backoff ("
+                . ($now - $last_fail) . 's of ' . NVME_PORTAL_BACKOFF_S . 's), skipping');
+            next;
+        }
+        push @connect_list, $portal;
+    }
+
+    if (!@connect_list) {
+        # %$ctrl is every controller the kernel holds for this NQN, whatever the
+        # configured portals resolve to. Empty means there is genuinely nothing,
+        # so callers that depend on this dying - most of them are not wrapped in
+        # eval - must not be told everything is merely "recovering".
+        die "Failed to connect to any NVMe/TCP portal for subsystem $nqn\n"
+            if !$live && !%$ctrl;
+        # No live path, but controllers exist and are mid-recovery. Another
+        # connect would be refused with EALREADY; only the kernel (or a
+        # disconnect) can move this forward, so make the state visible.
+        _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: no live path yet, "
+            . scalar(@recovering) . ' controller(s) recovering: '
+            . join(', ', @recovering)) if !$live && @recovering;
+        return;
+    }
+
+    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: $live portal(s) live, restoring "
+        . scalar(@connect_list) . ' missing path(s)') if $live;
 
     my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN', 0);
     my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
     my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;
 
-    for my $portal (@portals) {
+    for my $portal (@connect_list) {
         my ($host, $port) = _nvme_parse_portal($portal);
         $host = _nvme_untaint_cli_host($host);
-        $port = _nvme_untaint_cli_port($port);
+        # Numify first: _nvme_portal_key() already compares ports numerically, so
+        # a config entry of "04420" matches its controller and never reaches a
+        # connect - until a cold start, where the untainter's ^[1-9] would reject
+        # it and die outside the per-portal eval, taking the other portals down.
+        $port = _nvme_untaint_cli_port(0 + $port);
 
         _log($scfg, 2, 'debug', "[TrueNAS] nvme_connect: connecting to $host:$port");
 
@@ -3401,11 +3886,28 @@ sub _nvme_connect {
             push @cmd, '--dhchap-ctrl-secret', $dhchap_ctrl_secret;
         }
 
+        # Reconnection behaviour. Without these the kernel defaults apply
+        # (ctrl_loss_tmo 600s), after which a controller whose fabric stayed down
+        # is removed outright and never returns on its own.
+        push @cmd, '--ctrl-loss-tmo',
+            _nvme_untaint_cli_int($scfg->{tn_nvme_ctrl_loss_tmo}, 'NVMe ctrl-loss timeout', -1)
+            if defined $scfg->{tn_nvme_ctrl_loss_tmo};
+        push @cmd, '--reconnect-delay',
+            _nvme_untaint_cli_int($scfg->{tn_nvme_reconnect_delay}, 'NVMe reconnect delay', 1)
+            if defined $scfg->{tn_nvme_reconnect_delay};
+        push @cmd, '--keep-alive-tmo',
+            _nvme_untaint_cli_int($scfg->{tn_nvme_keep_alive_tmo}, 'NVMe keep-alive timeout', 1)
+            if defined $scfg->{tn_nvme_keep_alive_tmo};
+
         my $connect_stderr = '';
         eval {
+            # Backstop for the case the fabrics write's own ~3s failure cannot
+            # cover: the portal completes the TCP handshake and the NVMe one
+            # then stalls. Without this, run_command waits forever.
             run_command(\@cmd,
                 outfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] nvme connect: " . shift); },
-                errfunc => sub { $connect_stderr .= shift; }
+                errfunc => sub { $connect_stderr .= shift; },
+                timeout => NVME_CONNECT_TMO_S,
             );
             $connected_count++;
         };
@@ -3417,17 +3919,61 @@ sub _nvme_connect {
             } else {
                 my $detail = $connect_stderr ? " (stderr: $connect_stderr)" : '';
                 _log($scfg, 1, 'warning', "[TrueNAS] nvme_connect: failed to connect to portal $portal: $@$detail");
+                # time() again, not $now: with several dead portals the loop can
+                # have been running for tens of seconds by here, which would
+                # shorten the effective backoff window.
+                $_nvme_portal_backoff{"$hostkey|$portal"} = time();
+                delete $_portal_sync_last_ok{_cache_host_key($scfg)};
+                next;
             }
         }
+        delete $_nvme_portal_backoff{"$hostkey|$portal"};
     }
 
-    die "Failed to connect to any NVMe/TCP portal for subsystem $nqn\n" if $connected_count == 0;
+    die "Failed to connect to any NVMe/TCP portal for subsystem $nqn\n"
+        if ($connected_count + $live) == 0 && !%$ctrl;
 
-    # Wait for devices to settle
-    run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
-    usleep(UDEV_SETTLE_TIMEOUT_US);
+    # Only pay for udev when something actually attached. With a portal that
+    # stays down, every repair attempt fails and the settle plus its 250ms grace
+    # buy nothing at all - and `udevadm settle` is not cheap on a busy node.
+    if ($connected_count) {
+        run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {});
+        usleep(UDEV_SETTLE_TIMEOUT_US);
+    }
 
-    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: connected to $connected_count portal(s)");
+    # Recount from sysfs instead of trusting the attempts: `nvme connect` returns
+    # as soon as the controller exists, which may be in 'connecting', and the
+    # "already connected" branch counts one never inspected. Counted the same way
+    # as $live above - per configured portal - because the denominator is the
+    # configured portal count. A plain grep over every controller of the
+    # subsystem would include one belonging to a portal since removed from
+    # tn_portals, and report 2 of 2 with one path.
+    my $total = $live;
+    if ($connected_count) {
+        my $after = _nvme_controller_portals($scfg);
+        $total = 0;
+        for my $portal (@portals) {
+            my ($h, $p) = _nvme_parse_portal($portal);
+            my $st = _nvme_portal_state($after, $h, $p, $may_resolve);
+            $total++ if defined($st) && $st eq 'live';
+        }
+    }
+    _log($scfg, 1, 'info', "[TrueNAS] nvme_connect: $total of " . scalar(@portals) .
+        " configured portal(s) live (" . scalar(@connect_list) . " connect(s) attempted, "
+        . "$connected_count succeeded)");
+    # Only warn when every portal could actually be accounted for. On the hot
+    # path names are not resolved, so a portal configured by name never counts
+    # as live there - warning on that would cry wolf on every VM start.
+    if ($total < scalar(@portals) && !@unknown) {
+        my $warnkey = "$hostkey|" . ($repair ? 'repair' : 'hot');
+        my $last_warn = $_nvme_degraded_last_log{$warnkey} // 0;
+        $last_warn = 0 if $now < $last_warn;
+        my $wlvl = (time() - $last_warn) >= NVME_DEGRADED_LOG_S ? 0 : 2;
+        $_nvme_degraded_last_log{$warnkey} = time() if $wlvl == 0;
+        _log($scfg, $wlvl, $wlvl == 0 ? 'warning' : 'debug',
+            "[TrueNAS] nvme_connect: only $total of " . scalar(@portals) .
+            " portal(s) live - running with reduced path redundancy");
+    }
 }
 
 # Disconnect from NVMe/TCP subsystem
@@ -3512,12 +4058,14 @@ sub _nvme_find_controllers_for_subsystem {
     my $nqn = $scfg->{tn_subsystem_nqn};
     my @controllers;
 
-    # Build set of portals to match against
+    # Build set of portals to match against, using the same key machinery as
+    # the reconciler. Comparing the raw configured host against the numeric
+    # traddr the kernel stores meant a storage configured by hostname matched
+    # nothing at all and this returned an empty list.
     my %portal_set;
-    for my $portal_str ($scfg->{tn_discovery_portal}, $scfg->{tn_portals} ? split(/\s*,\s*/, $scfg->{tn_portals}) : ()) {
-        next unless $portal_str;
+    for my $portal_str (_nvme_configured_portals($scfg)) {
         my ($host, $port) = _nvme_parse_portal($portal_str);
-        $portal_set{"$host:$port"} = 1;
+        $portal_set{$_} = 1 for @{ _nvme_portal_keys($host, $port) };
     }
 
     opendir(my $dh, "/sys/class/nvme-subsystem") or return @controllers;
@@ -3551,11 +4099,13 @@ sub _nvme_find_controllers_for_subsystem {
             next unless $address;
 
             # Parse traddr=X.X.X.X,trsvcid=YYYY from address string
+            # \b matters: the address attribute also carries host_traddr=,
+            # which would otherwise match as the target address.
             my ($ctrl_host, $ctrl_port);
-            if ($address =~ /traddr=([^,\s]+)/) {
+            if ($address =~ /\btraddr=([^,\s]+)/) {
                 $ctrl_host = $1;
             }
-            if ($address =~ /trsvcid=(\d+)/) {
+            if ($address =~ /\btrsvcid=(\d+)/) {
                 $ctrl_port = $1;
             }
             next unless $ctrl_host;
@@ -3563,7 +4113,8 @@ sub _nvme_find_controllers_for_subsystem {
 
             # If we have portals configured, only include controllers matching them
             if (%portal_set) {
-                next unless $portal_set{"$ctrl_host:$ctrl_port"};
+                my $ctrl_key = _nvme_portal_key($ctrl_host, $ctrl_port);
+                next unless defined($ctrl_key) && $portal_set{$ctrl_key};
             }
 
             push @controllers, "/dev/nvme$ctrl_num";
@@ -4243,8 +4794,7 @@ sub _nvme_sync_portals {
 
     # Collect desired portals from storage config
     my @desired_portals = ();
-    push @desired_portals, $scfg->{tn_discovery_portal} if $scfg->{tn_discovery_portal};
-    push @desired_portals, split(/\s*,\s*/, $scfg->{tn_portals}) if $scfg->{tn_portals};
+    push @desired_portals, _nvme_configured_portals($scfg);
     return unless @desired_portals;
 
     # Query existing port-subsystem bindings
@@ -4264,6 +4814,7 @@ sub _nvme_sync_portals {
     }
 
     # Create missing ports (TrueNAS 25.10+ requires addr_ prefix and separate port_subsys association)
+    my $sync_ok = 1;
     for my $portal (@desired_portals) {
         my ($host, $port) = _nvme_parse_portal($portal);
         my $lookup_key = lc("$host:$port");
@@ -4298,6 +4849,7 @@ sub _nvme_sync_portals {
             }
             if (!$port_id) {
                 _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to create or find port for $portal: $create_err");
+                $sync_ok = 0;
                 next;
             }
         }
@@ -4315,11 +4867,16 @@ sub _nvme_sync_portals {
                 _log($scfg, 2, 'debug', "[TrueNAS] nvme_sync_portals: port_subsys association already exists for port_id=$port_id");
             } else {
                 _log($scfg, 1, 'warning', "[TrueNAS] nvme_sync_portals: failed to associate port for $portal: $@");
+                $sync_ok = 0;
             }
         }
     }
 
-    $_portal_sync_last_ok{$sid} = time();
+    # Only take the TTL shortcut next time if every desired portal really is
+    # published. Stamping unconditionally hid a failed port create for a full
+    # $CACHE_TTL - precisely the window in which the initiator keeps retrying a
+    # portal the target has not published yet.
+    $_portal_sync_last_ok{$sid} = time() if $sync_ok;
 }
 
 # Ensure NVMe subsystem exists on TrueNAS
@@ -5939,6 +6496,16 @@ sub status {
     my $host_key = _cache_host_key($scfg);
     my $status_method = _status_capacity_cache_method($storeid, $scfg);
 
+    # The one path-redundancy reconciliation point. pvestatd calls status() on
+    # a timer, so a portal that comes back is re-added within a poll interval,
+    # while a portal that stays down costs at most one bounded connect attempt
+    # per backoff window - and never on the VM start path. Detection itself is a
+    # pure sysfs read. Never allowed to break capacity reporting.
+    if (($scfg->{tn_transport_mode} // '') eq 'nvme-tcp') {
+        eval { _nvme_connect($scfg, repair => 1) };
+        _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $@") if $@;
+    }
+
     eval {
         my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
         if ($ds) {
@@ -6343,6 +6910,13 @@ sub activate_storage {
         # Ensure subsystem exists and connect
         eval {
             _nvme_ensure_subsystem($scfg);
+            # Initial bring-up only. With nothing live yet _nvme_connect()
+            # attempts every configured portal regardless of mode, so this
+            # still establishes full redundancy on a cold start. Repairing a
+            # portal that is down is deliberately NOT done here:
+            # activate_storage() is on the VM start path, and while the
+            # surrounding eval keeps a dead portal from failing a start, it
+            # would not keep it from slowing one. That job belongs to status().
             _nvme_connect($scfg);
         };
         if ($@) {
