@@ -2804,6 +2804,33 @@ sub _all_portals_connected($scfg) {
     return 1; # All portals are connected
 }
 
+# TrueNAS 25.10 enforces discovery-CHAP implicitly the moment ANY iscsi auth
+# group exists on the array - the old per-portal discovery_authmethod knob is
+# gone from the API. So with CHAP credentials configured, a plain sendtargets
+# discovery is refused ("initiator failed authorization") before the session
+# auth this file already sets ever gets a chance. Feed the same credentials to
+# the discoverydb first; without CHAP, keep the old one-shot discovery.
+# Verified live 2026-08-23 against TrueNAS 25.10.4.
+sub _iscsi_discover {
+    my ($scfg, $portal, $label) = @_;
+    if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+        _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'-o','new'],
+                 "iSCSI discoverydb create failed ($label)");
+        for my $kv (['discovery.sendtargets.auth.authmethod','CHAP'],
+                    ['discovery.sendtargets.auth.username',$scfg->{tn_chap_user}],
+                    ['discovery.sendtargets.auth.password',$scfg->{tn_chap_password}]) {
+            _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,
+                      '-o','update','-n',$kv->[0],'-v',$kv->[1]],
+                     "iSCSI discoverydb auth update failed ($label)");
+        }
+        _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'--discover'],
+                 "iSCSI discovery failed ($label)");
+    } else {
+        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$portal],
+                 "iSCSI discovery failed ($label)");
+    }
+}
+
 sub _iscsi_login_all($scfg) {
     # Skip login if all configured portals are already connected
     # This ensures multipath configurations establish sessions to ALL portals
@@ -2817,9 +2844,9 @@ sub _iscsi_login_all($scfg) {
     _probe_portal($_) for @extra;
 
     # Discovery (don't die on non-zero)
-    _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery failed (primary)");
+    _iscsi_discover($scfg, $primary, 'primary');
     for my $p (@extra) {
-        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p], "iSCSI discovery failed ($p)");
+        _iscsi_discover($scfg, $p, $p);
     }
 
     my $iqn = $scfg->{tn_target_iqn};
