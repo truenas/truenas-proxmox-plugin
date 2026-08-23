@@ -2850,14 +2850,21 @@ sub _iscsi_login_all($scfg) {
     }
 
     my $iqn = $scfg->{tn_target_iqn};
-    my @nodes = _run_lines(['iscsiadm','-m','node','-T',$iqn]);
+    # `iscsiadm -m node -T <iqn>` prints the full node RECORD, not the
+    # "portal,tpgt iqn" list this loop parses - so @nodes never matched and the
+    # whole loop below was dead code: the primary portal only ever logged in
+    # through the no-auth fallback at the bottom of this sub. Plain mode never
+    # noticed; CHAP mode could not establish a single session. List ALL nodes
+    # (that one does print the list) and filter ourselves.
+    my @nodes = grep { /\s\Q$iqn\E$/ } _run_lines(['iscsiadm','-m','node']);
 
     # Get current session list once for efficiency
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
 
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
-        next unless $n =~ /^(\S+)\s+$iqn$/;
+        # the list form is "190.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
+        next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
         my $portal = _normalize_portal($1);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
@@ -2887,7 +2894,10 @@ sub _iscsi_login_all($scfg) {
         if ($line =~ /\b\Q$iqn\E\b/) { $have_session = 1; last; }
     }
     if (!$have_session) {
-        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery retry");
+        # CHAP-aware retry: the plain `-m discovery` this used to run RESETS
+        # the discoverydb record, wiping the auth idk8 just configured - the
+        # fallback must go through the same helper as the main path.
+        _iscsi_discover($scfg, $primary, 'retry');
         for my $p (@extra, $primary) {
             _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'], "iSCSI login retry ($p)");
         }
