@@ -2804,6 +2804,33 @@ sub _all_portals_connected($scfg) {
     return 1; # All portals are connected
 }
 
+# TrueNAS 25.10 enforces discovery-CHAP implicitly the moment ANY iscsi auth
+# group exists on the array - the old per-portal discovery_authmethod knob is
+# gone from the API. So with CHAP credentials configured, a plain sendtargets
+# discovery is refused ("initiator failed authorization") before the session
+# auth this file already sets ever gets a chance. Feed the same credentials to
+# the discoverydb first; without CHAP, keep the old one-shot discovery.
+# Verified live 2026-08-23 against TrueNAS 25.10.4.
+sub _iscsi_discover {
+    my ($scfg, $portal, $label) = @_;
+    if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+        _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'-o','new'],
+                 "iSCSI discoverydb create failed ($label)");
+        for my $kv (['discovery.sendtargets.auth.authmethod','CHAP'],
+                    ['discovery.sendtargets.auth.username',$scfg->{tn_chap_user}],
+                    ['discovery.sendtargets.auth.password',$scfg->{tn_chap_password}]) {
+            _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,
+                      '-o','update','-n',$kv->[0],'-v',$kv->[1]],
+                     "iSCSI discoverydb auth update failed ($label)");
+        }
+        _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'--discover'],
+                 "iSCSI discovery failed ($label)");
+    } else {
+        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$portal],
+                 "iSCSI discovery failed ($label)");
+    }
+}
+
 sub _iscsi_login_all($scfg) {
     # Skip login if all configured portals are already connected
     # This ensures multipath configurations establish sessions to ALL portals
@@ -2817,20 +2844,27 @@ sub _iscsi_login_all($scfg) {
     _probe_portal($_) for @extra;
 
     # Discovery (don't die on non-zero)
-    _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery failed (primary)");
+    _iscsi_discover($scfg, $primary, 'primary');
     for my $p (@extra) {
-        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$p], "iSCSI discovery failed ($p)");
+        _iscsi_discover($scfg, $p, $p);
     }
 
     my $iqn = $scfg->{tn_target_iqn};
-    my @nodes = _run_lines(['iscsiadm','-m','node','-T',$iqn]);
+    # `iscsiadm -m node -T <iqn>` prints the full node RECORD, not the
+    # "portal,tpgt iqn" list this loop parses - so @nodes never matched and the
+    # whole loop below was dead code: the primary portal only ever logged in
+    # through the no-auth fallback at the bottom of this sub. Plain mode never
+    # noticed; CHAP mode could not establish a single session. List ALL nodes
+    # (that one does print the list) and filter ourselves.
+    my @nodes = grep { /\s\Q$iqn\E$/ } _run_lines(['iscsiadm','-m','node']);
 
     # Get current session list once for efficiency
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
 
     # Login to all discovered portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
-        next unless $n =~ /^(\S+)\s+$iqn$/;
+        # the list form is "190.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
+        next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
         my $portal = _normalize_portal($1);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
@@ -2860,7 +2894,10 @@ sub _iscsi_login_all($scfg) {
         if ($line =~ /\b\Q$iqn\E\b/) { $have_session = 1; last; }
     }
     if (!$have_session) {
-        _try_run(['iscsiadm','-m','discovery','-t','sendtargets','-p',$primary], "iSCSI discovery retry");
+        # CHAP-aware retry: the plain `-m discovery` this used to run RESETS
+        # the discoverydb record, wiping the auth idk8 just configured - the
+        # fallback must go through the same helper as the main path.
+        _iscsi_discover($scfg, $primary, 'retry');
         for my $p (@extra, $primary) {
             _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'], "iSCSI login retry ($p)");
         }
