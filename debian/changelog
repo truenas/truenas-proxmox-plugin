@@ -1,3 +1,96 @@
+truenas-proxmox-plugin (2.1.23~alpha33) unstable; urgency=medium
+
+  * Fix alpha32 compile error.
+
+    Alpha32 introduced a level-0 LOCKHOLD log line in _alloc_image_nvme's
+    deferred block that referenced $deferred_vmid without declaring it.
+    Perl's use strict caught it at plugin load:
+      Global symbol "$deferred_vmid" requires explicit package name
+    PVE could not load the plugin, treated 'truenasplugin' as
+    unsupported, and every test that used the storage skipped with
+    "storage 'truenas-nvme' not configured: 500 storage 'truenas-nvme'
+    does not exist".
+
+    Fix: drop the vmid= field from the LOCKHOLD log line. UUID is
+    already logged and is sufficient to correlate with the failing
+    activate_volume UUIDs. All other declarations were correct.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 10:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha32) unstable; urgency=medium
+
+  * NVMe: LOCKHOLD instrumentation.
+
+    Alpha31 stopped plugin-triggered NVMe reconnects from firing under
+    the VM config lock. Kernel logs confirm no more spurious
+    "Removing ctrl / new ctrl" events during test runs. But some
+    lock-timeout failures still show up in the driver logs at reduced
+    frequency, and we can not correlate them to any specific pvedaemon
+    action.
+
+    Alpha32 adds level-0 instrumentation at every phase of the two
+    code paths that hold the VM config lock while doing NVMe work:
+      - _alloc_image_nvme deferred block (runs before cluster_lock_storage
+        returns to qm set / qm create, therefore still inside the caller's
+        lock hold)
+      - _clone_image_nvme deferred block (same pattern for qm clone)
+      - activate_volume NVMe branch (runs inside qm start / qm clone
+        target's lock hold)
+
+    Each phase log line looks like:
+      [TrueNAS] LOCKHOLD alloc_nvme_deferred vmid=105 uuid=<uuid>
+                        phase=nvme_rescan elapsed=0.234s
+
+    Grep for LOCKHOLD in journalctl around a lock-timeout event to see
+    exactly which phase was still running when the concurrent qm op
+    started waiting. Whichever phase most often shows elapsed >5s is
+    the actual culprit.
+
+    Pure diagnostic — no behaviour change from alpha31.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 10:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha31) unstable; urgency=medium
+
+  * NVMe: forbid reconnect in _defer_after_lock pre-warm paths.
+
+    Root cause of the "can't lock file lock-<vmid>.conf - got timeout"
+    failures traced by journalctl analysis (2026-08-21 10:33 window on
+    pve, VM 121):
+
+      10:32:59  update VM 121 -scsi1        (holds lock, plugin alloc)
+      10:33:02  TIMING dataset.create +3.1s
+      10:33:05  update VM 121 -tpmstate0    (next holds lock, plugin alloc)
+      10:33:08  TIMING dataset.create +3.3s
+      10:33:17  kernel: nvme nvme0: Removing ctrl / new ctrl <-- HERE
+      10:33:17..30 udev storm: scsi-sg3_id.rules WARNING on ~30 devices
+      10:33:35  starting task qmstart:121   (lock wait begins)
+      10:33:45  qmstart:121: got timeout    (10s wait exhausted)
+
+    The alloc_image_nvme deferred block (runs under _defer_after_lock,
+    which fires WHILE the VM config lock is still held) called
+    _nvme_device_for_uuid with allow_reconnect=1. That authorized the
+    stale-NGUID reconnect gate at i==10. Under multi-node testing
+    (another node just created/destroyed a namespace) NGUID
+    contradiction is common, so the gate fires often: kernel does a
+    full controller remove+add, udev re-enumerates every namespace on
+    the subsystem, plugin's udevadm settle blocks 10-13s waiting for
+    the queue to drain -- the entire time still holding the config
+    lock. Concurrent qm ops from the test framework on the same VMID
+    then time out on the 10s lock wait. VM-config lock timeouts had
+    been categorised as harness/PVE issues in earlier reporting;
+    corrected: these are plugin-caused.
+
+    Fix: allow_reconnect=0 in both deferred pre-warm calls
+    (_alloc_image_nvme deferred at line 5752, _clone_image_nvme
+    deferred at line 7782). The deferred block is best-effort; when
+    the target device is not yet visible, activate_volume (which runs
+    OUTSIDE the config lock, in its own worker, with allow_reconnect=1)
+    will do the reconnect cleanly. Recovery isn't lost, just moved to
+    a moment the lock isn't held.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 09:30:00 +0000
+
 truenas-proxmox-plugin (2.1.23~alpha30) unstable; urgency=medium
 
   * NVMe: avoid nsid recycling on namespace create.

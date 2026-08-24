@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23~alpha30';
+our $VERSION = '2.1.23~alpha33';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -5733,28 +5733,63 @@ sub _alloc_image_nvme {
     my $deferred_uuid = $device_uuid;
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
+        # alpha32: instrument every phase at level 0 so we can see which
+        # step of the deferred block holds the VM config lock the longest.
+        # LOCKHOLD tag makes it grep-friendly against the "can't lock
+        # file" test failures. Each phase logs elapsed time from block
+        # entry.
+        my $t0 = Time::HiRes::time();
+        my $lap_defer = sub {
+            my ($phase) = @_;
+            _log($deferred_scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD alloc_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
+                $deferred_uuid, $phase, Time::HiRes::time() - $t0));
+        };
+        $lap_defer->('entry');
+
         # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
         eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }
+        $lap_defer->('subsys.update');
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] alloc_image_nvme deferred: connecting and discovering device for UUID $deferred_uuid");
         eval { _nvme_connect($deferred_scfg); };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: NVMe connect failed (activate_volume will retry): $@");
+            $lap_defer->('nvme_connect_failed_exit');
             return;
         }
+        $lap_defer->('nvme_connect');
         # Settle + rescan to detect new namespace (mirrors clone_image_nvme deferred path)
         usleep(200_000);  # 200ms initial settle
         eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        $lap_defer->('udevadm_settle');
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
-        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        $lap_defer->('nvme_rescan');
+        # alpha31: allow_reconnect=0 in the DEFERRED path. This runs while
+        # the VM's config lock (/var/lock/qemu-server/lock-<vmid>.conf) is
+        # still held by the calling qm operation. If _nvme_device_for_uuid
+        # triggers a reconnect (stale-NGUID gate at i==10 fires often under
+        # multi-node testing), the kernel does a full controller
+        # remove+add and udev re-enumerates every namespace under the
+        # subsystem (~30 devices). The subsequent udevadm settle inside
+        # _nvme_device_for_uuid blocks 10-13s waiting for udev to drain,
+        # and we STILL hold the config lock during that. Any concurrent
+        # qm op on the same VMID from the test framework times out on
+        # lock-<vmid>.conf. Pre-warm is best-effort — if the device is
+        # not yet visible here, activate_volume (which is called OUTSIDE
+        # the config lock via a fresh worker) has allow_reconnect=1 and
+        # will do the reconnect cleanly then.
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 0) };
+        $lap_defer->('device_for_uuid');
         if ($dev) {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device ready at $dev");
         } else {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] alloc_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
+        $lap_defer->('exit');
     });
 
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: volume created successfully: $volname");
@@ -7334,7 +7369,19 @@ sub activate_volume {
         }
 
     } elsif ($mode eq 'nvme-tcp') {
+        # alpha32: LOCKHOLD instrumentation for activate_volume NVMe path.
+        # This runs UNDER the VM config lock (qm start, qm clone target, etc).
+        my $t0_av = Time::HiRes::time();
+        my $lap_av = sub {
+            my ($phase) = @_;
+            _log($scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD activate_volume vmid=%s uuid=%s phase=%s elapsed=%.3fs",
+                $vmid // '?', $metadata, $phase, Time::HiRes::time() - $t0_av));
+        };
+        $lap_av->('entry');
+
         _nvme_connect($scfg);
+        $lap_av->('nvme_connect');
 
         # alpha29: force TN to re-sync nvmet configfs before we wait for the
         # target device. TrueNAS 25.10's nvmet.namespace.create returns as
@@ -7372,6 +7419,7 @@ sub activate_volume {
             _log($scfg, 1, 'warning',
                 "[TrueNAS] activate_volume: pre-wait subsys.update failed (non-fatal): $@");
         }
+        $lap_av->('pre_wait_subsys_update');
 
         # Wait for the specific namespace device to appear (up to 5s)
         my $device_uuid = $metadata;
@@ -7380,6 +7428,7 @@ sub activate_volume {
             my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
             _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: device ready at $dev");
         };
+        $lap_av->('device_for_uuid_exit');
         if ($@) {
             my $err = $@;
             $err = 'Unknown error while locating NVMe device' if !defined($err) || $err eq '';
@@ -7776,15 +7825,28 @@ sub _clone_image_nvme {
         }
 
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] clone_image_nvme deferred: discovering device for UUID $deferred_uuid");
+        # alpha32: same LOCKHOLD instrumentation as alloc deferred.
+        my $t0 = Time::HiRes::time();
+        my $lap_defer_clone = sub {
+            my ($phase) = @_;
+            _log($deferred_scfg, 0, 'info', sprintf(
+                "[TrueNAS] LOCKHOLD clone_nvme_deferred uuid=%s phase=%s elapsed=%.3fs",
+                $deferred_uuid, $phase, Time::HiRes::time() - $t0));
+        };
+        $lap_defer_clone->('entry');
         usleep(200_000);  # 200ms initial settle
         eval { run_command(['udevadm', 'settle'], outfunc => sub {}, errfunc => sub {}) };
+        $lap_defer_clone->('udevadm_settle');
         eval { _nvme_rescan_subsystem_controllers($deferred_scfg) };
-        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 1) };
+        $lap_defer_clone->('nvme_rescan');
+        my $dev = eval { _nvme_device_for_uuid($deferred_scfg, $deferred_uuid, allow_reconnect => 0) };
+        $lap_defer_clone->('device_for_uuid');
         if ($dev) {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device ready at $dev");
         } else {
             _log($deferred_scfg, 1, 'info', "[TrueNAS] clone_image_nvme deferred: device not yet visible (activate_volume will handle)");
         }
+        $lap_defer_clone->('exit');
     });
 
     return $clone_volname;
