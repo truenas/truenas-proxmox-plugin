@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23~alpha33';
+our $VERSION = '2.1.23~alpha34';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -297,6 +297,53 @@ sub _is_extent_name_conflict_error {
     my ($error) = @_;
     return 0 if !defined $error;
     return $error =~ /iscsi_extent_create\.name.*must be unique/i;
+}
+
+# Historical create_base extent-rename gap: create_base renamed a zvol
+# vm-<vmid>-disk-N -> base-<vmid>-disk-N and rewrote extent.disk, but
+# did NOT rename the extent itself. The vm-<vmid>-disk-N-<hash> name
+# slot on TN stayed owned by the (now-base) extent. Later VM allocs at
+# the same VMID hash to the same extent name and get
+# "iscsi_extent_create.name: Extent name must be unique". Fix B looks
+# up by name, sees the disk field differs, and correctly refuses to
+# reuse (it can't safely redirect this VM's disk to a base zvol).
+#
+# This helper repairs the stale name in place when the shape matches:
+# a same-name extent whose disk is zvol/<dataset>/base-<vmid>-disk-N.
+# Renaming the extent to its proper base-*-<hash> name frees the
+# vm-*-<hash> slot so the caller's next create can succeed. The rename
+# is bookkeeping-only from the initiator side: extent_id, targetextent
+# mapping, and naa/serial identifiers are all preserved. Nothing on
+# the wire changes; only the TN-side extent name is corrected.
+#
+# Returns 1 if the stale extent was renamed (caller should retry the
+# create). Returns 0 if the shape does not match (genuine hash-slot
+# collision -- caller should give up) or the rename call itself failed.
+sub _iscsi_extent_recover_stale_base_name {
+    my ($scfg, $stale_extent, $expected_zvol_path) = @_;
+    my $stale_disk = $stale_extent->{disk} // '';
+    my ($stale_zname) = $stale_disk =~ m{/(base-\d+-disk-\d+)$};
+    return 0 unless $stale_zname;
+    my $proper_name = _generate_extent_name($scfg, $stale_zname);
+    return 0 if $proper_name eq ($stale_extent->{name} // '');
+    _log($scfg, 0, 'info',
+        "[TrueNAS] iSCSI extent id=$stale_extent->{id} name=" .
+        ($stale_extent->{name} // '<undef>') .
+        " occupies our name slot for $expected_zvol_path but its disk is a " .
+        "base zvol ($stale_disk); renaming stale extent to $proper_name " .
+        "(create_base extent-rename recovery)");
+    eval {
+        _api_call_mutate($scfg, 'iscsi.extent.update',
+            [ $stale_extent->{id}, { name => $proper_name } ]);
+    };
+    if ($@) {
+        _log($scfg, 0, 'err',
+            "[TrueNAS] iSCSI stale-extent rename id=$stale_extent->{id} -> " .
+            "$proper_name failed: $@");
+        return 0;
+    }
+    _clear_cache(_cache_host_key($scfg));
+    return 1;
 }
 
 sub _is_not_found_error {
@@ -2601,6 +2648,15 @@ sub _tn_extent_create($scfg, $zname, $full, $extent_name=undef) {
                     "id=$by_name->{id} name=$submitted_name for $zvol_path (Fix B)");
                 $result = $by_name;
                 $err = '';
+            } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                # Historical create_base extent-rename gap. Stale extent
+                # renamed to its proper base-*-<hash>; retry our create.
+                $result = eval { _api_call_mutate($scfg, 'iscsi.extent.create', [ $payload ]) };
+                $err = $@;
+                if (!$err) {
+                    _log($scfg, 0, 'info',
+                        "[TrueNAS] _tn_extent_create: retry after stale-base rename succeeded for $submitted_name");
+                }
             } else {
                 _log($scfg, 0, 'err',
                     "[TrueNAS] _tn_extent_create: extent name '$submitted_name' " .
@@ -5511,6 +5567,17 @@ sub _alloc_image_iscsi {
                         "id=$by_name->{id} name=$extent_name for $zvol_path (Fix B)");
                     $ext = $by_name;
                     $err = '';
+                } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                    # Historical create_base extent-rename gap. Stale
+                    # base extent renamed; retry our create once.
+                    $ext = eval {
+                        _api_call_mutate($scfg, 'iscsi.extent.create', [ $extent_payload ]);
+                    };
+                    $err = $@;
+                    if (!$err) {
+                        _log($scfg, 0, 'info',
+                            "[TrueNAS] _alloc_image_iscsi: retry after stale-base rename succeeded for $extent_name");
+                    }
                 } else {
                     # An extent with our deterministic name exists but points
                     # at a different disk. Fix B cannot safely reuse it (that
@@ -7608,6 +7675,17 @@ sub _clone_image_iscsi {
                         "id=$by_name->{id} name=$extent_name for $zvol_path (Fix B)");
                     $ext = $by_name;
                     $err = '';
+                } elsif (_iscsi_extent_recover_stale_base_name($scfg, $by_name, $zvol_path)) {
+                    # Historical create_base extent-rename gap. Stale
+                    # base extent renamed; retry our create once.
+                    $ext = eval {
+                        _api_call_mutate($scfg, 'iscsi.extent.create', [ $extent_payload ]);
+                    };
+                    $err = $@;
+                    if (!$err) {
+                        _log($scfg, 0, 'info',
+                            "[TrueNAS] _clone_image_iscsi: retry after stale-base rename succeeded for $extent_name");
+                    }
                 } else {
                     _log($scfg, 0, 'err',
                         "[TrueNAS] _clone_image_iscsi: extent name '$extent_name' " .
@@ -7927,7 +8005,16 @@ sub create_base {
         die "create_base: no iSCSI extent found for $old_zvol_path\n" unless $extent;
         $transport_id   = $extent->{id};
         $rewire_method  = 'iscsi.extent.update';
-        $rewire_payload = { disk => $new_zvol_path };
+        # Rename the extent alongside the disk-field rewrite. Without
+        # the rename, the vm-<vmid>-disk-N-<hash> extent-name slot on
+        # TN stays owned by this (now-base) extent forever; the next
+        # VM allocated at the same VMID hashes to the same name and
+        # gets "iscsi_extent_create.name: Extent name must be unique".
+        # See _iscsi_extent_recover_stale_base_name for the recovery
+        # path that unwinds historical TN state where this rename was
+        # skipped.
+        my $new_extent_name = _generate_extent_name($scfg, $new_zname);
+        $rewire_payload = { disk => $new_zvol_path, name => $new_extent_name };
         $share_label    = "iSCSI extent id=$transport_id";
     } else {
         # nvme-tcp

@@ -1,3 +1,60 @@
+truenas-proxmox-plugin (2.1.23~alpha34) unstable; urgency=medium
+
+  * iSCSI: fix create_base extent-rename gap that produced cascading
+    "iscsi_extent_create.name: Extent name must be unique" failures on
+    every VM allocation at a VMID that had previously been templated.
+
+    Root cause: create_base renamed the zvol vm-<vmid>-disk-N ->
+    base-<vmid>-disk-N and issued iscsi.extent.update to rewrite the
+    extent's `disk` field, but never renamed the extent itself. The
+    vm-<vmid>-disk-N-<hash> extent-name slot on TN stayed owned by
+    the (now-base) extent. _generate_extent_name is deterministic on
+    (dataset, zname), so the next VM allocated at the same VMID hashed
+    to the same name and collided. Fix B looked up the conflicting
+    extent by name, saw its disk field pointed at a base zvol (not
+    ours), and correctly refused to reuse -- there was no safe reuse
+    path, and no repair path either. Test file died, next test file
+    hit it too, cascade.
+
+    Impact observed:
+      - Max R. Carrara's test_run6/truenas-2026-08-13 3-node cluster
+        runs: 2348-2632 "Extent name must be unique" hits per node.
+      - Same runs single-node: 1180 hits (visible even without
+        multi-node concurrency).
+      - Our iSCSI-only run 2026-08-24 against alpha33: 128-199 per
+        node, all on the same extent id.
+      - Was masked in earlier report summaries as generic FAIL verdicts
+        spread across ~14 different capability tests
+        (storage_plugin_disk_purge, template_linked_clone,
+        vm_create_default, etc.) -- not clustered as one bug.
+
+    Fix has two parts:
+
+    Part 1 (prevent new occurrences). create_base's iSCSI branch now
+    includes {name => _generate_extent_name($new_zname)} in the
+    iscsi.extent.update payload alongside the existing {disk =>
+    $new_zvol_path}. New templates leave TN with a properly-named
+    base-*-<hash> extent, freeing the vm-*-<hash> slot for future VMs.
+
+    Part 2 (recover from historical TN state). New helper
+    _iscsi_extent_recover_stale_base_name detects the shape of a
+    stale-extent conflict (same name, disk field points at a
+    base-<vmid>-disk-N zvol) and renames the extent to its proper
+    base-*-<hash> name. All three Fix B call sites -- _tn_extent_create,
+    _alloc_image_iscsi, _clone_image_iscsi -- invoke the helper in the
+    "refusing to reuse" branch and retry the create once on success.
+
+    The rename is bookkeeping-only from the initiator side: extent_id,
+    targetextent mapping, and naa/serial identifiers are all preserved.
+    Nothing on the wire changes; only the TN-side extent name is
+    corrected.
+
+    NVMe is not affected: nvmet namespaces are keyed by (subsys, nsid),
+    not by a name attribute, so the equivalent create_base rewire (of
+    namespace.device_path) does not leave a stale name slot behind.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Mon, 25 Aug 2026 00:00:00 +0000
+
 truenas-proxmox-plugin (2.1.23~alpha33) unstable; urgency=medium
 
   * Fix alpha32 compile error.
