@@ -11,6 +11,11 @@ Restart=on-failure
 RestartSec=2
 RuntimeDirectory=truenas-plugin
 RuntimeDirectoryMode=0700
+# Keep /run/truenas-plugin across service restarts so the preflight-alloc
+# cache stamps written by pvedaemon workers survive broker upgrades.
+# Tmpfs is still wiped on reboot, which is the correct invalidation
+# surface for cached TN health signals.
+RuntimeDirectoryPreserve=yes
 StandardOutput=journal
 StandardError=journal
 ProtectSystem=strict

@@ -31,7 +31,7 @@ use IO::Socket::SSL;
 use IO::Socket::INET;
 use IO::Select;
 use Fcntl qw(:flock);
-use POSIX qw(setsid strftime);
+use POSIX qw(setsid strftime WNOHANG);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP;
@@ -43,6 +43,20 @@ my $PIDFILE        = '/run/truenas-plugin/broker.pid';
 my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
 my $WS_PATH = '/api/current';
+
+# Prefork worker count. Each worker holds one upstream WS (auth'd once) and
+# accepts on the shared listen fd; the kernel load-balances accept() across
+# them. Under 3-node cluster test load a single-threaded broker serialized
+# every RPC through one WS, so 4 concurrent client calls (extent.query x2,
+# targetextent.query, pool.dataset.query) took 9.8 s wall vs 0.14+1.6+3.2+
+# 9.8 ≈ 15 s serial-sum -- close to fully serialized. With N workers each
+# client call parallelizes up to N-way. TN's rate-limit on
+# auth.login_with_api_key is 20 / 60 s / IP; N=4 auths at broker startup
+# stay well under that (and each worker only re-auths on WS disconnect).
+# Bump this if a node has many pvedaemon workers; keep it small enough
+# that startup burst + reconnect churn stays inside TN's 20/60s ceiling
+# with headroom for other operational traffic.
+my $PREFORK_N = 4;
 
 my $foreground = grep { $_ eq '--foreground' || $_ eq '-f' } @ARGV;
 my $debug      = grep { $_ eq '--debug' || $_ eq '-d' } @ARGV;
@@ -443,37 +457,94 @@ daemonize();
 write_pidfile();
 linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
 
+$SIG{PIPE} = 'IGNORE';
+# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
+# also propagate to the worker pool. Workers install their own TERM
+# handler in spawn_worker so they close their local %POOL WS connections
+# and exit cleanly without touching parent's socket / pidfile.
+
+my $srv = make_listener();
+
+# Prefork the worker pool. Parent creates listen fd, forks N children; each
+# child re-runs the accept loop against the shared fd. Kernel serializes
+# accept() among children so no race. Parent then waits and re-spawns any
+# child that dies.
+my %WORKER_PIDS;   # pid => 1
+
+sub spawn_worker {
+    my $pid = fork();
+    if (!defined $pid) {
+        lerr("fork worker failed: $!");
+        return;
+    }
+    if ($pid == 0) {
+        # child: close its own WS pool cleanly on TERM; do NOT touch
+        # parent's socket file or pidfile.
+        $SIG{TERM} = $SIG{INT} = sub {
+            for my $sk (keys %POOL) {
+                my $e = $POOL{$sk};
+                eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+            }
+            exit 0;
+        };
+        $SIG{CHLD} = 'DEFAULT';
+        worker_loop($srv);
+        exit 0;
+    }
+    $WORKER_PIDS{$pid} = 1;
+    ldebug("spawned worker pid=$pid");
+}
+
+sub worker_loop {
+    my ($srv) = @_;
+    my $sel = IO::Select->new($srv);
+    my $last_reap = time();
+    while (1) {
+        my @ready = $sel->can_read(60);
+        for my $fh (@ready) {
+            if ($fh == $srv) {
+                my $c = $srv->accept();
+                next unless $c;
+                eval { handle_request($c); };
+                if ($@) { lerr("handle_request died: $@"); }
+                eval { $c->close(); };
+            }
+        }
+        if (time() - $last_reap > 60) {
+            reap_idle();
+            $last_reap = time();
+        }
+    }
+}
+
+# Parent: spawn N workers, then supervise
+for (1..$PREFORK_N) { spawn_worker(); }
+linfo("prefork pool up (N=$PREFORK_N)");
+
+# Parent supervision loop: reap dead workers, respawn to keep pool full.
+# Set the parent's TERM/INT handler HERE (after workers are up) so it
+# only affects the parent process -- workers already installed their own
+# in spawn_worker.
 $SIG{TERM} = $SIG{INT} = sub {
-    linfo("shutting down");
-    for my $sk (keys %POOL) {
-        my $e = $POOL{$sk};
-        eval { $e->{conn}->{sock}->close() if $e && $e->{conn}; };
+    linfo("parent shutting down, signalling workers");
+    kill 'TERM', keys %WORKER_PIDS;
+    # Give workers a moment to close their WS cleanly.
+    for (1..10) {
+        last unless keys %WORKER_PIDS;
+        my $dead = waitpid(-1, WNOHANG);
+        if ($dead > 0) { delete $WORKER_PIDS{$dead}; }
+        else { select(undef, undef, undef, 0.1); }
     }
     unlink $SOCKET_PATH;
     unlink $PIDFILE;
     exit 0;
 };
-$SIG{PIPE} = 'IGNORE';
-
-my $srv = make_listener();
-my $sel = IO::Select->new($srv);
-my $last_reap = time();
 
 while (1) {
-    my @ready = $sel->can_read(60);
-    for my $fh (@ready) {
-        if ($fh == $srv) {
-            my $c = $srv->accept();
-            next unless $c;
-            # Handle inline (single-threaded). Per-conn the round trip is
-            # microseconds; broker bottleneck is the upstream WS not us.
-            eval { handle_request($c); };
-            if ($@) { lerr("handle_request died: $@"); }
-            eval { $c->close(); };
-        }
-    }
-    if (time() - $last_reap > 60) {
-        reap_idle();
-        $last_reap = time();
+    my $dead = waitpid(-1, 0);
+    if ($dead > 0) {
+        delete $WORKER_PIDS{$dead};
+        lwarn("worker pid=$dead exited (status=$?), respawning");
+        spawn_worker();
     }
 }
