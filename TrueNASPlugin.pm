@@ -58,6 +58,16 @@ my %_status_capacity_cache_stats = (
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
 
+# Recent-failure marker for status(): once a probe fails on a connectivity
+# error, remember it for tn_status_probe_backoff_s seconds and answer
+# inactive from memory instead of probing again right away. Keyed by
+# _cache_host_key(), so two storages against the same TrueNAS host share
+# one marker.
+my %_status_api_down;
+
+# Throttle state for _log_api_down_note(), keyed per call site and storeid.
+my %_api_down_log_last;
+
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
@@ -86,6 +96,9 @@ use constant {
     DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability)
     DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 5,   # device cleanup verification timeout
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
+
+    API_DOWN_PROBE_BUDGET_S   => 2,    # deadline for API work while the recent-failure marker stands
+    API_DOWN_LOG_S            => 60,   # throttle CEILING for recent-failure-marker notices
 };
 
 sub _cache_key {
@@ -263,6 +276,12 @@ sub _is_retryable_error {
     return 0; # Default: don't retry unknown errors
 }
 
+# Deadline for the API call currently in flight, or undef when none is
+# active. A caller that already knows the array is unreachable (see the
+# recent-failure marker added later) can set this via `local` to hand
+# _retry_with_backoff a nearer deadline without touching tn_api_budget_s.
+our $_api_deadline;
+
 sub _retry_with_backoff {
     my ($scfg, $operation_name, $code_ref, $retry_opts) = @_;
 
@@ -272,6 +291,26 @@ sub _retry_with_backoff {
     my $initial_delay = defined($retry_opts) && exists($retry_opts->{retry_delay})
         ? $retry_opts->{retry_delay}
         : ($scfg->{tn_api_retry_delay} // 1);
+
+    # Opt-in wall-clock budget, layered on top of the attempt-counted loop
+    # below. Activates only when tn_api_budget_s is set OR an outer
+    # $_api_deadline is already standing; neither is true by default, so
+    # $deadline stays undef and every branch that reads it is skipped -
+    # exhaustion still reports the classic "Operation failed after N
+    # retries" message.
+    my $configured_budget = $scfg->{tn_api_budget_s};
+    my ($started, $budget, $deadline);
+    if (defined($configured_budget) || defined($_api_deadline)) {
+        $budget = $configured_budget;
+        $budget = 120 if !defined($budget) || $budget !~ /^\d+(?:\.\d+)?$/ || $budget < 1;
+        $started = time();
+        $deadline = $started + $budget;
+        # An outer deadline wins when nearer - a cap must only ever shrink.
+        if (defined($_api_deadline) && $_api_deadline < $deadline) {
+            $deadline = $_api_deadline;
+        }
+    }
+    local $_api_deadline = $deadline;
 
     my $attempt = 0;
     my $last_error;
@@ -306,6 +345,30 @@ sub _retry_with_backoff {
         # Add jitter (0-20% random variation) to prevent thundering herd
         my $jitter = $delay * 0.2 * rand();
         $delay += $jitter;
+
+        # Only checked when a deadline is active (see the opt-in gate above).
+        if (defined($deadline)) {
+            my $left = $deadline - time();
+            if ($left <= 0) {
+                my $spent = time() - $started;
+                # Name the budget that actually governed: an outer deadline
+                # may have shrunk it, and "Budget of 120s spent" after two
+                # real seconds points the diagnosis the wrong way.
+                my $granted = $deadline - $started;
+                $granted = 0 if $granted < 0;
+                my $bnote = ($granted + 0.5 < $budget)
+                    ? sprintf('%ss, capped to %.0fs by an outer deadline', $budget, $granted)
+                    : "${budget}s";
+                _log($scfg, 0, 'err', "[TrueNAS] Budget of $bnote spent after $attempt "
+                    . "attempt(s) for $operation_name: $last_error");
+                die "Gave up on $operation_name after ${spent}s (budget $bnote, "
+                  . "$attempt attempt(s)); the array did not answer in time, so the "
+                  . "outcome is unknown: $last_error";
+            }
+            # Never sleep past the deadline: a backoff longer than what is
+            # left would only buy a retry guaranteed to be refused.
+            $delay = $left if $delay > $left;
+        }
 
         _log($scfg, 1, 'info', "[TrueNAS] Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
         sleep($delay);
@@ -509,6 +572,21 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_api_budget_s => {
+            description => "Wall-clock budget in seconds for a whole retry sequence " .
+                          "(across all attempts and backoff delays). Unset by default: " .
+                          "a call is then bounded only by tn_api_retry_max, as before. " .
+                          "Bounds when a new attempt may START, not an attempt already " .
+                          "blocked in a syscall.",
+            type => 'integer', optional => 1, minimum => 1,
+        },
+        tn_status_probe_backoff_s => {
+            description => "After status() sees a connectivity failure, suppress further " .
+                          "API probes for this many seconds and report the storage inactive " .
+                          "from memory instead. Set to 0 to probe on every poll (no marker). " .
+                          "Default 30.",
+            type => 'integer', optional => 1, default => 30, minimum => 0,
+        },
         tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
@@ -592,6 +670,8 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_api_budget_s => { optional => 1 },
+        tn_status_probe_backoff_s => { optional => 1 },
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
@@ -4114,6 +4194,17 @@ sub _nvme_sync_portals {
     my $existing_bindings = eval {
         _api_call($scfg, 'nvmet.port_subsys.query', []);
     } // [];
+    # "Could not ask" must not impersonate "no bindings" silently - under
+    # the marker's cap this now fails routinely during an outage.
+    if (my $q_err = $@) {
+        if (defined(my $marker_s = _api_recently_down($scfg))) {
+            _log_api_down_note($scfg, 'portal-query', "subsys$subsys_id", $marker_s,
+                'port_subsys.query failed, assuming no existing bindings', 'warning');
+        } else {
+            _log($scfg, 0, 'warning', "[TrueNAS] sync_portals: port_subsys.query "
+                . "failed, assuming no existing bindings: $q_err");
+        }
+    }
 
     # Build lookup of existing "addr:port" for this subsystem
     my %existing_set;
@@ -4215,11 +4306,15 @@ sub _nvme_ensure_subsystem {
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
     # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
-    my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
+    my $subsys = eval { _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
-    }]);
+    }]) };
+    # Wrapped like its sibling mutations - unwrapped, its failure propagated
+    # a bare "Gave up on ..." that the marker classifier would file as
+    # routine noise, when a CREATE with an unknown outcome is news.
+    die "nvme_ensure_subsystem: failed to create subsystem $nqn: $@" if $@;
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
 
@@ -5690,6 +5785,67 @@ sub _invalidate_status_capacity_cache {
     _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
 }
 
+# ======== recent-failure marker: shared helpers ========
+# Single source of truth for the backoff window, read here and in
+# activate_storage, written in status().
+sub _status_probe_backoff {
+    my ($scfg) = @_;
+    my $backoff = $scfg->{tn_status_probe_backoff_s};
+    return 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
+    return $backoff;
+}
+
+# Seconds remaining while the marker stands, else undef. activate_storage()
+# runs BEFORE status() on every pvestatd sweep, so this lets it read the
+# same fact status() writes.
+sub _api_recently_down {
+    my ($scfg) = @_;
+    return undef if _status_probe_backoff($scfg) <= 0;
+    my $down_until = $_status_api_down{_cache_host_key($scfg)};
+    return undef if !defined($down_until);
+    my $left = $down_until - time();
+    return $left > 0 ? $left : undef;
+}
+
+# The short probe deadline, clamped to any outer deadline already standing -
+# a cap must only ever shrink.
+sub _capped_api_deadline {
+    my $cap = time() + API_DOWN_PROBE_BUDGET_S;
+    $cap = $_api_deadline if defined($_api_deadline) && $_api_deadline < $cap;
+    return $cap;
+}
+
+# One place for the "the array is still marked down" family of notes, now
+# throttled (per call site + storeid, windowed to the marker's own backoff,
+# capped at API_DOWN_LOG_S) so an outage does not turn one note into six a
+# minute. tn_debug bypasses the throttle. Severity is per call: a note that
+# carries an actual cause is logged at warning, so it survives a
+# >=warning syslog filter.
+sub _log_api_down_note {
+    my ($scfg, $tag, $storeid, $left, $what, $sev) = @_;
+    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
+    my $now = time();
+    my $last = $_api_down_log_last{$key} // 0;
+    $last = 0 if $now < $last;   # clock stepped back: don't mute forever
+    my $verbose = ($scfg->{tn_debug} // 0) >= 1;
+    my $win = _status_probe_backoff($scfg);
+    $win = API_DOWN_LOG_S if $win <= 0 || $win > API_DOWN_LOG_S;
+    return if !$verbose && ($now - $last) < $win;
+    $_api_down_log_last{$key} = $now;
+    _log($scfg, 0, $sev // 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
+        . "array marked down for another " . int($left) . "s");
+}
+
+# Test-only escape hatch: control the throttle state without a symbolic
+# reference into this lexical hash.
+sub _reset_api_down_throttle { %_api_down_log_last = (); }
+
+sub _seed_api_down_throttle {
+    my ($scfg, $tag, $storeid, $ago_s) = @_;
+    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
+    $_api_down_log_last{$key} = time() - $ago_s;
+}
+
 # ======== status(): dataset capacity ========
 # total = quota (if set) else (written/used + available)
 # avail = (quota - written/used) when quota present, else dataset available
@@ -5700,6 +5856,14 @@ sub status {
     my ($total, $avail, $used) = (0,0,0);
     my $host_key = _cache_host_key($scfg);
     my $status_method = _status_capacity_cache_method($storeid, $scfg);
+
+    # $backoff is still needed below, where the marker is WRITTEN.
+    my $backoff = _status_probe_backoff($scfg);
+    if (defined(my $left = _api_recently_down($scfg))) {
+        _log_api_down_note($scfg, 'status', $storeid, $left,
+            'reported inactive from the recent-failure marker');
+        return (0, 0, 0, 0);
+    }
 
     eval {
         my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
@@ -5744,6 +5908,12 @@ sub status {
             # Network/connectivity issue - mark as inactive (temporary)
             _log($scfg, 0, 'info', "[TrueNAS] status: storage '$storeid' marked inactive (connectivity issue): $err");
             $active = 0;
+            # Arm the marker read at the top. Only for connectivity: a bad
+            # dataset name or a rejected API key answers fast and needs no
+            # suppression.
+            if ($backoff > 0) {
+                $_status_api_down{$host_key} = time() + $backoff;
+            }
         } elsif (_is_not_found_error($err)) {
             # Dataset doesn't exist - this is a configuration error
             _log($scfg, 0, 'err', "[TrueNAS] status: storage '$storeid' configuration error (dataset not found): $err");
@@ -5762,6 +5932,11 @@ sub status {
         $total = 0;
         $avail = 0;
         $used  = 0;
+    } else {
+        # It answered: drop any suppression immediately rather than waiting
+        # out the window, so a recovered array is not held down by its own
+        # past failure.
+        delete $_status_api_down{$host_key};
     }
     return ($total, $avail, $used, $active);
 }
@@ -6102,13 +6277,57 @@ sub activate_storage {
             die "NVMe/TCP storage activation failed: $@\n";
         }
 
-        # Ensure subsystem exists and connect
+        # Ensure subsystem exists and connect. activate_storage() runs
+        # BEFORE status() on every pvestatd sweep, so the ensure below has
+        # to honour the marker too, or it pays a full API timeout on every
+        # poll for as long as the array is unreachable. CAP it, don't skip
+        # it: it also republishes portals the target lost, which matters
+        # most exactly when the array is flaky - and the 2s cap covers its
+        # mutations too (an abandoned create is reconciled by the next poll).
         eval {
-            _nvme_ensure_subsystem($scfg);
+            my $marker_left = _api_recently_down($scfg);
+            if (defined($marker_left)) {
+                _log_api_down_note($scfg, 'activate_storage', $storeid, $marker_left,
+                    'capping subsystem ensure at ' . API_DOWN_PROBE_BUDGET_S . 's');
+                local $_api_deadline = _capped_api_deadline();
+                eval { _nvme_ensure_subsystem($scfg) };
+            } else {
+                eval { _nvme_ensure_subsystem($scfg) };
+            }
+            if (my $ensure_err = $@) {
+                # A capped ensure hitting ITS OWN probe budget is the marker
+                # doing its job, expected while an outage lasts; anything
+                # else (401, DHCHAP, EINVAL...) is a real fault. Classify by
+                # the retry engine's own two death messages, anchored to the
+                # string START - never a substring, which can also match
+                # inside a foreign payload (e.g. a traceback containing the
+                # word "timeout").
+                my $excerpt = $ensure_err;
+                $excerpt =~ s/\s+/ /g;
+                $excerpt = substr($excerpt, 0, 160) . '...' if length($excerpt) > 160;
+                if (defined($marker_left)
+                    && $ensure_err =~ /^Gave up on |^Operation failed after \d+ retries: /) {
+                    _log_api_down_note($scfg, 'ensure-budget', $storeid, $marker_left,
+                        "subsystem ensure hit the probe budget ($excerpt); will retry next poll",
+                        'warning');
+                } elsif (defined($marker_left)) {
+                    # A real fault that REPEATS while the marker stands: still
+                    # a warning, but throttled - first occurrence still logs.
+                    _log_api_down_note($scfg, 'ensure-fault', $storeid, $marker_left,
+                        "subsystem ensure failed ($excerpt), still attempting connect",
+                        'warning');
+                } else {
+                    _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
+                        . "ensure failed for $storeid, still attempting connect: $ensure_err");
+                }
+            }
+            # Separate eval from the ensure above: sharing one meant a die
+            # here also skipped this sysfs/nvme-cli reconnect, which needs
+            # no API and can repair a portal even with the array's API down.
             _nvme_connect($scfg);
         };
         if ($@) {
-            _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
+            _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
         }
     }
 

@@ -21,6 +21,8 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [api_insecure](#api_insecure)
   - [api_retry_max](#api_retry_max)
   - [api_retry_delay](#api_retry_delay)
+  - [api_budget_s](#api_budget_s)
+  - [status_probe_backoff_s](#status_probe_backoff_s)
   - [storage_lock_timeout](#storage_lock_timeout)
 - [Network Configuration](#network-configuration)
   - [prefer_ipv4](#prefer_ipv4)
@@ -231,6 +233,34 @@ Each retry doubles the delay: `delay * 2^(attempt-1)`. Example: 1s → 2s → 4s
 
 ```ini
 tn_api_retry_delay 2
+```
+
+### `tn_api_budget_s`
+**Description**: Wall-clock budget in seconds for a whole retry sequence (across all attempts and backoff delays)
+**Type**: Integer (minimum 1)
+**Default**: unset (disabled - a call is then bounded only by `tn_api_retry_max`, as before this option existed)
+
+Bounds how long ONE API call can hold a locked storage operation, regardless of `tn_api_retry_max`. The budget only bounds when a new attempt may START; it cannot interrupt an attempt already blocked in a syscall.
+
+```ini
+# Cap any single retry sequence at 60s
+tn_api_budget_s 60
+```
+
+### `tn_status_probe_backoff_s`
+**Description**: After `status()` sees a connectivity failure, suppress further API probes for this many seconds and report the storage inactive from memory instead
+**Type**: Integer (minimum 0)
+**Default**: `30`
+**Validation**: `0` disables the marker (probe on every poll, matching behavior before this option existed)
+
+Prevents `pvestatd` from paying a full probe timeout on every poll for every storage while a TrueNAS array is unreachable.
+
+```ini
+# Suppress re-probing for 60s after a connectivity failure
+tn_status_probe_backoff_s 60
+
+# Disable the marker entirely (always probe)
+tn_status_probe_backoff_s 0
 ```
 
 ### `tn_storage_lock_timeout`
