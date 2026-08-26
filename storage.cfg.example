@@ -58,6 +58,8 @@ truenasplugin: truenas-cluster
     # Advanced options
     tn_force_delete_on_inuse 1
     tn_logout_on_free 0
+    # Resilience (optional; shown here at a non-default value)
+    tn_api_budget_s 60
 
 # =============================================================================
 # HIGH AVAILABILITY CONFIGURATION
@@ -271,6 +273,9 @@ truenasplugin: truenas-soho
 # - Ensure all nodes have identical configurations
 # - Test failover scenarios regularly
 # - NVMe/TCP and iSCSI cannot be mixed on same storage ID
+#
+# Resilience:
+# - tn_api_budget_s: wall-clock cap for one retry sequence (unset = unbounded by tn_api_retry_max only, as always)
 #
 # Monitoring:
 # - Monitor storage performance regularly

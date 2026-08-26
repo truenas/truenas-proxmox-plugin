@@ -263,6 +263,12 @@ sub _is_retryable_error {
     return 0; # Default: don't retry unknown errors
 }
 
+# Deadline for the API call currently in flight, or undef when none is
+# active. A caller that already knows the array is unreachable (see the
+# recent-failure marker added later) can set this via `local` to hand
+# _retry_with_backoff a nearer deadline without touching tn_api_budget_s.
+our $_api_deadline;
+
 sub _retry_with_backoff {
     my ($scfg, $operation_name, $code_ref, $retry_opts) = @_;
 
@@ -272,6 +278,26 @@ sub _retry_with_backoff {
     my $initial_delay = defined($retry_opts) && exists($retry_opts->{retry_delay})
         ? $retry_opts->{retry_delay}
         : ($scfg->{tn_api_retry_delay} // 1);
+
+    # Opt-in wall-clock budget, layered on top of the attempt-counted loop
+    # below. Activates only when tn_api_budget_s is set OR an outer
+    # $_api_deadline is already standing; neither is true by default, so
+    # $deadline stays undef and every branch that reads it is skipped -
+    # exhaustion still reports the classic "Operation failed after N
+    # retries" message.
+    my $configured_budget = $scfg->{tn_api_budget_s};
+    my ($started, $budget, $deadline);
+    if (defined($configured_budget) || defined($_api_deadline)) {
+        $budget = $configured_budget;
+        $budget = 120 if !defined($budget) || $budget !~ /^\d+(?:\.\d+)?$/ || $budget < 1;
+        $started = time();
+        $deadline = $started + $budget;
+        # An outer deadline wins when nearer - a cap must only ever shrink.
+        if (defined($_api_deadline) && $_api_deadline < $deadline) {
+            $deadline = $_api_deadline;
+        }
+    }
+    local $_api_deadline = $deadline;
 
     my $attempt = 0;
     my $last_error;
@@ -306,6 +332,30 @@ sub _retry_with_backoff {
         # Add jitter (0-20% random variation) to prevent thundering herd
         my $jitter = $delay * 0.2 * rand();
         $delay += $jitter;
+
+        # Only checked when a deadline is active (see the opt-in gate above).
+        if (defined($deadline)) {
+            my $left = $deadline - time();
+            if ($left <= 0) {
+                my $spent = time() - $started;
+                # Name the budget that actually governed: an outer deadline
+                # may have shrunk it, and "Budget of 120s spent" after two
+                # real seconds points the diagnosis the wrong way.
+                my $granted = $deadline - $started;
+                $granted = 0 if $granted < 0;
+                my $bnote = ($granted + 0.5 < $budget)
+                    ? sprintf('%ss, capped to %.0fs by an outer deadline', $budget, $granted)
+                    : "${budget}s";
+                _log($scfg, 0, 'err', "[TrueNAS] Budget of $bnote spent after $attempt "
+                    . "attempt(s) for $operation_name: $last_error");
+                die "Gave up on $operation_name after ${spent}s (budget $bnote, "
+                  . "$attempt attempt(s)); the array did not answer in time, so the "
+                  . "outcome is unknown: $last_error";
+            }
+            # Never sleep past the deadline: a backoff longer than what is
+            # left would only buy a retry guaranteed to be refused.
+            $delay = $left if $delay > $left;
+        }
 
         _log($scfg, 1, 'info', "[TrueNAS] Retry attempt $attempt/$max_retries for $operation_name after ${delay}s delay (error: $last_error)");
         sleep($delay);
@@ -509,6 +559,14 @@ sub properties {
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
+        tn_api_budget_s => {
+            description => "Wall-clock budget in seconds for a whole retry sequence " .
+                          "(across all attempts and backoff delays). Unset by default: " .
+                          "a call is then bounded only by tn_api_retry_max, as before. " .
+                          "Bounds when a new attempt may START, not an attempt already " .
+                          "blocked in a syscall.",
+            type => 'integer', optional => 1, minimum => 1,
+        },
         tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
@@ -592,6 +650,7 @@ sub options {
         # Retry configuration
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
+        tn_api_budget_s => { optional => 1 },
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
