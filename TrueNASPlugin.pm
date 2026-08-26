@@ -65,6 +65,9 @@ my %_portal_sync_last_ok;
 # one marker.
 my %_status_api_down;
 
+# Throttle state for _log_api_down_note(), keyed per call site and storeid.
+my %_api_down_log_last;
+
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
@@ -95,6 +98,7 @@ use constant {
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
 
     API_DOWN_PROBE_BUDGET_S   => 2,    # deadline for API work while the recent-failure marker stands
+    API_DOWN_LOG_S            => 60,   # throttle CEILING for recent-failure-marker notices
 };
 
 sub _cache_key {
@@ -4190,6 +4194,17 @@ sub _nvme_sync_portals {
     my $existing_bindings = eval {
         _api_call($scfg, 'nvmet.port_subsys.query', []);
     } // [];
+    # "Could not ask" must not impersonate "no bindings" silently - under
+    # the marker's cap this now fails routinely during an outage.
+    if (my $q_err = $@) {
+        if (defined(my $marker_s = _api_recently_down($scfg))) {
+            _log_api_down_note($scfg, 'portal-query', "subsys$subsys_id", $marker_s,
+                'port_subsys.query failed, assuming no existing bindings', 'warning');
+        } else {
+            _log($scfg, 0, 'warning', "[TrueNAS] sync_portals: port_subsys.query "
+                . "failed, assuming no existing bindings: $q_err");
+        }
+    }
 
     # Build lookup of existing "addr:port" for this subsystem
     my %existing_set;
@@ -4291,11 +4306,15 @@ sub _nvme_ensure_subsystem {
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
     # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
-    my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
+    my $subsys = eval { _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
         allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
-    }]);
+    }]) };
+    # Wrapped like its sibling mutations - unwrapped, its failure propagated
+    # a bare "Gave up on ..." that the marker classifier would file as
+    # routine noise, when a CREATE with an unknown outcome is news.
+    die "nvme_ensure_subsystem: failed to create subsystem $nqn: $@" if $@;
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
 
@@ -5796,11 +5815,35 @@ sub _capped_api_deadline {
     return $cap;
 }
 
-# One place for the "the array is still marked down" family of notes.
+# One place for the "the array is still marked down" family of notes, now
+# throttled (per call site + storeid, windowed to the marker's own backoff,
+# capped at API_DOWN_LOG_S) so an outage does not turn one note into six a
+# minute. tn_debug bypasses the throttle. Severity is per call: a note that
+# carries an actual cause is logged at warning, so it survives a
+# >=warning syslog filter.
 sub _log_api_down_note {
-    my ($scfg, $tag, $storeid, $left, $what) = @_;
-    _log($scfg, 0, 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
+    my ($scfg, $tag, $storeid, $left, $what, $sev) = @_;
+    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
+    my $now = time();
+    my $last = $_api_down_log_last{$key} // 0;
+    $last = 0 if $now < $last;   # clock stepped back: don't mute forever
+    my $verbose = ($scfg->{tn_debug} // 0) >= 1;
+    my $win = _status_probe_backoff($scfg);
+    $win = API_DOWN_LOG_S if $win <= 0 || $win > API_DOWN_LOG_S;
+    return if !$verbose && ($now - $last) < $win;
+    $_api_down_log_last{$key} = $now;
+    _log($scfg, 0, $sev // 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
         . "array marked down for another " . int($left) . "s");
+}
+
+# Test-only escape hatch: control the throttle state without a symbolic
+# reference into this lexical hash.
+sub _reset_api_down_throttle { %_api_down_log_last = (); }
+
+sub _seed_api_down_throttle {
+    my ($scfg, $tag, $storeid, $ago_s) = @_;
+    my $key = _cache_host_key($scfg) . "|$tag|" . ($storeid // '-');
+    $_api_down_log_last{$key} = time() - $ago_s;
 }
 
 # ======== status(): dataset capacity ========
@@ -6259,10 +6302,20 @@ sub activate_storage {
                 # string START - never a substring, which can also match
                 # inside a foreign payload (e.g. a traceback containing the
                 # word "timeout").
+                my $excerpt = $ensure_err;
+                $excerpt =~ s/\s+/ /g;
+                $excerpt = substr($excerpt, 0, 160) . '...' if length($excerpt) > 160;
                 if (defined($marker_left)
                     && $ensure_err =~ /^Gave up on |^Operation failed after \d+ retries: /) {
                     _log_api_down_note($scfg, 'ensure-budget', $storeid, $marker_left,
-                        'subsystem ensure hit the probe budget; will retry next poll');
+                        "subsystem ensure hit the probe budget ($excerpt); will retry next poll",
+                        'warning');
+                } elsif (defined($marker_left)) {
+                    # A real fault that REPEATS while the marker stands: still
+                    # a warning, but throttled - first occurrence still logs.
+                    _log_api_down_note($scfg, 'ensure-fault', $storeid, $marker_left,
+                        "subsystem ensure failed ($excerpt), still attempting connect",
+                        'warning');
                 } else {
                     _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
                         . "ensure failed for $storeid, still attempting connect: $ensure_err");
