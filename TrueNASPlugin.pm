@@ -93,6 +93,8 @@ use constant {
     DATASET_DELETE_TIMEOUT_S         => 30,  # dataset deletion job timeout (increased for reliability)
     DEVICE_CLEANUP_VERIFY_TIMEOUT_S  => 5,   # device cleanup verification timeout
     DATASET_DELETE_RETRY_COUNT       => 3,   # max retries for dataset deletion on "busy" errors
+
+    API_DOWN_PROBE_BUDGET_S   => 2,    # deadline for API work while the recent-failure marker stands
 };
 
 sub _cache_key {
@@ -5764,6 +5766,43 @@ sub _invalidate_status_capacity_cache {
     _log($scfg, 2, 'debug', "[TrueNAS] status-cache: invalidate key=$method");
 }
 
+# ======== recent-failure marker: shared helpers ========
+# Single source of truth for the backoff window, read here and in
+# activate_storage, written in status().
+sub _status_probe_backoff {
+    my ($scfg) = @_;
+    my $backoff = $scfg->{tn_status_probe_backoff_s};
+    return 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
+    return $backoff;
+}
+
+# Seconds remaining while the marker stands, else undef. activate_storage()
+# runs BEFORE status() on every pvestatd sweep, so this lets it read the
+# same fact status() writes.
+sub _api_recently_down {
+    my ($scfg) = @_;
+    return undef if _status_probe_backoff($scfg) <= 0;
+    my $down_until = $_status_api_down{_cache_host_key($scfg)};
+    return undef if !defined($down_until);
+    my $left = $down_until - time();
+    return $left > 0 ? $left : undef;
+}
+
+# The short probe deadline, clamped to any outer deadline already standing -
+# a cap must only ever shrink.
+sub _capped_api_deadline {
+    my $cap = time() + API_DOWN_PROBE_BUDGET_S;
+    $cap = $_api_deadline if defined($_api_deadline) && $_api_deadline < $cap;
+    return $cap;
+}
+
+# One place for the "the array is still marked down" family of notes.
+sub _log_api_down_note {
+    my ($scfg, $tag, $storeid, $left, $what) = @_;
+    _log($scfg, 0, 'info', "[TrueNAS] $tag: '" . ($storeid // '-') . "' $what; "
+        . "array marked down for another " . int($left) . "s");
+}
+
 # ======== status(): dataset capacity ========
 # total = quota (if set) else (written/used + available)
 # avail = (quota - written/used) when quota present, else dataset available
@@ -5775,23 +5814,12 @@ sub status {
     my $host_key = _cache_host_key($scfg);
     my $status_method = _status_capacity_cache_method($storeid, $scfg);
 
-    # pvestatd walks every storage on a timer from a single process; against
-    # an unreachable array, each poll paid a full probe timeout before
-    # reporting inactive, stalling metrics for every storage on the node for
-    # as long as the outage lasted. Remember a connectivity failure briefly
-    # (write side below) and answer from memory while it stands - recovery
-    # is then noticed up to tn_status_probe_backoff_s late, a trade worth
-    # making against pvestatd going silent for the whole outage.
-    my $backoff = $scfg->{tn_status_probe_backoff_s};
-    $backoff = 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
-    if ($backoff > 0) {
-        my $down_until = $_status_api_down{$host_key};
-        if (defined($down_until) && time() < $down_until) {
-            _log($scfg, 1, 'info', "[TrueNAS] status: '$storeid' reported inactive from "
-                . "the recent-failure marker; not probing the API again for "
-                . int($down_until - time()) . "s");
-            return (0, 0, 0, 0);
-        }
+    # $backoff is still needed below, where the marker is WRITTEN.
+    my $backoff = _status_probe_backoff($scfg);
+    if (defined(my $left = _api_recently_down($scfg))) {
+        _log_api_down_note($scfg, 'status', $storeid, $left,
+            'reported inactive from the recent-failure marker');
+        return (0, 0, 0, 0);
     }
 
     eval {
@@ -6206,13 +6234,34 @@ sub activate_storage {
             die "NVMe/TCP storage activation failed: $@\n";
         }
 
-        # Ensure subsystem exists and connect
+        # Ensure subsystem exists and connect. activate_storage() runs
+        # BEFORE status() on every pvestatd sweep, so the ensure below has
+        # to honour the marker too, or it pays a full API timeout on every
+        # poll for as long as the array is unreachable. CAP it, don't skip
+        # it: it also republishes portals the target lost, which matters
+        # most exactly when the array is flaky - and the 2s cap covers its
+        # mutations too (an abandoned create is reconciled by the next poll).
         eval {
-            _nvme_ensure_subsystem($scfg);
+            my $marker_left = _api_recently_down($scfg);
+            if (defined($marker_left)) {
+                _log_api_down_note($scfg, 'activate_storage', $storeid, $marker_left,
+                    'capping subsystem ensure at ' . API_DOWN_PROBE_BUDGET_S . 's');
+                local $_api_deadline = _capped_api_deadline();
+                eval { _nvme_ensure_subsystem($scfg) };
+            } else {
+                eval { _nvme_ensure_subsystem($scfg) };
+            }
+            if (my $ensure_err = $@) {
+                _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
+                    . "ensure failed for $storeid, still attempting connect: $ensure_err");
+            }
+            # Separate eval from the ensure above: sharing one meant a die
+            # here also skipped this sysfs/nvme-cli reconnect, which needs
+            # no API and can repair a portal even with the array's API down.
             _nvme_connect($scfg);
         };
         if ($@) {
-            _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
+            _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: NVMe/TCP subsystem connection failed for $storeid: $@");
         }
     }
 
