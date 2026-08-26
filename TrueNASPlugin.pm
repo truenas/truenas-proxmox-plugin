@@ -6252,8 +6252,21 @@ sub activate_storage {
                 eval { _nvme_ensure_subsystem($scfg) };
             }
             if (my $ensure_err = $@) {
-                _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
-                    . "ensure failed for $storeid, still attempting connect: $ensure_err");
+                # A capped ensure hitting ITS OWN probe budget is the marker
+                # doing its job, expected while an outage lasts; anything
+                # else (401, DHCHAP, EINVAL...) is a real fault. Classify by
+                # the retry engine's own two death messages, anchored to the
+                # string START - never a substring, which can also match
+                # inside a foreign payload (e.g. a traceback containing the
+                # word "timeout").
+                if (defined($marker_left)
+                    && $ensure_err =~ /^Gave up on |^Operation failed after \d+ retries: /) {
+                    _log_api_down_note($scfg, 'ensure-budget', $storeid, $marker_left,
+                        'subsystem ensure hit the probe budget; will retry next poll');
+                } else {
+                    _log($scfg, 0, 'warning', "[TrueNAS] activate_storage: subsystem "
+                        . "ensure failed for $storeid, still attempting connect: $ensure_err");
+                }
             }
             # Separate eval from the ensure above: sharing one meant a die
             # here also skipped this sysfs/nvme-cli reconnect, which needs
