@@ -58,6 +58,13 @@ my %_status_capacity_cache_stats = (
 # Per-storage cache for NVMe portal sync (avoids redundant port_subsys.query on every alloc)
 my %_portal_sync_last_ok;
 
+# Recent-failure marker for status(): once a probe fails on a connectivity
+# error, remember it for tn_status_probe_backoff_s seconds and answer
+# inactive from memory instead of probing again right away. Keyed by
+# _cache_host_key(), so two storages against the same TrueNAS host share
+# one marker.
+my %_status_api_down;
+
 # Utility function to normalize TrueNAS API values
 # Handles both scalar values and hash structures with parsed/raw fields
 # Used throughout the plugin for consistent value extraction
@@ -567,6 +574,13 @@ sub properties {
                           "blocked in a syscall.",
             type => 'integer', optional => 1, minimum => 1,
         },
+        tn_status_probe_backoff_s => {
+            description => "After status() sees a connectivity failure, suppress further " .
+                          "API probes for this many seconds and report the storage inactive " .
+                          "from memory instead. Set to 0 to probe on every poll (no marker). " .
+                          "Default 30.",
+            type => 'integer', optional => 1, default => 30, minimum => 0,
+        },
         tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120.",
@@ -651,6 +665,7 @@ sub options {
         tn_api_retry_max => { optional => 1 },
         tn_api_retry_delay => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
+        tn_status_probe_backoff_s => { optional => 1 },
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
@@ -5760,6 +5775,25 @@ sub status {
     my $host_key = _cache_host_key($scfg);
     my $status_method = _status_capacity_cache_method($storeid, $scfg);
 
+    # pvestatd walks every storage on a timer from a single process; against
+    # an unreachable array, each poll paid a full probe timeout before
+    # reporting inactive, stalling metrics for every storage on the node for
+    # as long as the outage lasted. Remember a connectivity failure briefly
+    # (write side below) and answer from memory while it stands - recovery
+    # is then noticed up to tn_status_probe_backoff_s late, a trade worth
+    # making against pvestatd going silent for the whole outage.
+    my $backoff = $scfg->{tn_status_probe_backoff_s};
+    $backoff = 30 if !defined($backoff) || $backoff !~ /^\d+(?:\.\d+)?$/;
+    if ($backoff > 0) {
+        my $down_until = $_status_api_down{$host_key};
+        if (defined($down_until) && time() < $down_until) {
+            _log($scfg, 1, 'info', "[TrueNAS] status: '$storeid' reported inactive from "
+                . "the recent-failure marker; not probing the API again for "
+                . int($down_until - time()) . "s");
+            return (0, 0, 0, 0);
+        }
+    }
+
     eval {
         my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
         if ($ds) {
@@ -5803,6 +5837,12 @@ sub status {
             # Network/connectivity issue - mark as inactive (temporary)
             _log($scfg, 0, 'info', "[TrueNAS] status: storage '$storeid' marked inactive (connectivity issue): $err");
             $active = 0;
+            # Arm the marker read at the top. Only for connectivity: a bad
+            # dataset name or a rejected API key answers fast and needs no
+            # suppression.
+            if ($backoff > 0) {
+                $_status_api_down{$host_key} = time() + $backoff;
+            }
         } elsif (_is_not_found_error($err)) {
             # Dataset doesn't exist - this is a configuration error
             _log($scfg, 0, 'err', "[TrueNAS] status: storage '$storeid' configuration error (dataset not found): $err");
@@ -5821,6 +5861,11 @@ sub status {
         $total = 0;
         $avail = 0;
         $used  = 0;
+    } else {
+        # It answered: drop any suppression immediately rather than waiting
+        # out the window, so a recovered array is not held down by its own
+        # past failure.
+        delete $_status_api_down{$host_key};
     }
     return ($total, $avail, $used, $active);
 }
