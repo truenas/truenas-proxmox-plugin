@@ -442,7 +442,21 @@ sub handle_request {
         # Rate Limit Exceeded, invalid params, method not found). Worth
         # logging so users can match a failing test to a TN-side cause.
         my $err_repr = ref($result_obj->{error}) ? encode_json($result_obj->{error}) : $result_obj->{error};
-        lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        # Downgrade the well-known "already gone" case to INFO. A DELETE
+        # against a resource that TN reports as InstanceNotFound / ENOENT
+        # is a benign race the callers already handle idempotently
+        # (see e.g. free_image, _teardown_snapshot_device). Leaving it
+        # at WARN level drowns real errors under vzdump-* snapshot-clone
+        # teardown noise: Max Carrara's test_run7 2026-08-25 3-node
+        # cluster-01 logged ~2000 of these per node per subrun.
+        my $is_benign_delete_enoent =
+            ($method =~ /\.delete$/) &&
+            ($err_repr =~ /InstanceNotFound|\bENOENT\b|does not exist/i);
+        if ($is_benign_delete_enoent) {
+            linfo("upstream ENOENT on $method (already gone; sk=$sk)");
+        } else {
+            lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        }
         my $msg = encode_json({ error => encode_json($result_obj->{error}) });
         $client->syswrite("$msg\n");
     } else {

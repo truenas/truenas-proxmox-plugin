@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23~alpha34';
+our $VERSION = '2.1.23~alpha36';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 14;
 use JSON::PP qw(encode_json decode_json);
@@ -350,6 +350,87 @@ sub _is_not_found_error {
     my ($error) = @_;
     return 0 if !defined $error;
     return $error =~ /404 Not Found|ENOENT|InstanceNotFound|does not exist|not found/i;
+}
+
+# pool.dataset.rename EEXIST classifier. TN returns:
+#   [EEXIST] zfs.resource.rename: 'tank/<pool>/base-<vmid>-disk-N' already exists
+# When create_base's rename hits this, it usually means a prior template of
+# the same VMID left the base dataset on TN. If that base is an orphan (no
+# live clones, no children), the plugin can safely delete it and retry.
+# See _dataset_orphan_check_and_delete and project_create_base_eexist_gap.
+sub _is_dataset_already_exists_error {
+    my ($error) = @_;
+    return 0 if !defined $error;
+    return ($error =~ /ZFSPathAlreadyExistsException|EEXIST/i)
+        && ($error =~ /zfs\.resource\.rename|pool\.dataset\.rename/i)
+        && ($error =~ /already exists/i);
+}
+
+# Check whether $target_dataset is an orphan on TN (no non-snapshot children,
+# no linked clones deriving from its @__base__ snapshot). If it is, delete it
+# and return 1 so the caller can retry the operation that originally hit the
+# EEXIST. Return 0 if the dataset has live children/clones (unsafe to remove),
+# or if the query/delete itself failed.
+sub _dataset_orphan_check_and_delete {
+    my ($scfg, $target_dataset) = @_;
+    my $query = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [[ 'id', '=', $target_dataset ]] ]);
+    };
+    if (my $err = $@) {
+        _log($scfg, 0, 'warning',
+            "[TrueNAS] _dataset_orphan_check_and_delete: query $target_dataset failed: $err");
+        return 0;
+    }
+    my $target = $query && ref($query) eq 'ARRAY' ? $query->[0] : undef;
+    if (!$target) {
+        # Dataset is gone since the EEXIST (another node just cleaned it).
+        # Signal caller to retry.
+        _log($scfg, 0, 'info',
+            "[TrueNAS] $target_dataset gone since the EEXIST; caller can retry");
+        return 1;
+    }
+    my @children = grep {
+        ($_->{type} // '') ne 'SNAPSHOT'
+    } @{ $target->{children} // [] };
+    if (@children) {
+        my $child_names = join(', ', map { $_->{name} // $_->{id} } @children);
+        _log($scfg, 0, 'err',
+            "[TrueNAS] $target_dataset has child dataset(s) [$child_names]; " .
+            "cannot delete for orphan recovery");
+        return 0;
+    }
+    # Check for linked clones deriving from the @__base__ snapshot. Any dataset
+    # whose origin.parsed points at $target_dataset@__base__ is a live clone
+    # and destroying the base would break it.
+    my $snap_clones = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [[ 'origin.parsed', '=', "${target_dataset}\@__base__" ]],
+              { select => [ 'id' ] } ]);
+    };
+    if (!$@ && $snap_clones && ref($snap_clones) eq 'ARRAY' && @$snap_clones) {
+        my $clone_names = join(', ', map { $_->{id} // '<undef>' } @$snap_clones);
+        _log($scfg, 0, 'err',
+            "[TrueNAS] $target_dataset has linked clone(s) [$clone_names] " .
+            "deriving from \@__base__; cannot delete for orphan recovery");
+        return 0;
+    }
+    _log($scfg, 0, 'info',
+        "[TrueNAS] deleting orphaned $target_dataset (no children, no clones) " .
+        "to allow retry of the operation that hit EEXIST");
+    eval {
+        _api_call_mutate($scfg, 'pool.dataset.delete',
+            [ $target_dataset, { recursive => JSON::PP::true, force => JSON::PP::true } ]);
+    };
+    if (my $err = $@) {
+        # A concurrent cleanup may have raced us here -- that's fine, the
+        # ENOENT after our query is exactly what the caller wants.
+        return 1 if $err =~ /does not exist|ENOENT|InstanceNotFound/i;
+        _log($scfg, 0, 'err',
+            "[TrueNAS] delete of orphaned $target_dataset failed: $err");
+        return 0;
+    }
+    return 1;
 }
 
 sub _is_auth_error {
@@ -4673,6 +4754,21 @@ sub _nvme_device_for_uuid {
             "[TrueNAS] nvme_device_for_uuid: emergency reconnect SKIPPED "
             . "(_nvme_is_connected=0) — subsystem not currently connected");
     } else {
+        # Before the emergency reconnect, sweep orphan namespaces off our
+        # subsystem. Under multi-node load the publication-mismatch that
+        # brings us here is often caused by an accumulating pile of
+        # orphaned namespace records on TN whose backing datasets no
+        # longer exist. Reconnecting the kernel does not shrink that
+        # pile; TN still publishes the ballooned namespace list and the
+        # next device lookup can still mis-match. Reap first, then
+        # reconnect -- the reconnect's re-enumeration will then reflect
+        # the trimmed namespace set.
+        eval {
+            my $reaped = _nvme_reap_orphan_namespaces($scfg);
+            _log($scfg, 0, 'warning',
+                "[TrueNAS] nvme_device_for_uuid: pre-reconnect reap removed $reaped orphan namespace(s)")
+                if $reaped;
+        };
         my $note = $reconnect_attempted
             ? " (SECOND reconnect — prior mid-loop reconnect fired too early)"
             : "";
@@ -5151,6 +5247,119 @@ sub _nvme_create_namespace_idempotent {
         die $err;
     }
     return $ns;
+}
+
+# Reap orphan NVMe namespaces on our subsystem: those whose device_path
+# points at a zvol under our tn_dataset prefix but whose backing dataset
+# no longer exists on TN. These accumulate when a namespace teardown
+# fails partway (network glitch, TN transient) and the plugin surfaces a
+# warn but does not persist a retry ledger. Over many operations the
+# orphans build up on TN, the publication-mismatch detector in
+# _nvme_device_for_uuid then reports "TrueNAS API namespace count: N,
+# Linux-visible block devices: M" and dies for every subsequent VM
+# activation. Confirmed in Max R. Carrara's test_run7 2026-08-26 3-node
+# cluster runs: 253-274 mismatch cascades per node, all traced to
+# monotonically-growing orphan namespace counts (4 -> 8 -> 25 -> 49 in
+# one subrun).
+#
+# Scope: only namespaces under our subsystem AND under our storage's
+# tn_dataset prefix. Namespaces belonging to other storage configs
+# sharing the subsystem, and ephemeral vzdump snapshot clones (issue
+# #42), are left alone.
+#
+# Returns the number of namespaces reaped, or undef on setup failure.
+# Never dies -- best-effort cleanup, called from deferred paths.
+sub _nvme_reap_orphan_namespaces {
+    my ($scfg) = @_;
+
+    my $nqn = $scfg->{tn_subsystem_nqn};
+    return undef unless defined $nqn && length $nqn;
+
+    my $ds_prefix = $scfg->{tn_dataset};
+    return undef unless defined $ds_prefix && length $ds_prefix;
+
+    my $reap_prefix = "zvol/$ds_prefix/";
+
+    my $subsystems = eval {
+        _api_call($scfg, 'nvmet.subsys.query', [
+            [ [ 'subnqn', '=', $nqn ] ]
+        ]);
+    };
+    if ($@ || !$subsystems || !@$subsystems) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: subsystem query failed: " . ($@ // 'no subsystem'));
+        return undef;
+    }
+    my $subsys_id = $subsystems->[0]{id};
+
+    my $namespaces = eval {
+        _api_call($scfg, 'nvmet.namespace.query',
+            [ [ [ 'subsys.id', '=', $subsys_id ] ] ]);
+    };
+    if ($@ || ref($namespaces) ne 'ARRAY') {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: namespace query failed: " . ($@ // 'not an array'));
+        return undef;
+    }
+
+    my $datasets = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [ [ 'id', '^', "$ds_prefix/" ] ] ]);
+    };
+    if ($@ || ref($datasets) ne 'ARRAY') {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] reap_orphan_namespaces: dataset query failed: " . ($@ // 'not an array'));
+        return undef;
+    }
+    my %ds_exists = map { ($_->{id} // '') => 1 } @$datasets;
+
+    my @orphans;
+    for my $ns (@$namespaces) {
+        my $dp = $ns->{device_path} // '';
+        next unless length $dp;
+        next unless index($dp, $reap_prefix) == 0;  # only our storage's slice
+        (my $ds_id = $dp) =~ s{^zvol/}{};
+        next if $ds_exists{$ds_id};                 # backing dataset still there -- keep
+        my ($zname) = $dp =~ m{/([^/]+)$};
+        next if $zname && _is_snapshot_clone_zname($zname);  # issue #42 clones own their cleanup
+        push @orphans, $ns;
+    }
+
+    return 0 unless @orphans;
+
+    _log($scfg, 0, 'info',
+        "[TrueNAS] reap_orphan_namespaces: found " . scalar(@orphans) .
+        " orphan namespace(s) in subsys id=$subsys_id under $ds_prefix/ " .
+        "(referencing deleted datasets); deleting");
+
+    my $reaped = 0;
+    for my $ns (@orphans) {
+        my $ns_id = $ns->{id};
+        my $dp    = $ns->{device_path} // '<undef>';
+        my $uuid  = $ns->{device_uuid} // '<undef>';
+        my $nsid  = $ns->{nsid}        // '<undef>';
+        eval {
+            _api_call($scfg, 'nvmet.namespace.delete', [ $ns_id ]);
+        };
+        if (my $err = $@) {
+            if ($err =~ /does not exist|ENOENT|InstanceNotFound/i) {
+                $reaped++;
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] reap_orphan_namespaces: id=$ns_id already gone");
+            } else {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] reap_orphan_namespaces: failed to delete id=$ns_id " .
+                    "nsid=$nsid uuid=$uuid device_path=$dp: $err");
+            }
+        } else {
+            $reaped++;
+            _log($scfg, 0, 'info',
+                "[TrueNAS] reap_orphan_namespaces: deleted orphan id=$ns_id " .
+                "nsid=$nsid uuid=$uuid device_path=$dp");
+        }
+    }
+
+    return $reaped;
 }
 
 # Delete NVMe namespace
@@ -6356,11 +6565,22 @@ sub _free_image_nvme {
     };
     die $@ if $@;
 
-    # 4) Defer udev cleanup after lock release
+    # 4) Defer udev cleanup after lock release, then reap any orphan
+    # namespaces on our subsystem. Under multi-node load a namespace
+    # teardown occasionally fails partway (network glitch, TN transient);
+    # the plugin logs a warn but has no persistent retry ledger, so the
+    # namespace lives on TN forever. Over many operations these
+    # accumulate and the publication-mismatch detector in
+    # _nvme_device_for_uuid starts failing every activate_volume that
+    # runs against the ballooned namespace list. Reap here so orphans
+    # get cleaned up at the natural rate of one-per-free without
+    # slowing the caller (deferred block runs after the lock releases).
+    # See _nvme_reap_orphan_namespaces for the full rationale.
     my $deferred_scfg = $scfg;
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_nvme deferred: udev settle");
         eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+        eval { _nvme_reap_orphan_namespaces($deferred_scfg) };
     });
 
     # Return cleanup_worker for the slow dataset delete (see _free_image_iscsi
@@ -6433,8 +6653,21 @@ sub _list_images_iscsi {
     my $res = [];
 
     # ---- fetch fresh TrueNAS state (minimal caching for target_id only) ----
-    my $extents    = _tn_extents($scfg) // [];
-    my $maps       = _tn_targetextents($scfg) // [];
+    # Bypass the per-worker _tn_extents / _tn_targetextents caches: list_images
+    # must reflect the current TN state, and the caches are per-pvedaemon-worker.
+    # After free_image runs in worker A, worker A clears its own cache but B's
+    # cache still shows the deleted extent+mapping. free_image also defers the
+    # pool.dataset.delete to an imgdel task (see the "PVE::Storage::vdisk_free
+    # forks whatever we return as an 'imgdel' UPID task AFTER releasing the cfs
+    # storage lock" comment near line 6208), so the ground-truth dataset query
+    # below can't filter the phantom out either -- the dataset is genuinely
+    # still on TN when list_images runs immediately after purge. The disk_purge
+    # test asserts that the purged volid disappears from storage content
+    # listing; without bypassing the cache here it intermittently reappears.
+    # Cost: two extra TN API calls per list_images invocation. list_images is
+    # not in a hot loop -- it's called on demand from storage-content queries.
+    my $extents    = _api_call($scfg, 'iscsi.extent.query', []) // [];
+    my $maps       = _api_call($scfg, 'iscsi.targetextent.query', []) // [];
     my $target_id  = $cache->{target_id} //= _resolve_target_id($scfg);
 
     # Index extents by id for quick lookups
@@ -8050,15 +8283,43 @@ sub create_base {
     # because TN's safety check refuses to rename a dataset that an
     # iSCSI extent or nvmet namespace references; we override because
     # we are about to update the share in step 3.
-    eval {
+    my $rename_ok = eval {
         _api_call_mutate(
             $scfg,
             'pool.dataset.rename',
             [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
         );
+        1;
     };
-    if ($@) {
-        my $err = $@;
+    my $rename_err = $rename_ok ? undef : $@;
+
+    # On-EEXIST recovery: TN returns
+    #   [EEXIST] zfs.resource.rename: 'tank/<pool>/base-<vmid>-disk-N' already exists
+    # when the target base dataset is left over from a prior template of the
+    # same VMID that was not fully cleaned. Confirmed in Max R. Carrara's
+    # test_run7 2026-08-25 3-node cluster runs at 9-54 hits per node.
+    # If the leftover is an orphan (no children, no linked clones), remove
+    # it and retry the rename once. Otherwise fall through to the die below
+    # with the original error so the operator sees the real conflict.
+    if ($rename_err && _is_dataset_already_exists_error($rename_err) &&
+        _dataset_orphan_check_and_delete($scfg, $new_full)) {
+        _log($scfg, 0, 'info',
+            "[TrueNAS] create_base: retrying rename $old_full -> $new_full after orphan cleanup");
+        $rename_ok = eval {
+            _api_call_mutate(
+                $scfg,
+                'pool.dataset.rename',
+                [ $old_full, { new_name => $new_full, force => JSON::PP::true } ],
+            );
+            1;
+        };
+        $rename_err = $rename_ok ? undef : $@;
+        _log($scfg, 0, 'info',
+            "[TrueNAS] create_base: rename retry after orphan cleanup succeeded for $new_full")
+            if $rename_ok;
+    }
+
+    if ($rename_err) {
         if ($mode eq 'nvme-tcp') {
             # Re-enable namespace so we don't leave it disabled.
             eval {
@@ -8069,7 +8330,7 @@ sub create_base {
                 );
             };
         }
-        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $err";
+        die "create_base: pool.dataset.rename '$old_full' -> '$new_full' failed: $rename_err";
     }
 
     # Step 3: rewire the transport share to point at the new zvol path.

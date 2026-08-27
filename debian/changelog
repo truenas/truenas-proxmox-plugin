@@ -1,3 +1,148 @@
+truenas-proxmox-plugin (2.1.23~alpha36) unstable; urgency=medium
+
+  * NVMe: reap orphan namespaces on our subsystem after every free_image
+    and before every emergency reconnect.
+
+    Under multi-node concurrent load a namespace teardown occasionally
+    fails partway (network glitch, TN transient). The plugin logs a
+    warn but has no persistent retry ledger, so the namespace lives on
+    TN forever. Test framework never re-runs delete for that VM because
+    from its perspective the VM is gone. Over many operations these
+    orphans accumulate on TN. The publication-mismatch detector in
+    _nvme_device_for_uuid (added in alphas 20-30) then reports
+      TrueNAS API namespace count: 49
+      Linux-visible block devices: 11
+      Selector mismatch reason: namespace_metadata_did_not_match_visible_devices
+    and dies for every activate_volume that runs against the ballooned
+    namespace list. This is exactly the "chug along fine then upset"
+    pattern Max R. Carrara flagged in his 2026-08-27 test_run7 mail --
+    253-274 mismatch cascades per 3-node cluster subrun, with TN's
+    namespace count growing monotonically (4 -> 8 -> 25 -> 49 in one
+    subrun) while Linux only ever saw 7-11 devices.
+
+    Fix: new helper _nvme_reap_orphan_namespaces that queries
+    nvmet.namespace on our subsystem, cross-checks each namespace's
+    device_path against a fresh pool.dataset.query for datasets under
+    our tn_dataset prefix, and deletes any namespace whose backing
+    dataset no longer exists. Scope is limited to our subsystem's
+    slice under our storage's dataset prefix; namespaces belonging to
+    other storage configs sharing the same subsystem, and ephemeral
+    vzdump snapshot clones (issue #42), are left alone.
+
+    Called from two places:
+      1. _free_image_nvme's _defer_after_lock block. Runs off the
+         caller's synchronous path after every namespace free, so
+         orphans get cleaned up at the natural rate of one-per-free
+         without slowing new-VM creation.
+      2. _nvme_device_for_uuid's emergency-reconnect branch, before
+         firing the reconnect. Reconnecting the kernel does not shrink
+         an orphan pile on TN; TN still publishes the ballooned
+         namespace list and the next device lookup can still mismatch.
+         Reap first, then reconnect -- the reconnect's re-enumeration
+         then reflects the trimmed namespace set.
+
+    Two extra TN API calls per invocation (nvmet.namespace.query +
+    pool.dataset.query on our subsystem+prefix). Both are already
+    called in adjacent code paths; the incremental cost is small
+    compared to the failure mode it prevents. Best-effort throughout
+    -- never dies; if TN itself is unreachable we log and return.
+
+    NVMe reap only. The iSCSI equivalent -- iscsi.extent.query
+    cross-checked with pool.dataset.query -- is a smaller problem
+    because the extent-delete path in _free_image_iscsi already runs
+    synchronously and the extent name uniqueness constraint stops
+    orphan accumulation from becoming self-reinforcing. Future work
+    if the same shape shows up on iSCSI under similar load.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 27 Aug 2026 14:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha35) unstable; urgency=medium
+
+  * create_base: on-EEXIST recovery for the pool.dataset.rename step.
+
+    TN raises
+      [EEXIST] zfs.resource.rename: 'tank/<pool>/base-<vmid>-disk-N' already exists
+    when the target base dataset is left over from a prior template of the
+    same VMID that was not fully cleaned. Before this change the plugin
+    caught the error, re-enabled the NVMe namespace on that branch, and
+    rethrew -- the caller's linked-clone step then failed as a cascade
+    ("template task succeeded" -> "template / linked-clone: Linked clone
+    feature is not supported for vol-vm-*").
+
+    Fix: on that specific error shape, query the leftover base dataset for
+    non-snapshot children and for linked clones deriving from its
+    @__base__ snapshot (any pool.dataset whose origin.parsed points at
+    <target>@__base__ is a live clone). If both are empty, delete the
+    leftover with recursive=true+force=true and retry the rename once.
+    If either check finds live data, fall through to the original
+    validation error so the operator sees the real conflict rather than
+    a silent redirect.
+
+    Impact observed: 9-54 hits per node in Max R. Carrara's test_run7
+    2026-08-25 3-node cluster runs. The affected test file
+    (template_linked_clone.pl) is the only path in the suite that
+    exercises create_base under multi-round load; every hit produced
+    both a "template task succeeded" failure and a downstream
+    "Linked clone feature is not supported" failure. With the recovery
+    in place the rename retries transparently and the linked-clone step
+    proceeds.
+
+  * list_images: bypass the per-worker extents / targetextents cache in the
+    iSCSI implementation.
+
+    The disk_purge test asserts that a purged volid disappears from the
+    storage content listing. It failed intermittently even when the
+    delete succeeded on TN, because:
+      1. free_image ran in pvedaemon worker A, deleted the iSCSI extent
+         and targetextent synchronously, cleared worker A's per-process
+         _tn_extents / _tn_targetextents cache, and returned a coderef.
+      2. PVE forked the coderef as an imgdel UPID task (the
+         pool.dataset.delete is intentionally deferred to keep the
+         caller's storage lock hold under the 180s test-framework limit
+         that vm_disk_buses breached in test_run6/truenas-2026-08-13).
+      3. The test's next call landed on worker B, whose per-process
+         cache still had the deleted extent + mapping.
+      4. The existing ground-truth check at line 6495
+         (`next MAPPING if $datasets_ok && !exists $dataset_cache{$ds_full}`)
+         could not filter it out because the dataset was genuinely still
+         on TN -- the imgdel task had not yet run pool.dataset.delete.
+      5. Volume showed up in the listing -> test failed.
+
+    Fix: in _list_images_iscsi replace `_tn_extents($scfg)` /
+    `_tn_targetextents($scfg)` with direct `_api_call($scfg,
+    'iscsi.extent.query', [])` and `_api_call($scfg,
+    'iscsi.targetextent.query', [])`. Fresh reads mean the extent-based
+    iteration no longer surfaces the phantom regardless of which worker
+    handles the request. Two extra TN API calls per list_images
+    invocation; list_images is not in a hot loop -- it's called on
+    demand from storage content queries.
+
+    NVMe is not affected: _list_images_nvme already reads namespaces
+    directly via `nvmet.namespace.query` (line 6604) without going
+    through a cached wrapper.
+
+  * broker: downgrade the "upstream error" WARN to INFO for the well-known
+    "already gone" delete race.
+
+    Any DELETE method (iscsi.extent.delete, iscsi.targetextent.delete,
+    pool.dataset.delete, nvmet.namespace.delete, ...) that TN answers
+    with InstanceNotFound / ENOENT / "does not exist" is a benign race
+    the plugin's callers already handle idempotently (see e.g.
+    free_image, _teardown_snapshot_device). Leaving those at WARN level
+    drowned real errors under vzdump-* ephemeral snapshot-clone
+    teardown noise: Max R. Carrara's test_run7 2026-08-25 3-node
+    cluster-01 logged around 2000 of these per node per subrun.
+
+    Fix: in the broker's structured-error handler downgrade to INFO
+    (`upstream ENOENT on <method> (already gone; sk=<sk>)`) when
+    the method name ends in .delete AND the error carries
+    InstanceNotFound / \bENOENT\b / "does not exist". All other error
+    shapes (rename EEXIST, validation errors, EBUSY, rate limit, ...)
+    still log at WARN. Cosmetic on correctness but restores
+    signal-to-noise ratio for future forensics.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 27 Aug 2026 12:00:00 +0000
+
 truenas-proxmox-plugin (2.1.23~alpha34) unstable; urgency=medium
 
   * iSCSI: fix create_base extent-rename gap that produced cascading
