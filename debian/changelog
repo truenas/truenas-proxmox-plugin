@@ -1,3 +1,39 @@
+truenas-proxmox-plugin (2.1.23~beta1) unstable; urgency=medium
+
+  * Promote 2.1.23~alpha36 to 2.1.23~beta1 following external
+    validation from Max R. Carrara (Proxmox VE team, 2026-09-02):
+    "passes all testing at their end".
+
+    Also validated locally on 2026-09-01 in a 3-node cluster with:
+      - Max's full plugin-test suite (both iSCSI and NVMe storages,
+        20 rounds per node),
+      - chaos injection every 90s across all four fault classes
+        (kill-broker, restart-broker, drop-tn-net-30s,
+        iscsi-portal-flap; ~90 total injections in a ~4h run),
+      - fio randrw on a dedicated persistent iSCSI volume on one
+        node throughout.
+
+    Under all three simultaneously, every plugin-side failure class
+    tracked by our check-errors tool (extU / EEX / nvme-mm /
+    nvme-loc / purge-l) came back zero across all three nodes. The
+    alpha36 orphan-namespace reaper never had orphans to clean up,
+    which is the intended outcome under the alloc/free discipline
+    now in force.
+
+    Chaos exposure that DID land (broker: EOF before complete
+    response; broker socket missing during systemd restart window;
+    could not activate storage during broker-down window) was
+    surfaced by the counters but produced no cascading corruption,
+    no orphan storms, no deadlocks. Every op that got hit failed
+    cleanly and left the next op free to proceed. Fix candidates for
+    those signatures (retry-with-bounded-backoff on socket-missing;
+    retry-on-EOF for read-only ops) are queued for a later release,
+    intentionally not in this beta.
+
+  * No functional changes from 2.1.23~alpha36; VERSION bump and
+    changelog only.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 02 Sep 2026 09:00:00 -0400
 truenas-proxmox-plugin (2.1.23~alpha36) unstable; urgency=medium
 
   * NVMe: reap orphan namespaces on our subsystem after every free_image
