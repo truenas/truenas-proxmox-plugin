@@ -6714,9 +6714,13 @@ tn_api_call_write() {
             exit 1;
         }
 
-        # Make the API call with ephemeral connection
+        # Make the API call with ephemeral connection.
+        # TrueNASPlugin.pm exposes _api_call and _api_call_mutate;
+        # _api_call_write was a name that never landed on the .pm side,
+        # so this wrapper needs to call _api_call_mutate to reach the
+        # write path.
         my $result = eval {
-            PVE::Storage::Custom::TrueNASPlugin::_api_call_write($scfg, $method, $params);
+            PVE::Storage::Custom::TrueNASPlugin::_api_call_mutate($scfg, $method, $params);
         };
 
         if ($@) {
@@ -6855,12 +6859,42 @@ tn_create_dataset() {
     local full_path="${parent_pool}/${dataset_name}"
     log "INFO" "Creating dataset: $full_path"
 
-    # Create dataset with FILESYSTEM type (for zvol children)
+    # Create dataset with FILESYSTEM type (for zvol children).
+    #
+    # TrueNAS 25.10.x's legacy API shim leaves any omitted optional
+    # field as an unresolved _NotRequired sentinel, which crashes
+    # pool.dataset.create -- either during validation or during
+    # audit-log JSON serialization AFTER a successful server-side
+    # create. The post-create serialization crash is the dangerous
+    # one: the client sees an error, retries, and gets "dataset
+    # already exists", leaving the first (successful) dataset as
+    # an orphan. To avoid this, send every optional field the
+    # FILESYSTEM path expects. Values match the plugin-runtime fix
+    # (PR #82, TrueNASPlugin.pm _tn_dataset_create and alloc_image).
+    #
+    # Note: this wrapper only creates FILESYSTEM datasets (the
+    # parent for zvol children). Zvol (VOLUME) creates go through
+    # the plugin's alloc_image path, which was already fixed in
+    # PR #82. So only the FILESYSTEM field-set is inlined here.
     local params
     # Use Python to construct JSON with proper escaping
     params=$(python3 -c "
 import json, sys
-data = [{'name': sys.argv[1], 'type': 'FILESYSTEM'}]
+data = [{
+    'name': sys.argv[1],
+    'type': 'FILESYSTEM',
+    'acltype': 'INHERIT',
+    'aclmode': 'INHERIT',
+    'atime':   'INHERIT',
+    'recordsize': 'INHERIT',
+    'snapdev':    'INHERIT',
+    'casesensitivity': 'SENSITIVE',
+    'quota':          0,
+    'refquota':       0,
+    'reservation':    0,
+    'refreservation': 0,
+    'special_small_block_size': 0,
+}]
 print(json.dumps(data))
 " "$full_path" 2>&1)
 

@@ -1,3 +1,47 @@
+truenas-proxmox-plugin (2.1.23~beta2) unstable; urgency=medium
+
+  * install.sh: two fixes to the wizard's TrueNAS API write path,
+    surfaced by a user report against 2.1.17+deb1 on TrueNAS
+    SCALE 25.10.6 / PVE 9.2.11. Both bugs are pre-existing (also
+    present in 2.1.17+deb1 and 2.1.23~beta1); only the plugin's
+    runtime path was previously fixed for the _NotRequired issue,
+    so wizard-driven first-run setup was still exposed.
+
+    - Fix wizard write ops calling a plugin function that does not
+      exist. install.sh's tn_api_call_write bash wrapper invoked
+      PVE::Storage::Custom::TrueNASPlugin::_api_call_write from an
+      embedded Perl block. TrueNASPlugin.pm has never defined a
+      _api_call_write; the write-path helper is _api_call_mutate
+      (the rename landed in commit d245787 without a corresponding
+      install.sh update). Effect: every write op driven by the
+      wizard -- pool.dataset.create, iscsi.portal.create,
+      iscsi.target.create, nvmet.subsys.create, nvmet.port.create,
+      and their delete counterparts -- died inside the embedded
+      Perl block instead of reaching TrueNAS. Fix: call
+      _api_call_mutate.
+
+    - Fix tn_create_dataset exposing the wizard to the
+      _NotRequired audit-logger crash. install.sh's
+      tn_create_dataset previously sent only two fields to
+      pool.dataset.create: name and type=FILESYSTEM. On
+      TrueNAS 25.10.x, every omitted optional field lands in the
+      audit-logger as an unresolved _NotRequired sentinel; JSON
+      serialization then fails AFTER the create has already
+      succeeded server-side. The client sees an error, retries,
+      and the retry fails with "dataset already exists" -- leaving
+      the successfully-created dataset as an orphan. PR #82 fixed
+      this on the plugin runtime side (_tn_dataset_create,
+      alloc_image) but the install-time wizard path was still
+      exposed. Fix: send all optional fields the FILESYSTEM path
+      expects (acltype/aclmode/atime/recordsize/snapdev = INHERIT,
+      casesensitivity = SENSITIVE, quota/refquota/reservation/
+      refreservation = 0, special_small_block_size = 0) so the
+      audit logger has real values to serialize.
+
+  * No plugin runtime changes. TrueNASPlugin.pm bytes are unchanged
+    from beta1 except for the VERSION string.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 02 Sep 2026 10:00:00 -0400
 truenas-proxmox-plugin (2.1.23~beta1) unstable; urgency=medium
 
   * Promote 2.1.23~alpha36 to 2.1.23~beta1 following external
