@@ -17,11 +17,13 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - [Storage Shows as Inactive](#storage-shows-as-inactive)
 - [Connection and API Issues](#connection-and-api-issues)
   - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
+  - [FQDN `tn_api_host` fails with `Socket::AUTOLOAD`](#fqdn-tn_api_host-fails-with-socketautoload)
   - [API Rate Limiting](#api-rate-limiting)
 - [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
   - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
   - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
   - [iSCSI Session Issues](#iscsi-session-issues)
+  - ["iscsiadm: Could not log into all portals"](#iscsiadm-could-not-log-into-all-portals)
 - [NVMe/TCP Connection Issues](#nvmetcp-connection-issues)
   - ["nvme-cli is not installed"](#nvme-cli-is-not-installed)
   - ["Could not determine host NQN"](#could-not-determine-host-nqn)
@@ -769,6 +771,21 @@ tn_api_insecure 1
 # Production: import TrueNAS cert or use valid CA cert
 ```
 
+### FQDN `tn_api_host` fails with `Socket::AUTOLOAD`
+
+**Symptom**: Storage stays inactive, or the broker log shows:
+
+```
+Can't locate auto/Socket/gethostbyname.al in @INC
+Undefined subroutine &Socket::AUTOLOAD
+```
+
+**Cause**: With `tn_prefer_ipv4 1` (the default), the plugin and broker resolved `tn_api_host` through `Socket::gethostbyname`. That function is gone from the Socket package on Perl 5.40 / Debian Trixie (Proxmox VE 9), so an FQDN API host crashed before the WebSocket opened.
+
+**Workaround** (older builds): set `tn_api_host` to an IPv4 literal, or `tn_prefer_ipv4 0` so `IO::Socket::SSL` resolves the name itself.
+
+**Fix**: current plugin/broker resolve A records with `getaddrinfo`. FQDN + `tn_prefer_ipv4 1` is the supported path on PVE 9.
+
 ### API Rate Limiting
 
 **Symptom**: Errors mentioning rate limits or "too many requests"
@@ -920,6 +937,33 @@ iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox --logout
 iscsiadm -m node -T iqn.2005-10.org.freenas.ctl:proxmox \
   -p YOUR_TRUENAS_IP:3260 --login
 ```
+
+### "iscsiadm: Could not log into all portals"
+
+**Symptom**: VM start still reports `TASK OK`, but the task log is full of:
+
+```
+iscsiadm login failed (nas.example.com:3260): iscsiadm: Could not log into all portals
+```
+
+`iscsiadm -m session` already shows one session, recorded as an IP:
+
+```
+tcp: [1] 192.168.135.129:3260,1 iqn....target
+```
+
+Repeating the login by hand prints:
+
+```
+default: 1 session requested, but 1 already present
+iscsiadm: Could not log into all portals
+```
+
+**Cause**: `tn_discovery_portal` (or `tn_portals`) is a hostname. SendTargets stores the portal as an IP. `_portal_connected` used to compare those strings literally, so every `activate_volume` thought the hostname portal was down and issued another `--login`.
+
+**Workaround** (older builds): put the portal IP in `storage.cfg`.
+
+**Fix**: current `_portal_connected` also matches the hostname's A records against the IP session, so the extra login is skipped. FQDN portals are supported.
 
 ## NVMe/TCP Connection Issues
 
