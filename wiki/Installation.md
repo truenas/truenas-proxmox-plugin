@@ -23,13 +23,13 @@ Use the APT repository if you want standard package install and upgrade workflow
 Run the installer in non-interactive mode with APT setup and package install:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh) --non-interactive --apt-install
 ```
 
 Optional suite override:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh) --non-interactive --apt-install --apt-suite trixie
+bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh) --non-interactive --apt-install --apt-suite trixie
 ```
 
 Suite mapping:
@@ -73,12 +73,12 @@ apt-get install --only-upgrade -y truenas-proxmox-plugin
 Install the plugin with a single command:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash
 ```
 
 Or using curl:
 ```bash
-curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash
 ```
 
 The installer will:
@@ -199,13 +199,13 @@ For automation or CI/CD pipelines:
 
 ```bash
 # Download and install automatically
-wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash -s -- --non-interactive
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash -s -- --non-interactive
 ```
 
 Or download first:
 ```bash
 # Download installer
-wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh
 chmod +x install.sh
 
 # Run in non-interactive mode
@@ -224,7 +224,7 @@ Non-interactive mode will:
 #### First-Time Installation
 ```bash
 # Run the one-liner
-wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash
 
 # Installer will:
 # 1. Download and install plugin (latest)
@@ -468,7 +468,7 @@ Run the installer interactively on any cluster node:
 
 ```bash
 # On any cluster node
-wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh
+wget https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh
 chmod +x install.sh
 ./install.sh
 
@@ -533,11 +533,11 @@ If you prefer manual installation:
 
 ```bash
 # On first node
-wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash
 
 # On remaining nodes
-ssh root@node2 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash"
-ssh root@node3 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh | bash"
+ssh root@node2 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash"
+ssh root@node3 "wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/alpha/install.sh | bash"
 ```
 
 ### Cluster Installation Troubleshooting
