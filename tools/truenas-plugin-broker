@@ -35,7 +35,7 @@ use POSIX qw(setsid strftime);
 use Digest::SHA qw(sha1 sha1_hex);
 use MIME::Base64 qw(encode_base64);
 use JSON::PP;
-use Socket;
+use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
 use Time::HiRes qw(time);
 
 my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
@@ -91,12 +91,51 @@ sub write_pidfile {
 }
 
 # ---------------- WebSocket helpers (subset of plugin code) ----------------
+
+# Resolve $host to an IPv4 literal so IO::Socket::INET/SSL cannot pick the
+# AAAA record on a dual-stack TrueNAS when the caller asked for IPv4. Mirrors
+# TrueNASPlugin.pm::_host_ipv4. Returns $host unchanged when it is already an
+# IPv4 literal, when the lookup fails, or when the host is an IPv6 literal.
+#
+# Do not call Socket::gethostbyname: on Perl 5.40 / Debian Trixie (PVE 9)
+# that name is gone from the Socket package and the call dies via
+# Socket::AUTOLOAD, which made FQDN api_host unusable with prefer_ipv4=1.
+sub _host_ipv4 {
+    my ($host) = @_;
+    return $host if !defined $host || $host eq '';
+    return $1 if $host =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+    return $host if $host =~ /:/; # IPv6 literal
+
+    my @ips;
+    eval {
+        my ($err, @res) = getaddrinfo($host, '', {
+            family   => AF_INET,
+            socktype => SOCK_STREAM,
+        });
+        return if $err || !@res;
+        for my $ai (@res) {
+            my ($nerr, $ip) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+            next if $nerr;
+            push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+        }
+    };
+    if (!@ips) {
+        my @ent = eval { CORE::gethostbyname($host) };
+        if (@ent && defined $ent[4]) {
+            my $ip = eval { inet_ntoa($ent[4]) };
+            push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+        }
+    }
+    return $ips[0] if @ips;
+    return $host;
+}
+
 sub ws_open {
     my ($scfg) = @_;
     my $scheme = $scfg->{api_scheme} || 'wss';
     my $host   = $scfg->{api_host} or die "ws_open: no api_host";
     my $port   = $scfg->{api_port} // (($scheme eq 'wss') ? 443 : 80);
-    my $peer   = $host;
+    my $peer   = (($scfg->{prefer_ipv4} // 1) ? _host_ipv4($host) : $host);
 
     my $sock;
     if ($scheme eq 'wss') {

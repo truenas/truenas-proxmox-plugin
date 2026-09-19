@@ -1,5 +1,12 @@
 # TrueNAS Plugin Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- **Fix FQDN `tn_api_host` on Proxmox VE 9 (#102)**: `_host_ipv4` (plugin and broker) called `Socket::gethostbyname` when `tn_prefer_ipv4` is on (the default). On Perl 5.40 / Debian Trixie that name is no longer in the Socket package, so the call dies with `Socket::AUTOLOAD` and the storage never comes up. Resolution now uses `getaddrinfo` (A records only) with `CORE::gethostbyname` as a fallback.
+- **Fix `iscsiadm: Could not log into all portals` when the discovery portal is a hostname (#102)**: open-iscsi records the session as `IP:3260` even if SendTargets was issued against an FQDN. `_portal_connected` compared the configured hostname string to that IP session, decided the portal was down, and retried `--login` on every VM start (`1 session requested, but 1 already present`). It now also matches the resolved A records, so a hostname portal is treated as connected when the IP session already exists.
+
 ## Version 2.1.5 (June 16, 2026)
 
 ### Bug Fixes

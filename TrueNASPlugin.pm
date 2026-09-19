@@ -16,7 +16,7 @@ use IO::Socket::SSL;
 use IO::Select;
 use Time::HiRes qw(usleep);
 use POSIX ();
-use Socket qw(inet_ntoa);
+use Socket qw(inet_ntoa getaddrinfo getnameinfo AF_INET SOCK_STREAM NI_NUMERICHOST NIx_NOSERV);
 use Cwd qw(abs_path);
 use Sys::Syslog qw(openlog syslog);
 use Carp qw(carp croak);
@@ -406,7 +406,7 @@ sub properties {
             optional => 1,
         },
         tn_discovery_portal => {
-            description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
+            description => "Primary SendTargets portal (hostname[:port], IP[:port], or [IPv6]:port).",
             type => 'string',
         },
         tn_portals => {
@@ -763,14 +763,51 @@ sub check_config {
 }
 
 # ======== DNS/IPv4 helper ========
-sub _host_ipv4($host) {
-    return $host if $host =~ /^\d+\.\d+\.\d+\.\d+$/; # already IPv4 literal
-    my @ent = Socket::gethostbyname($host); # A-record lookup
-    if (@ent && defined $ent[4]) {
-        my $ip = inet_ntoa($ent[4]);
-        return $ip if $ip;
+# Socket::gethostbyname was removed from the Socket package on Perl 5.40 /
+# Debian Trixie (PVE 9). Calling it autovivifies Socket::AUTOLOAD and dies,
+# which broke FQDN tn_api_host whenever tn_prefer_ipv4 (default 1) ran.
+# getaddrinfo is the supported replacement; CORE::gethostbyname remains as a
+# last-resort fallback because it is still a perl builtin.
+sub _ipv4_addrs($host) {
+    return () unless defined $host && length $host;
+    if ($host =~ /^(\d+\.\d+\.\d+\.\d+)$/) {
+        return ($1);
     }
-    return $host; # fallback (could be IPv6 literal or DNS)
+    return () if $host =~ /:/; # IPv6 literal — not an A-record lookup
+
+    my @ips;
+    eval {
+        my ($err, @res) = getaddrinfo($host, '', {
+            family   => AF_INET,
+            socktype => SOCK_STREAM,
+        });
+        return if $err || !@res;
+        for my $ai (@res) {
+            my ($nerr, $ip) = getnameinfo($ai->{addr}, NI_NUMERICHOST, NIx_NOSERV);
+            next if $nerr;
+            push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+        }
+    };
+    if (!@ips) {
+        my @ent = eval { CORE::gethostbyname($host) };
+        if (@ent) {
+            for my $addr (@ent[4 .. $#ent]) {
+                next unless defined $addr;
+                my $ip = eval { inet_ntoa($addr) };
+                push @ips, $1 if defined($ip) && $ip =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+            }
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @ips;
+}
+
+sub _host_ipv4($host) {
+    return $host if !defined $host || $host eq '';
+    return $1 if $host =~ /^(\d+\.\d+\.\d+\.\d+)$/;
+    my ($ip) = _ipv4_addrs($host);
+    return $ip if $ip;
+    return $host; # fallback (IPv6 literal, or DNS failed)
 }
 
 # ======== WebSocket JSON-RPC client ========
@@ -2757,10 +2794,28 @@ sub _target_sessions_active($scfg) {
     return 0;
 }
 
+# SendTargets records portals as IP:port even when discovery was issued
+# against a hostname. Return every string that can identify $portal in an
+# `iscsiadm -m session` line: the original host:port plus each resolved A.
+sub _portal_match_needles($portal) {
+    my $norm = _normalize_portal($portal);
+    return () unless $norm;
+    my @needles = ($norm);
+    if ($norm =~ /^([^:]+):(\d+)$/) {
+        my ($host, $port) = ($1, $2);
+        if ($host !~ /^\d+\.\d+\.\d+\.\d+$/) {
+            push @needles, map { "$_:$port" } _ipv4_addrs($host);
+        }
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @needles;
+}
+
 # Check if a specific portal has an active session for this target
 sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
-    my $iqn = $scfg->{tn_target_iqn};
-    my $norm_portal = _normalize_portal($portal);
+    my $iqn = $scfg->{tn_target_iqn} or return 0;
+    my @needles = _portal_match_needles($portal);
+    return 0 unless @needles;
 
     # Get active sessions if not provided
     my @session_lines;
@@ -2771,11 +2826,12 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
         return 0 if $@;
     }
 
-    # Check if this portal has an active session
+    # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
+    # Match hostname portals against the IP open-iscsi actually logged.
     for my $line (@session_lines) {
-        # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
-        if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E/) {
-            return 1;
+        next unless $line =~ /\Q$iqn\E/;
+        for my $needle (@needles) {
+            return 1 if $line =~ /\Q$needle\E/;
         }
     }
     return 0;
