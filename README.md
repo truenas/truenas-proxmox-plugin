@@ -258,6 +258,9 @@ qm rollback 100 backup1
 
 # Delete snapshot
 qm delsnapshot 100 backup1
+
+# Import snapshots that already exist on TrueNAS into the guest configuration
+truenas-proxmox-manage import-snapshots 100 --dry-run
 ```
 
 ### Storage Management

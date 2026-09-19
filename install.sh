@@ -755,6 +755,15 @@ TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}
 
 Usage: $0 [OPTIONS]
 
+COMMANDS:
+    import-snapshots <vmid> [--dry-run] [--yes] [--match REGEX]
+                        Import the snapshots that already exist on TrueNAS for
+                        this VM's zvols into its Proxmox configuration, so the
+                        Snapshots tab lists them and qm delsnapshot can remove
+                        them. Only snapshots present on every disk of the VM,
+                        with a name PVE accepts and no dependent clone, are
+                        imported.
+
 OPTIONS:
     --version           Display installer version
     --non-interactive   Run in non-interactive mode with defaults
@@ -768,6 +777,9 @@ EXAMPLES:
 
     # Non-interactive installation
     $0 --non-interactive
+
+    # Show what could be imported for VM 100, without writing anything
+    truenas-proxmox-manage import-snapshots 100 --dry-run
 
     # Non-interactive APT bootstrap install
     $0 --non-interactive --apt-install --apt-suite trixie
@@ -792,6 +804,18 @@ parse_arguments() {
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            import-snapshots)
+                # A subcommand, not an installation. It is dispatched from
+                # here, before main() reconnects stdin to /dev/tty and arms
+                # the installer's cleanup traps, and exec replaces this shell
+                # entirely so none of the installer's state applies to it.
+                # The logic lives in the plugin, which is the only thing that
+                # knows how to talk to the array.
+                shift
+                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
+                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::snapshot_import_cli(@ARGV)' \
+                    -- "$@"
+                ;;
             --version)
                 echo "TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}"
                 exit 0

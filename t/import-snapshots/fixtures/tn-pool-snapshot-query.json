@@ -1,0 +1,583 @@
+[
+   {
+      "createtxg" : "4336320",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@s1",
+      "name" : "pool/pve/vm-9990-disk-0@s1",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789610000000
+            },
+            "rawvalue" : "1789610000",
+            "source" : "NONE",
+            "value" : "Thu Sep 17 01:53:20 2026"
+         }
+      },
+      "snapshot_name" : "s1",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336321",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@s1",
+      "name" : "pool/pve/vm-9990-disk-1@s1",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789610000000
+            },
+            "rawvalue" : "1789610000",
+            "source" : "NONE",
+            "value" : "Thu Sep 17 01:53:20 2026"
+         }
+      },
+      "snapshot_name" : "s1",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336322",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@auto-2026-09-18_00-00",
+      "name" : "pool/pve/vm-9990-disk-0@auto-2026-09-18_00-00",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789704000000
+            },
+            "rawvalue" : "1789704000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 04:00:00 2026"
+         }
+      },
+      "snapshot_name" : "auto-2026-09-18_00-00",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336323",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@auto-2026-09-18_00-00",
+      "name" : "pool/pve/vm-9990-disk-1@auto-2026-09-18_00-00",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789704000000
+            },
+            "rawvalue" : "1789704000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 04:00:00 2026"
+         }
+      },
+      "snapshot_name" : "auto-2026-09-18_00-00",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336324",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@Daily-1",
+      "name" : "pool/pve/vm-9990-disk-0@Daily-1",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789707600000
+            },
+            "rawvalue" : "1789707600",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 05:00:00 2026"
+         }
+      },
+      "snapshot_name" : "Daily-1",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336325",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@Daily-1",
+      "name" : "pool/pve/vm-9990-disk-1@Daily-1",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789707600000
+            },
+            "rawvalue" : "1789707600",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 05:00:00 2026"
+         }
+      },
+      "snapshot_name" : "Daily-1",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336326",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@tn-weekly-7",
+      "name" : "pool/pve/vm-9990-disk-0@tn-weekly-7",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789711200000
+            },
+            "rawvalue" : "1789711200",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 06:00:00 2026"
+         }
+      },
+      "snapshot_name" : "tn-weekly-7",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336327",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@tn-weekly-7",
+      "name" : "pool/pve/vm-9990-disk-1@tn-weekly-7",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789711200000
+            },
+            "rawvalue" : "1789711200",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 06:00:00 2026"
+         }
+      },
+      "snapshot_name" : "tn-weekly-7",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336328",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@manual_snap",
+      "name" : "pool/pve/vm-9990-disk-0@manual_snap",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789714800000
+            },
+            "rawvalue" : "1789714800",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 07:00:00 2026"
+         }
+      },
+      "snapshot_name" : "manual_snap",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336329",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@manual_snap",
+      "name" : "pool/pve/vm-9990-disk-1@manual_snap",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789714800000
+            },
+            "rawvalue" : "1789714800",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 07:00:00 2026"
+         }
+      },
+      "snapshot_name" : "manual_snap",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336330",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@snap2026",
+      "name" : "pool/pve/vm-9990-disk-0@snap2026",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789718400000
+            },
+            "rawvalue" : "1789718400",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 08:00:00 2026"
+         }
+      },
+      "snapshot_name" : "snap2026",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336331",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@snap2026",
+      "name" : "pool/pve/vm-9990-disk-1@snap2026",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789718400000
+            },
+            "rawvalue" : "1789718400",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 08:00:00 2026"
+         }
+      },
+      "snapshot_name" : "snap2026",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336332",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@cloned-snap",
+      "name" : "pool/pve/vm-9990-disk-0@cloned-snap",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789719000000
+            },
+            "rawvalue" : "1789719000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 08:10:00 2026"
+         }
+      },
+      "snapshot_name" : "cloned-snap",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336333",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@cloned-snap",
+      "name" : "pool/pve/vm-9990-disk-1@cloned-snap",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789719000000
+            },
+            "rawvalue" : "1789719000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 08:10:00 2026"
+         }
+      },
+      "snapshot_name" : "cloned-snap",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336334",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@partial-one",
+      "name" : "pool/pve/vm-9990-disk-0@partial-one",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789720000000
+            },
+            "rawvalue" : "1789720000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 08:26:40 2026"
+         }
+      },
+      "snapshot_name" : "partial-one",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336335",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@no-creation",
+      "name" : "pool/pve/vm-9990-disk-0@no-creation",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : null,
+            "source" : "NONE"
+         }
+      },
+      "snapshot_name" : "no-creation",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336336",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@no-creation",
+      "name" : "pool/pve/vm-9990-disk-1@no-creation",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : null,
+            "source" : "NONE"
+         }
+      },
+      "snapshot_name" : "no-creation",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336337",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@auto.bad",
+      "name" : "pool/pve/vm-9990-disk-0@auto.bad",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700000000
+            },
+            "rawvalue" : "1789700000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:53:20 2026"
+         }
+      },
+      "snapshot_name" : "auto.bad",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336338",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@auto.bad",
+      "name" : "pool/pve/vm-9990-disk-1@auto.bad",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700000000
+            },
+            "rawvalue" : "1789700000",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:53:20 2026"
+         }
+      },
+      "snapshot_name" : "auto.bad",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336339",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@vzdump",
+      "name" : "pool/pve/vm-9990-disk-0@vzdump",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700100000
+            },
+            "rawvalue" : "1789700100",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:55:00 2026"
+         }
+      },
+      "snapshot_name" : "vzdump",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336340",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@vzdump",
+      "name" : "pool/pve/vm-9990-disk-1@vzdump",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700100000
+            },
+            "rawvalue" : "1789700100",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:55:00 2026"
+         }
+      },
+      "snapshot_name" : "vzdump",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336341",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@__base__",
+      "name" : "pool/pve/vm-9990-disk-0@__base__",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700200000
+            },
+            "rawvalue" : "1789700200",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:56:40 2026"
+         }
+      },
+      "snapshot_name" : "__base__",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336342",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@__base__",
+      "name" : "pool/pve/vm-9990-disk-1@__base__",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700200000
+            },
+            "rawvalue" : "1789700200",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:56:40 2026"
+         }
+      },
+      "snapshot_name" : "__base__",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336343",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@__replicate_9990-0_1789700300",
+      "name" : "pool/pve/vm-9990-disk-0@__replicate_9990-0_1789700300",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700300000
+            },
+            "rawvalue" : "1789700300",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:58:20 2026"
+         }
+      },
+      "snapshot_name" : "__replicate_9990-0_1789700300",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336344",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@__replicate_9990-0_1789700300",
+      "name" : "pool/pve/vm-9990-disk-1@__replicate_9990-0_1789700300",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700300000
+            },
+            "rawvalue" : "1789700300",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 02:58:20 2026"
+         }
+      },
+      "snapshot_name" : "__replicate_9990-0_1789700300",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336345",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@pending",
+      "name" : "pool/pve/vm-9990-disk-0@pending",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700400000
+            },
+            "rawvalue" : "1789700400",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:00:00 2026"
+         }
+      },
+      "snapshot_name" : "pending",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336346",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@pending",
+      "name" : "pool/pve/vm-9990-disk-1@pending",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700400000
+            },
+            "rawvalue" : "1789700400",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:00:00 2026"
+         }
+      },
+      "snapshot_name" : "pending",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336347",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@current",
+      "name" : "pool/pve/vm-9990-disk-0@current",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700500000
+            },
+            "rawvalue" : "1789700500",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:01:40 2026"
+         }
+      },
+      "snapshot_name" : "current",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336348",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@current",
+      "name" : "pool/pve/vm-9990-disk-1@current",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700500000
+            },
+            "rawvalue" : "1789700500",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:01:40 2026"
+         }
+      },
+      "snapshot_name" : "current",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336349",
+      "dataset" : "pool/pve/vm-9990-disk-0",
+      "id" : "pool/pve/vm-9990-disk-0@abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "name" : "pool/pve/vm-9990-disk-0@abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700600000
+            },
+            "rawvalue" : "1789700600",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:03:20 2026"
+         }
+      },
+      "snapshot_name" : "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type" : "SNAPSHOT"
+   },
+   {
+      "createtxg" : "4336350",
+      "dataset" : "pool/pve/vm-9990-disk-1",
+      "id" : "pool/pve/vm-9990-disk-1@abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "name" : "pool/pve/vm-9990-disk-1@abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pool" : "pool",
+      "properties" : {
+         "creation" : {
+            "parsed" : {
+               "$date" : 1789700600000
+            },
+            "rawvalue" : "1789700600",
+            "source" : "NONE",
+            "value" : "Fri Sep 18 03:03:20 2026"
+         }
+      },
+      "snapshot_name" : "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type" : "SNAPSHOT"
+   }
+]

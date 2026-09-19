@@ -31,6 +31,74 @@ Note: Health check, orphan cleanup, and plugin function testing are now integrat
 
 ---
 
+## Import Foreign Snapshots
+
+```
+truenas-proxmox-manage import-snapshots <vmid> [--dry-run] [--yes] [--match REGEX]
+```
+
+> **Locking:** the command holds the guest's PVE config lock for the whole run (inventory, clone check and write all happen inside it), so nothing else can change the guest meanwhile. Run it when no backup, migration or other operation on that guest is in progress; a concurrent operation would report `can't lock` after 10 s, nothing is corrupted. Confirmation is tied to the snapshot's identity, not to its name: a snapshot destroyed and recreated with the same name between the listing and the confirmation is dropped and reported, not imported.
+
+Writes the snapshots that already exist on TrueNAS for a guest's zvols
+into its Proxmox configuration, so the Snapshots tab lists them and
+`qm delsnapshot` / `pct delsnapshot` can remove them. Without it they are invisible to PVE
+and block `qm rollback` with `is not most recent snapshot`.
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Print the plan, write nothing |
+| `--yes` | Do not ask for confirmation |
+| `--match REGEX` | Only consider snapshot names matching this regex |
+
+Each candidate is reported as `import`, `partial`, `invalid` or
+`present`:
+
+```
+$ truenas-proxmox-manage import-snapshots 100 --dry-run
+import   auto-2026-09-18_00-00                    2026-09-18 00:00:00
+partial  auto-2026-09-17_00-00                    missing on: truenas-1:vol-vm-100-disk-1-lun1
+invalid  auto.2026-09-16                          not a valid PVE snapshot name (pve-configid)
+present  before-upgrade                           already in the guest configuration
+Dry run: 1 snapshot(s) would be imported into guest 100.
+```
+
+Rules, all fail-closed:
+
+- Only snapshots present on **every** volume of the guest: non-cdrom
+  disks on a VM, `rootfs` and the `mpN` that are storage volumes on a
+  container. A partial one would leave the uncovered disks in `unusedN`
+  on rollback. A bind mount or a device mountpoint (`mp1=/mnt/data`,
+  `/dev/...`) is not a storage volume and is ignored, exactly as a cdrom
+  is on a VM; an `mpN` on another storage is refused, as any disk
+  outside this plugin is.
+- Only names PVE accepts, and never renamed: here the PVE snapshot name
+  **is** the ZFS snapshot name.
+- Not if the snapshot has a dependent clone: PVE could never delete it.
+- `snaptime` is the array's creation time, and **every** disk must report
+  one; disks more than an hour apart are not one capture. Ties in the
+  same second are ordered by `createtxg`, and refused when that cannot
+  order them.
+- No `vmstate`: rollback restores disks and configuration, and the VM
+  starts cold.
+- Idempotent: a second run imports nothing and does not rewrite the
+  configuration. Existing sections are never modified.
+- Refuses a template (VM or CT), a locked configuration, a snapshot
+  operation in flight, and any volume outside this plugin.
+- Nothing seen before the lock is trusted inside it: the array is asked
+  again, and any listed snapshot that was destroyed or cloned meanwhile
+  is skipped and reported instead of written.
+
+Exit codes: `0` done (including "nothing to import"), `1` error, `2`
+cancelled - which is what you get when there is no terminal to confirm on
+and `--yes` was not given.
+
+Run it on the node that hosts the guest. VMs and containers alike: the
+guest type is taken from the configuration file that exists, and a
+container goes through `PVE::LXC::Config` with `rootfs`/`mpN` instead of
+`scsiN`/`virtioN`.
+
+---
+
 ## Development Test Suite
 
 > ⚠️ **WARNING: DEVELOPMENT USE ONLY**
