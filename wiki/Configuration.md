@@ -36,6 +36,9 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_nvme_dhchap_secret](#tn_nvme_dhchap_secret)
   - [tn_nvme_dhchap_ctrl_secret](#tn_nvme_dhchap_ctrl_secret)
   - [tn_nr_io_queues](#tn_nr_io_queues)
+  - [tn_nvme_ctrl_loss_tmo](#tn_nvme_ctrl_loss_tmo)
+  - [tn_nvme_reconnect_delay](#tn_nvme_reconnect_delay)
+  - [tn_nvme_keep_alive_tmo](#tn_nvme_keep_alive_tmo)
 - [iSCSI Behavior](#iscsi-behavior)
   - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
   - [tn_logout_on_free](#tn_logout_on_free)
@@ -498,6 +501,53 @@ When unset, the plugin auto-detects a queue count: the online CPU count when all
 
 ```ini
 tn_nr_io_queues 8
+```
+
+### `tn_nvme_ctrl_loss_tmo`
+**Description**: Seconds the kernel keeps retrying a lost controller before removing it
+**Type**: Integer
+**Valid Range**: -1, or 1-3600 (`-1` means retry forever)
+**Default**: None (kernel default of 600 applies)
+
+Passed to `nvme connect --ctrl-loss-tmo`. Once a controller exists, the kernel — not
+the plugin — is what brings a path back after an outage. With the kernel default of
+600 seconds, a path whose fabric stays down for over ten minutes is removed outright
+and does not return on its own.
+
+Recommended for multi-portal setups, where silently dropping a path is worse than
+retrying indefinitely:
+
+```ini
+tn_nvme_ctrl_loss_tmo -1
+```
+
+A value of `0` is rejected: it disables retries entirely, which is worse than the
+default this option exists to override.
+
+### `tn_nvme_reconnect_delay`
+**Description**: Seconds between kernel reconnect attempts for a lost controller
+**Type**: Integer
+**Valid Range**: 1-3600
+**Default**: None (kernel default of 10 applies)
+
+Passed to `nvme connect --reconnect-delay`.
+
+```ini
+tn_nvme_reconnect_delay 5
+```
+
+### `tn_nvme_keep_alive_tmo`
+**Description**: NVMe/TCP keep-alive timeout in seconds
+**Type**: Integer
+**Valid Range**: 1-3600
+**Default**: None (kernel default applies)
+
+Passed to `nvme connect --keep-alive-tmo`. Lower values detect a dead path sooner,
+at the cost of more keep-alive traffic. At the default, a cut path takes roughly ten
+seconds to move out of `live`.
+
+```ini
+tn_nvme_keep_alive_tmo 5
 ```
 
 ## iSCSI Behavior
