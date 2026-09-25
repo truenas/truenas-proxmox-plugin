@@ -156,7 +156,7 @@ truenasplugin: truenas-storage
     tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:3260
-    content images
+    content images,rootdir
     shared 1
 ```
 
@@ -164,6 +164,10 @@ Replace:
 - `192.168.1.100` with your TrueNAS IP
 - `1-your-truenas-api-key-here` with your TrueNAS API key
 - `tank/proxmox` with your ZFS dataset path
+
+`content images,rootdir` enables both VM disks and LXC container rootfs on this
+storage. Drop `rootdir` if you only need VM disks; see
+[wiki/LXC-Setup.md](wiki/LXC-Setup.md) for the container-side details.
 
 #### NVMe/TCP Configuration (Alternative)
 
@@ -177,7 +181,7 @@ truenasplugin: truenas-nvme
     tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox
     tn_discovery_portal 192.168.1.100:4420
-    content images
+    content images,rootdir
     shared 1
 ```
 
