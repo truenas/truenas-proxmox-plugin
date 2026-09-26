@@ -4893,13 +4893,16 @@ run_health_check() {
     fi
 
     # Check 5b: API authentication
+    # core.ping requires no role (any authenticated key may call it), so
+    # this probe passes for least-privilege keys per wiki/API-Permissions.md.
+    # system.info needs READONLY_ADMIN and fails for them (#113, #93).
     local api_key_early
     api_key_early=$(get_storage_config_value "$storage_name" "tn_api_key")
     if [[ -n "$api_host" ]] && [[ -n "$api_key_early" ]]; then
         printf "%-30s " "API authentication:"
         start_spinner
         local auth_result
-        if tn_api_call "$api_host" "$api_key_early" "system.info" '[]' >/dev/null 2>&1; then
+        if tn_api_call "$api_host" "$api_key_early" "core.ping" '[]' >/dev/null 2>&1; then
             auth_result="${COLOR_GREEN}✓${COLOR_RESET} Authenticated"
             ((checks_passed++))
         else
@@ -5927,21 +5930,26 @@ test_truenas_api() {
     start_spinner
 
     local response
-    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null)
-    local exit_code=$?
-
-    stop_spinner
-    printf "\r\033[K"  # Clear spinner line
-
-    if [[ $exit_code -eq 0 ]] && [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
-        local version
+    local version=""
+    # Best-effort version probe: system.info requires READONLY_ADMIN, which
+    # least-privilege keys per wiki/API-Permissions.md do not have (#113,
+    # #93). The authoritative auth check is core.ping (no role required).
+    response=$(tn_api_call "$ip" "$apikey" "system.info" "[]" 2>/dev/null) || true
+    if [[ -n "$response" ]] && echo "$response" | grep -q '"version"'; then
         version=$(echo "$response" | grep -Po '"version":\s*"\K[^"]+' 2>/dev/null)
-        success "Connected to TrueNAS successfully (version: $version)"
-        return 0
-    else
+    fi
+
+    if [[ -z "$version" ]] && ! tn_api_call "$ip" "$apikey" "core.ping" "[]" >/dev/null 2>&1; then
+        stop_spinner
+        printf "\r\033[K"  # Clear spinner line
         error "Failed to connect to TrueNAS API"
         return 1
     fi
+
+    stop_spinner
+    printf "\r\033[K"  # Clear spinner line
+    success "Connected to TrueNAS successfully (version: ${version:-unknown})"
+    return 0
 }
 
 # Verify dataset exists
