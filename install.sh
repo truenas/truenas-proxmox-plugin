@@ -739,6 +739,25 @@ get_install_state() {
     fi
 }
 
+# Get install source classification (issue #93 sweep, P0).
+# Returns one of:
+#   apt  = dpkg package registered AND the plugin APT source is configured
+#   dpkg = dpkg package registered via bare `dpkg -i` (no plugin APT source)
+#   raw  = no dpkg package (raw-file install)
+# apt and bare `dpkg -i` are indistinguishable in dpkg state; the configured
+# APT source file (APT_SOURCES_PATH) is the tell.
+get_install_source() {
+    if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        if [[ -f "$APT_SOURCES_PATH" ]]; then
+            echo "apt"
+        else
+            echo "dpkg"
+        fi
+    else
+        echo "raw"
+    fi
+}
+
 # ============================================================================
 # ERROR HANDLING
 # ============================================================================
@@ -1271,6 +1290,34 @@ compare_versions() {
 # Returns: "version:prerelease" (e.g., "1.1.3:true") if update available, empty otherwise
 check_for_updates() {
     local current_version="$1"
+
+    # Source-aware detection (issue #93 sweep, P0): for an APT-managed install
+    # the source of truth is the APT candidate, not the GitHub latest release.
+    # Comparing against GitHub and then raw-pulling would desync dpkg state.
+    # Report an update only when the APT candidate is newer than what is
+    # installed (using dpkg's own version ordering).
+    local install_source
+    install_source=$(get_install_source)
+    if [[ "$install_source" == "apt" ]]; then
+        local installed_full="" candidate=""
+        installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+        candidate=$(apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null | awk -F': ' '/^  Candidate:/{print $2}' | xargs) || true
+        if [[ -z "$candidate" || "$candidate" == "none" ]]; then
+            log "INFO" "apt-managed: no APT candidate available; not reporting an update"
+            return 1
+        fi
+        if [[ -n "$installed_full" ]] && dpkg --compare-versions "$installed_full" "lt" "$candidate"; then
+            local apt_core=""
+            local apt_pre=false
+            apt_core=$(printf '%s' "$candidate" | grep -Po '^[0-9]+(\.[0-9]+)*' || true)
+            if [[ "$candidate" =~ [-~](alpha|beta|rc)[0-9] ]]; then apt_pre=true; fi
+            log "INFO" "apt-managed: update available via APT (installed $installed_full -> candidate $candidate)"
+            echo "${apt_core:-$candidate}:${apt_pre}"
+            return 0
+        fi
+        log "INFO" "apt-managed: no APT update available (installed ${installed_full:-unknown}, candidate $candidate)"
+        return 1
+    fi
     local latest_release
     latest_release=$(get_latest_release) || return 1
 
@@ -1678,6 +1725,57 @@ install_plugin_on_remote_node() {
     return 0
 }
 
+# Update the plugin on a remote node through its own APT repo (issue #93
+# sweep, P0). Mirrors install_plugin_on_remote_node's return codes: 0 on
+# success, 1 on failure, 2 on success with a pending service restart. Refuses
+# to raw-pull so the node's dpkg state stays consistent.
+install_plugin_on_remote_node_via_apt() {
+    local node_ip="$1"
+    if [[ -z "$node_ip" ]]; then
+        echo "Invalid parameters"
+        return 1
+    fi
+    log "INFO" "Starting remote APT update on $node_ip"
+    local remote_out=""
+    local rc=0
+    remote_out=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" '
+        set -e
+        pkg="truenas-proxmox-plugin"
+        src="/etc/apt/sources.list.d/truenas-proxmox-plugin.sources"
+        pmf="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            echo "node is not dpkg-managed; refusing raw cluster pull"
+            exit 1
+        fi
+        if [[ ! -f "$src" ]]; then
+            echo "no plugin APT source configured on node"
+            exit 1
+        fi
+        apt-get update -qq >/dev/null 2>&1 || true
+        if [[ ! -f "$pmf" ]]; then
+            apt-get install --reinstall -y "$pkg" >/dev/null 2>&1
+        else
+            apt-get install --only-upgrade -y "$pkg" >/dev/null 2>&1
+        fi
+        if ! systemctl restart pvedaemon pveproxy >/dev/null 2>&1; then
+            echo "updated; service restart required"
+            exit 2
+        fi
+        echo "updated via apt"
+    ' 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log "INFO" "Remote APT update on $node_ip: success"
+        return 0
+    fi
+    if [[ $rc -eq 2 ]]; then
+        log "WARNING" "Remote APT update on $node_ip: installed, service restart required"
+        return 2
+    fi
+    log "ERROR" "Remote APT update on $node_ip failed: ${remote_out:-rc=$rc}"
+    echo "${remote_out:-APT update failed (rc=$rc)}"
+    return 1
+}
+
 # Display cluster installation summary
 # Args: arrays successful_nodes, failed_nodes, failure_reasons
 show_cluster_install_summary() {
@@ -1774,6 +1872,80 @@ perform_cluster_wide_installation() {
     if [[ ! "$confirm_choice" =~ ^[Yy] ]]; then
         info "Cluster installation cancelled"
         return 1
+    fi
+
+    # Source-aware routing (issue #93 sweep, P0): an APT-managed cluster node
+    # updates every node through the plugin's APT repo (local + remote), never
+    # a raw-file pull, so dpkg state stays consistent cluster-wide. The raw
+    # GitHub path below is left intact for dpkg-only / raw installs and for
+    # specific-version installs.
+    if [[ "$version" == "latest" ]] && [[ "$(get_install_source)" == "apt" ]]; then
+        info "This node is APT-managed; updating all nodes through the plugin APT repo"
+
+        local -a successful_nodes=()
+        local -a failed_nodes=()
+        local -a failure_reasons=()
+
+        # Local node via APT
+        if [[ "$include_local" == "true" ]]; then
+            echo
+            info "Updating local node ($current_node) via APT..."
+            if apt_bootstrap_install; then
+                if restart_pve_services; then
+                    successful_nodes+=("$current_node")
+                else
+                    warning "Local node updated but services may need manual restart"
+                    successful_nodes+=("$current_node (services need restart)")
+                fi
+            else
+                error "Local node APT update failed"
+                failed_nodes+=("$current_node")
+                failure_reasons+=("APT update failed")
+            fi
+        fi
+
+        # Remote nodes via their own APT repo
+        echo
+        info "Updating remote cluster nodes via APT..."
+        echo
+        local apt_total=${#remote_nodes[@]}
+        local apt_current=0
+        local apt_msg=""
+        local apt_rc=0
+        for node_info in "${remote_nodes[@]}"; do
+            apt_current=$((apt_current + 1))
+            local apt_node_name="${node_info%%:*}"
+            local apt_node_ip="${node_info##*:}"
+            printf "[%d/%d] %s (%s): " "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+            start_spinner
+            apt_rc=0
+            apt_msg=$(install_plugin_on_remote_node_via_apt "$apt_node_ip" 2>&1) || apt_rc=$?
+            stop_spinner
+            if [[ $apt_rc -eq 0 ]]; then
+                printf "\r[%d/%d] %s (%s): ${c3}✓ Success${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                successful_nodes+=("$apt_node_name")
+            elif [[ $apt_rc -eq 2 ]]; then
+                printf "\r[%d/%d] %s (%s): ${c4}⚠ Success (restart needed)${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                successful_nodes+=("$apt_node_name (services need restart)")
+            else
+                printf "\r[%d/%d] %s (%s): ${c5}✗ Failed${c0}\n" "$apt_current" "$apt_total" "$apt_node_name" "$apt_node_ip"
+                failed_nodes+=("$apt_node_name")
+                failure_reasons+=("${apt_msg:-APT update failed}")
+            fi
+        done
+
+        show_cluster_install_summary
+        echo
+        if [[ ${#successful_nodes[@]} -gt 0 ]]; then
+            success "Cluster-wide APT update completed"
+            if [[ "$include_local" == "true" ]]; then
+                show_next_steps
+            fi
+            return 0
+        else
+            error "All cluster nodes failed to update via APT"
+            return 1
+        fi
     fi
 
     # Download plugin from GitHub
@@ -1975,6 +2147,33 @@ perform_installation() {
     local version="${1:-latest}"
 
     print_header "Installing TrueNAS Plugin"
+
+    # Source-aware routing (issue #93 sweep, P0): an APT-managed install
+    # updates through the plugin's APT repo so dpkg state and the .pm file
+    # stay in lockstep. A raw-file GitHub pull here would leave dpkg reporting
+    # the old version while the file becomes a newer build — a mixed state the
+    # next `apt-get upgrade` may clobber.
+    local install_source
+    install_source=$(get_install_source)
+    if [[ "$install_source" == "apt" ]] && [[ "$version" == "latest" ]]; then
+        info "Plugin is APT-managed; updating via the plugin APT repo (not a raw-file pull)"
+        if ! apt_bootstrap_install; then
+            error "APT update failed"
+            return 1
+        fi
+        if ! restart_pve_services; then
+            warning "Plugin updated but services may need manual restart"
+        fi
+        local updated_version
+        updated_version=$(get_installed_version) || updated_version="unknown"
+        echo
+        success "TrueNAS Plugin v${updated_version} updated via APT!"
+        if is_cluster_node; then
+            show_cluster_warning
+        fi
+        show_next_steps
+        return 0
+    fi
 
     # Get release information
     local release_data
@@ -9649,7 +9848,17 @@ EOF
     echo "	shared 1"
 
     if [[ -n "$portal" ]]; then
-        echo "	tn_discovery_portal ${portal}"
+        # Defense in depth (issue #86 sub-item 1, tracked in #93): never write a
+        # malformed portal (e.g. a bare ":" produced from an all-empty IP/port
+        # pair, which the plain non-empty guard would happily accept). stdout is
+        # the config, so warn on stderr and omit rather than fail the capture.
+        local portal_ip="${portal%%:*}"
+        local portal_port="${portal##*:}"
+        if [[ -n "$portal_ip" && -n "$portal_port" ]]; then
+            echo "	tn_discovery_portal ${portal}"
+        else
+            echo "WARNING: omitting malformed tn_discovery_portal '${portal}' (empty IP or port)" >&2
+        fi
     fi
 
     if [[ -n "$blocksize" ]]; then
@@ -10665,13 +10874,20 @@ menu_configure_storage() {
             local use_multipath="$PROV_USE_MULTIPATH"
             local portals="$PROV_ADDITIONAL_PORTALS"
 
+            # Build the discovery portal only when BOTH IP and port resolved.
+            # An all-empty pair would otherwise yield a bare ":" (issue #86
+            # sub-item 1, tracked in #93) that the non-empty guard would write
+            # to storage.cfg even after the subsystem-ID lookup fails and the
+            # user chooses "Continue anyway".
+            if [[ -n "$PROVISIONED_PORTAL_IP" && -n "$PROVISIONED_PORTAL_PORT" ]]; then
+                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
+            fi
+
             if [[ "$transport_mode" == "nvme-tcp" ]]; then
                 subsystem_nqn="$PROVISIONED_SUBSYSTEM_NQN"
-                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
                 hostnqn="$PROV_HOSTNQN"
             else
                 target="$PROVISIONED_TARGET_IQN"
-                portal="${PROVISIONED_PORTAL_IP}:${PROVISIONED_PORTAL_PORT}"
             fi
 
             # Node restriction (cluster only)
