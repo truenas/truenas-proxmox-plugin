@@ -11846,6 +11846,10 @@ uninstall_plugin() {
 
 # Menu: Uninstall
 menu_uninstall() {
+    clear_screen
+    print_banner
+    echo
+
     print_header "Uninstall TrueNAS Plugin"
 
     warning "This will remove the TrueNAS plugin from Proxmox"
