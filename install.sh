@@ -639,7 +639,26 @@ validate_cluster_ssh() {
 # ============================================================================
 
 # Get currently installed plugin version
+# When the plugin is dpkg-managed, the package version is the
+# authoritative source (issue #87, tracked in #93): the embedded
+# $VERSION string in the .pm was frozen at 2.1.5 for a long stretch of
+# releases (see #64), so a stale raw-file copy reported the wrong
+# version permanently. Returns the semver core (e.g. "2.1.23") with the
+# Debian revision (+deb1) and pre-release suffix (-beta5 / ~beta5)
+# stripped — compare_versions() and GitHub tag lookups cannot handle
+# those.
 get_installed_version() {
+    local dpkg_version
+    dpkg_version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || dpkg_version=""
+    if [[ -n "$dpkg_version" ]]; then
+        local core
+        core=$(printf '%s' "$dpkg_version" | grep -Po '^[0-9]+(\.[0-9]+)*' || true)
+        if [[ -n "$core" ]]; then
+            echo "$core"
+            return 0
+        fi
+    fi
+
     if [[ ! -f "$PLUGIN_FILE" ]]; then
         echo ""
         return 1
@@ -667,7 +686,23 @@ get_installed_prerelease_status() {
         return 0
     fi
 
-    # Fetch release data from GitHub for this version
+    # dpkg-managed: derive pre-release status from the package version
+    # string itself (e.g. 2.1.23~beta5, 2.1.21-alpha1) — no network
+    # round-trip needed, and it works even when the release API does not
+    # expose the exact tag.
+    local dpkg_version
+    dpkg_version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || dpkg_version=""
+    if [[ -n "$dpkg_version" ]]; then
+        local pre_re='[-~](alpha|beta|rc)[0-9]'
+        if [[ "$dpkg_version" =~ ${pre_re} ]]; then
+            echo "true"
+        else
+            echo "false"
+        fi
+        return 0
+    fi
+
+    # Fetch release data from GitHub for this version (raw-file install)
     local release_data
     release_data=$(github_api_call "/releases/tags/v${version}" 2>/dev/null) || {
         # If API call fails, assume not a pre-release
@@ -957,11 +992,27 @@ EOF
     echo -e "${c2}OK${c0}"
 
     if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
-        printf "%-30s " "Upgrading package:"
-        if ! apt-get install --only-upgrade -y "$APT_PACKAGE_NAME"; then
-            echo -e "${c1}FAILED${c0}"
-            error "Failed to upgrade $APT_PACKAGE_NAME"
-            return 1
+        if [[ ! -f "$PLUGIN_FILE" ]]; then
+            # Package is registered but the plugin file is missing — this
+            # is the state left behind by the installer's uninstall menu,
+            # which removes the raw file without `apt remove`. A plain
+            # upgrade is a no-op here (apt reports "already the newest
+            # version"), so the file would never be restored and the
+            # verify step below would fail. Reinstall instead (issue
+            # #105, tracked in #93).
+            printf "%-30s " "Reinstalling package (plugin file missing):"
+            if ! apt-get install --reinstall -y "$APT_PACKAGE_NAME"; then
+                echo -e "${c1}FAILED${c0}"
+                error "Failed to reinstall $APT_PACKAGE_NAME"
+                return 1
+            fi
+        else
+            printf "%-30s " "Upgrading package:"
+            if ! apt-get install --only-upgrade -y "$APT_PACKAGE_NAME"; then
+                echo -e "${c1}FAILED${c0}"
+                error "Failed to upgrade $APT_PACKAGE_NAME"
+                return 1
+            fi
         fi
     else
         printf "%-30s " "Installing package:"
@@ -11730,6 +11781,18 @@ uninstall_plugin() {
         success "Plugin file removed"
     else
         info "Plugin file not found (already removed)"
+    fi
+
+    # If the plugin is dpkg-managed, remove the package too. Leaving it
+    # registered makes the next "Install via APT" a no-op (apt reports
+    # "already the newest version") and its verify step then fails with
+    # "Plugin file not found" (issue #105, tracked in #93).
+    if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        if apt-get remove -y "$APT_PACKAGE_NAME"; then
+            success "APT package $APT_PACKAGE_NAME removed"
+        else
+            warning "Failed to remove APT package $APT_PACKAGE_NAME — 'Install via APT' may report the plugin as already installed"
+        fi
     fi
 
     # Handle storage configuration
