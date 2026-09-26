@@ -6,6 +6,12 @@
 # Interactive installation, update, and configuration wizard
 #
 
+# Re-exec under bash when invoked via `sh install.sh`: dash ignores the
+# shebang and dies on the bashisms below (e.g. [[ =~ ]]) with a syntax
+# error. POSIX-safe on purpose — nothing bash-specific may run first.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 # ============================================================================
