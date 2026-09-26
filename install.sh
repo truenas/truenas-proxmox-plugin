@@ -422,8 +422,12 @@ check_dependencies() {
 
 # Detect if running on a Proxmox cluster node
 is_cluster_node() {
-    # Check if /etc/pve directory exists and has cluster configuration
-    if [[ -d "/etc/pve/nodes" ]] && [[ $(find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) -gt 1 ]]; then
+    # Cluster membership comes from the authoritative count (get_cluster_node_count),
+    # which reads /etc/pve/.members rather than counting /etc/pve/nodes/ subdirs —
+    # the latter can include stale directories left behind by removed/renamed nodes.
+    local count
+    count=$(get_cluster_node_count)
+    if [[ "${count:-0}" -gt 1 ]]; then
         return 0
     fi
     return 1
@@ -431,7 +435,15 @@ is_cluster_node() {
 
 # Get cluster node count
 get_cluster_node_count() {
-    if [[ -d "/etc/pve/nodes" ]]; then
+    # Count the authoritative membership list (/etc/pve/.members) — the same
+    # source get_cluster_nodes() reads. Do NOT count /etc/pve/nodes/ subdirs:
+    # they can include stale directories from removed/renamed nodes (e.g. an old
+    # "pve-920x-3"), which inflates the reported cluster size.
+    local count
+    count=$(get_cluster_nodes 2>/dev/null | grep -c .)
+    if [[ -n "$count" ]] && [[ "$count" -ge 1 ]]; then
+        echo "$count"
+    elif [[ -d "/etc/pve/nodes" ]]; then
         find /etc/pve/nodes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
     else
         echo "0"
@@ -756,6 +768,15 @@ get_install_source() {
     else
         echo "raw"
     fi
+}
+
+# Echo the APT candidate version for the plugin package (empty string when the
+# package is not installed or no candidate is published). Single source of truth
+# for reading the APT candidate, shared by check_for_updates and the update action
+# so the two never diverge.
+get_apt_candidate_version() {
+    apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null \
+        | awk -F': ' '/^  Candidate:/{print $2}' | xargs
 }
 
 # ============================================================================
@@ -1301,7 +1322,7 @@ check_for_updates() {
     if [[ "$install_source" == "apt" ]]; then
         local installed_full="" candidate=""
         installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
-        candidate=$(apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null | awk -F': ' '/^  Candidate:/{print $2}' | xargs) || true
+        candidate=$(get_apt_candidate_version) || true
         if [[ -z "$candidate" || "$candidate" == "none" ]]; then
             log "INFO" "apt-managed: no APT candidate available; not reporting an update"
             return 1
@@ -1809,6 +1830,8 @@ perform_cluster_wide_installation() {
     local version="${1:-latest}"
     local include_local="${2:-true}"
 
+    clear_screen
+    print_banner
     print_header "Installing TrueNAS Plugin (Cluster-Wide)"
 
     # Check for non-interactive mode
@@ -2146,6 +2169,8 @@ perform_cluster_wide_installation() {
 perform_installation() {
     local version="${1:-latest}"
 
+    clear_screen
+    print_banner
     print_header "Installing TrueNAS Plugin"
 
     # Source-aware routing (issue #93 sweep, P0): an APT-managed install
@@ -2157,6 +2182,18 @@ perform_installation() {
     install_source=$(get_install_source)
     if [[ "$install_source" == "apt" ]] && [[ "$version" == "latest" ]]; then
         info "Plugin is APT-managed; updating via the plugin APT repo (not a raw-file pull)"
+        # Only bootstrap+restart when the APT candidate is actually newer than the
+        # installed version. Otherwise a no-op "update" would still run apt, restart
+        # pvedaemon/pveproxy, and claim an update happened.
+        local installed_full apt_candidate
+        installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+        apt_candidate=$(get_apt_candidate_version) || true
+        if [[ -z "$installed_full" || -z "$apt_candidate" || "$apt_candidate" == "none" ]] \
+            || ! dpkg --compare-versions "$installed_full" "lt" "$apt_candidate"; then
+            echo
+            info "TrueNAS Plugin is already up to date (v${installed_full:-unknown}; APT candidate: ${apt_candidate:-none})"
+            return 0
+        fi
         if ! apt_bootstrap_install; then
             error "APT update failed"
             return 1
