@@ -41,25 +41,46 @@ enable_broker() {
 }
 
 restart_proxmox_services() {
-    # Restarting pvedaemon / pveproxy / pvestatd disconnects the operator
-    # from any active PVE web-UI session, which for people who reach the
-    # UI through a jump host or a PAM-mediated password vault is more
-    # painful than for a local admin (issue #60). Give them an escape
-    # hatch: setting TRUENAS_PLUGIN_NO_RESTART=1 before `dpkg -i` skips
-    # the PVE-side restarts and prints exactly the command to run when
-    # they can afford the disconnect. The truenas-plugin-broker restart
-    # in enable_broker() still runs unconditionally -- that's our own
-    # service and does not touch the web UI session.
+    # The plugin-loading daemons (pvedaemon / pvestatd / pvescheduler / the HA
+    # daemons) do not touch the operator's web-UI session. pveproxy IS the web
+    # UI gateway and serves the xterm.js terminal that streams `apt upgrade`
+    # output when an operator updates from the UI (issue #60): restarting it
+    # synchronously drops that terminal mid-transaction. So we restart the
+    # plugin-loading daemons now and DEFER pveproxy ~10s via a systemd one-shot
+    # timer -- by the time it fires the apt transaction (and its terminal) has
+    # closed, so pveproxy still picks up the new plugin without dropping the
+    # session.
+    #
+    # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who reach
+    # the UI through a jump host or a PAM-mediated password vault and can't
+    # afford even the deferred pveproxy restart: it skips the PVE-side restarts
+    # entirely and prints the command to run later. The truenas-plugin-broker
+    # restart in enable_broker() still runs unconditionally -- our own service,
+    # does not touch the web UI session.
     if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
         echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting Proxmox services."
         echo "  When convenient, run manually to pick up the new plugin:"
-        echo "    systemctl restart pvedaemon pveproxy pvestatd pve-ha-crm pve-ha-lrm"
+        echo "    systemctl restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm pveproxy"
         return 0
     fi
     if have_systemd; then
-        systemctl try-restart pvedaemon pveproxy pvestatd pve-ha-crm pve-ha-lrm || true
+        # Plugin-loading daemons, restarted immediately (try-restart: HA units
+        # may not be active on a standalone node, and that is not fatal here).
+        systemctl try-restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm || true
+        # Defer pveproxy ~10s so an active web-UI upgrade terminal survives the
+        # transaction; fall back to an immediate restart if systemd-run is
+        # unavailable.
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+                systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                systemctl try-restart pveproxy || true
+        else
+            systemctl try-restart pveproxy || true
+        fi
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
+        invoke-rc.d pvestatd restart || true
+        invoke-rc.d pvescheduler restart || true
         invoke-rc.d pveproxy restart || true
         invoke-rc.d pve-ha-crm restart || true
         invoke-rc.d pve-ha-lrm restart || true
