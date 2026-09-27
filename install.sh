@@ -1038,6 +1038,11 @@ EOF
     echo -e "${c2}OK${c0}"
 
     if dpkg -s "$APT_PACKAGE_NAME" >/dev/null 2>&1; then
+        # Preserve the current version (plugin file + .deb) before we change
+        # it, so a later rollback can restore it dpkg-consistently. The .deb
+        # must be captured BEFORE the upgrade, since apt-get replaces the
+        # cached .deb with the new version's. No-op when nothing to back up.
+        backup_plugin || warning "Could not back up current version before APT upgrade"
         if [[ ! -f "$PLUGIN_FILE" ]]; then
             # Package is registered but the plugin file is missing — this
             # is the state left behind by the installer's uninstall menu,
@@ -1423,6 +1428,42 @@ backup_plugin() {
 
     success "Backup created: $backup_file"
     log "INFO" "Backup created: $backup_file"
+
+    # Also capture the installed .deb (best-effort) so rollback can reinstall
+    # it with `dpkg -i` and keep dpkg state consistent. Never blocks the caller.
+    backup_installed_deb
+    return 0
+}
+
+# Capture the currently-installed package's .deb into BACKUP_DIR so a later
+# rollback can reinstall it with `dpkg -i` (keeps dpkg state consistent with
+# the on-disk plugin, unlike a raw .pm copy). Best-effort: the .deb is only in
+# /var/cache/apt/archives until `apt-get clean`, and beta/alpha versions were
+# never in the APT repo -- if it can't be found we log and move on (the .pm
+# backup remains the fallback). Never blocks the caller.
+backup_installed_deb() {
+    local version
+    version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
+    if [[ -z "$version" ]]; then
+        return 0
+    fi
+    local src
+    src=$(ls -1 "/var/cache/apt/archives/${APT_PACKAGE_NAME}_${version}"*.deb 2>/dev/null | head -n1)
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        log "WARNING" "backup_installed_deb: no cached .deb for ${APT_PACKAGE_NAME}_${version}; .pm backup is the rollback fallback"
+        return 0
+    fi
+    local dest
+    dest="${BACKUP_DIR}/$(basename "$src")"
+    if [[ -f "$dest" ]]; then
+        return 0
+    fi
+    mkdir -p "$BACKUP_DIR"
+    if ! cp "$src" "$dest" 2>/dev/null; then
+        log "WARNING" "backup_installed_deb: failed to copy $(basename "$src") to $BACKUP_DIR"
+        return 0
+    fi
+    log "INFO" "backup_installed_deb: captured $(basename "$dest") for dpkg-consistent rollback"
     return 0
 }
 
