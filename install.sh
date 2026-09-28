@@ -683,8 +683,8 @@ if [ "$kind" = "nvme" ]; then
     echo "${subsys:-0} 0 ${luns}"
 else
     recs=$(iscsiadm -m node 2>/dev/null | awk -v t="$target" '$2 == t' | wc -l)
-    sess=$(iscsiadm -m session 2>/dev/null | awk -v t="$target" '$1 == "target:" && $2 == t' | wc -l)
-    luns=$(ls /dev/disk/by-path 2>/dev/null | grep -cF "${target}-ip-" || true)
+    sess=$(iscsiadm -m session 2>/dev/null | awk -v t="$target" '$1 == "tcp:" { for (i = 2; i <= NF; i++) if ($i == t) { n++; break } } END { print n + 0 }')
+    luns=$(ls /dev/disk/by-path 2>/dev/null | grep -cF "iscsi-${target}-lun-" || true)
     echo "$recs $sess ${luns:-0}"
 fi
 PARITY_SCRIPT
