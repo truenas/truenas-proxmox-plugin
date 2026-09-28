@@ -69,13 +69,19 @@ restart_proxmox_services() {
         systemctl try-restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm || true
         # Defer pveproxy ~10s so an active web-UI upgrade terminal survives the
         # transaction; fall back to an immediate restart if systemd-run is
-        # unavailable.
-        if command -v systemd-run >/dev/null 2>&1; then
-            systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
-                systemctl try-restart pveproxy >/dev/null 2>&1 || \
+        # unavailable. A pending timer from a concurrent installer run is
+        # detected and NOT re-scheduled: a second `systemd-run` with the same
+        # unit name fails while the first timer is pending, and the fallback
+        # would restart pveproxy immediately -- dropping the terminal this
+        # deferral exists to protect (issue #60).
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+                    systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl try-restart pveproxy || true
+            else
                 systemctl try-restart pveproxy || true
-        else
-            systemctl try-restart pveproxy || true
+            fi
         fi
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true

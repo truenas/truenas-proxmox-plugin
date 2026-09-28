@@ -1712,6 +1712,41 @@ install_plugin_file() {
     return 0
 }
 
+# True if a deferred pveproxy restart timer is already pending on this host.
+# The transient unit is shared by every code path that defers pveproxy
+# (postinst, restart_pve_services, the remote one-liners): a second
+# `systemd-run --unit=truenas-pveproxy-restart` while the first timer is
+# pending FAILS, and the old fallback then restarted pveproxy immediately --
+# re-introducing the web-UI terminal drop this deferral exists to prevent.
+pveproxy_restart_pending() {
+    systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null
+}
+
+# Schedule a deferred (~10s) pveproxy restart unless one is already pending.
+# Returns 0 when the restart is covered (timer already pending, newly
+# scheduled, or immediate fallback succeeded); 1 only if scheduling AND the
+# immediate fallback both failed.
+schedule_pveproxy_deferred_restart() {
+    if pveproxy_restart_pending; then
+        success "pveproxy restart already deferred (~10s, timer pending)"
+        return 0
+    fi
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+            systemctl try-restart pveproxy >/dev/null 2>&1; then
+            success "pveproxy restart deferred ~10s"
+            return 0
+        fi
+        warning "systemd-run scheduling failed; restarting pveproxy immediately"
+    fi
+    if systemctl restart pveproxy 2>/dev/null; then
+        success "Restarted pveproxy"
+        return 0
+    fi
+    error "Failed to restart pveproxy"
+    return 1
+}
+
 # Restart PVE services
 #
 # Every daemon that loads /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
@@ -1739,28 +1774,14 @@ restart_pve_services() {
     done
 
     # Defer pveproxy so an active web-UI upgrade terminal survives the
-    # transaction. Fall back to an immediate restart if systemd-run is
-    # unavailable (preserves prior behaviour).
-    if command -v systemd-run >/dev/null 2>&1; then
-        if systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
-            systemctl try-restart pveproxy >/dev/null 2>&1; then
-            success "pveproxy restart deferred ~10s"
-        else
-            warning "systemd-run scheduling failed; restarting pveproxy immediately"
-            if systemctl restart pveproxy 2>/dev/null; then
-                success "Restarted pveproxy"
-            else
-                error "Failed to restart pveproxy"
-                failed=true
-            fi
-        fi
+    # transaction. A pending timer (e.g. scheduled by the package postinst
+    # seconds earlier in the same flow) is detected and NOT re-scheduled:
+    # the second systemd-run would fail and the fallback would restart
+    # pveproxy immediately -- re-introducing the drop (issue #60).
+    if schedule_pveproxy_deferred_restart; then
+        :
     else
-        if systemctl restart pveproxy 2>/dev/null; then
-            success "Restarted pveproxy"
-        else
-            error "Failed to restart pveproxy"
-            failed=true
-        fi
+        failed=true
     fi
 
     if [[ "$failed" == "true" ]]; then
@@ -1866,8 +1887,24 @@ install_plugin_on_remote_node() {
 
     # Restart the plugin-loading daemons immediately; defer pveproxy ~10s so an
     # active web-UI upgrade terminal survives the transaction (issue #60), with
-    # an immediate-restart fallback if systemd-run is unavailable.
-    if ! ssh "root@${node_ip}" "systemctl restart pvedaemon pvestatd pvescheduler; if command -v systemd-run >/dev/null 2>&1; then systemd-run --on-active=10s --unit=truenas-pveproxy-restart systemctl try-restart pveproxy >/dev/null 2>&1 || systemctl restart pveproxy; else systemctl restart pveproxy; fi" 2>/dev/null; then
+    # an immediate-restart fallback if systemd-run is unavailable. A pending
+    # timer from a concurrent flow is detected and NOT re-scheduled (the
+    # second systemd-run would fail), and a failed daemon restart is reported
+    # (the old `; if` form swallowed its exit status).
+    if ! ssh "root@${node_ip}" "
+        if ! systemctl restart pvedaemon pvestatd pvescheduler 2>/dev/null; then
+            echo 'daemon restart failed'
+            exit 1
+        fi
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            else
+                systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            fi
+        fi
+    " 2>/dev/null; then
         log "WARNING" "Remote installation to $node_ip: Service restart failed"
         echo "Service restart failed - manual restart required"
         return 2  # Special return code: installed but needs manual service restart
@@ -1911,17 +1948,22 @@ install_plugin_on_remote_node_via_apt() {
         fi
         # Restart the plugin-loading daemons immediately; defer pveproxy ~10s (it
         # serves the web-UI terminal, issue #60), falling back to an immediate
-        # restart when systemd-run is absent.
-        systemctl restart pvedaemon pvestatd pvescheduler >/dev/null 2>&1 || true
+        # restart when systemd-run is absent. A timer pending from the apt
+        # postinst in the same transaction is detected and NOT re-scheduled,
+        # and a failed daemon restart is reported (the old `|| true` swallowed it).
+        daemon_ok=true
         pveproxy_ok=true
-        if command -v systemd-run >/dev/null 2>&1; then
-            systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
-                systemctl try-restart pveproxy >/dev/null 2>&1 || \
+        systemctl restart pvedaemon pvestatd pvescheduler >/dev/null 2>&1 || daemon_ok=false
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
+                    systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl restart pveproxy >/dev/null 2>&1 || pveproxy_ok=false
+            else
                 systemctl restart pveproxy >/dev/null 2>&1 || pveproxy_ok=false
-        else
-            systemctl restart pveproxy >/dev/null 2>&1 || pveproxy_ok=false
+            fi
         fi
-        if [ "$pveproxy_ok" = "false" ]; then
+        if [ "$daemon_ok" = "false" ] || [ "$pveproxy_ok" = "false" ]; then
             echo "updated; service restart required"
             exit 2
         fi
