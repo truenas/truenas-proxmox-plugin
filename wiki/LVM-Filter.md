@@ -26,7 +26,7 @@ Reference: GitHub issue [#4](https://github.com/truenas/truenas-proxmox-plugin/i
 
 ## The fix
 
-Add a reject regex to LVM's `global_filter` in `/etc/lvm/lvm.conf`
+Add a reject regex to LVM's `global_filter` (see [Which file](#which-file-lvmlocalconf-vs-lvmconf))
 so LVM stops scanning TrueNAS-served NVMe namespaces:
 
 ```
@@ -47,6 +47,19 @@ Why this works:
   `nvme-Samsung_...`, `nvme-Intel_...`) and never match, so host
   LVM (root filesystem VGs, local-lvm, etc.) is untouched.
 
+## Which file: `lvmlocal.conf` vs `lvm.conf`
+
+LVM reads `/etc/lvm/lvm.conf`, then `/etc/lvm/lvmlocal.conf`, and the
+latter **overrides** the former for any key they both set. On PVE hosts
+the effective `global_filter` usually lives in a `# truenasplugin
+managed` `devices { }` block at the bottom of `lvmlocal.conf` (which also
+sets `scan = [ "/dev/disk/by-id" ]`). Editing only `lvm.conf` would be
+silently overridden by that block, so the helper and the installer both
+target the **effective** file: `lvmlocal.conf` when it carries a
+`global_filter` line, otherwise `lvm.conf`. They first check the merged
+config (`lvm dumpconfig`) so they stay idempotent no matter which file the
+filter already lives in.
+
 ## Applying the fix
 
 ### Automated (recommended)
@@ -59,8 +72,8 @@ sudo pvscan --cache
 sudo vgscan
 ```
 
-`--install` appends the regex to the existing `global_filter` line
-in `/etc/lvm/lvm.conf`, tagged with a comment marker
+`--install` appends the regex to the effective `global_filter` line
+(`lvmlocal.conf` preferred, else `lvm.conf`), tagged with a comment marker
 (`# truenas-proxmox-plugin issue #4`) for future removal. A
 timestamped backup is written first, and `lvm dumpconfig` is run
 after the edit to verify the file still parses.
@@ -85,11 +98,15 @@ truenas-plugin-lvm-filter --status
 The script is idempotent: running `--install` when the filter is
 already installed, or `--uninstall` when it isn't, is a no-op.
 
+The installer offers the same step automatically after a storage is
+configured (either transport), with the same idempotency and backup
+behaviour.
+
 ### Manual
 
-Edit `/etc/lvm/lvm.conf`, find the `global_filter =` line inside
-the `devices { ... }` section, and append `"r|/dev/disk/by-id/nvme-TrueNAS_.*|"`
-to the list. Save. Refresh LVM:
+Edit the effective file (see [Which file](#which-file-lvmlocalconf-vs-lvmconf)) —
+find the `global_filter =` line inside the `devices { ... }` block and append
+`"r|/dev/disk/by-id/nvme-TrueNAS_.*|"` to the list. Save. Refresh LVM:
 
 ```
 sudo pvscan --cache
@@ -107,6 +124,25 @@ After the fix:
 ```
 global_filter = [ "r|/dev/zd.*|", "r|/dev/rbd.*|", "r|/dev/disk/by-id/nvme-TrueNAS_.*|" ]
 ```
+
+## Cleaning up `/etc/lvm/archive`
+
+Even with the filter in place, a host that ran without it for a while
+has accumulated stale metadata archives in `/etc/lvm/archive/` — LVM
+snapshots its metadata there before every change. A pile of thousands
+of these files slows `vgs` / `pvscan`, and at the extreme makes
+`pvesm status`-class calls even slower.
+
+Once you have confirmed there are no pending LVM rollbacks you might
+want to undo, it is safe to clear the directory:
+
+```
+sudo rm -f /etc/lvm/archive/*
+```
+
+The installer counts the files and offers this cleanup after applying
+the filter when the directory is large. You can also delete individual
+old archives if you want to keep the most recent one around.
 
 ## Why this isn't done at package install
 

@@ -48,7 +48,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 - [Performance Issues](#performance-issues)
   - [Slow VM Disk Performance](#slow-vm-disk-performance)
   - [Slow Multipath Read Performance](#slow-multipath-read-performance)
-  - [Host LVM scanning TrueNAS NVMe namespaces / `pvesh` timeouts / duplicate-VG warning storms](LVM-Filter.md) — see [LVM-Filter](LVM-Filter.md) for the fix (`truenas-plugin-lvm-filter --install`).
+  - [Host LVM scanning TrueNAS NVMe namespaces / `pvesh` timeouts / duplicate-VG warning storms / `/etc/lvm/archive` bloat](LVM-Filter.md) — see [LVM-Filter](LVM-Filter.md) for the `global_filter` fix (`truenas-plugin-lvm-filter --install`, or the installer's post-configuration prompt) and the `/etc/lvm/archive` cleanup.
   - [Slow VM Cloning](#slow-vm-cloning)
 - [Cluster-Specific Issues](#cluster-specific-issues)
   - [Storage Not Shared Across Nodes](#storage-not-shared-across-nodes)

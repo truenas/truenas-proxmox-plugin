@@ -2085,7 +2085,7 @@ perform_cluster_wide_installation() {
 
     local install_version
     install_version=$(get_release_version "$release_data") || {
-        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        error "Release tag format is invalid; expected vX.Y.Z (optionally with a -prerelease suffix)"
         return 1
     }
     info "Installing version: $install_version"
@@ -2327,7 +2327,7 @@ perform_installation() {
 
     local install_version
     install_version=$(get_release_version "$release_data") || {
-        error "Release tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN"
+        error "Release tag format is invalid; expected vX.Y.Z (optionally with a -prerelease suffix)"
         return 1
     }
     info "Installing version: $install_version"
@@ -10741,6 +10741,189 @@ wizard_add_storage() {
     return 0
 }
 
+# ============================================================================
+# LVM GLOBAL FILTER (GitHub issue #4)
+# ============================================================================
+# The host's LVM stack scans TrueNAS-served NVMe/TCP namespaces. A guest VM
+# whose disk lives on a TN namespace usually runs its own LVM; the host sees
+# the guest's PV signatures and treats them as host-level PVs, producing
+# duplicate-VG warning storms on every LVM call (pvesm, pvesh, qm, pvestatd
+# polls). With many cloned namespaces this can push `pvesh get
+# /nodes/<node>/storage` past the 596s API timeout, breaking Veeam and
+# similar backup integrations, and fills /etc/lvm/archive with stale metadata.
+#
+# Fix: add a reject regex to LVM's global_filter matching the
+# /dev/disk/by-id/nvme-TrueNAS_* symlinks that udev builds from the NVMe
+# controller MODEL string. Local NVMe drives never match, so local LVM is
+# unaffected. /dev/zd* and /dev/rbd* are already rejected by the existing
+# filter, so we add only the TrueNAS-specific pattern.
+#
+# WHICH FILE: /etc/lvm/lvmlocal.conf is read AFTER /etc/lvm/lvm.conf and
+# OVERRIDES it. On PVE hosts the effective global_filter usually lives in a
+# "truenasplugin managed" devices { } block in lvmlocal.conf (which also
+# restricts `scan` to /dev/disk/by-id). Editing lvm.conf alone would be
+# silently overridden by that block, so we detect the EFFECTIVE filter via
+# `lvm dumpconfig` and apply to the effective file (lvmlocal.conf when it
+# carries a global_filter line, else lvm.conf). This matches where the filter
+# already lives on hosts that have it, and stays idempotent.
+#
+# The regex + marker below are byte-identical to tools/truenas-plugin-lvm-filter
+# so that script's --status / --uninstall keep working on an installer-applied
+# filter. lvm.conf is a pve-manager conffile and lvmlocal.conf is operator-
+# owned; we never edit either silently -- this always asks first and writes a
+# timestamped backup.
+#
+# Offered for both transports (iSCSI and NVMe/TCP) per issue #4; the filter
+# only matches NVMe/TCP namespaces, so for a pure-iSCSI setup it is harmless
+# (no matching devices) and future-proofs a host that later adds NVMe.
+
+readonly LVM_CONF_FILE="/etc/lvm/lvm.conf"
+readonly LVM_LOCAL_CONF_FILE="/etc/lvm/lvmlocal.conf"
+readonly LVM_FILTER_REGEX='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+readonly LVM_FILTER_MARKER='truenas-proxmox-plugin issue #4'
+
+# True if a REJECT pattern for nvme-TrueNAS_ namespaces is ALREADY ACTIVE in
+# the effective LVM config (lvm.conf, lvmlocal.conf, or any override),
+# regardless of which file it lives in or whether it is anchored (^...).
+_lvm_filter_effective() {
+    command -v lvm >/dev/null 2>&1 || return 1
+    local cfg
+    cfg=$(lvm dumpconfig 2>/dev/null) || return 1
+    grep -qE 'r\|[^"]*nvme-TrueNAS_' <<<"$cfg"
+}
+
+# Echo the file whose global_filter line is in effect and return 0; return 1
+# with no output if neither file has an active global_filter line. lvmlocal.conf
+# wins over lvm.conf, so it is preferred when it carries a global_filter.
+_lvm_filter_target_file() {
+    local f
+    for f in "$LVM_LOCAL_CONF_FILE" "$LVM_CONF_FILE"; do
+        if [[ -f "$f" ]] && grep -qE "^[[:space:]]*global_filter[[:space:]]*=" "$f"; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Note about /etc/lvm/archive bloat (stale LVM metadata archives) if present.
+_lvm_archive_note() {
+    local archive_dir="/etc/lvm/archive"
+    [[ -d "$archive_dir" ]] || return 0
+    local count
+    count=$(find "$archive_dir" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+    if [[ "${count:-0}" -gt 50 ]]; then
+        echo
+        warning "$count stale metadata files in $archive_dir"
+        echo "  LVM archives old metadata there on every change; a large pile slows scans."
+        echo "  Safe to clear once no LVM rollback is pending:"
+        echo "    rm -f $archive_dir/*"
+    fi
+    return 0
+}
+
+# Apply the filter: pick the effective file, timestamped backup, insert
+# regex+marker into its existing global_filter array, verify LVM still parses,
+# refresh LVM caches, restart lvm2-monitor, and note any /etc/lvm/archive
+# bloat. Returns non-zero on failure (caller handles messaging).
+_lvm_filter_apply() {
+    local target
+    if ! target=$(_lvm_filter_target_file); then
+        echo "  No active global_filter line in lvm.conf or lvmlocal.conf -- refusing to create one."
+        echo "  Add one inside a devices { ... } section, then re-run."
+        return 1
+    fi
+
+    local backup="${target}.bak.$(date +%Y%m%d%H%M%S).truenas-plugin"
+    if ! cp -a "$target" "$backup"; then
+        echo "  Backup failed -- aborting without modifying $target."
+        return 1
+    fi
+    echo "  Editing: $target"
+    echo "  Backup:  $backup"
+
+    # Insert the regex before the closing "]" of the global_filter array,
+    # tagged with the marker comment. Identical edit to the helper.
+    if ! perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(\s*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/\s+$//;
+            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
+            $_ = "${lead}${body} ${r} ${close} # ${m}\n";
+        }
+    ' -- -r="$LVM_FILTER_REGEX" -m="$LVM_FILTER_MARKER" "$target"; then
+        echo "  Failed to edit $target -- restore with: cp $backup $target"
+        return 1
+    fi
+
+    # Verify LVM still parses the (merged) config: lvm loads lvm.conf +
+    # lvmlocal.conf for any command; a parse error exits non-zero.
+    if command -v lvm >/dev/null 2>&1 && ! lvm dumpconfig >/dev/null 2>&1; then
+        echo "  LVM config no longer parses -- restoring backup."
+        cp -a "$backup" "$target" 2>/dev/null || true
+        return 1
+    fi
+
+    success "LVM global filter installed"
+
+    # Refresh LVM's device caches and restart the monitor daemon. All
+    # best-effort under set -e (a cache hiccup must never fail the flow).
+    rm -f /etc/lvm/cache/.cache 2>/dev/null || true
+    command -v pvscan >/dev/null 2>&1 && pvscan --cache >/dev/null 2>&1 || true
+    command -v vgscan >/dev/null 2>&1 && vgscan --cache >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files lvm2-monitor.service >/dev/null 2>&1; then
+        if systemctl restart lvm2-monitor >/dev/null 2>&1; then
+            success "Restarted lvm2-monitor"
+        else
+            warning "Could not restart lvm2-monitor -- run: systemctl restart lvm2-monitor"
+        fi
+    fi
+
+    _lvm_archive_note
+    return 0
+}
+
+# Offer, and on consent apply, the LVM global filter for TrueNAS NVMe/TCP.
+# Idempotent and non-fatal: no LVM, an already-effective filter, a declined
+# prompt, or an edit error all just print a note and return 0, so this never
+# breaks the surrounding storage flow. $1 = transport mode (for the message).
+offer_lvm_filter() {
+    local transport_mode="${1:-}"
+
+    if [[ ! -f "$LVM_CONF_FILE" && ! -f "$LVM_LOCAL_CONF_FILE" ]]; then
+        info "LVM not detected on this host -- skipping LVM filter step"
+        return 0
+    fi
+    if _lvm_filter_effective; then
+        info "LVM global_filter already rejects TrueNAS NVMe namespaces (effective config) -- nothing to do"
+        return 0
+    fi
+    if [[ "${NON_INTERACTIVE:-}" == "true" ]]; then
+        info "LVM filter for TrueNAS NVMe not active. Apply later with: truenas-plugin-lvm-filter --install"
+        return 0
+    fi
+
+    echo
+    warning "Host LVM is scanning TrueNAS NVMe/TCP namespaces (transport: ${transport_mode:-unknown})"
+    echo "  A guest VM that runs LVM inside will cause duplicate-VG warning storms on"
+    echo "  this host and can push storage-list API calls past the 596s timeout."
+    echo
+    echo "  Fix: add this reject regex to LVM's global_filter:"
+    echo "      $LVM_FILTER_REGEX"
+    echo "  (local /dev/zd* and /dev/rbd* are already rejected by the existing filter)"
+    echo
+    read -rp "Apply the LVM global filter now? [Y/n]: " lvm_confirm
+    if [[ ! "$lvm_confirm" =~ ^[Nn] ]]; then
+        _lvm_filter_apply || {
+            warning "LVM filter was not applied (see above). You can run it later with:"
+            echo "  truenas-plugin-lvm-filter --install"
+        }
+    else
+        info "Skipped. Apply later with: truenas-plugin-lvm-filter --install"
+    fi
+    return 0
+}
+
 # Configuration wizard
 menu_configure_storage() {
     clear_screen
@@ -11128,6 +11311,8 @@ menu_configure_storage() {
             fi
 
             success "Storage '$storage_name' configured successfully!"
+
+            offer_lvm_filter "$transport_mode"
 
             read -rp "Press any key to return to main menu..." -n1 _
             echo
@@ -11630,6 +11815,8 @@ menu_configure_storage() {
         error "Failed to add configuration"
         return 1
     fi
+
+    offer_lvm_filter "$transport_mode"
 
     read -rp "Press Enter to continue..."
 }
