@@ -25,6 +25,7 @@ for the underlying option definitions.
   - [iSCSI HA failover tuning](#iscsi-ha-failover-tuning)
   - [NVMe/TCP HA failover](#nvmetcp-ha-failover)
   - [Snapshot coexistence with TrueNAS auto-snapshots](#snapshot-coexistence-with-truenas-auto-snapshots)
+  - [Snapshots taken on TrueNAS](#snapshots-taken-on-truenas)
 - [Provisioning Workflow](#provisioning-workflow)
   - [Templates and linked clones](#templates-and-linked-clones)
   - [What is offloaded, what is not](#what-is-offloaded-what-is-not)
@@ -247,6 +248,76 @@ Suggested convention:
 
 Do not let TrueNAS retention delete a snapshot that PVE thinks it owns —
 it will surface as a rollback failure inside PVE.
+
+
+### Snapshots taken on TrueNAS
+
+A snapshot created on the array is invisible to PVE: the Snapshots tab
+renders `$conf->{snapshots}` from `/etc/pve/qemu-server/<vmid>.conf` (or
+`/etc/pve/lxc/<vmid>.conf` for a container) and never asks the storage. Invisible is not inert:
+
+- A TrueNAS snapshot newer than a PVE one makes `qm rollback <older>`
+  fail with `is not most recent snapshot`, and the GUI offers no way to
+  remove the blocker.
+- A rollback that does go through **destroys** every snapshot taken
+  after the target, this plugin's and the array's alike, because the
+  plugin asks ZFS for a recursive rollback (`zfs rollback -r`).
+
+Adopt them into the VM configuration and both problems go away, because
+PVE can then see and delete them:
+
+```bash
+truenas-proxmox-manage import-snapshots 100 --dry-run   # list, write nothing
+truenas-proxmox-manage import-snapshots 100 --yes       # adopt
+```
+
+What that means afterwards, and why it is opt-in:
+
+- PVE now owns those snapshots. `qm delsnapshot` destroys them **on the
+  array**; if TrueNAS retention removes one first, the PVE side needs
+  `--force`.
+- A section records the configuration as of the import, not as of the
+  snapshot: rolling back to one restores the disks of that moment with
+  today's configuration, and without RAM (the VM starts cold).
+- They are **crash-consistent, not application-consistent**. TrueNAS does
+  not know a guest is running on the zvol, so there is no guest-agent
+  `fs-freeze`: rolling back to one is the guest losing power at that
+  instant. Journaling filesystems normally come back clean; databases may
+  need their own recovery. When you need a known-good state, take a PVE
+  snapshot with the QEMU guest agent enabled and treat imported ones as a
+  safety net.
+- PVE only rolls back to the newest snapshot, so importing a periodic one
+  newer than your deliberate PVE snapshot puts it in the way of that
+  rollback (it was already in the way, invisibly, before the import). Use
+  `--match` to adopt only the snapshots you name on purpose, or keep
+  periodic snapshot tasks off the zvols that back PVE guests.
+- Only snapshots present on every disk of the VM, with a name PVE accepts
+  (`pve-configid`: `[a-z][a-z0-9_-]+`, at least 2 and at most 40
+  characters, and not `vzdump` / `current` / `pending` / `__base__` /
+  `__replicate_*` in any capitalisation) and with no dependent clone are
+  imported. The rest are listed with the reason, which is also the tool's
+  answer to "why is this one not in the list".
+- The same name on every disk is not enough: every disk must carry a
+  creation time from the array, and they must be within an hour of each
+  other. Two snapshots hours apart that happen to share a name are two
+  snapshots, and a section built from them would pair one disk's Monday
+  with the other disk's Tuesday.
+- Two snapshots created in the same second are ordered by `createtxg`,
+  the ZFS transaction group. When that cannot settle it - the other one
+  is a PVE snapshot, which has none - the candidate is refused rather
+  than placed in the chain by guesswork.
+- An imported snapshot dated *between* two PVE snapshots hangs off the
+  one before it, and the PVE snapshot after it keeps its own parent: it
+  shows up as a **branch** in the Snapshots tree. Existing sections are
+  never rewritten, and that is the trade.
+- Run it on the node hosting the guest, and prefer `--dry-run` first. In
+  a script pass `--yes`: without a terminal to confirm on, the command
+  refuses and exits 2 rather than assuming consent.
+- Containers are covered: the guest type comes from the configuration
+  file that exists, and a container's `rootfs` and storage `mpN` are
+  treated exactly as a VM's disks. Bind mounts and device mountpoints are
+  ignored (they are not storage volumes); an `mpN` on another storage is
+  refused.
 
 ---
 
