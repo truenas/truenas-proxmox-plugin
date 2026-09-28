@@ -670,17 +670,27 @@ collect_parity_facts() {
     local script
     read -r -d '' script <<'PARITY_SCRIPT' || true
 if [ "$kind" = "nvme" ]; then
-    subsys=$(nvme list-subsys 2>/dev/null | grep -cF "NQN=$target")
+    # Exact NQN match: the header line is 'nvme-subsysN - NQN=<nqn>'; compare
+    # the value after the first 'NQN=' for equality (a substring match would
+    # also accept sibling subsystems whose NQN is a superstring of the
+    # target). Controllers are taken from port lines only (' +- nvmeN
+    # tcp/pcie …') so an NQN that happens to contain 'nvme<digit>' cannot
+    # inject a local PCIe controller into the count.
+    subsys=0
     ctrls=$(nvme list-subsys 2>/dev/null | awk -v nqn="$target" '
-        /^[A-Za-z0-9_-]+ - NQN=/ { inb = (index($0, nqn) > 0) }
-        inb { print }
-    ' | grep -oE 'nvme[0-9]+' | sort -u)
+        {
+            p = index($0, "NQN=")
+            if (p > 0) { inb = (substr($0, p + 4) == nqn) }
+        }
+        inb && $2 ~ /^nvme[0-9]+$/ { print $2 }
+    ' | sort -u)
+    if [ -n "$ctrls" ]; then subsys=1; fi
     luns=0
     for c in $ctrls; do
         n=$(ls /dev/${c}n* 2>/dev/null | wc -l)
         luns=$((luns + n))
     done
-    echo "${subsys:-0} 0 ${luns}"
+    echo "$subsys 0 $luns"
 else
     recs=$(iscsiadm -m node 2>/dev/null | awk -v t="$target" '$2 == t' | wc -l)
     sess=$(iscsiadm -m session 2>/dev/null | awk -v t="$target" '$1 == "tcp:" { for (i = 2; i <= NF; i++) if ($i == t) { n++; break } } END { print n + 0 }')
