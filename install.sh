@@ -652,6 +652,49 @@ validate_cluster_ssh() {
     return 0
 }
 
+# Collect multipath/iscsid parity facts for a TrueNAS target on one node (#21).
+# Runs a self-contained POSIX sh script locally or over ssh, so it does not
+# depend on the remote node having the same installer version. Read-only.
+# Args: $1 = kind (iscsi|nvme), $2 = target (IQN or NQN), $3 = node IP ("" = local)
+# kind/target are passed to the script via environment (not positional args):
+# `sh -s` positional-arg semantics differ between dash and bash-as-sh.
+# Prints: "records sessions luns"
+#   iscsi: records = portal node records, sessions = active sessions,
+#          luns = by-path devices for the target
+#   nvme:  records = 1 if the subsystem is connected, sessions = 0 (unused),
+#          luns = live namespaces across the subsystem's controllers
+collect_parity_facts() {
+    local kind="$1"
+    local target="$2"
+    local node_ip="${3:-}"
+    local script
+    read -r -d '' script <<'PARITY_SCRIPT' || true
+if [ "$kind" = "nvme" ]; then
+    subsys=$(nvme list-subsys 2>/dev/null | grep -cF "NQN=$target")
+    ctrls=$(nvme list-subsys 2>/dev/null | awk -v nqn="$target" '
+        /^[A-Za-z0-9_-]+ - NQN=/ { inb = (index($0, nqn) > 0) }
+        inb { print }
+    ' | grep -oE 'nvme[0-9]+' | sort -u)
+    luns=0
+    for c in $ctrls; do
+        n=$(ls /dev/${c}n* 2>/dev/null | wc -l)
+        luns=$((luns + n))
+    done
+    echo "${subsys:-0} 0 ${luns}"
+else
+    recs=$(iscsiadm -m node 2>/dev/null | awk -v t="$target" '$2 == t' | wc -l)
+    sess=$(iscsiadm -m session 2>/dev/null | awk -v t="$target" '$1 == "target:" && $2 == t' | wc -l)
+    luns=$(ls /dev/disk/by-path 2>/dev/null | grep -cF "${target}-ip-" || true)
+    echo "$recs $sess ${luns:-0}"
+fi
+PARITY_SCRIPT
+    if [[ -z "$node_ip" ]]; then
+        kind="$kind" target="$target" sh -c "$script"
+    else
+        printf '%s\n' "$script" | ssh -o ConnectTimeout=5 -o BatchMode=yes "root@${node_ip}" "kind='$kind' target='$target' sh -s"
+    fi
+}
+
 # ============================================================================
 # INSTALLATION STATE DETECTION
 # ============================================================================
@@ -5702,6 +5745,137 @@ run_health_check() {
     else
         # NVMe/TCP mode - skip weight check (not applicable)
         check_result "Weight volume presence" "SKIP" "Not applicable for NVMe/TCP"
+    fi
+
+    # Check 14: Cluster parity — multipath/iscsid functional parity across
+    # cluster nodes (#21). Read-only; per-node detail lines plus one
+    # aggregate row. Never aborts the health check.
+    local -a parity_nodes=()
+    mapfile -t parity_nodes < <(get_cluster_nodes 2>/dev/null) || true
+    if [[ ${#parity_nodes[@]} -le 1 ]]; then
+        check_result "Cluster parity" "SKIP" "Not applicable (single node)"
+    else
+        local parity_kind parity_target
+        if [[ "$transport_mode" == "nvme-tcp" ]]; then
+            parity_kind="nvme"
+            parity_target="${subsystem_nqn:-}"
+        else
+            parity_kind="iscsi"
+            parity_target="${target_iqn:-}"
+        fi
+        if [[ -z "$parity_target" ]]; then
+            check_result "Cluster parity" "SKIP" "No target configured"
+        else
+            # Gather: one local or ssh round-trip per node
+            local -a p_names=() p_ips=() p_facts=()
+            local cur_node pname pip facts
+            cur_node=$(get_current_node_name)
+            printf "%-30s " "Cluster parity:"
+            start_spinner
+            for pip_full in "${parity_nodes[@]}"; do
+                pname="${pip_full%%:*}"
+                pip="${pip_full##*:}"
+                if [[ "$pname" == "$cur_node" ]]; then
+                    facts=$(collect_parity_facts "$parity_kind" "$parity_target" "" 2>/dev/null) || facts=""
+                else
+                    facts=$(collect_parity_facts "$parity_kind" "$parity_target" "$pip" 2>/dev/null) || facts=""
+                fi
+                p_names+=("$pname")
+                p_ips+=("$pip")
+                p_facts+=("$facts")
+            done
+            stop_spinner
+
+            # Evaluate: cluster maxima + per-node verdicts
+            local max_recs=0 max_sess=0 max_luns=0
+            local -a p_recs=() p_sess=() p_luns=() p_status=()
+            local i fr fs fl
+            for i in "${!p_facts[@]}"; do
+                if [[ "${p_facts[$i]}" =~ ^([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+                    fr="${BASH_REMATCH[1]}"
+                    fs="${BASH_REMATCH[2]}"
+                    fl="${BASH_REMATCH[3]}"
+                else
+                    fr=""
+                    fs=""
+                    fl=""
+                fi
+                p_recs[i]="$fr"
+                p_sess[i]="$fs"
+                p_luns[i]="$fl"
+                if [[ -n "$fr" && "$fr" -gt "$max_recs" ]]; then max_recs="$fr"; fi
+                if [[ -n "$fs" && "$fs" -gt "$max_sess" ]]; then max_sess="$fs"; fi
+                if [[ -n "$fl" && "$fl" -gt "$max_luns" ]]; then max_luns="$fl"; fi
+            done
+            local parity_errors=0 parity_warnings=0
+            for i in "${!p_facts[@]}"; do
+                if [[ -z "${p_recs[$i]}" ]]; then
+                    p_status[i]="WARN no data (node unreachable via SSH)"
+                    ((parity_warnings++))
+                elif [[ "$parity_kind" == "nvme" ]]; then
+                    if [[ "${p_recs[$i]}" -eq 0 ]]; then
+                        p_status[i]="CRIT subsystem not connected"
+                        ((parity_errors++))
+                    elif [[ "${p_luns[$i]}" -eq 0 && "$max_luns" -gt 0 ]]; then
+                        p_status[i]="CRIT 0 live namespaces (cluster sees $max_luns)"
+                        ((parity_errors++))
+                    elif [[ "${p_luns[$i]}" -lt "$max_luns" ]]; then
+                        p_status[i]="WARN only ${p_luns[$i]}/$max_luns live namespace(s)"
+                        ((parity_warnings++))
+                    else
+                        p_status[i]="OK connected, ${p_luns[$i]} live namespace(s)"
+                    fi
+                else
+                    if [[ "${p_recs[$i]}" -eq 0 ]]; then
+                        p_status[i]="CRIT no node records for target"
+                        ((parity_errors++))
+                    elif [[ "${p_recs[$i]}" -lt "$max_recs" ]]; then
+                        p_status[i]="WARN only ${p_recs[$i]}/$max_recs portal record(s)"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -eq 0 && "$max_sess" -gt 0 ]]; then
+                        p_status[i]="WARN no active sessions (cluster sees $max_sess)"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -gt 0 && "${p_luns[$i]}" -eq 0 && "$max_luns" -gt 0 ]]; then
+                        p_status[i]="CRIT session(s) active but 0 LUNs visible (cluster sees $max_luns)"
+                        ((parity_errors++))
+                    elif [[ "${p_sess[$i]}" -gt 0 && "${p_luns[$i]}" -lt "$max_luns" ]]; then
+                        p_status[i]="WARN only ${p_luns[$i]}/$max_luns LUN(s) visible"
+                        ((parity_warnings++))
+                    elif [[ "${p_sess[$i]}" -gt 0 ]]; then
+                        p_status[i]="OK ${p_recs[$i]} record(s), ${p_sess[$i]} session(s), ${p_luns[$i]} LUN(s)"
+                    else
+                        p_status[i]="OK ${p_recs[$i]} record(s), no active sessions (login on demand)"
+                    fi
+                fi
+            done
+
+            # Aggregate row, then per-node detail lines
+            local parity_icon parity_msg
+            if [[ $parity_errors -gt 0 ]]; then
+                parity_icon="${COLOR_RED}✗"
+                parity_msg="$parity_errors critical, $parity_warnings warning(s) across ${#p_facts[@]} nodes"
+                ((errors++))
+            elif [[ $parity_warnings -gt 0 ]]; then
+                parity_icon="${COLOR_YELLOW}⚠"
+                parity_msg="$parity_warnings of ${#p_facts[@]} node(s) inconsistent"
+                ((warnings++))
+            else
+                parity_icon="${COLOR_GREEN}✓"
+                parity_msg="All ${#p_facts[@]} nodes consistent"
+                ((checks_passed++))
+            fi
+            ((checks_total++))
+            echo -e "\r$(printf "%-30s " "Cluster parity:")${parity_icon}${COLOR_RESET} ${parity_msg} (${parity_kind})"
+            for i in "${!p_facts[@]}"; do
+                local lvl="${p_status[$i]%% *}"
+                local detail="${p_status[$i]#* }"
+                case "$lvl" in
+                    OK)   printf "  %-28s ${COLOR_GREEN}✓${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                    WARN) printf "  %-28s ${COLOR_YELLOW}⚠${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                    *)    printf "  %-28s ${COLOR_RED}✗${COLOR_RESET} %s\n" "${p_names[$i]} (${p_ips[$i]})" "$detail" ;;
+                esac
+            done
+        fi
     fi
 
     # Summary
