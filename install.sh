@@ -1476,6 +1476,15 @@ list_backups() {
     find "$BACKUP_DIR" -name "TrueNASPlugin.pm.backup.*" -type f | sort -r
 }
 
+# List available package (.deb) backups
+list_deb_backups() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        return 1
+    fi
+
+    find "$BACKUP_DIR" -name "${APT_PACKAGE_NAME}_*.deb" -type f | sort -r
+}
+
 # Human-readable file size
 format_size() {
     local bytes="$1"
@@ -11629,6 +11638,47 @@ menu_configure_storage() {
 # ROLLBACK FUNCTIONALITY
 # ============================================================================
 
+# Restore from a packaged .deb backup via `dpkg -i`. Unlike a raw .pm copy,
+# this keeps dpkg state consistent with the on-disk plugin: afterwards `dpkg -l`
+# reports the rolled-back version. The package's postinst runs (broker-socket
+# wait + the deferred service restarts), so no separate restart is needed here.
+restore_from_deb() {
+    local deb_file="$1"
+
+    if [[ ! -f "$deb_file" ]]; then
+        error "Package backup not found: $deb_file"
+        return 1
+    fi
+
+    if ! command -v dpkg >/dev/null 2>&1; then
+        error "dpkg is required to restore from a .deb backup"
+        return 1
+    fi
+
+    # Integrity check -- a corrupt archive would otherwise fail inside dpkg -i
+    # with a confusing message.
+    if ! dpkg-deb --info "$deb_file" >/dev/null 2>&1; then
+        error "Package backup failed integrity check: $deb_file"
+        return 1
+    fi
+
+    local ver
+    ver=$(dpkg-deb -f "$deb_file" Version 2>/dev/null || echo "unknown")
+    info "Restoring plugin from package backup via dpkg -i: $(basename "$deb_file") ($ver)"
+
+    # Preserve the current version before replacing it (enables re-rollback).
+    backup_plugin || warning "Could not backup current version"
+
+    if ! dpkg -i "$deb_file"; then
+        error "dpkg -i failed for $(basename "$deb_file")"
+        return 1
+    fi
+
+    success "Plugin rolled back to $ver via dpkg (dpkg state consistent)"
+    log "INFO" "Plugin restored from package: $deb_file ($ver)"
+    return 0
+}
+
 # Restore from backup
 restore_plugin_from_backup() {
     local backup_file="$1"
@@ -11665,7 +11715,77 @@ restore_plugin_from_backup() {
     # Restart services
     restart_pve_services || warning "Services may need manual restart"
 
+    # A raw .pm copy does not update dpkg state: on a dpkg-managed node
+    # `dpkg -l` still reports the pre-rollback version -- exactly the #87
+    # drift. Make it visible instead of silent, and point at the resync.
+    if [[ "$(get_install_source)" == "apt" ]]; then
+        warning "Raw .pm restore does not update dpkg state."
+        warning "dpkg -l will report the pre-rollback version until you resync:"
+        warning "  apt-get install --reinstall $APT_PACKAGE_NAME"
+    fi
+
     return 0
+}
+
+# Roll back all REMOTE cluster nodes to the same artifact. $1 = local artifact
+# path, $2 = kind ("deb" | "pm"). For each remote node: transfer the artifact to
+# its BACKUP_DIR, then dpkg -i (deb) or raw .pm copy + service restart (pm).
+# A failure on one node does not abort the others; per-node results are reported.
+rollback_cluster_to_artifact() {
+    local artifact="$1" kind="$2"
+    local -a remotes
+    mapfile -t remotes < <(get_remote_cluster_nodes 2>/dev/null || true)
+
+    if [[ ${#remotes[@]} -eq 0 ]]; then
+        warning "No remote cluster nodes to roll back"
+        return 1
+    fi
+
+    local base
+    base=$(basename "$artifact")
+    local ok_count=0 fail_count=0
+
+    for entry in "${remotes[@]}"; do
+        local node_name="${entry%%:*}"
+        local node_ip="${entry##*:}"
+        info "Rolling back $node_name ($node_ip) to $(basename "$artifact")..."
+
+        if ! scp -o ConnectTimeout=10 -o BatchMode=yes "$artifact" "root@${node_ip}:${BACKUP_DIR}/${base}" >/dev/null 2>&1; then
+            error "$node_name: failed to transfer artifact"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        if [[ "$kind" == "deb" ]]; then
+            # dpkg -i runs the postinst (broker wait + service restarts).
+            if ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" "dpkg -i '${BACKUP_DIR}/${base}'" >/dev/null 2>&1; then
+                success "$node_name: rolled back via dpkg"
+                ok_count=$((ok_count + 1))
+            else
+                error "$node_name: dpkg -i failed"
+                fail_count=$((fail_count + 1))
+            fi
+        else
+            # Raw .pm copy + immediate restart of the plugin-loading daemons.
+            # dpkg state on that node goes stale (same caveat as a local raw restore).
+            if ssh -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" \
+                "cp '${BACKUP_DIR}/${base}' '$PLUGIN_FILE' && chown root:root '$PLUGIN_FILE' && chmod 644 '$PLUGIN_FILE' && systemctl restart pvedaemon pvestatd pvescheduler pveproxy" >/dev/null 2>&1; then
+                warning "$node_name: rolled back via raw .pm copy (dpkg state stale on that node)"
+                ok_count=$((ok_count + 1))
+            else
+                error "$node_name: raw .pm restore failed"
+                fail_count=$((fail_count + 1))
+            fi
+        fi
+    done
+
+    echo
+    if [[ $fail_count -eq 0 ]]; then
+        success "Cluster rollback: $ok_count node(s) updated, 0 failed"
+    else
+        warning "Cluster rollback: $ok_count succeeded, $fail_count failed"
+    fi
+    [[ $fail_count -eq 0 ]]
 }
 
 # Menu: Rollback
@@ -11673,10 +11793,11 @@ menu_rollback() {
     print_header "Rollback to Previous Version"
 
     info "Searching for available backups..."
-    local backups
-    backups=$(list_backups 2>/dev/null || true)
+    local pm_backups deb_backups
+    pm_backups=$(list_backups 2>/dev/null || true)
+    deb_backups=$(list_deb_backups 2>/dev/null || true)
 
-    if [[ -z "$backups" ]]; then
+    if [[ -z "$pm_backups" && -z "$deb_backups" ]]; then
         warning "No backups found"
         info "Backups are stored in: $BACKUP_DIR"
         read -rp "Press Enter to continue..."
@@ -11684,37 +11805,45 @@ menu_rollback() {
     fi
 
     echo
-    echo "Available backups:"
+    echo "Available rollback targets:"
     echo "─────────────────────────────────────────────────────────"
 
-    local -a backup_array
+    local -a target_array=()
+    local -a target_kind=()
     local index=1
-    while IFS= read -r backup; do
-        # Extract version and timestamp from filename
-        local filename
-        filename=$(basename "$backup")
-        # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
-        # Remove prefix to get VERSION.TIMESTAMP
-        local version_timestamp
-        version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
-        # Split on last underscore (timestamp starts with YYYYMMDD_)
-        local version
-        version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
-        local timestamp
-        timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
 
-        # Format timestamp for display
-        local display_time
-        if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
-            display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
-        else
-            display_time="$timestamp"
-        fi
+    if [[ -n "$deb_backups" ]]; then
+        echo "  Package backups  (dpkg-consistent restore via dpkg -i):"
+        while IFS= read -r deb; do
+            local dver
+            dver=$(dpkg-deb -f "$deb" Version 2>/dev/null || echo "unknown")
+            echo "    $index) $dver   [dpkg]   $(basename "$deb")"
+            target_array+=("$deb")
+            target_kind+=("deb")
+            ((index++))
+        done <<< "$deb_backups"
+    fi
 
-        echo "  $index) Version $version - $display_time"
-        backup_array+=("$backup")
-        ((index++))
-    done <<< "$backups"
+    if [[ -n "$pm_backups" ]]; then
+        echo "  Plugin file backups  (raw .pm copy; dpkg state goes stale):"
+        while IFS= read -r backup; do
+            local filename version_timestamp version timestamp display_time
+            filename=$(basename "$backup")
+            # Format: TrueNASPlugin.pm.backup.VERSION.TIMESTAMP
+            version_timestamp=$(echo "$filename" | sed 's/TrueNASPlugin\.pm\.backup\.//')
+            version=$(echo "$version_timestamp" | sed 's/\.[0-9]*_[0-9]*$//')
+            timestamp=$(echo "$version_timestamp" | sed 's/.*\.\([0-9]*_[0-9]*\)$/\1/')
+            if [[ "$timestamp" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+                display_time="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+            else
+                display_time="$timestamp"
+            fi
+            echo "    $index) $version - $display_time   [raw]"
+            target_array+=("$backup")
+            target_kind+=("pm")
+            ((index++))
+        done <<< "$pm_backups"
+    fi
 
     echo "  0) Cancel"
     echo "─────────────────────────────────────────────────────────"
@@ -11728,10 +11857,15 @@ menu_rollback() {
         return 0
     fi
 
-    local selected_backup="${backup_array[$((choice - 1))]}"
+    local selected="${target_array[$((choice - 1))]}"
+    local kind="${target_kind[$((choice - 1))]}"
 
     echo
-    warning "This will replace the current plugin with the selected backup"
+    if [[ "$kind" == "deb" ]]; then
+        warning "This will reinstall the selected .deb via dpkg (dpkg-consistent)"
+    else
+        warning "This will replace the current plugin with the selected .pm backup"
+    fi
     read -rp "Continue with rollback? [y/N]: " confirm
 
     if [[ ! "$confirm" =~ ^[Yy] ]]; then
@@ -11740,12 +11874,29 @@ menu_rollback() {
         return 0
     fi
 
-    if restore_plugin_from_backup "$selected_backup"; then
+    local rollback_ok=false
+    if [[ "$kind" == "deb" ]]; then
+        if restore_from_deb "$selected"; then
+            rollback_ok=true
+        fi
+    else
+        if restore_plugin_from_backup "$selected"; then
+            rollback_ok=true
+        fi
+    fi
+
+    if [[ "$rollback_ok" == "true" ]]; then
         success "Rollback completed successfully"
 
-        # Show cluster warning if applicable
+        # Cluster-wide opt-in: offer to roll back the rest of the cluster to the
+        # same artifact. Declining leaves the other nodes untouched.
         if is_cluster_node; then
             show_cluster_warning
+            echo
+            read -rp "Roll back all cluster nodes to this version too? [y/N]: " cluster_choice
+            if [[ "$cluster_choice" =~ ^[Yy] ]]; then
+                rollback_cluster_to_artifact "$selected" "$kind"
+            fi
         fi
     else
         error "Rollback failed"
