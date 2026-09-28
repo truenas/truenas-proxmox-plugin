@@ -687,7 +687,10 @@ if [ "$kind" = "nvme" ]; then
     if [ -n "$ctrls" ]; then subsys=1; fi
     luns=0
     for c in $ctrls; do
-        n=$(ls /dev/${c}n* 2>/dev/null | wc -l)
+        # Namespace devices only: /dev/${c}n* also matches partition nodes
+        # (nvmeXnYpZ), which would inflate the count and produce a permanent
+        # spurious WARN on a partitioned LUN.
+        n=$(ls /dev/${c}n* 2>/dev/null | grep -vcE 'n[0-9]+p[0-9]+$' || true)
         luns=$((luns + n))
     done
     echo "$subsys 0 $luns"
