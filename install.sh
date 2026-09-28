@@ -1053,6 +1053,15 @@ apt_bootstrap_install() {
         error "Failed to download APT key from $APT_KEY_URL"
         return 1
     fi
+    # Validate before installing: a 200-with-empty-body (or truncated) key
+    # download passes download_file, and installing it leaves a 0-byte
+    # keyring that fails every apt signature check afterwards.
+    if [[ ! -s "$key_tmp" ]] || ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$key_tmp"; then
+        rm -f "$key_tmp"
+        echo -e "${c1}FAILED${c0}"
+        error "Downloaded APT key is empty or not a PGP key block -- not installing it"
+        return 1
+    fi
     install -m 0644 "$key_tmp" "$APT_KEYRING_PATH"
     rm -f "$key_tmp"
     echo -e "${c2}OK${c0}"
