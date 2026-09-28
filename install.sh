@@ -11072,6 +11072,17 @@ _lvm_filter_apply() {
         return 1
     fi
 
+    # The perl edit is a silent no-op (exit 0) when the global_filter array
+    # spans multiple lines or the closing ] carries a trailing comment -- the
+    # parse check below cannot catch that because nothing changed. Verify the
+    # marker actually landed before claiming success (marker is absent here:
+    # the idempotency check ran first).
+    if ! grep -qF "$LVM_FILTER_MARKER" "$target"; then
+        echo "  Edit not applied -- global_filter is multi-line or has a trailing comment after ]."
+        echo "  File unchanged (backup kept: $backup). Collapse the array to one line and re-run."
+        return 1
+    fi
+
     # Verify LVM still parses the (merged) config: lvm loads lvm.conf +
     # lvmlocal.conf for any command; a parse error exits non-zero.
     if command -v lvm >/dev/null 2>&1 && ! lvm dumpconfig >/dev/null 2>&1; then

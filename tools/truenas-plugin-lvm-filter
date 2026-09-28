@@ -166,6 +166,17 @@ do_install() {
         }
     ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$t"
 
+    # The perl edit is a silent no-op (exit 0) when the global_filter array
+    # spans multiple lines or the closing ] carries a trailing comment. The
+    # parse check below cannot catch that because nothing changed -- verify
+    # the marker actually landed (it is absent here: idempotency ran first).
+    if ! grep -qF "$MARKER_TAG" "$t"; then
+        echo "ERROR: edit not applied -- global_filter is multi-line or has a" >&2
+        echo "trailing comment after ]. File unchanged (backup kept). Collapse" >&2
+        echo "the array to one line and re-run." >&2
+        exit 5
+    fi
+
     # Sanity-check the merged config still parses (lvm dumps config on
     # stdout; exits non-zero on parse error).
     if ! lvm dumpconfig >/dev/null 2>&1; then
