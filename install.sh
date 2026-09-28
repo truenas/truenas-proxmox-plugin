@@ -828,8 +828,17 @@ get_install_source() {
 # for reading the APT candidate, shared by check_for_updates and the update action
 # so the two never diverge.
 get_apt_candidate_version() {
-    apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null \
-        | awk -F': ' '/^  Candidate:/{print $2}' | xargs
+    local v
+    v=$(apt-cache policy "$APT_PACKAGE_NAME" 2>/dev/null \
+        | awk -F': ' '/^  Candidate:/{print $2}' | xargs)
+    # apt-cache prints the literal sentinel '(none)' when no candidate exists
+    # (unreachable repo / unknown package). Normalize it to empty so callers
+    # can rely on -z alone instead of remembering the sentinel spelling.
+    if [[ -z "$v" || "$v" == "(none)" || "$v" == "none" ]]; then
+        echo ""
+        return 0
+    fi
+    printf '%s\n' "$v"
 }
 
 # ============================================================================
@@ -1390,7 +1399,7 @@ check_for_updates() {
         local installed_full="" candidate=""
         installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
         candidate=$(get_apt_candidate_version) || true
-        if [[ -z "$candidate" || "$candidate" == "none" ]]; then
+        if [[ -z "$candidate" || "$candidate" == "none" || "$candidate" == "(none)" ]]; then
             log "INFO" "apt-managed: no APT candidate available; not reporting an update"
             return 1
         fi
@@ -2392,7 +2401,7 @@ perform_installation() {
         local installed_full apt_candidate
         installed_full=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null) || true
         apt_candidate=$(get_apt_candidate_version) || true
-        if [[ -z "$installed_full" || -z "$apt_candidate" || "$apt_candidate" == "none" ]] \
+        if [[ -z "$installed_full" || -z "$apt_candidate" || "$apt_candidate" == "none" || "$apt_candidate" == "(none)" ]] \
             || ! dpkg --compare-versions "$installed_full" "lt" "$apt_candidate"; then
             echo
             info "TrueNAS Plugin is already up to date (v${installed_full:-unknown}; APT candidate: ${apt_candidate:-none})"
