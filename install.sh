@@ -5856,8 +5856,8 @@ run_health_check() {
             check_result "Cluster parity" "SKIP" "No target configured"
         else
             # Gather: one local or ssh round-trip per node
-            local -a p_names=() p_ips=() p_facts=()
-            local cur_node pname pip facts
+            local -a p_names=() p_ips=() p_facts=() p_rcs=()
+            local cur_node pname pip facts p_rc
             cur_node=$(get_current_node_name)
             printf "%-30s " "Cluster parity:"
             start_spinner
@@ -5865,13 +5865,22 @@ run_health_check() {
                 pname="${pip_full%%:*}"
                 pip="${pip_full##*:}"
                 if [[ "$pname" == "$cur_node" ]]; then
-                    facts=$(collect_parity_facts "$parity_kind" "$parity_target" "" 2>/dev/null) || facts=""
+                    if facts=$(collect_parity_facts "$parity_kind" "$parity_target" "" 2>/dev/null); then
+                        p_rc=0
+                    else
+                        p_rc=$?
+                    fi
                 else
-                    facts=$(collect_parity_facts "$parity_kind" "$parity_target" "$pip" 2>/dev/null) || facts=""
+                    if facts=$(collect_parity_facts "$parity_kind" "$parity_target" "$pip" 2>/dev/null); then
+                        p_rc=0
+                    else
+                        p_rc=$?
+                    fi
                 fi
                 p_names+=("$pname")
                 p_ips+=("$pip")
                 p_facts+=("$facts")
+                p_rcs+=("$p_rc")
             done
             stop_spinner
 
@@ -5899,7 +5908,14 @@ run_health_check() {
             local parity_errors=0 parity_warnings=0
             for i in "${!p_facts[@]}"; do
                 if [[ -z "${p_recs[$i]}" ]]; then
-                    p_status[i]="WARN no data (node unreachable via SSH)"
+                    # Distinguish a collector that failed (SSH down, node
+                    # unreachable, collector crashed) from one that ran but
+                    # produced unparseable output.
+                    if [[ "${p_rcs[$i]}" != "0" ]]; then
+                        p_status[i]="WARN no data (collector failed -- node unreachable or SSH error)"
+                    else
+                        p_status[i]="WARN no data (collector returned malformed output)"
+                    fi
                     ((parity_warnings++))
                 elif [[ "$parity_kind" == "nvme" ]]; then
                     if [[ "${p_recs[$i]}" -eq 0 ]]; then
