@@ -1775,6 +1775,23 @@ schedule_pveproxy_deferred_restart() {
     return 1
 }
 
+# Deferred pveproxy restart, armed by restart_pve_services and consumed when
+# the installer exits (review P2-9): arming the ~10s timer right after an
+# install would drop the operator's web-UI terminal while they are still at
+# the installer's main menu. Scheduling from the EXIT trap lands the restart
+# after the installer has gone, and the pending-timer guard still prevents
+# double-scheduling against the package postinst's own timer (issue #60).
+PVEPROXY_DEFER_SCHEDULE=false
+
+pveproxy_exit_schedule() {
+    [[ "${PVEPROXY_DEFER_SCHEDULE:-false}" == "true" ]] || return 0
+    PVEPROXY_DEFER_SCHEDULE=false
+    # Best effort at exit: schedule_pveproxy_deferred_restart handles the
+    # pending-timer guard, systemd-run scheduling, and the immediate
+    # fallback. Output is suppressed; the operator has left the installer.
+    schedule_pveproxy_deferred_restart >/dev/null 2>&1 || true
+}
+
 # Restart PVE services
 #
 # Every daemon that loads /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
@@ -1801,16 +1818,15 @@ restart_pve_services() {
         fi
     done
 
-    # Defer pveproxy so an active web-UI upgrade terminal survives the
-    # transaction. A pending timer (e.g. scheduled by the package postinst
-    # seconds earlier in the same flow) is detected and NOT re-scheduled:
-    # the second systemd-run would fail and the fallback would restart
-    # pveproxy immediately -- re-introducing the drop (issue #60).
-    if schedule_pveproxy_deferred_restart; then
-        :
-    else
-        failed=true
-    fi
+    # Defer pveproxy until the installer exits so the ~10s restart does not
+    # land while the operator is still at the installer's main menu (review
+    # P2-9). A pending timer from the package postinst is detected at exit
+    # and NOT re-scheduled: the second systemd-run would fail and the
+    # fallback would restart pveproxy immediately -- re-introducing the web-UI
+    # terminal drop this deferral exists to prevent (issue #60).
+    PVEPROXY_DEFER_SCHEDULE=true
+    trap 'pveproxy_exit_schedule; cleanup_all; cleanup_on_error' EXIT
+    info "pveproxy restart will be scheduled when the installer exits"
 
     if [[ "$failed" == "true" ]]; then
         warning "Some services failed to restart. Please check manually."
