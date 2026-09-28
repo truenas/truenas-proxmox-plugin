@@ -1762,6 +1762,12 @@ schedule_pveproxy_deferred_restart() {
         success "pveproxy restart already deferred (~10s, timer pending)"
         return 0
     fi
+    # A previously failed transient unit keeps its name in the failed state,
+    # and systemd-run then refuses to re-create the unit (rc=1) -- the
+    # deferral would silently fall back to an immediate restart (the #60
+    # drop). Reset any stale failed state; no-op when the units are clean.
+    systemctl reset-failed truenas-pveproxy-restart.timer \
+        truenas-pveproxy-restart.service 2>/dev/null || true
     if command -v systemd-run >/dev/null 2>&1; then
         if systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
             systemctl try-restart pveproxy >/dev/null 2>&1; then
