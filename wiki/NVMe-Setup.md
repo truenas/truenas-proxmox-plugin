@@ -194,6 +194,9 @@ truenasplugin: truenas-nvme
 | `tn_nvme_dhchap_secret` | No | Host authentication secret | None |
 | `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
 | `tn_nr_io_queues` | No | Pin NVMe/TCP I/O queue count per controller (1–256). Auto-detected when unset: uses online CPU count normally, or `floor(possible/2)` when any CPU is offline. Set manually if TrueNAS reports queue limit errors. | Auto-detected |
+| `tn_nvme_ctrl_loss_tmo` | No | Seconds the kernel retries a lost controller before removing it (`-1` = forever). Strongly recommended with multiple portals — see [Multipath Configuration](#multipath-configuration). | Kernel default (600) |
+| `tn_nvme_reconnect_delay` | No | Seconds between kernel reconnect attempts. | Kernel default (10) |
+| `tn_nvme_keep_alive_tmo` | No | Keep-alive timeout. Lower detects a dead path sooner. | Kernel default |
 
 **Important Notes:**
 - TrueNAS 25.10+ is required for NVMe-oF operations
@@ -234,6 +237,22 @@ ls -la /dev/disk/by-id/nvme-uuid.*
 ## Multipath Configuration
 
 NVMe/TCP supports native multipath for high availability and increased bandwidth.
+
+> **Set `tn_nvme_ctrl_loss_tmo -1` when you configure more than one portal.**
+> Path maintenance is the kernel's job once a controller exists: it reconnects on
+> its own, and a path restored this way comes back with the same I/O queue count it
+> had before. At the kernel default of 600 seconds, however, a fabric that stays
+> down for over ten minutes has its controller removed, and the kernel will not
+> recreate it. The plugin re-adds such a portal from `status()`, on pvestatd's
+> timer, so the node runs on a single path until the next poll rather than
+> indefinitely — but with `-1` the kernel keeps retrying on its own, so the path
+> returns within one reconnect interval (`tn_nvme_reconnect_delay`, kernel default
+> 10) of the fabric coming back, with no plugin-side re-add needed at all.
+>
+> Note that a controller reports `state=live` whenever the kernel holds it, which
+> is not the same as the path being usable for I/O: a path can be `live` and at the
+> same time `inaccessible` via ANA. Path selection is the kernel's decision; the
+> plugin's portal count reports controllers, not ANA-accessible paths.
 
 ### TrueNAS Multipath Setup
 
