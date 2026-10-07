@@ -141,61 +141,62 @@ is($portal_connected->($scfg_portal, '10.0.0.1:3260'), 1,
 # ============================================================
 # _nvme_is_connected: short NQN against long-NQN subsystem
 # ============================================================
-# _nvme_is_connected uses run_command, not _run_lines. Patch it.
-my $nvme_list_subsys_output;
+# _nvme_is_connected reads controller state from sysfs ($NVME_SYSFS_CLASS,
+# matching each controller's subsysnqn with eq) instead of parsing
+# `nvme list-subsys`, so the fixture is a fake sysfs tree, not command output.
+use File::Temp qw(tempdir);
+use File::Path qw(make_path);
+
+my $sysfs_root = tempdir(CLEANUP => 1);
 {
-    no warnings 'redefine';
-    # run_command is imported into the plugin's own namespace at
-    # `use PVE::Tools qw(run_command ...)` time, so patching
-    # PVE::Tools::run_command alone won't intercept the plugin's
-    # callsites — they resolved to the imported alias at compile
-    # time. Patch the plugin's own slot too.
-    my $stub = sub {
-        my ($cmd, %opts) = @_;
-        if ($cmd->[0] eq 'nvme' && $cmd->[1] eq 'list-subsys') {
-            for my $line (split /\n/, $nvme_list_subsys_output // '') {
-                $opts{outfunc}->($line) if $opts{outfunc};
-            }
-        }
-        return 0;
-    };
-    *PVE::Tools::run_command = $stub;
-    *PVE::Storage::Custom::TrueNASPlugin::run_command = $stub;
+    no strict 'refs';
+    ${"PVE::Storage::Custom::TrueNASPlugin::NVME_SYSFS_CLASS"} = $sysfs_root;
 }
+
+# Replace the fake sysfs with the given controllers: [name, nqn, state].
+my $set_controllers = sub {
+    my (@ctrls) = @_;
+    opendir(my $dh, $sysfs_root) or die "opendir: $!";
+    for my $e (grep { /^nvme\d+$/ } readdir($dh)) {
+        for my $f (glob("$sysfs_root/$e/*")) { unlink $f }
+        rmdir "$sysfs_root/$e";
+    }
+    closedir($dh);
+    for my $c (@ctrls) {
+        my ($name, $subnqn, $state) = @$c;
+        make_path("$sysfs_root/$name");
+        my %attr = (
+            subsysnqn => $subnqn,
+            transport => 'tcp',
+            state     => $state,
+            address   => 'traddr=10.0.0.2,trsvcid=4420,src_addr=10.0.0.3',
+        );
+        for my $k (keys %attr) {
+            open(my $fh, '>', "$sysfs_root/$name/$k") or die "open: $!";
+            print {$fh} "$attr{$k}
+";
+            close($fh);
+        }
+    }
+};
 
 my $nqn      = 'nqn.2011-06.com.truenas:uuid:abc:proxmox-nvme-protected';
 my $nqn_long = 'nqn.2011-06.com.truenas:uuid:abc:proxmox-nvme-protected-16k';
 
 my $scfg_nvme_short = { tn_subsystem_nqn => $nqn };
 
-$nvme_list_subsys_output = <<EOF;
-nvme-subsys0 - NQN=$nqn_long
-\\
- +- nvme0 tcp traddr=10.0.0.2,trsvcid=4420,src_addr=10.0.0.3 live
-EOF
+$set_controllers->(['nvme0', $nqn_long, 'live']);
 is($nvme_is_connected->($scfg_nvme_short), 0,
     'Fix #124: _nvme_is_connected returns 0 when only longer-NQN subsystem is live');
 
-$nvme_list_subsys_output = <<EOF;
-nvme-subsys0 - NQN=$nqn
-\\
- +- nvme0 tcp traddr=10.0.0.2,trsvcid=4420,src_addr=10.0.0.3 live
-EOF
+$set_controllers->(['nvme0', $nqn, 'live']);
 is($nvme_is_connected->($scfg_nvme_short), 1,
     'Fix #124: _nvme_is_connected returns 1 for the exact NQN');
 
-# Case: two subsystems, long one listed first (live), short one listed
-# second (also live). _nvme_is_connected should see the short-NQN
-# subsystem's live transport and return 1 — but critically must NOT
-# have been fooled into returning 1 for the long-only case above.
-$nvme_list_subsys_output = <<EOF;
-nvme-subsys0 - NQN=$nqn_long
-\\
- +- nvme0 tcp traddr=10.0.0.2,trsvcid=4420,src_addr=10.0.0.3 live
-nvme-subsys1 - NQN=$nqn
-\\
- +- nvme1 tcp traddr=10.0.0.2,trsvcid=4420,src_addr=10.0.0.3 live
-EOF
+# Two subsystems, long one first (live), short one second (also live):
+# the short-NQN controller must be seen, but the long-only case above must
+# not have been fooled into returning 1.
+$set_controllers->(['nvme0', $nqn_long, 'live'], ['nvme1', $nqn, 'live']);
 is($nvme_is_connected->($scfg_nvme_short), 1,
     'Fix #124: _nvme_is_connected returns 1 when exact NQN is one of multiple subsystems');
 
