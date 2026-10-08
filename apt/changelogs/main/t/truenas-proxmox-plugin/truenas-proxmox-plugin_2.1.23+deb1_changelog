@@ -1,0 +1,2630 @@
+truenas-proxmox-plugin (2.1.23+deb1) unstable; urgency=medium
+
+  * Promote 2.1.23~beta11 to 2.1.23+deb1 (stable). First stable
+    release of the 2.1.23 line after a thirty-six-alpha / eleven-beta
+    development cycle, following external validation from Max R.
+    Carrara (Proxmox VE team, 2026-09-02: "passes all testing at
+    their end") on alpha36, and a 20-iteration local run of Max's
+    storage-plugin-validation suite against truenas-storage on the
+    pve/proxmox2/pvevm1 cluster on 2026-10-07/08:
+
+      - 19 / 20 rounds PASS, 19 capabilities validated each (0 failed,
+        2 unsupported, 3 not tested for prerequisite reasons).
+      - 1 / 20 FAIL in round 17: three backup tests (backup_vm,
+        backup_ct, backup_running) hit their per-test 180s/300s
+        deadlines while a cron-scheduled nightly PBS backup held the
+        host-wide vzdump global lock. Not a plugin fault; the vzdump
+        tasks the test triggered all completed cleanly once the lock
+        was released. Rounds 18-20 (after the cron window) all PASS.
+
+    This stable also carries the four PRs from Alfonso Kuen Arroyo
+    merged in beta11 (NVMe/TCP portal reconcile hardening, iSCSI CHAP
+    against TrueNAS SCALE 25.10, bounded API retries while the array
+    is unreachable, and the Snapshots-on-TrueNAS best-practices
+    section). Credit lines appear in the per-item beta11 entry below.
+
+  * No functional changes from 2.1.23~beta11; version string and
+    changelog only.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 08 Oct 2026 02:00:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta11) unstable; urgency=medium
+
+  * fix(#94): NVMe/TCP reconcile restores a portal that was down at
+    connect time. Original diagnosis and patch from Alfonso Kuen
+    Arroyo (github.com/alfonsokuen); landed via branch pr94-fixes
+    which also layers portal-untaint + explicit Socket import +
+    regression tests on top (filed separately as #128). The
+    reconcile call sits at status() entry and only runs when
+    transport mode is nvme-tcp; a stuck portal costs at most one
+    bounded connect per poll window and never on the VM start path.
+
+  * fix(#95): iSCSI CHAP against TrueNAS SCALE 25.10 — dead login
+    loop plus implicit discovery-CHAP. Original diagnosis and patch
+    from Alfonso Kuen Arroyo; landed via branch pr95-cleanup as two
+    commits: 'iscsiadm -m node -T <iqn>' prints a record (not the
+    list) so the login loop was walking the wrong structure, and
+    sendtargets discovery now gets the CHAP credentials fed to it
+    on the retry that re-establishes the discoverydb record.
+
+  * fix(#97): storage poll resilience — bounded API retries while
+    the array is unreachable. From Alfonso Kuen Arroyo. A fresh
+    recent-failure marker short-circuits status() to "inactive"
+    inside the probe-backoff window, and activate_storage()'s
+    subsystem ensure runs under a capped API deadline so pvestatd
+    polls do not pay a full API timeout on every tick during an
+    outage. Ensure failures are classified against the retry
+    engine's own two death strings (anchored at start to avoid
+    foreign-payload substring matches) so budget hits are logged
+    quietly while real faults still warn.
+
+  * docs(#111): wiki Best-Practices now carries the "Snapshots taken
+    on TrueNAS" section describing crash-consistency semantics, the
+    import-snapshots workflow, and why PVE rollback can be blocked
+    by an unimported array-side snapshot. From Alfonso Kuen Arroyo;
+    supersedes the earlier shorter note so there is one authoritative
+    section.
+
+  * No API or storage-cfg changes relative to beta10. Deployed to the
+    3-node test cluster (pve/proxmox2/pvevm1) and single-iteration
+    Max storage-plugin-validation suite against truenas-storage passed
+    18 capabilities (1 unrelated timeout on cluster_migration from
+    unreachable TrueNAS portals advertised to the SAN — pre-existing).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 17:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta10) unstable; urgency=medium
+
+  * fix(#124): end-anchor every IQN/NQN comparison so a longer-IQN
+    (NQN) session on the same portal no longer gets treated as
+    "connected" for a shorter one. Reporter matobodo: two targets
+    ...:proxmox-nvme-protected and ...:proxmox-nvme-protected-16k on
+    the same portal, where the shorter target's login was silently
+    skipped after a reboot because _portal_connected's bare
+    substring regex matched the longer target's session line. Every
+    VM with a disk on that storage then failed to start with "Could
+    not locate by-path device for LUN <N>". Seven comparison sites
+    patched: six adopt the (?![\w.:-]) end anchor, which refuses any
+    IQN-legal suffix continuation, and the seventh (by-path error
+    diagnostic) uses the natural "-lun-" suffix anchor instead. Live
+    verified by creating a prefix-colliding iSCSI target on the test
+    TrueNAS, logging into both targets concurrently, and confirming
+    _target_sessions_active / _portal_connected correctly separate
+    them; crafted long-only session table reproduces the reporter's
+    exact failure signature and the fix returns 0 for the short IQN
+    where pre-fix returned 1.
+
+  * fix(#4): tools/truenas-plugin-lvm-filter now also rejects
+    TrueNAS iSCSI LUNs by their /dev/disk/by-path/ip-*-iscsi-*
+    symlinks. Reporter lucasblack29: the iSCSI reject regex has been
+    missing from this helper since the tool was introduced; the
+    original #4 fix only installed the NVMe by-id reject, so hosts
+    with VMs on iSCSI-mode truenasplugin storage got the same
+    duplicate-VG / slow-pvs symptom the NVMe case was already
+    protecting against. OUR_SET refactor keeps install/uninstall/
+    status iterating over both regexes with a shared marker tag.
+    Live symptom-silence verified: pvcreate on a real iSCSI LUN
+    makes it visible to pvs; install → pvs filters it out; uninstall
+    → pvs sees it again.
+
+  * fix(#125): install.sh's "Weight volume presence" healthcheck now
+    looks up the canonical weight zvol name (pve-weight-<suffix>-
+    <sha1(iqn)[0:8]>, present since v2.0.20) in addition to the two
+    older names it already probed. Reporter lucasblack29 ran the
+    healthcheck against a freshly provisioned storage and saw
+    "Weight zvol missing" even though the zvol existed and the LUN
+    was mounted — because the healthcheck was only ever asking for
+    the pre-v2.0.20 names. All four cascade branches live-exercised
+    (canonical hit, legacy fallback, very-old fallback, truly-
+    missing WARN).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 07 Oct 2026 09:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta9) unstable; urgency=medium
+
+  * fix(#123): LXC snapshot-mode vzdump cleanup now surfaces clone
+    teardown failure instead of silently leaving the CT with
+    lock=snapshot-delete + parent=vzdump after a successful PBS
+    archive. Reporter Barbapapade saw 14 CTs in production stuck in
+    that state because _teardown_snapshot_device wrapped the clone
+    pool.dataset.delete in eval+warn with no readiness barrier and
+    no retry, and volume_snapshot_delete continued to the dependent
+    origin snapshot delete regardless. Three changes together:
+      - _teardown_snapshot_device: udevadm settle after the
+        initiator-side scsi/multipath/extent teardown, then a bounded
+        retry ladder around pool.dataset.delete (0, +500, +1000,
+        +2000, +4000 ms worst case) with a pool.dataset.get_instance
+        readback after each reported success. The readback is
+        required because TN 26.0 BETA.3 can report delete success
+        while the underlying zfs destroy returned EBUSY -- 25.10.x
+        surfaces the EBUSY correctly, 26.0 BETA swallows it. On
+        persistent failure after the budget we die with an
+        authoritative "after bounded retry" message instead of
+        warning.
+      - _is_retryable_error: ordering fix. The structured classifiers
+        (EBUSY, dependent-clones, ZFSPathAlreadyExistsException,
+        EINVAL, auth, not-found, validation) now run BEFORE the loose
+        substring heuristic in _is_connection_error. The old order
+        meant any JSON-RPC error whose embedded Python traceback
+        happened to mention "timeout" or "connection reset" was
+        false-matched as retryable and looped at the generic retry
+        layer -- Barbapapade's EINVAL from pool.snapshot.delete did
+        this while the real EBUSY from pool.dataset.delete was
+        swallowed by the eval+warn.
+      - volume_snapshot_delete: dies when _teardown_snapshot_device
+        fails, instead of warning + continuing to pool.snapshot.delete.
+        PVE's vzdump cleanup now surfaces our authoritative error
+        ("refusing to delete ... clone cannot be torn down") rather
+        than a confused "has dependent clones" from the ZFS layer, and
+        no origin snapshot is removed while the clone is still live.
+    Validation: new t/rate-limit/13-issue-123-clone-teardown.t with
+    23 TAP assertions covering all three fix paths including the
+    silent-success readback case. Live end-to-end against iSCSI on TN
+    26.0 BETA.3, NVMe/TCP on TN 26.0 BETA.3, and iSCSI on TN 25.10.3.1
+    -- all three force a persistent EBUSY via a held FD on the TN
+    side, confirm the authoritative error chain reaches the vzdump
+    task log, then release the FD and run a second vzdump to verify
+    the leftover-clone regex (#59/#121) reuses the stale clone and
+    cleans up normally.
+
+  * docs: new "Installing a specific pre-release build" subsection in
+    wiki/Installation.md plus matching note in README.md explaining
+    that the APT repository is intentionally stable-only (the publish
+    job skips -alpha*/-beta*/-rc* tags, so apt upgrade never pulls an
+    unstable build) and that install.sh's "Install specific version"
+    menu or the GitHub release page's .deb are the two paths that get
+    a beta onto a node. Prompted by a user who ran plain apt install
+    and landed on 2.1.17 after being asked to try beta8.
+
+  * install.sh: --apt-install validator now accepts binary OpenPGP
+    public keys (first byte 0x98/0x99) in addition to ASCII-armored
+    "BEGIN PGP PUBLIC KEY BLOCK" blocks. Our hosted pubkey at
+    truenas.github.io/truenas-proxmox-plugin/apt/pubkey.gpg is served
+    as a binary export; validators that only accepted the armored
+    form hard-failed the install at the key-import step.
+
+  * docs(Known-Limitations): scope trim. All upstream Proxmox /
+    QEMU / CPU-arch references removed; our wiki documents the
+    plugin only. Proxmox owns their own issue tracker.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 06 Oct 2026 12:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta8) unstable; urgency=medium
+
+  * fix(#88): path() fast-fail + deterministic by-path fallback.
+    PVE's destroy_vm foreach_volume_full closure at QemuServer.pm:1839
+    calls path() -> remove_owned_drive -> vdisk_free -> free_image;
+    when path() died, the closure exited before free_image ran and
+    TrueNAS state leaked (zvol, iSCSI extent, and target-extent
+    mapping stayed behind forever). The old path() called
+    _device_for_lun with the default 600-retry budget (60 s), longer
+    than the destroy hold, so any node that never activated the disk
+    locally (cross-node destroy of an orphan, destroy after a leaked
+    config-migrate, or destroy on a node whose iSCSI session was
+    down) aborted destroy_vm before free_image ran. Now: retries=5
+    (500 ms) at the path() call site, deterministic by-path string
+    fallback (/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<N>) for
+    callers that don't need a live device, and die only if we lack
+    LUN + portal + IQN to build the deterministic name. Verified with
+    a two-scenario timing test: same-node destroy 11.5 s, cross-node
+    destroy with iSCSI session logged out on destroying node 15.6 s;
+    TN state cleaned in both. Pre-fix the cross-node case hung ~60 s
+    and leaked. Closes #88.
+
+  * fix: iSCSI extent blocksize=4096 pblocksize=true to satisfy the
+    QEMU 10.1 alignment check. QEMU 10.1's stricter permission/
+    alignment negotiation refuses to attach a scsi-hd whose backing
+    image reports the mismatch shape that TrueNAS's default extent
+    config produces: logical_block_size=512 alongside
+    physical_block_size=16384 (inferred from the zvol's 16K
+    volblocksize). qm start on any iSCSI-backed disk dies with:
+    "kvm: -device scsi-hd,...,write-cache=on: Cannot get 'write'
+    permission without 'resize': Image size is not a multiple of
+    request alignment". Now every iscsi.extent.create payload
+    (_tn_extent_create, _alloc_image_iscsi, _clone_image_iscsi)
+    sends blocksize=4096 and pblocksize=true, so TN reports
+    lbs=4096 pbs=4096 to the initiator and QEMU's check passes.
+    Existing extents are unchanged; older VMs that already fail to
+    start under QEMU 10.1 need their extents updated in place or
+    refreshed via a clone. Verified: 2G / 3G / 4G disks previously
+    refused by qm start now start on the same QEMU/PVE combination.
+
+  * docs(#117): walk through Base Name, Portal, and Target group
+    bindings in README.md and wiki/Installation.md. The old iSCSI
+    setup recipe covered only the target creation step, producing
+    the exact failure mode from issue #117: target created on
+    TrueNAS but 'iscsiadm --mode discovery' from Proxmox returned
+    empty and the plugin could only get as far as extent creation.
+    Both docs now walk through: verify the iSCSI Base Name under
+    Target Global Configuration (must start with 'iqn.'; feeds
+    tn_target_iqn as '<Base Name>:<Target Name>'); create/verify
+    the Portal on 0.0.0.0:3260 and note the Portal ID; create the
+    Target with Portal Group ID + Initiator Group ID bindings and
+    Authentication Method set explicitly, with a callout that
+    without those group bindings the target exists but is not
+    exposed on the network. Refs #117.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 30 Sep 2026 18:20:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta7) unstable; urgency=medium
+
+  * install.sh: complete the #93 install.sh sweep from PR #116
+    (WarlockSyno). Bundles 21 commits across install.sh, debian/postinst,
+    tools/truenas-plugin-lvm-filter, and two wiki pages. Installer /
+    packaging only - no changes to TrueNASPlugin.pm from PR #116.
+
+  * APT-managed install / update / rollback (#93, #105): install, update,
+    and rollback now shell out to APT against the plugin's own APT repo
+    instead of pulling raw .pm files from GitHub. Backup captures the
+    installed .deb at backup time so rollback is dpkg-consistent, with
+    a cluster-wide opt-in. Source-aware update detection compares against
+    the APT candidate on apt-managed nodes (dpkg version ordering, pre-
+    release aware) and keeps the GitHub path on raw / dpkg-only nodes;
+    a raw cluster pull is refused on non-dpkg nodes. Uninstall runs
+    'apt remove' on dpkg-managed packages, and APT install '--reinstall's
+    when the package is registered but the .pm file is missing (#105).
+    APT repo key content is validated (non-empty, PGP block header) before
+    install so a 200-with-empty-body no longer leaves a 0-byte keyring,
+    and the 'apt-cache' '(none)' candidate sentinel is normalized so
+    'dpkg --compare-versions' no longer emits 'bad syntax' noise when the
+    repo is unreachable. The installer re-execs under bash when invoked
+    via sh.
+
+  * Deferred pveproxy restart (#60): both debian/postinst and install.sh
+    now restart the plugin-loading daemons (pvedaemon, pvestatd,
+    pve-ha-crm, pve-ha-lrm) immediately and defer the pveproxy restart
+    by ~10 s through a transient systemd timer, so a web-UI xterm.js
+    upgrade terminal survives the apt transaction. The TRUENAS_PLUGIN_NO
+    _RESTART=1 escape hatch prints the manual command instead. install.sh
+    mirrors the deferral: the timer is armed at installer exit (not
+    mid-menu), a pending timer from the postinst is detected and not
+    re-scheduled, stale failed unit state is 'reset-failed' before
+    scheduling, and remote one-liners report daemon-restart failures
+    instead of swallowing them. Verified live on 2026-09-29 pve: web UI
+    stayed reachable through the install (real outages 0 s over 25 s of
+    polling) and pveproxy did restart afterward.
+
+  * Cluster parity health check (#21, active scope): new "Check 14:
+    Cluster parity" plus collect_parity_facts(). Per-node, one local or
+    ssh round-trip collects functional facts - iSCSI: node records,
+    active sessions, visible LUNs; NVMe: subsystem connected, live
+    namespaces - with exact IQN / NQN field matching so sibling targets
+    (e.g. ':proxmox-move') do not false-match. Per-node rows plus one
+    aggregate row, SKIP on single-node, read-only, non-fatal. 0 LUNs
+    while the cluster sees N is CRIT; 0 sessions everywhere is OK
+    (login is on-demand); partition nodes are excluded from namespace
+    counts; malformed collector output is labeled separately from an
+    SSH failure. MTU-match remains deferred per the issue's scope note.
+    Verified live 2026-09-29: correctly detected a transient asymmetry
+    (pve saw 7 iSCSI LUNs, pvevm1 saw 6) from a just-freed test LUN
+    that pve's session still cached.
+
+  * LVM global filter (#4): install.sh offers the global_filter fix
+    (with confirmation) after storage config for either transport,
+    targets the effective file (lvmlocal.conf when it carries a filter,
+    else lvm.conf), verifies the edit landed (no more false "installed"
+    on multi-line / trailing-comment configs), clears the LVM cache,
+    restarts lvm2-monitor, and is idempotent. New standalone helper
+    tools/truenas-plugin-lvm-filter with '--status' and '--uninstall',
+    plus a wiki troubleshooting entry.
+
+  * Other sweep items: version reporting trusts 'dpkg-query -W' over
+    the plugin's embedded $VERSION (#87), pre-release status derived
+    from the dpkg version. A fresh NVMe/TCP install can no longer
+    write a literal ':' to tn_discovery_portal; generate_storage_config()
+    refuses empty IP / port pairs (#86 part 1). The version picker
+    accepts any pre-release suffix ('-alphaN', '-betaN', '-rcN'), not
+    just '-debN' (#86 part 2). IPv6 tn_api_host validation and portal
+    splitting (#68).
+
+  * install.sh health check preserves the beta6 auth-probe semantics
+    (issues #113, #93): auth.me remains the authoritative auth check
+    at both call sites; system.info is kept only as a best-effort
+    version-display fallback. auth.me is stricter than core.ping (which
+    is no_auth_required and would give a false green on a bogus or
+    revoked API key) while working for every documented least-privilege
+    key. Matches the plugin's own _preflight_check_alloc auth probe.
+
+  * Verified live 2026-09-29 on the 3-node PVE cluster (pve / proxmox2
+    / pvevm1, PVE 9.1.1, TrueNAS 25.10.7):
+      - live-test-v4 sweep (v3-import, v4-iscsi, v4-nvme, v4-lxc,
+        v4-advanced, v4-boot-cluster): 60/60 assertions pass, 0 fail.
+      - proxmox-test-runner storage-plugin-validation with 'rootdir'
+        enabled on both truenas-storage (iSCSI) and truenas-nvme
+        (NVMe/TCP): 19 validated / 0 real failures per transport. The
+        1 cluster_migration.pl failure per run was an environmental
+        PVE-ticket auth issue in the runner itself (direct 'qm migrate'
+        worked), not a plugin regression.
+      - LVM filter helper on all 3 nodes: present, executable, syntax
+        OK, --status reports correct filter state, --help documented.
+      - APT source, apt-cache policy, apt remove + install cleanly:
+        plugin runtime remained active through cross-version churn.
+      - Cluster parity check detected a real transient asymmetry.
+
+  Closes #4, #21, #60, #68, #86, #87, #93, #105.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 29 Sep 2026 11:00:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta6) unstable; urgency=medium
+
+  * install.sh: health check no longer requires READONLY_ADMIN on the
+    TrueNAS API user (issue #113). The two probes that previously used
+    'system.info' - the wizard/health-check auth check and the
+    connectivity test in test_truenas_api - now use 'auth.me', which
+    every authenticated API key can call regardless of role. 'system.info'
+    is still called on a best-effort basis by test_truenas_api solely
+    to display the TrueNAS version string on success; if the key lacks
+    the role the version display is silently omitted and connectivity
+    is still confirmed. Least-privilege API keys configured per
+    wiki/API-Permissions.md now pass the health check cleanly instead
+    of getting a misleading "Authentication failed" message.
+
+  * wiki/API-Permissions.md: new "install.sh vs. the plugin runtime"
+    section documenting the small set of TrueNAS methods install.sh
+    calls beyond the plugin's runtime footprint (system.info,
+    interface.query) and the least-privilege behavior for each. Also
+    adds a Caveats bullet naming the pre-fix issue #113 symptom so
+    operators on older install.sh copies know to upgrade.
+
+  * wiki/NVMe-Setup.md: correct the ZFS block size tuning callout to
+    reflect that the plugin does not set a default (issue #108). The
+    previous "tn_zvol_blocksize 64K  # Default" comment was misleading -
+    64K is a recommendation for NVMe/TCP workloads, not a default. Zvols
+    with tn_zvol_blocksize omitted inherit TrueNAS SCALE's own
+    pool.dataset.create default (16K on 25.10.x), matching what
+    Configuration.md already documented.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 28 Sep 2026 09:45:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta5) unstable; urgency=medium
+
+  * New feature: import foreign TrueNAS snapshots (PR #110 by Alfonso
+    Kuen). ZFS snapshots created outside PVE (periodic snapshot tasks,
+    replication targets, hand-invoked `zfs snapshot`) are otherwise
+    invisible to PVE, but they already affect it: a TrueNAS snapshot
+    newer than the last PVE snapshot blocks `qm rollback` with "is not
+    most recent snapshot" and rollback destroys them recursively. The
+    new `truenas-proxmox-manage import-snapshots <vmid>` walks the
+    guest's disks on TrueNAS and adopts the missing snapshots into the
+    PVE configuration so they can be listed, rolled back, and deleted
+    by the standard `qm listsnapshot` / `qm rollback` / `qm delsnapshot`
+    workflow. Explicit, per-guest, with `--dry-run` to preview and
+    `--match REGEX` to import only the ones you want. Covers both VMs
+    and LXC containers (rootfs plus additional mountpoints); refuses
+    containers with bind mounts because PVE itself does. Non-import
+    guest state is left alone.
+
+  * Cluster-aware refusal for the importer. `truenas-proxmox-manage
+    import-snapshots <vmid>` invoked on a node that does not own the
+    guest now dies with an explicit "$vmid is a VM/CT on node 'X', not
+    on this one; run import-snapshots there" instead of the generic
+    "Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does
+    not exist". Root cause was that _tn_guest_config queried
+    PVE::Cluster::get_vmlist() from a fresh Perl process (install.sh's
+    `exec perl -MPVE::Storage::Custom::TrueNASPlugin ...` dispatch is
+    always a fresh process), where the in-process cluster vmlist cache
+    is empty until PVE::Cluster::cfs_update() is called first;
+    get_vmlist() returned {ids => {}} regardless of what pmxcfs had
+    propagated, and $entry stayed undef.
+
+  * Docs: import-snapshots note in wiki/Tools.md explains that adopted
+    snapshots are crash-consistent (no guest-agent fs-freeze, no RAM
+    state), unlike PVE-native `qm snapshot` with the guest agent
+    enabled; points at wiki/Best-Practices.md for when the distinction
+    matters. Also documents `--dry-run` and `--match REGEX` semantics.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 23 Sep 2026 14:30:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta4) unstable; urgency=medium
+
+  * Packaging (debian/postinst): restart pve-ha-crm and pve-ha-lrm on
+    install/upgrade (#100).
+
+    PVE::Storage.pm globs /usr/share/perl5/PVE/Storage/Custom/*.pm and
+    registers each plugin class exactly once, at the moment a process
+    first loads PVE::Storage. pve-ha-crm and pve-ha-lrm auto-start at
+    boot whether or not HA is in use, so on a node where they were
+    already running before this package was installed, HA-manager
+    never learns the truenasplugin type exists until those two
+    daemons restart -- surfacing as "storage provided by plugin is
+    unsupported" in HA resource config. debian/postinst now restarts
+    pve-ha-crm/pve-ha-lrm alongside pvedaemon/pveproxy/pvestatd, still
+    gated by the existing TRUENAS_PLUGIN_NO_RESTART opt-out. Verified
+    live that a bare service restart never triggers a real HA
+    freeze/migrate/fence action, because PVE::HA::LRM only queues
+    those on a pending shutdown.target/reboot.target job -- which a
+    systemctl restart does not create.
+
+  * Plugin runtime: status() capacity cache now survives across
+    processes via a /run/truenas-plugin/status-<key> stamp (issue
+    #106).
+
+    status()'s STATUS_CAPACITY_TTL_S=10s cache lived in the in-process
+    %API_CACHE. Every `pvesm status` is a fresh Perl interpreter so
+    that cache was always cold in exactly the path PVE hits from
+    PVE::API2::Storage::Status::upload -- that handler runs
+    `ssh peer pvesm status --storage local` synchronously and
+    pveproxy closes the connection at 5s idle. Reporter measured
+    8-11s per pvesm status on a 501-dataset pool; roughly two of
+    three Cluster-API VM uploads failed with "curl: (52) Empty
+    reply from server". status() now first checks the in-process
+    cache (unchanged), then falls through to an on-disk JSON stamp
+    that any process can read within STATUS_CAPACITY_STAMP_TTL_S,
+    and only then hits pool.dataset.get_instance. Cache is
+    invalidated on any mutation the plugin already invalidates for.
+    Stamp I/O is best-effort (bumps a counter but never dies).
+
+    Stamp TTL initially set to 60s, verified by inspection then
+    lowered to 15s after disk_discard.pl fill/observe on the test
+    cluster came back as "writing data grew the storage allocation:
+    +0.00 GiB". 60s TTL was long enough that the after-fill
+    pvesm status hit the stamp written before the ~30s in-guest
+    fill and returned the pre-fill value. 15s is short enough that
+    a ~30s write completes past the TTL, so the follow-up status()
+    reflects the fresh 'used' number, while still coalescing the
+    burst of back-to-back cross-node upload probes that motivated
+    the fix.
+
+  * Plugin runtime + broker: FQDN handling on PVE 9 / Perl 5.40
+    (issue #102). Two independent FQDN failures reported against
+    a 7-node PVE 9.2 cluster on TrueNAS SCALE 25.10.7:
+
+    - _host_ipv4 called Socket::gethostbyname($host). Perl 5.40
+      (Debian Trixie, ships with PVE 9) removed the AUTOLOAD path
+      that used to resolve that name to the core builtin; the call
+      now dies with "Undefined subroutine Socket::AUTOLOAD" and the
+      storage never comes up when tn_api_host is an FQDN. Switched
+      both TrueNASPlugin.pm and tools/truenas-plugin-broker to
+      Socket::inet_aton, which is the proper Socket export for an
+      A-record lookup and works on every supported Perl.
+
+    - _portal_connected compared the configured portal against
+      iscsiadm session output as a literal string. iscsiadm always
+      reports the resolved IPv4 (e.g. 192.0.2.10:3260), storage.cfg
+      often holds the FQDN (e.g. storage.example.com:3260); the two
+      never match, so _iscsi_login_all retried login on every
+      activate_volume, and open-iscsi answered "1 session
+      requested, but 1 already present". Task still completed
+      TASK OK but the log noise was on every VM start.
+      _portal_connected now precomputes the IP-resolved form of the
+      configured portal (via the newly-reliable _host_ipv4) and
+      matches session lines against both the original form and the
+      IP form. Falls back to the literal path when DNS resolution
+      fails; IP literals stay a no-op.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Thu, 18 Sep 2026 23:15:00 -0400
+
+truenas-proxmox-plugin (2.1.23~beta3) unstable; urgency=medium
+
+  * Bundle of fixes across the plugin runtime, the broker, install.sh,
+    and packaging. Every item below cites the GitHub issue it closes
+    or contributes to.
+
+  * Plugin runtime (TrueNASPlugin.pm):
+
+    - #77 (WarlockSyno): _api_bulk_call passed 4 args to _api_call_mutate,
+      whose 3-arg Perl signature dies before reaching TrueNAS. Trailing
+      "die on transport unavailable" fallback was aspirational --
+      _api_call_mutate already dies from its own broker path -- so
+      dropped the 4th argument. Dormant in shipping releases (dead
+      code path) but no longer a trap the moment anything wires the
+      bulk helpers in.
+
+    - #76 (WarlockSyno): _wait_for_job_completion called TrueNAS as
+      _api_call($scfg, 'core.call', ['core.get_jobs', ...]). TN's
+      middleware has no 'core.call' method (JSON-RPC -32601 verified
+      live against TN 25.10.2.1), so every job-completion poll
+      returned an eval error and the plugin reported success as
+      failure. Rewrote to call 'core.get_jobs' directly with the
+      standard .query filter shape [[ ["id", "=", int($job_id)] ]].
+      Same "dormant in current release paths, but a trap for future
+      wiring" impact as #77.
+
+    - #90 (joaquinv98, root-cause traced by WarlockSyno): plugin
+      hardcoded allow_any_host => JSON::PP::true on the NVMe subsystem
+      in six sites. On TN 25.10.x with a populated allowed_hosts,
+      attr_allow_any_host=1 is mutually exclusive with the allow-list
+      at the kernel level; nvmet's config writer aborts the whole
+      render, port-subsys/port/namespace symlinks never get written,
+      the TCP listener never opens, and namespace deletions never
+      propagate to the kernel (zvols stay EBUSY, feeds #88 half 2).
+      Introduced `tn_nvme_allow_any_host` config knob (bool, optional,
+      default TRUE) plus helper `_nvme_allow_any_host_flag($scfg)`
+      wiring the value through the subsystem-create call and all five
+      Issue-#12 configfs-resync ping sites. Users on TN 25.10.x with
+      a populated allowed_hosts should set `tn_nvme_allow_any_host 0`
+      in storage.cfg to opt into the enforcement posture and fix the
+      reporter's original render-abort bug on that version.
+
+      Default is TRUE (not FALSE, which was tried and reverted during
+      beta3 iteration): on TN 26.0.0-BETA.2 a freshly-created subsystem
+      with allow_any_host=false AND empty allowed_hosts is silently
+      not rendered to the kernel configfs at all -- port has no
+      listener, no host can connect, `nvme discover` shows only the
+      discovery subsystem. Verified live: flipping a fresh
+      allow_any_host=false subsys to true on TN 26.0.0-BETA.2
+      immediately triggers configfs render (generation counter
+      increments, subsys appears in discovery). Since we cannot
+      auto-populate allowed_hosts from the plugin without a bigger
+      rework, defaulting to true keeps NVMe working out-of-the-box
+      on 26.x and lets 25.10.x users opt into the enforcement posture
+      when they have configured allowed_hosts. Auto-population of
+      the host allow-list is deferred to a later release.
+
+    - #98 (lubosmikulec): broker's core.ping liveness check was
+      no_auth_required, so it kept returning success even after
+      TrueNAS silently expired the API-key session at 30 days
+      (AA_LEVEL1.max_session_age hardcoded on TN middleware). Broker
+      would then indefinitely hand out an unauth'd connection whose
+      every real API call fails ENOTAUTHENTICATED; only a
+      broker restart recovered. Switched broker liveness check to
+      `auth.me` (requires auth). Also extended plugin's preflight
+      "API reachable" call from core.ping to auth.me, and extended
+      _is_auth_error() to match ENOTAUTHENTICATED / "Not authenticated".
+
+      auth.me returns a large response (full user + role list) that
+      TN's middleware serialises around user-record locks. Running
+      it on every get_or_open_ws() call as a naive replacement for
+      core.ping tripped 596 PVE-API timeouts under multi-node test
+      load. The broker now caches the last successful liveness probe
+      per pool entry for LIVENESS_CACHE_SECS (60s) and skips the
+      probe when it's still fresh -- healthy connections pay near
+      zero per-call overhead, and the 30-day expiry is still detected
+      within one cache window of the next call. A freshly-opened
+      pool entry is stamped as-of the successful ws_open() +
+      auth.login_with_api_key, so the first burst of calls after a
+      new session doesn't probe redundantly either.
+
+    - #68 (kbogert, root-cause + fix by WarlockSyno): bracketed IPv6
+      literals in tn_api_host (e.g. `[fd00:1::1]`) were rejected by
+      the storage-config parser, because the schema format was
+      `pve-storage-server`, which accepts only bare IPv4/DNS names
+      and refuses colons/brackets. Switched to `pve-storage-portal-dns`
+      (same format PVE core's ISCSIPlugin uses for its portal field),
+      which correctly parses bracketed IPv6. Paired plugin fixes in
+      _ws_open: normalise bare IPv6 to bracketed form for consistent
+      PeerHost/Host-header/SNI handling, and strip brackets before
+      passing to SSL_hostname so SNI + certificate name-verify match
+      the cert's IPv6 SAN. Cherry-picked from PR-branch
+      fix/issue-68-ipv6-api-host after realising it had never been
+      merged to alpha despite the earlier close-invitation.
+
+    - #85 / #84 (JonahMMay): two related template-clone bugs.
+      _find_free_disk_name and list_images' owner-VMID detection only
+      recognized `vm-<vmid>-...` names, so a template disk already
+      renamed to `base-<vmid>-disk-N` by create_base became invisible
+      to both the disk allocator and any VMID-scoped listing. Moving
+      a second disk of the same template to a storage reused the same
+      disk index and create_base's rename crashed with "dataset already
+      exists". Both now match `base-`-prefixed names too. Cloud-init
+      volumes were named vol-<zname>-lun<N>/-ns<uuid> like every other
+      disk, but PVE core's drive_is_cloudinit() only recognizes a
+      volid ending in "cloudinit" with no vol- prefix or metadata
+      suffix. Since ours never matched, core treated cloud-init drives
+      as plain CD-ROMs and copied the reference verbatim on clone
+      instead of regenerating it, so clones silently kept the
+      template's cloud-init config. Cloud-init disks are now named
+      exactly `vm-<vmid>-cloudinit`; since that form can't carry
+      embedded LUN/NVMe-UUID metadata, path() and activate_volume
+      resolve the transport device dynamically by zvol path when
+      metadata is absent. Also carried in this cherry-pick: shared
+      `_resolve_iscsi_lun` / `_resolve_nvme_uuid` helpers used from
+      path() / activate_volume / free_image; free_image best-effort
+      LUN resolve so its pre-teardown SCSI cleanup no longer skips
+      cloud-init deletes; NVMe path()'s device-discovery retry now
+      short-circuits when the re-resolved UUID matches the failed one
+      (avoids a duplicate subsystem reconnect); nvmet.namespace.query
+      now cached in _resolve_nvme_uuid to halve back-to-back
+      activate_volume + path() round trips. Cherry-picked from PR-branch
+      fix/issue-84-85-template-clone-naming after realising it had
+      never been merged to alpha.
+
+    - #91 (klosz007): _iscsi_login_all gave tn_portals entries a
+      guaranteed --login fallback but not tn_discovery_portal, which
+      only got a session if it happened to appear in the node list
+      produced by sendtargets discovery. With distinct portals for
+      the discovery IP and tn_portals (the documented multipath
+      example) only the tn_portals IP connected. The fallback loop
+      now covers $primary the same as @extra. Cherry-picked from
+      PR-branch fix/issue-91-iscsi-primary-portal-login.
+
+  * Broker (tools/truenas-plugin-broker):
+
+    - #98: paired with the plugin change above. get_or_open_ws()
+      pings with auth.me instead of core.ping, so an expired session
+      fails the check and the pool entry is dropped + reopened +
+      re-auth'd on the next call.
+
+  * install.sh:
+
+    - #68 (kbogert, root-cause + fix by WarlockSyno): matching
+      installer-side IPv6 gaps. validate_ip() accepts IPv6 bare or
+      bracketed. validate_host() routes any colon-containing input
+      to validate_ip() instead of the hostname regex. /dev/tcp
+      reachability probes strip brackets before connecting (bash
+      doesn't understand bracket syntax). Manual portal IP:port
+      entry now disambiguates [ipv6]:port, bare IPv6, and
+      ipv4-or-host:port as three separate forms. TrueNAS interface
+      auto-discovery captures IPv6 addresses too (was IPv4-only) and
+      skips ::1/fe80:: link-local. tn_create_portal /
+      tn_create_nvme_port / tn_find_nvme_port strip brackets before
+      sending to TrueNAS APIs (which expect bare addresses).
+
+
+    - #67 (spz-uquidit): plugin function test hardcoded --net0
+      bridge=vmbr0 in three qm create sites, failing outright on
+      hosts without vmbr0 (common on hosts with separate storage
+      and public bridges). New `test_pick_bridge()` helper resolves
+      bridge via env var override (TRUENAS_PLUGIN_TEST_BRIDGE),
+      then vmbr0 if it exists, then first vmbr* found via
+      `ip -o link show type bridge`, falling back to vmbr0 to
+      preserve legacy behaviour. All three test-VM create sites
+      now use the helper.
+
+    - #86 issue 4 (RobD68): normalize_tag_version() regex accepted
+      only vX.Y.Z or vX.Y.Z-debN, so any alpha/beta/rc release tag
+      (v2.1.21-alpha1, v2.1.23-beta2) was rejected with "Release
+      tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN",
+      forcing admins to dpkg -i a manually-downloaded .deb. Broadened
+      the pre-release suffix regex to `(-[A-Za-z0-9._~+-]+)?$`.
+
+    - #86 issue 1 (plappermaul): execute_provisioning() silently
+      accepted an empty PROV_SUBSYSTEM_ID from a
+      `python3 -c "...data.get('id', '')"` one-liner with stderr
+      suppressed, then skipped the NVMe port block (gated on
+      -n PROV_SUBSYSTEM_ID) without incrementing errors, leaving
+      PROVISIONED_PORTAL_IP unset and writing a literal
+      `tn_discovery_portal :` (bare colon) to storage.cfg. Now
+      captures the underlying lookup's exit code and stderr, prints
+      a loud error with remediation guidance, and increments errors
+      so the errors gate on the port block does its job.
+
+  * Packaging (debian/):
+
+    - #60 (lucidnx): postinst unconditionally ran `systemctl
+      try-restart pvedaemon pveproxy pvestatd`, silently disconnecting
+      any active PVE web-UI session (painful for admins reaching
+      the UI through jump hosts or PAM-mediated password vaults).
+      Added TRUENAS_PLUGIN_NO_RESTART=1 env-var escape hatch: when
+      set, postinst skips the PVE-side restart and prints the exact
+      command to run manually. truenas-plugin-broker restart in
+      enable_broker() still runs unconditionally (our own service,
+      does not touch the web UI).
+
+    - #4 (JonahMMay): Ship a new /usr/sbin/truenas-plugin-lvm-filter
+      helper that appends a global_filter reject regex to
+      /etc/lvm/lvm.conf's existing list, addressing the host-side
+      LVM scanning of TN NVMe/TCP namespaces (which triggers
+      duplicate-VG warning storms and can cascade into 596s API
+      timeouts that break Veeam and other pollers). The regex
+      matches `/dev/disk/by-id/nvme-TrueNAS_.*`, populated by udev
+      from the NVMe controller MODEL string; local NVMe drives use
+      other vendor prefixes and are untouched. Not applied at
+      package install (that would silently edit pve-manager's
+      conffile); the sysadmin runs `truenas-plugin-lvm-filter
+      --install` explicitly. Idempotent, with timestamped backup
+      and clean `--uninstall`. Documented in
+      wiki/LVM-Filter.md, cross-linked from Troubleshooting.md.
+
+  * No functional change over #77 and #76's shipping behaviour
+    (both were latent code paths, not user-visible bugs). #90 is
+    the only semi-breaking change and is scoped by the migration
+    notes above. #98 removes the 30-day session-expiry silent
+    failure. #60/#67/#86/#4 are all admin-experience improvements
+    with well-defined defaults.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 09 Sep 2026 15:30:00 -0400
+truenas-proxmox-plugin (2.1.23~beta2) unstable; urgency=medium
+
+  * install.sh: two fixes to the wizard's TrueNAS API write path,
+    surfaced by a user report against 2.1.17+deb1 on TrueNAS
+    SCALE 25.10.6 / PVE 9.2.11. Both bugs are pre-existing (also
+    present in 2.1.17+deb1 and 2.1.23~beta1); only the plugin's
+    runtime path was previously fixed for the _NotRequired issue,
+    so wizard-driven first-run setup was still exposed.
+
+    - Fix wizard write ops calling a plugin function that does not
+      exist. install.sh's tn_api_call_write bash wrapper invoked
+      PVE::Storage::Custom::TrueNASPlugin::_api_call_write from an
+      embedded Perl block. TrueNASPlugin.pm has never defined a
+      _api_call_write; the write-path helper is _api_call_mutate
+      (the rename landed in commit d245787 without a corresponding
+      install.sh update). Effect: every write op driven by the
+      wizard -- pool.dataset.create, iscsi.portal.create,
+      iscsi.target.create, nvmet.subsys.create, nvmet.port.create,
+      and their delete counterparts -- died inside the embedded
+      Perl block instead of reaching TrueNAS. Fix: call
+      _api_call_mutate.
+
+    - Fix tn_create_dataset exposing the wizard to the
+      _NotRequired audit-logger crash. install.sh's
+      tn_create_dataset previously sent only two fields to
+      pool.dataset.create: name and type=FILESYSTEM. On
+      TrueNAS 25.10.x, every omitted optional field lands in the
+      audit-logger as an unresolved _NotRequired sentinel; JSON
+      serialization then fails AFTER the create has already
+      succeeded server-side. The client sees an error, retries,
+      and the retry fails with "dataset already exists" -- leaving
+      the successfully-created dataset as an orphan. PR #82 fixed
+      this on the plugin runtime side (_tn_dataset_create,
+      alloc_image) but the install-time wizard path was still
+      exposed. Fix: send all optional fields the FILESYSTEM path
+      expects (acltype/aclmode/atime/recordsize/snapdev = INHERIT,
+      casesensitivity = SENSITIVE, quota/refquota/reservation/
+      refreservation = 0, special_small_block_size = 0) so the
+      audit logger has real values to serialize.
+
+  * No plugin runtime changes. TrueNASPlugin.pm bytes are unchanged
+    from beta1 except for the VERSION string.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 02 Sep 2026 10:00:00 -0400
+truenas-proxmox-plugin (2.1.23~beta1) unstable; urgency=medium
+
+  * Promote 2.1.23~alpha36 to 2.1.23~beta1 following external
+    validation from Max R. Carrara (Proxmox VE team, 2026-09-02):
+    "passes all testing at their end".
+
+    Also validated locally on 2026-09-01 in a 3-node cluster with:
+      - Max's full plugin-test suite (both iSCSI and NVMe storages,
+        20 rounds per node),
+      - chaos injection every 90s across all four fault classes
+        (kill-broker, restart-broker, drop-tn-net-30s,
+        iscsi-portal-flap; ~90 total injections in a ~4h run),
+      - fio randrw on a dedicated persistent iSCSI volume on one
+        node throughout.
+
+    Under all three simultaneously, every plugin-side failure class
+    tracked by our check-errors tool (extU / EEX / nvme-mm /
+    nvme-loc / purge-l) came back zero across all three nodes. The
+    alpha36 orphan-namespace reaper never had orphans to clean up,
+    which is the intended outcome under the alloc/free discipline
+    now in force.
+
+    Chaos exposure that DID land (broker: EOF before complete
+    response; broker socket missing during systemd restart window;
+    could not activate storage during broker-down window) was
+    surfaced by the counters but produced no cascading corruption,
+    no orphan storms, no deadlocks. Every op that got hit failed
+    cleanly and left the next op free to proceed. Fix candidates for
+    those signatures (retry-with-bounded-backoff on socket-missing;
+    retry-on-EOF for read-only ops) are queued for a later release,
+    intentionally not in this beta.
+
+  * No functional changes from 2.1.23~alpha36; VERSION bump and
+    changelog only.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 02 Sep 2026 09:00:00 -0400
+truenas-proxmox-plugin (2.1.23~alpha36) unstable; urgency=medium
+
+  * NVMe: reap orphan namespaces on our subsystem after every free_image
+    and before every emergency reconnect.
+
+    Under multi-node concurrent load a namespace teardown occasionally
+    fails partway (network glitch, TN transient). The plugin logs a
+    warn but has no persistent retry ledger, so the namespace lives on
+    TN forever. Test framework never re-runs delete for that VM because
+    from its perspective the VM is gone. Over many operations these
+    orphans accumulate on TN. The publication-mismatch detector in
+    _nvme_device_for_uuid (added in alphas 20-30) then reports
+      TrueNAS API namespace count: 49
+      Linux-visible block devices: 11
+      Selector mismatch reason: namespace_metadata_did_not_match_visible_devices
+    and dies for every activate_volume that runs against the ballooned
+    namespace list. This is exactly the "chug along fine then upset"
+    pattern Max R. Carrara flagged in his 2026-08-27 test_run7 mail --
+    253-274 mismatch cascades per 3-node cluster subrun, with TN's
+    namespace count growing monotonically (4 -> 8 -> 25 -> 49 in one
+    subrun) while Linux only ever saw 7-11 devices.
+
+    Fix: new helper _nvme_reap_orphan_namespaces that queries
+    nvmet.namespace on our subsystem, cross-checks each namespace's
+    device_path against a fresh pool.dataset.query for datasets under
+    our tn_dataset prefix, and deletes any namespace whose backing
+    dataset no longer exists. Scope is limited to our subsystem's
+    slice under our storage's dataset prefix; namespaces belonging to
+    other storage configs sharing the same subsystem, and ephemeral
+    vzdump snapshot clones (issue #42), are left alone.
+
+    Called from two places:
+      1. _free_image_nvme's _defer_after_lock block. Runs off the
+         caller's synchronous path after every namespace free, so
+         orphans get cleaned up at the natural rate of one-per-free
+         without slowing new-VM creation.
+      2. _nvme_device_for_uuid's emergency-reconnect branch, before
+         firing the reconnect. Reconnecting the kernel does not shrink
+         an orphan pile on TN; TN still publishes the ballooned
+         namespace list and the next device lookup can still mismatch.
+         Reap first, then reconnect -- the reconnect's re-enumeration
+         then reflects the trimmed namespace set.
+
+    Two extra TN API calls per invocation (nvmet.namespace.query +
+    pool.dataset.query on our subsystem+prefix). Both are already
+    called in adjacent code paths; the incremental cost is small
+    compared to the failure mode it prevents. Best-effort throughout
+    -- never dies; if TN itself is unreachable we log and return.
+
+    NVMe reap only. The iSCSI equivalent -- iscsi.extent.query
+    cross-checked with pool.dataset.query -- is a smaller problem
+    because the extent-delete path in _free_image_iscsi already runs
+    synchronously and the extent name uniqueness constraint stops
+    orphan accumulation from becoming self-reinforcing. Future work
+    if the same shape shows up on iSCSI under similar load.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 27 Aug 2026 14:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha35) unstable; urgency=medium
+
+  * create_base: on-EEXIST recovery for the pool.dataset.rename step.
+
+    TN raises
+      [EEXIST] zfs.resource.rename: 'tank/<pool>/base-<vmid>-disk-N' already exists
+    when the target base dataset is left over from a prior template of the
+    same VMID that was not fully cleaned. Before this change the plugin
+    caught the error, re-enabled the NVMe namespace on that branch, and
+    rethrew -- the caller's linked-clone step then failed as a cascade
+    ("template task succeeded" -> "template / linked-clone: Linked clone
+    feature is not supported for vol-vm-*").
+
+    Fix: on that specific error shape, query the leftover base dataset for
+    non-snapshot children and for linked clones deriving from its
+    @__base__ snapshot (any pool.dataset whose origin.parsed points at
+    <target>@__base__ is a live clone). If both are empty, delete the
+    leftover with recursive=true+force=true and retry the rename once.
+    If either check finds live data, fall through to the original
+    validation error so the operator sees the real conflict rather than
+    a silent redirect.
+
+    Impact observed: 9-54 hits per node in Max R. Carrara's test_run7
+    2026-08-25 3-node cluster runs. The affected test file
+    (template_linked_clone.pl) is the only path in the suite that
+    exercises create_base under multi-round load; every hit produced
+    both a "template task succeeded" failure and a downstream
+    "Linked clone feature is not supported" failure. With the recovery
+    in place the rename retries transparently and the linked-clone step
+    proceeds.
+
+  * list_images: bypass the per-worker extents / targetextents cache in the
+    iSCSI implementation.
+
+    The disk_purge test asserts that a purged volid disappears from the
+    storage content listing. It failed intermittently even when the
+    delete succeeded on TN, because:
+      1. free_image ran in pvedaemon worker A, deleted the iSCSI extent
+         and targetextent synchronously, cleared worker A's per-process
+         _tn_extents / _tn_targetextents cache, and returned a coderef.
+      2. PVE forked the coderef as an imgdel UPID task (the
+         pool.dataset.delete is intentionally deferred to keep the
+         caller's storage lock hold under the 180s test-framework limit
+         that vm_disk_buses breached in test_run6/truenas-2026-08-13).
+      3. The test's next call landed on worker B, whose per-process
+         cache still had the deleted extent + mapping.
+      4. The existing ground-truth check at line 6495
+         (`next MAPPING if $datasets_ok && !exists $dataset_cache{$ds_full}`)
+         could not filter it out because the dataset was genuinely still
+         on TN -- the imgdel task had not yet run pool.dataset.delete.
+      5. Volume showed up in the listing -> test failed.
+
+    Fix: in _list_images_iscsi replace `_tn_extents($scfg)` /
+    `_tn_targetextents($scfg)` with direct `_api_call($scfg,
+    'iscsi.extent.query', [])` and `_api_call($scfg,
+    'iscsi.targetextent.query', [])`. Fresh reads mean the extent-based
+    iteration no longer surfaces the phantom regardless of which worker
+    handles the request. Two extra TN API calls per list_images
+    invocation; list_images is not in a hot loop -- it's called on
+    demand from storage content queries.
+
+    NVMe is not affected: _list_images_nvme already reads namespaces
+    directly via `nvmet.namespace.query` (line 6604) without going
+    through a cached wrapper.
+
+  * broker: downgrade the "upstream error" WARN to INFO for the well-known
+    "already gone" delete race.
+
+    Any DELETE method (iscsi.extent.delete, iscsi.targetextent.delete,
+    pool.dataset.delete, nvmet.namespace.delete, ...) that TN answers
+    with InstanceNotFound / ENOENT / "does not exist" is a benign race
+    the plugin's callers already handle idempotently (see e.g.
+    free_image, _teardown_snapshot_device). Leaving those at WARN level
+    drowned real errors under vzdump-* ephemeral snapshot-clone
+    teardown noise: Max R. Carrara's test_run7 2026-08-25 3-node
+    cluster-01 logged around 2000 of these per node per subrun.
+
+    Fix: in the broker's structured-error handler downgrade to INFO
+    (`upstream ENOENT on <method> (already gone; sk=<sk>)`) when
+    the method name ends in .delete AND the error carries
+    InstanceNotFound / \bENOENT\b / "does not exist". All other error
+    shapes (rename EEXIST, validation errors, EBUSY, rate limit, ...)
+    still log at WARN. Cosmetic on correctness but restores
+    signal-to-noise ratio for future forensics.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Wed, 27 Aug 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha34) unstable; urgency=medium
+
+  * iSCSI: fix create_base extent-rename gap that produced cascading
+    "iscsi_extent_create.name: Extent name must be unique" failures on
+    every VM allocation at a VMID that had previously been templated.
+
+    Root cause: create_base renamed the zvol vm-<vmid>-disk-N ->
+    base-<vmid>-disk-N and issued iscsi.extent.update to rewrite the
+    extent's `disk` field, but never renamed the extent itself. The
+    vm-<vmid>-disk-N-<hash> extent-name slot on TN stayed owned by
+    the (now-base) extent. _generate_extent_name is deterministic on
+    (dataset, zname), so the next VM allocated at the same VMID hashed
+    to the same name and collided. Fix B looked up the conflicting
+    extent by name, saw its disk field pointed at a base zvol (not
+    ours), and correctly refused to reuse -- there was no safe reuse
+    path, and no repair path either. Test file died, next test file
+    hit it too, cascade.
+
+    Impact observed:
+      - Max R. Carrara's test_run6/truenas-2026-08-13 3-node cluster
+        runs: 2348-2632 "Extent name must be unique" hits per node.
+      - Same runs single-node: 1180 hits (visible even without
+        multi-node concurrency).
+      - Our iSCSI-only run 2026-08-24 against alpha33: 128-199 per
+        node, all on the same extent id.
+      - Was masked in earlier report summaries as generic FAIL verdicts
+        spread across ~14 different capability tests
+        (storage_plugin_disk_purge, template_linked_clone,
+        vm_create_default, etc.) -- not clustered as one bug.
+
+    Fix has two parts:
+
+    Part 1 (prevent new occurrences). create_base's iSCSI branch now
+    includes {name => _generate_extent_name($new_zname)} in the
+    iscsi.extent.update payload alongside the existing {disk =>
+    $new_zvol_path}. New templates leave TN with a properly-named
+    base-*-<hash> extent, freeing the vm-*-<hash> slot for future VMs.
+
+    Part 2 (recover from historical TN state). New helper
+    _iscsi_extent_recover_stale_base_name detects the shape of a
+    stale-extent conflict (same name, disk field points at a
+    base-<vmid>-disk-N zvol) and renames the extent to its proper
+    base-*-<hash> name. All three Fix B call sites -- _tn_extent_create,
+    _alloc_image_iscsi, _clone_image_iscsi -- invoke the helper in the
+    "refusing to reuse" branch and retry the create once on success.
+
+    The rename is bookkeeping-only from the initiator side: extent_id,
+    targetextent mapping, and naa/serial identifiers are all preserved.
+    Nothing on the wire changes; only the TN-side extent name is
+    corrected.
+
+    NVMe is not affected: nvmet namespaces are keyed by (subsys, nsid),
+    not by a name attribute, so the equivalent create_base rewire (of
+    namespace.device_path) does not leave a stale name slot behind.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Mon, 25 Aug 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha33) unstable; urgency=medium
+
+  * Fix alpha32 compile error.
+
+    Alpha32 introduced a level-0 LOCKHOLD log line in _alloc_image_nvme's
+    deferred block that referenced $deferred_vmid without declaring it.
+    Perl's use strict caught it at plugin load:
+      Global symbol "$deferred_vmid" requires explicit package name
+    PVE could not load the plugin, treated 'truenasplugin' as
+    unsupported, and every test that used the storage skipped with
+    "storage 'truenas-nvme' not configured: 500 storage 'truenas-nvme'
+    does not exist".
+
+    Fix: drop the vmid= field from the LOCKHOLD log line. UUID is
+    already logged and is sufficient to correlate with the failing
+    activate_volume UUIDs. All other declarations were correct.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 10:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha32) unstable; urgency=medium
+
+  * NVMe: LOCKHOLD instrumentation.
+
+    Alpha31 stopped plugin-triggered NVMe reconnects from firing under
+    the VM config lock. Kernel logs confirm no more spurious
+    "Removing ctrl / new ctrl" events during test runs. But some
+    lock-timeout failures still show up in the driver logs at reduced
+    frequency, and we can not correlate them to any specific pvedaemon
+    action.
+
+    Alpha32 adds level-0 instrumentation at every phase of the two
+    code paths that hold the VM config lock while doing NVMe work:
+      - _alloc_image_nvme deferred block (runs before cluster_lock_storage
+        returns to qm set / qm create, therefore still inside the caller's
+        lock hold)
+      - _clone_image_nvme deferred block (same pattern for qm clone)
+      - activate_volume NVMe branch (runs inside qm start / qm clone
+        target's lock hold)
+
+    Each phase log line looks like:
+      [TrueNAS] LOCKHOLD alloc_nvme_deferred vmid=105 uuid=<uuid>
+                        phase=nvme_rescan elapsed=0.234s
+
+    Grep for LOCKHOLD in journalctl around a lock-timeout event to see
+    exactly which phase was still running when the concurrent qm op
+    started waiting. Whichever phase most often shows elapsed >5s is
+    the actual culprit.
+
+    Pure diagnostic — no behaviour change from alpha31.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 10:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha31) unstable; urgency=medium
+
+  * NVMe: forbid reconnect in _defer_after_lock pre-warm paths.
+
+    Root cause of the "can't lock file lock-<vmid>.conf - got timeout"
+    failures traced by journalctl analysis (2026-08-21 10:33 window on
+    pve, VM 121):
+
+      10:32:59  update VM 121 -scsi1        (holds lock, plugin alloc)
+      10:33:02  TIMING dataset.create +3.1s
+      10:33:05  update VM 121 -tpmstate0    (next holds lock, plugin alloc)
+      10:33:08  TIMING dataset.create +3.3s
+      10:33:17  kernel: nvme nvme0: Removing ctrl / new ctrl <-- HERE
+      10:33:17..30 udev storm: scsi-sg3_id.rules WARNING on ~30 devices
+      10:33:35  starting task qmstart:121   (lock wait begins)
+      10:33:45  qmstart:121: got timeout    (10s wait exhausted)
+
+    The alloc_image_nvme deferred block (runs under _defer_after_lock,
+    which fires WHILE the VM config lock is still held) called
+    _nvme_device_for_uuid with allow_reconnect=1. That authorized the
+    stale-NGUID reconnect gate at i==10. Under multi-node testing
+    (another node just created/destroyed a namespace) NGUID
+    contradiction is common, so the gate fires often: kernel does a
+    full controller remove+add, udev re-enumerates every namespace on
+    the subsystem, plugin's udevadm settle blocks 10-13s waiting for
+    the queue to drain -- the entire time still holding the config
+    lock. Concurrent qm ops from the test framework on the same VMID
+    then time out on the 10s lock wait. VM-config lock timeouts had
+    been categorised as harness/PVE issues in earlier reporting;
+    corrected: these are plugin-caused.
+
+    Fix: allow_reconnect=0 in both deferred pre-warm calls
+    (_alloc_image_nvme deferred at line 5752, _clone_image_nvme
+    deferred at line 7782). The deferred block is best-effort; when
+    the target device is not yet visible, activate_volume (which runs
+    OUTSIDE the config lock, in its own worker, with allow_reconnect=1)
+    will do the reconnect cleanly. Recovery isn't lost, just moved to
+    a moment the lock isn't held.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Sun, 24 Aug 2026 09:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha30) unstable; urgency=medium
+
+  * NVMe: avoid nsid recycling on namespace create.
+
+    Alpha29's pre-wait subsys.update didn't stop the failure. Deep
+    inspection showed the ACTUAL disagreement between TN and kernel:
+      kernel: nvme0n3 nsid=3 uuid=<OLD-DELETED-NAMESPACE-UUID>
+      TN DB : nsid=3 uuid=<NEW-NAMESPACE-UUID>
+    TN's nvmet.namespace.create auto-assigns the lowest free nsid.
+    Under multi-node create/destroy churn nsids recycle rapidly.
+    TN's configfs sync from DB does not always land the nsid=3
+    rewrite before a connecting host reads the port's namespace list.
+    Kernel then has a stale UUID at that nsid and no rescan, subsys
+    reload, or full disconnect+reconnect can dislodge it — every
+    such op re-reads TN configfs, which still shows the stale entry.
+
+    Fix: explicit monotonic nsid on create. Query current max nsid
+    for the subsystem, add random jitter 1..8 (reduces cross-node
+    concurrent-alloc collisions), pass explicit nsid in the create
+    payload. Every namespace lands at a nsid that has never been
+    used in this subsystem's lifetime — kernel has no cached mapping
+    for that nsid, so it enumerates fresh from configfs. Configfs
+    for a never-used nsid can't be stale.
+
+    Alpha30 falls back to TN auto-assignment when max_nsid + jitter
+    approaches the subsystem NN ceiling (1024). Under Max's test-suite
+    churn this ceiling is well above what we see (peak ~20 concurrent
+    namespaces).
+
+    Also handles the rare cross-node "both nodes picked the same
+    max+jitter" collision by re-querying max and retrying once with
+    a fresh jitter.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 19:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha29) unstable; urgency=medium
+
+  * NVMe: activate_volume forces nvmet.subsys.update before waiting.
+
+    Alpha28's emergency reconnect fired correctly on the failures but
+    always logged:
+      "emergency reconnect completed but target UUID still not visible
+       after 2s — falling through to error"
+    Even a fresh disconnect+reconnect couldn't make the kernel see the
+    target namespace. That ruled out kernel-side stale cache. Root
+    cause is on TrueNAS: nvmet.namespace.create returns as soon as
+    the DB row lands, BEFORE the configfs entry under
+    /sys/kernel/config/nvmet/subsystems/*/namespaces/* is created.
+    An nvmet.subsys.update forces TN to flush DB->configfs — the
+    plugin has this workaround, but it runs in _defer_after_lock
+    inside alloc_image/clone_image/expose_snapshot, only on the
+    CREATING node.
+
+    Under multi-node clustering where VM allocation happens on one
+    node and start (activate_volume) happens on another (cluster
+    migration, live migrate, or PVE routing an allocate to node A
+    and a start to node B), the DIFFERENT node's activate never runs
+    the workaround. It connects, sees pre-namespace configfs state,
+    and no rescan/reconnect can invent an entry TN never wrote to
+    configfs.
+
+    Fix: activate_volume's NVMe branch fires nvmet.subsys.update
+    itself, right after _nvme_connect and before _nvme_device_for_uuid.
+    Idempotent, one extra API call per activation, only when the
+    plugin is about to wait for a device. Forces TN to sync its
+    configfs so the subsequent device-lookup can succeed.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 18:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha28) unstable; urgency=medium
+
+  * NVMe: emergency reconnect ignores reconnect_attempted.
+
+    Alpha27 diagnostic proved every failed activate_volume ran the
+    emergency block and skipped with:
+      emergency reconnect SKIPPED (reconnect_attempted=1) —
+      a prior mid-loop reconnect already fired
+
+    Root cause: some earlier mid-loop reconnect (usually i==10
+    stale-NGUID) fires ~1s into the retry loop, BEFORE TN has
+    finished publishing the target namespace. That reconnect
+    completes but the kernel view stays stale-for-a-different-
+    reason: TN just hasn't sent AER for the new namespace yet.
+    The loop continues, still cannot find target, exhausts, then
+    the emergency block silently declines to reconnect a second
+    time because reconnect_attempted was already 1. The
+    single-reconnect cap was killing recovery.
+
+    Fix: emergency block ignores reconnect_attempted. Cost is
+    ~500ms extra NVMe drop on the shared subsystem, worst case
+    twice per failing activate_volume. Benefit: recovery from the
+    "reconnect fired too early" case. Trade-off favors recovery.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 18:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha27) unstable; urgency=medium
+
+  * NVMe: promote emergency-reconnect diagnostic to level 0.
+
+    Alpha26 added the emergency reconnect at loop exit but its log
+    messages were at level 1 (only emitted when tn_debug >= 1).
+    Our storage.cfg does not set tn_debug, so no messages appeared
+    in syslog and we could not tell whether the block ran, was
+    skipped by one of its three gates, or ran but failed to help.
+
+    Alpha27 is diagnostic only: every branch in the emergency
+    reconnect block now logs at level 0. Three SKIPPED reasons
+    (allow_reconnect=0, reconnect_attempted=1, subsystem
+    disconnected) each emit an explicit log line, plus explicit
+    logs on RECONNECT / RECOVERED / STILL NOT VISIBLE. No functional
+    behavior change. Downgrade back to level 1 once the root cause
+    is identified.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 17:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha26) unstable; urgency=medium
+
+  * NVMe: emergency reconnect after retry budget exhausted.
+
+    Under sustained 3-node concurrent load, ~2 activate_volume calls
+    per 250 tests still failed with "Could not locate NVMe device"
+    even with alpha24's halfway/last-resort reconnects in place.
+    Root cause: those mid-loop reconnect gates never fired because
+      - fuser check saw other VMs using the shared subsystem
+      - the inline tn_has_uuid check occasionally returned empty
+        under TN API load, silently skipping the reconnect body
+    Meanwhile the kernel controller was holding stale namespace
+    entries whose NGUIDs matched no current TN namespace. Only a
+    disconnect+reconnect flushes those stale entries.
+
+    Alpha26 adds a single unconditional emergency reconnect at
+    LOOP EXIT — after the 150-iteration budget runs dry, before
+    constructing the death error. No fuser check (loop is about to
+    fail; brief NVMe I/O pause on other VMs is the lesser evil).
+    No tn_has_uuid gate (metadata was queryable enough for the
+    failure to be classified). Reconnect, brief 2-second rescan
+    retry, and if the target device appears, return it.
+
+    Only gated on allow_reconnect=1 and !reconnect_attempted (some
+    earlier gate actually did fire), same as every other reconnect
+    site.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 17:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha25) unstable; urgency=medium
+
+  * NVMe: enable reconnect-driven recovery from path().
+
+    Alpha24 added the i==125 last-resort reconnect. It never fired in
+    the follow-up run. Investigation showed sub path() (line 5003) —
+    which every PVE VM op goes through: qmclone, qmstart, qmdestroy —
+    was calling _nvme_device_for_uuid WITHOUT allow_reconnect=>1.
+    Every reconnect gate (i==10 stale-NGUID, i==25 zero-device,
+    i==35 stale-NGUID again, i==75 halfway, i==125 last-resort) is
+    guarded by $allow_reconnect. path() drove the retry loop but
+    denied it the recovery interventions, so mismatch failures always
+    reached loop-exhaustion.
+
+    Fix: pass allow_reconnect => 1 from both nvme-tcp call sites in
+    sub path (line 5025 snapshot mode + line 5054 normal mode).
+    activate_volume already passes allow_reconnect=1; path() now
+    matches. No functional change on the happy path (device found
+    immediately, reconnect gates never enter).
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha24) unstable; urgency=medium
+
+  * NVMe: last-resort reconnect at i==125 that ignores the fuser gate.
+
+    Alpha23's halfway reconnect (i==75) never fires in multi-node
+    steady-state — there is always SOME other VM using SOME device
+    on the shared subsystem, and the fuser check declares the whole
+    subsystem too busy to reconnect. The failure keeps happening
+    with 0 halfway-reconnects logged.
+
+    Alpha24: add a second trigger at i==125 (~12.5s in, ~2.5s of
+    budget left) that forces the reconnect regardless of the fuser
+    check. Rationale: at this point the retry loop is going to fail
+    anyway. A confirmed activate_volume failure is worse for the
+    user than a few hundred milliseconds of NVMe I/O pause on other
+    VMs — kernel NVMe controller-loss handling normally resumes
+    cleanly on reconnect. Same "target UUID confirmed on TN" gate
+    as i==75, so we still don't disrupt anything on a bad UUID.
+
+    Log message distinguishes "i==75 halfway" from "i==125 last-resort"
+    and notes when the fuser gate was overridden.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha23) unstable; urgency=medium
+
+  * NVMe: restructure the publication-mismatch check for shared subsystems.
+
+    Alpha22 tightened rescan cadence and doubled the budget. Helped
+    the short bursts, but under sustained 3-node concurrent creates
+    the "Could not locate NVMe device" failure came back at scale
+    (15 mismatches on pve, 13 on proxmox2, 13 on pvevm1 across ~90
+    tests). Root cause: the check was structurally wrong for shared
+    NVMe-oF subsystems.
+
+    - Every node connected to a shared subsystem enumerates its OWN
+      view of published namespaces. TN's API returns the TOTAL for
+      the subsystem, which includes namespaces every other node just
+      created. Kernel-count strictly less-than api-count is the
+      STEADY-STATE norm in this environment, not a fault.
+    - The old 'linux_api_namespace_count_mismatch' reason flagged
+      the norm as a fault. Once the retry loop exhausted its budget,
+      that fault was the exit reason.
+
+    Changes:
+      1. Dropped 'linux_api_namespace_count_mismatch' from the reason
+         table. Count inequality no longer produces a diagnostic
+         "mismatch" — only "api_namespace_not_visible_in_linux" (0
+         kernel devices) and "single_visible_device_but_api_reports_
+         multiple_namespaces" (stale-device suspect) remain as real
+         faults.
+      2. Iteration budget 100 → 150 (10s → 15s). Still well under
+         pveproxy's 60s cap.
+      3. New halfway-point (i==75) reconnect trigger for the exact
+         failure mode we observed: target UUID confirmed on TN but
+         this host's kernel hasn't seen it yet after ~7.5s. Fires
+         disconnect+reconnect ONLY when no subsystem device is in
+         use by any process on this host (fuser check) — reconnect
+         momentarily drops all namespaces and would hang running
+         VMs writing to other namespaces on the same subsystem.
+         Gated on allow_reconnect=1 (already the default from
+         activate_volume).
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 14:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha22) unstable; urgency=medium
+
+  * NVMe: rescan more aggressively in _nvme_device_for_uuid.
+
+    Alpha21 killed the retry-storm duplication (TN now sees the correct
+    ~5-11 namespaces instead of 96). But the "Could not locate NVMe
+    device" failure came back at reduced rate under 3-node concurrent
+    creates:
+
+      pve: 5 mismatches, api=11 vs kernel=6
+      proxmox2: 3, api=5-6 vs kernel=4
+      pvevm1: 2, api=4 vs kernel=3
+
+    Delta = 1-5 namespaces genuinely on TN but not yet published to
+    this host's kernel controller. Different failure mode than the
+    alpha21 target — no duplicates, just late publication.
+
+    Root cause: _nvme_device_for_uuid ran only 2 rescans (at i==15,
+    i==30) across its 50-iteration / 5-second budget. Between rescans
+    the kernel returned the same stale namespace list, so all 50
+    iterations saw the same "not there" answer and the loop died.
+
+    Fix:
+      - nvme ns-rescan every 5 iterations (~500ms). Cheap IOCTL,
+        safe to fire this often; harmless when there is nothing new.
+      - Iteration budget 50 → 100 (5s → 10s). Under multi-node
+        concurrent create load, TN's per-host publication can lag
+        several seconds; late-appearing devices no longer arrive
+        after we have already died.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha21) unstable; urgency=medium
+
+  * NVMe: fix retry-storm namespace duplication.
+
+    Root cause: nvmet.namespace.create is not idempotent — the payload
+    has no name/key uniqueness on the TN side (unlike iscsi.extent.create
+    which is protected by an "Extent name must be unique" constraint
+    and the plugin's Fix B name-conflict recovery). Every mutation goes
+    through _api_call -> _retry_with_backoff, which retries up to 3
+    times on connection errors. Under 3-node concurrent alloc load,
+    connection blips are frequent. When TN successfully creates a
+    namespace but the WS response is lost mid-flight, the retry fires
+    a SECOND create for the same device_path. TN accepts it. Both
+    survive.
+
+    Impact observed (2026-08-20 3-node NVMe run, tn-reset log):
+      ns_deleted=68 ds_deleted=24  (2.83 namespace rows per zvol)
+      total on TN = 96, only 9 published to kernel controllers,
+      activate_volume dies with "namespace publication mismatch"
+      (linux visible = 9, api reports = 96).
+
+    Fix: new helper _nvme_create_namespace_idempotent that
+      (a) queries device_path first — if a namespace exists, reuse it
+          (also closes _clone_image_nvme's pre-existing gap where it
+          had no existing-check at all — concurrent clones on the
+          same target zvol would leak duplicates).
+      (b) attempts create with retry_max=0 (retries disabled)
+      (c) on any error, re-queries device_path — if a namespace now
+          exists, treat as success (create landed before response was
+          lost)
+      (d) only re-raises when nothing exists after the re-query.
+
+    Applied to all 3 nvmet.namespace.create call sites:
+      _alloc_image_nvme (5361), _expose_snapshot_device (6845),
+      _clone_image_nvme (7404).
+
+    Zvol-visibility polling loops around each site stay — that error
+    is not a connection error and never triggered the outer retry.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Fri, 21 Aug 2026 09:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha20) unstable; urgency=medium
+
+  * NVMe: fix nvmet.namespace.query filter to use "subsys.id" instead
+    of "subsys" (TrueNASPlugin.pm:4014-4020).
+
+    TrueNAS 25.10+ returns each namespace's `subsys` field as a nested
+    object ({id, name, subnqn, ...}), not a scalar id. The plugin's
+    filter ["subsys", "=", $subsys_id] compared the whole object to
+    a scalar and always returned 0. That made api_namespace_count = 0,
+    which the publication-mismatch check compared against
+    linux_device_count > 0 and failed with:
+
+      TrueNAS namespace publication mismatch detected.
+        -> Linux-visible block devices: N
+        -> TrueNAS API namespace count: 0
+        -> Selector mismatch reason: linux_api_namespace_count_mismatch
+
+    Every NVMe activate_volume died with "Could not locate NVMe device
+    for TrueNAS UUID ...". Filter now uses "subsys.id" nested-field
+    syntax which returns the correct count on 25.10+.
+
+    Verified against live TN 25.10: [["subsys","=",1]] -> 0 results;
+    [["subsys.id","=",1]] -> 14 results (all namespaces).
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Thu, 20 Aug 2026 16:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha19) unstable; urgency=medium
+
+  * activate_volume iSCSI: verify size > 0 on the sd backing the LUN
+    after rescan; if stuck at 0, purge the stale sd and force session
+    --rescan so the kernel re-attaches a live device.
+
+    Symptom (cluster_test_run 2026-08-19):
+      io_integrity.pl: short write to
+        /dev/disk/by-path/...iqn.2005-10.org.freenas.ctl:proxmox-lun-7
+      syswrite returned undef (EIO); test bailed.
+
+    Root cause: under 3-node concurrent load with recycled LUNs
+    (test_A destroys VM 105 -> LUN 6 unmapped -> test_B creates new
+    VM 106 -> TN reassigns LUN 6 -> new zvol), the kernel keeps sdX
+    bound to LUN 6 but drops its READ CAPACITY to 0. The existing
+    _iscsi_rescan_sd_capacity pokes /sys/block/sdX/device/rescan but
+    does not wait for the result. If capacity is still 0 when
+    activate_volume returns, the caller opens a zero-length block
+    device and every write fails.
+
+    Fix: new helper _iscsi_ensure_lun_ready(scfg, lun, path) called
+    from activate_volume right after _device_for_lun. Retries the
+    per-sd rescan up to 10x (300ms sleep, ~3s worst case). If size
+    is still 0, writes 1 to /sys/block/sdX/device/delete to evict
+    the stale device, runs iscsiadm -m session --rescan to force
+    re-attach, re-resolves the by-path symlink, and requires the
+    new sd to report size > 0 or dies loud.
+
+    Doesn't touch happy path (size > 0 on first read = zero-cost
+    return). Only kicks in on the recycle-race failure mode.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Thu, 20 Aug 2026 09:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha18) unstable; urgency=medium
+
+  * Bypass the PVE CFS cluster storage lock by default. This is the
+    single biggest lever for the multi-node concurrent-alloc problem
+    the last dozen alphas have been chipping at. cluster_test_run
+    2026-08-17 3-node VM 276 timing:
+
+      13:20:30 pvedaemon logs "update VM 276: -scsi1"
+      13:22:22 alloc_image FINALLY enters -- ~112 s of pure lock wait
+      13:22:40 alloc_image body done in 18 s
+
+    Body time is fine. The 2-minute wait is entirely in
+    PVE::Storage::Plugin::cluster_lock_storage's cfs_lock_storage
+    serialization while OTHER nodes' allocs held the lock. Test client
+    bailed at 60 s with 596; downstream tests then failed on stale
+    VM-config locks (test cascade C).
+
+    PVE's cfs_lock_storage is the right primitive for local storages
+    (local, LVM) where concurrent PVE-side metadata mutation would
+    corrupt state. For a network storage like TrueNAS SCALE it's
+    redundant: TN's middleware already serializes conflicting mutations
+    (iscsi.extent.create name uniqueness, iscsi.targetextent LUN
+    assignment, ZFS dataset name uniqueness), and the plugin's Fix 1
+    (alloc-time extent reuse), Fix B (post-hoc name-conflict recovery),
+    and the dataset-already-exists auto-increment cover any residual
+    PVE-side race. Bypass eliminates the cross-node queue entirely;
+    nodes alloc in true parallel, TN serializes internally as needed.
+
+    New tn_use_cluster_lock=1 storage.cfg option restores the classic
+    PVE-serialized behavior for regression comparison or for setups
+    running an unusual TN configuration where its own internal
+    serialization is not trusted. Default remains bypass.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 19:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha17) unstable; urgency=medium
+
+  * Add RuntimeDirectoryPreserve=yes to the broker systemd unit so
+    /run/truenas-plugin (and the preflight-alloc stamp files inside it)
+    survive broker service restarts. alpha16's post-install broker
+    restart wiped the stamps every deploy, so the first alloc on each
+    node after every upgrade paid the full 16-19 s preflight under
+    load and re-primed the 596 window. Tmpfs is still cleared on
+    reboot, which is the correct invalidation surface for cached
+    health signals.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 18:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha16) unstable; urgency=medium
+
+  * Prefork the broker worker pool (N=4). The single-threaded accept
+    loop was serializing every client RPC through one upstream WS --
+    measured on pve, 4 concurrent broker calls that could parallelize
+    took 9.8 s wall (last call queued behind all others) vs the fastest
+    call finishing in 0.14 s. Under 3-node cluster test load, this
+    stacked on top of TN's own contention: extent.create (3-6 s) and
+    targetextent.create (7-8 s) on ONE alloc, then serial-queued on the
+    broker with pool.dataset.query from pvestatd and other workers'
+    calls, pushed body time past the pveproxy 60 s ceiling with three
+    nodes hitting the shared cluster_lock_storage.
+
+    Parent creates the listen fd + workers, then supervises: each
+    worker inherits the listen fd and runs the original accept loop
+    with its own persistent %POOL WS (auth'd once at worker startup).
+    Kernel serializes accept() across workers so no thundering-herd
+    race. Workers install their own TERM handler to close their WS
+    cleanly on shutdown without touching the parent's socket / pidfile.
+    Parent handler signals all workers, waits briefly for them to
+    exit, then unlinks the runtime files.
+
+    N=4 keeps auth cost well under TN's 20 / 60 s / IP rate limit on
+    auth.login_with_api_key (4 auths at broker startup + occasional
+    reconnect churn) while giving 4-way parallelism per node.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 18:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha15) unstable; urgency=medium
+
+  * Bump preflight cache TTL 300 s -> 3600 s. alpha14 TIMING data
+    confirmed the shared /run stamp is now persisting across mutations
+    and across pvedaemon workers, but the 300 s TTL still expired
+    between test framework bursts (~5 min inter-burst gap), so every
+    burst's first alloc paid the full 10-13 s preflight and queued the
+    whole 3-node cluster past the pveproxy 60 s ceiling. 1 hour TTL
+    covers even long gaps between test runs. Preflight signals (pool
+    ONLINE, service RUNNING, dataset exists) don't change on that
+    timescale under normal operation; free-space accounting stays
+    fresh via pvestatd's 10 s status() polling regardless.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 17:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha14) unstable; urgency=medium
+
+  * Stop unlinking the preflight stamp file in _clear_cache. alpha12
+    added the /run/truenas-plugin/preflight-<key> shared cache but
+    also wired _clear_cache to unlink the stamp -- and _clear_cache
+    runs after every extent / targetextent / zvol mutation, which
+    completely defeated the cross-worker cache (alpha13 diagnostic
+    confirmed the stamp being written and then immediately wiped by
+    the next mutation). Preflight signals (pool ONLINE, service
+    RUNNING, dataset exists, space free) are orthogonal to whether
+    an extent got created; the stamp's correct invalidation surface
+    is TTL expiry (300 s) or tmpfs reset on reboot, not per-mutation.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 17:15:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha13) unstable; urgency=medium
+
+  * Preflight stamp write: convert silent eval into die-on-failure with
+    diagnostic logging (level 0 always visible), since alpha12's stamp
+    file was never appearing on disk despite preflight succeeding. The
+    original `eval { open ... and close ... }` pattern was swallowing
+    the actual failure mode; explicit `open() or die` inside a wrapping
+    eval + a WRITE FAILED / WROTE OK log line surfaces exactly what
+    happened. Diagnostic build.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 17:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha12) unstable; urgency=medium
+
+  * Share the preflight-alloc cache across pvedaemon workers via a
+    /run/truenas-plugin/preflight-<key> stamp file. alpha11 bumped
+    the in-process TTL 30 s -> 300 s but the TIMING data from the
+    follow-up run showed every alloc STILL paying the full 6 s, because
+    each pvedaemon worker process has its own %_preflight_last_ok and
+    workers rotate faster than the TTL. cluster_test_run 2026-08-17
+    VM 222 disk-0 landed on pvedaemon PID 767131, disk-1 on PID 765189,
+    both charged the full preflight. With the shared stamp any sibling
+    worker on the same node picks up an "already validated" hit in the
+    stat() call and skips the 4 TN API calls entirely. Target per-alloc
+    body time: ~15 s -> ~9 s for allocs 2..N in a burst.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 16:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha11) unstable; urgency=medium
+
+  * Bump _preflight_check_alloc cache TTL 30 s -> 300 s. TIMING data
+    from cluster_test_run 2026-08-17 3-node run (alpha10
+    instrumentation) showed preflight adding 6 s per alloc inside
+    cluster_lock_storage under concurrent load -- the previous 30 s
+    TTL expired between most test cycles so every alloc paid the full
+    4-call round trip (core.ping + pool.query + service.query +
+    dataset_get). Total per-alloc body time went from ~21 s to ~15 s
+    at 3-way concurrency, which keeps the aggregate cluster response
+    time under the pveproxy 60 s ceiling that was 596'ing the test
+    harness on vm_additional_disk_vtpm, vm_disk_buses, and
+    io_integrity. All four preflight signals still surface as clear
+    TN-side errors on the actual pool.dataset.create if they go wrong
+    mid-window -- the cache is a rate-limit on redundant health
+    chatter, not a correctness gate.
+
+  * TIMING instrumentation from alpha10 retained (level-0 log lines,
+    ~7 per alloc). Cheap enough for production, useful for the next
+    round of optimization work. To be moved behind tn_debug >= 1 once
+    the cluster-load 596s stop showing up in test runs.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha10) unstable; urgency=medium
+
+  * Wall-clock TIMING instrumentation in alloc_image + _alloc_image_iscsi.
+    Level-0 log lines with "TIMING" prefix at each phase boundary
+    (entry, preflight, pool.dataset.create, zvol.job.wait,
+    extent.reuse_check, extent.create, targetextent.create,
+    deferred.start, deferred.end) so operators (and this branch's
+    debugging effort) can attribute the 60-90 s cluster-load alloc
+    delays to a specific step under 3-node concurrent load. Diagnostic
+    build only -- to be reverted once the bottleneck is confirmed
+    and fixed.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 15:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha9) unstable; urgency=medium
+
+  * Cap alloc_image's deferred device-verify at ~2 s instead of the
+    latent 480 s worst case. The deferred discovery already ran an
+    8-attempt best-effort outer loop with 250 ms between attempts,
+    but each iteration called _device_for_lun which itself blocks up
+    to tn_device_ready_retries * 100 ms (default 600 = 60 s) waiting
+    for the by-path symlink to appear. Nested that is 8 x 60 s = 480 s
+    per alloc, which under 3-node concurrent load routinely burned
+    the pveproxy 60 s window on VM_add-disk PUTs and left VM-config
+    locks held past the test-framework 180 s ceiling (test class A
+    cascades from cluster_test_run 2026-08-17). _device_for_lun now
+    accepts an optional max_retries_override, and the deferred alloc
+    path passes 1 so the inner call collapses to a single check --
+    the outer 250 ms retry loop is the actual retry budget for this
+    best-effort path, and activate_volume remains the authoritative
+    60 s wait when the VM starts. Non-deferred callers (path,
+    activate_volume, snapshot device activation) still get the full
+    default timeout.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha8) unstable; urgency=medium
+
+  * Fix retry classifier false-positive that turned every benign
+    "dataset already exists" collision into a 3x retry storm under
+    cluster load (cluster_test_run 2026-08-17 3-node runs, VM 179).
+    Two related changes:
+
+    - _is_connection_error: dropped the /WebSocket.*closed/ alternative.
+      middlewared's JSON-RPC error payload embeds Python object reprs
+      like `RpcWebSocketApp object at 0x...` and later `EventLoop ...
+      closed=False`; the wildcard between them matched the class name
+      to the closed=False attribute even when the underlying error was
+      a plain ZFS collision. The WS-specific broker patterns (WS read,
+      WS write, WS len, WS payload) plus the generic timeout / reset /
+      connection-refused alternatives already cover every real
+      WS-close failure our broker or upstream emits.
+
+    - _is_retryable_error: added an explicit early return-0 for
+      /dataset already exists|EZFS_EXISTS|zfs_create.*failed/i, gated
+      before the connection-error check so a false-positive there
+      cannot resurface. alloc_image already has an auto-increment
+      recovery for the "already exists" case; without this the
+      retry_with_backoff loop was firing 3 times per collision before
+      it ever reached that recovery, burning seconds on the shared
+      cluster storage lock and pushing concurrent alloc requests past
+      the pveproxy 60 s / test-framework 180 s ceilings.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 14:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha7) unstable; urgency=medium
+
+  * Narrow-query the iSCSI extent / targetextent hot paths so alloc,
+    free, and clone stop paying the full-list cost per operation.
+    The previous _tn_extents / _tn_targetextents helpers pulled every
+    row on the array back over the wire and cache-invalidated on every
+    mutation, so under 3-node concurrent alloc load the cache stayed
+    cold and each op serialized 100+ rows just to find or check for
+    one. cluster_test_run 2026-08-14 3-node runs surfaced this as
+    io_integrity, disk_thin_discard, vm_disk_buses, and
+    vm_additional_disk_vtpm hitting the pveproxy 60 s / test-framework
+    180 s ceilings while queued behind cluster_lock_storage on the
+    other nodes' allocs. New narrow helpers push the filter to
+    middlewared using TN's query-filter syntax so the response carries
+    only the row(s) actually being asked for:
+
+      _tn_extent_query_by_disk         [[["disk","=",zvol_path]]]
+      _tn_extent_query_by_name         [[["name","=",extent_name]]]
+      _tn_targetextent_query_by_target_extent
+                                       [[["target","=",tid],["extent","=",eid]]]
+      _tn_targetextent_query_by_extent [[["extent","=",eid]]]
+
+    Callsites updated in the alloc/free/clone/base-rename flows:
+    _resolve_extent_by_disk, _tn_extent_create Fix B recovery,
+    _tn_targetextent_create existence + stale-cache recheck,
+    _current_lun_for_zname, _alloc_image_iscsi (reuse + Fix B + LUN
+    fallback), _free_image_iscsi (main + retry paths + active-LUN
+    count), _clone_image_iscsi (all three), _teardown_snapshot_device,
+    create_base extent rewire. Read-only inspection paths (pre-flight
+    weight-extent check, bulk processor) still use the full-list
+    cached readers -- they run once per storage-add, not per-VM.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 17 Aug 2026 13:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha6) unstable; urgency=medium
+
+  * Auto-heal empty iSCSI node-record files at the start of
+    _login_target_all_portals. Pre-alpha4 test runs left zero-byte
+    /var/lib/iscsi/nodes/<iqn>/<portal>,3260,<tpgt>/default files
+    behind (from the -o delete vs -o new race that ~alpha4 stopped
+    creating), and `iscsiadm -o new` treats an empty file as an
+    existing record and refuses to overwrite it -- so every
+    subsequent --login returns "iscsiadm: No records found" and the
+    caller busy-loops in PVE's iscsi_login retry harness for minutes.
+    New _iscsi_repair_empty_node_records() unlinks the zero-byte
+    files (and their empty parent directories) before the -o new
+    call so the record gets recreated cleanly. Logs a syslog warning
+    listing what it removed so operators can trace the historical
+    corruption. ~alpha4 stopped fresh corruption; this heals existing
+    corruption in-place so nodes upgraded from pre-alpha4 don't
+    require manual /var/lib/iscsi/nodes cleanup.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 14 Aug 2026 19:30:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha5) unstable; urgency=medium
+
+  * Bump broker Unix-socket round-trip deadline default from 30 s to
+    60 s and expose it as the tn_broker_timeout schema key with a
+    range of 5-300 s (was undocumented). test_run6/truenas-2026-08-13
+    3-node runs and 2026-08-14 local rerun both showed pveproxy
+    returning 596 to the test harness on vm_additional_disk_vtpm's
+    scsi1 alloc, because concurrent qmcreate/qmclone/qmdestroy tests
+    piled up behind cluster_lock_storage and individual broker RPCs
+    (pool.dataset.get_instance, iscsi.extent.query) crossed the 30 s
+    deadline. 30 s was aligned with the per-WS-frame envelope; the
+    broker deadline covers the whole queue-plus-round-trip and needs
+    headroom above that. Also raised the status() path's
+    _tn_dataset_get retry_max from 0 to 2 so a single broker
+    timeout under transient TN slowness no longer flaps the storage
+    to inactive (the status-capacity cache still keeps pvestatd
+    from re-hitting the API every poll).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 14 Aug 2026 19:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha4) unstable; urgency=medium
+
+  * Stop deleting iSCSI node records during free_image (test_run6/
+    2026-08-14 3-node cluster runs hung with every subsequent qmcreate
+    stuck in "iscsi session rescan: No session found" retry loops).
+    _logout_target_all_portals was calling `iscsiadm -m node -o delete`
+    after `--logout`, which removes the node record file at
+    /var/lib/iscsi/nodes/<iqn>/<portal>/default. Under concurrent test
+    load a peer's later `-o new` raced this delete and left empty node
+    record files, so subsequent logins failed with "No records found"
+    for the entire cluster's TrueNAS access. Session logout alone is
+    sufficient for the retry-extent-delete purpose; the node record
+    persists across logouts and lets subsequent activate_volume /
+    _login_target_all_portals reconnect cleanly.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 14 Aug 2026 18:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha3) unstable; urgency=medium
+
+  * Hoist pool.dataset.delete out of the synchronous free_image path via
+    the PVE cleanup_worker fork (test_run6/truenas-2026-08-13 run-37
+    vm_disk_buses.pl hit the test-framework's 180 s hard limit under
+    cluster load; each qm destroy was blocking 20-50 s on TN dataset-
+    delete while other nodes still held the extent's underlying zvol).
+    _free_image_iscsi and _free_image_nvme now return a coderef that
+    PVE::Storage::vdisk_free forks as an 'imgdel' UPID task AFTER
+    releasing the cfs storage lock, so qm destroy returns as soon as
+    the extent/namespace and target-extent mapping are gone. The
+    zvol delete then runs in parallel; if the next alloc arrives
+    before it completes, the plugin's existing dataset-already-exists
+    auto-increment handles the residual.
+  * Tighten three cleanup-path timeouts. All are safe defaults, still
+    bounded by retries for legitimate slow TN cases:
+      DEVICE_CLEANUP_VERIFY_TIMEOUT_S : 5 -> 2 (device disconnect
+        polling; normal path completes ~200 ms).
+      DATASET_DELETE_TIMEOUT_S        : 30 -> 15 (per-attempt wait
+        for pool.dataset.delete job completion; retries still cover
+        genuinely slow TN).
+    Combined with the cleanup_worker change these get the sync
+    portion of free_image back to sub-15 s in the common case.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 14 Aug 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha2) unstable; urgency=medium
+
+  * Fix B (name-conflict recovery) now looks up by extent NAME instead
+    of by disk path (test_run6/truenas-2026-08-13 cluster runs still
+    hit "iscsi_extent_create.name: Extent name must be unique" despite
+    ~alpha1's Fix B). The plugin knows the exact deterministic name it
+    submitted; a name lookup is more direct than the by-disk-path grep
+    was, and it works even if TN stored the disk field in a form that
+    doesn't exact-match what the plugin computes. Reuse only when the
+    matched extent's disk field equals the target zvol path; when it
+    does NOT match (an unknown extent occupies our hash slot), log the
+    actual disk field at level 0 ('err') so operators see it without
+    needing tn_debug=2. Same treatment applied in _alloc_image_iscsi,
+    _clone_image_iscsi, and _tn_extent_create.
+  * Bump tn_device_ready_retries default from 200 (~20 s) to 600
+    (~60 s). Max R. Carrara's (Proxmox) test_run6 single-node iSCSI
+    runs saw the target LUN device appear via the kernel scsi scan
+    ~30 s after our previous 20 s timeout gave up, causing
+    activate_volume to fail with "Could not locate by-path device for
+    LUN N (retries 200)" and cascading VM starts. 60 s covers observed
+    latency with headroom. Maximum bumped from 600 to 1200 to keep
+    it a valid override.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 13 Aug 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.1.23~alpha1) unstable; urgency=medium
+
+  * Idempotent iSCSI extent + NVMe namespace create in alloc_image
+    (Fix 1). _alloc_image_iscsi and _alloc_image_nvme now check whether
+    an extent / namespace already targets the same zvol path and reuse
+    its id instead of colliding on the deterministic
+    _generate_extent_name hash. Mirrors the reuse pattern the clone
+    paths already had.
+  * Post-hoc reuse on iSCSI extent name-conflict (Fix B, on top of Fix
+    1). New classifier _is_extent_name_conflict_error matches the TN
+    uniqueness rejection ("iscsi_extent_create.name: Extent name must
+    be unique"). At three iSCSI create sites -- alloc_image,
+    clone_image, and the _tn_extent_create helper used by the
+    snapshot-expose path -- if the create returns that specific error,
+    query iscsi.extent.query by disk path and reuse the extent id if a
+    match is found. Catches two failure modes Fix 1's up-front check
+    cannot handle: (1) a concurrent path that committed the same
+    extent between our pre-check and our create call, and (2) an
+    _api_call_mutate retry that fired on a connection failure whose
+    first attempt actually committed server-side (the retry then sees
+    "name must be unique" from its own prior commit). NVMe/TCP does
+    not need Fix B: TN's nvmet uniqueness is per-NSID (server-
+    assigned), not on device_path, so the analogous self-race does not
+    manifest as a "must be unique" error.
+  * Serialize volume_snapshot, volume_snapshot_delete, and
+    volume_snapshot_rollback via $class->cluster_lock_storage. PVE
+    core's Storage.pm wraps vdisk_alloc / vdisk_free / vdisk_clone /
+    vdisk_create_base in cluster_lock_storage (Storage.pm:1090, 1113,
+    1170, 1198) but dispatches the three snapshot methods directly
+    (Storage.pm:428, 443, 459). Two cluster nodes calling qm snapshot
+    on the same volume otherwise raced on the TN pool.snapshot.create
+    call, and rollback especially is dangerous unlocked because
+    recursive=1 destroys newer snapshots as a side effect. Closes the
+    fork()-or-similar-circumventing-locks gap Max R. Carrara (Proxmox)
+    flagged in the 2026-08-06 cluster-test writeup.
+  * Tests: t/rate-limit/11-alloc-extent-namespace-reuse.t seeds the
+    extent-orphan-past-zvol-delete scenario and verifies TN cascade-
+    deletes the extent (regression check on the TN behavior our fix
+    assumptions depend on). t/rate-limit/12-fix-b-extent-name-conflict.t
+    runs a two-tier verification of Fix B: classifier unit tests (no
+    TN needed) plus a real-TN uniqueness rejection + recovery lookup.
+  * Whether these fixes actually resolve the "Extent name must be
+    unique" cascade Max observed in test_run5/truenas-2026-08-06 is
+    unproven at ship time; his default tn_debug=0 level gates the
+    retry log lines that would otherwise confirm or deny the
+    _api_call_mutate self-retry theory. All three fixes ship as
+    tolerance / defense-in-depth regardless.
+  * An earlier iteration wrapped alloc_image / free_image /
+    clone_image / create_base themselves in cluster_lock_storage;
+    reverted after PVE core proved to already wrap them and
+    cfs_lock_storage is not re-entrant (the inner wrap deadlocked
+    every mutation with a 15 s "got lock request timeout"). The
+    current release only wraps the three snapshot methods.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 07 Aug 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.1.22+deb1) unstable; urgency=high
+
+  * Fix pool.dataset.create crash on TrueNAS 25.10.4 (#58, #65, #78).
+    Both create call sites (_tn_dataset_create and alloc_image's inline
+    payload) omitted six optional fields: volblocksize (when
+    tn_zvol_blocksize was unset), snapdev, reservation, refreservation,
+    special_small_block_size, force_size. TrueNAS 25.10.4's legacy API
+    shim leaves omitted optional fields as unresolved _NotRequired
+    sentinel objects instead of real defaults, which crashes
+    pool.dataset.create both during validation (dataset.py's
+    __common_validation and do_create) and, even when validation
+    passes, during audit-log JSON serialization afterward - the latter
+    masks a create that actually succeeded server-side, leaving an
+    orphaned zvol while Proxmox reports total failure. All six fields
+    are now sent explicitly at both call sites. special_small_block_size
+    is set to 'INHERIT' specifically: 0 fails a ZFS-level check ("does
+    not apply to datasets of this type"), null fails the Pydantic
+    schema check, INHERIT satisfies both, consistent with how every
+    other inheritable property in the payload is already handled.
+  * Fix tainted volsize/size values causing full clone and move-disk
+    to fail under Perl taint mode (#71). _normalize_value, the
+    common helper used to pull byte-count fields (volsize,
+    volblocksize, available, quota, written, used) out of TrueNAS
+    API responses, passed the decoded JSON scalar straight through
+    without untainting it. Every value decoded from a WebSocket/
+    broker socket read is tainted under Perl's -T mode, which
+    pveproxy/pvedaemon run under. When PVE core called
+    volume_size_info during a full clone or move-disk to a
+    non-TrueNAS storage (NFS, dir, LVM, etc.) and interpolated the
+    tainted size into the qemu-img create argv, the operation died
+    with "Insecure dependency in exec while running with -T switch".
+    _normalize_value now untaints the value via regex capture and
+    dies loudly if a value is ever non-numeric, instead of silently
+    forwarding a tainted or malformed scalar.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 21 Jul 2026 00:00:00 +0000
+truenas-proxmox-plugin (2.1.21~alpha2) unstable; urgency=medium
+
+  * Untaint TrueNAS API scalars in _normalize_value (fixes disk-migration
+    regression seen in test_run5/truenas-2026-07-22, "Insecure dependency
+    in exec while running with -T switch at IPC/Open3.pm line 176"). Ports
+    the fix from #71 that never landed on the alpha lineage. Every value
+    decoded from a WS/broker read is tainted under -T, so volsize would
+    flow tainted into qemu-img create argv during any move-disk to a
+    non-TrueNAS target. Untaint via regex capture in the single funnel
+    point; die on non-numeric input instead of silently forwarding.
+  * Retry iscsi.extent.create and nvmet.namespace.create on the specific
+    zvol-not-ready validator errors (fixes the 1/20 linked-clone failure
+    in test_run5). pool.snapshot.clone / pool.dataset.create returns as
+    soon as ZFS is done, but TN validates the create call by stat'ing
+    /dev/zvol/<ds>, and udev may still be materializing the symlink.
+    New narrow classifier _is_zvol_not_ready_error matches only the two
+    validator strings so genuinely bad paths still fail immediately. Up
+    to 15 x 200 ms wait applied at every live create site: _tn_extent_create,
+    alloc_image (iSCSI + NVMe), _expose_snapshot_device NVMe, and both
+    _clone_image_* paths.
+  * Broker URL construction correctness: mirror TrueNASPlugin.pm's scheme
+    normalization (https -> wss, http -> ws) and honor prefer_ipv4 via a
+    new _host_ipv4 helper. Prior broker took api_scheme raw, so a config
+    with tn_api_scheme=https would silently fall through to plain TCP and
+    the WS handshake would 400; and although the wire schema always
+    listed prefer_ipv4 the broker never read it, so the OS resolver could
+    pick AAAA on a dual-stack TN even after the plugin resolved A.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 23 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.21~alpha1) unstable; urgency=medium
+
+  * Make truenas-plugin-broker mandatory (fixes rate-limit cascade seen in
+    test_run4/truenas-2026-07-{13..15}). Direct-WS fallback re-authenticated
+    in every forked PVE process and reliably tripped the TrueNAS middlewared
+    login rate limiter, cascading into pre-flight failures across snapshot,
+    resize, clone, additional-disk, and backup paths. _ws_get_persistent now
+    refuses to open a direct WS when /run/truenas-plugin/broker.sock is
+    absent, dying with a message that points at the .deb install and the
+    truenas-plugin-broker.service unit. Escape hatch:
+    TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1 in the environment for dev use.
+    postinst now waits up to 5 s for the broker socket after starting the
+    service and prints a diagnostic if it never appears — the previous
+    silent fallback let bad copies (cp TrueNASPlugin.pm without dpkg -i)
+    look healthy until the first heavy test load.
+  * Preserve real error message in alloc_image and clone_image failure
+    paths (6 sites in create-extent / target-extent-mapping / namespace-
+    create for both iSCSI and NVMe-oF). The cleanup eval that follows a
+    failed create call clobbered $@ before the outer die, so operators
+    saw "Failed to create iSCSI extent for clone: " with an empty tail
+    (see test_run4/truenas-2026-07-13/run-01 template/linked-clone
+    failures). Capture the create error into a lexical before the
+    cleanup so the die carries the underlying diagnostic (e.g. the
+    duplicate-extent-name or EBUSY that actually caused the failure).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 20 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.20+deb1) unstable; urgency=medium
+
+  * Fix installer health check auth false positive (#57 bug 1): inline-Perl
+    $scfg builders used bare (unprefixed) keys, so tn_api_host/tn_api_key
+    were never seen and health checks always reported "Authentication
+    failed" regardless of key validity. Now use tn_-prefixed keys.
+  * Fix installer hostname rejection (#57 bug 2): storage wizard only
+    accepted a bare IP for the TrueNAS host. Added validate_host() to
+    accept a hostname/FQDN too, matching what tn_api_host already accepts.
+  * Fix unbound variable crash when editing existing storage (#57 bug 3):
+    menu_edit_storage read bare-named fields (e.g. config_values[dataset])
+    from a config_values array populated with tn_-prefixed keys, crashing
+    under set -u. Loader now strips the tn_ prefix on load; a leftover
+    config_values[tn_sparse] read was corrected to config_values[sparse].
+  * Installer diagnostic calls always disabled TLS certificate verification
+    (community PR #63 follow-up): once bug 1 above fixed the tn_-prefixed
+    $scfg keys, the hardcoded tn_api_insecure => 1 became a real, always-on
+    TLS bypass regardless of a storage's configured tn_api_insecure. A
+    TN_API_INSECURE global (mirroring TN_API_PORT) now threads the
+    configured value through menu_cleanup_orphans, detect_orphaned_resources,
+    and run_health_check.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.19+deb1) unstable; urgency=medium
+
+  * Restrict the relaxed :identifier suffix to host NQNs only (#44
+    follow-up). _nvme_untaint_cli_nqn is shared by both host and
+    subsystem NQN validation; making the suffix optional also silently
+    accepted suffix-less subsystem NQNs, which the NVMe-oF spec still
+    mandates. New require_identifier flag defaults to required; only
+    the host-NQN call site opts out.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.18+deb1) unstable; urgency=medium
+
+  * Relax NVMe host NQN validation to accept NQNs without :identifier
+    suffix (#44). Per NVMe-oF spec the :identifier segment is mandatory
+    for subsystem NQNs but optional for host NQNs. The Linux kernel
+    generates host NQNs as nqn.YYYY-MM.tld.domain with no further suffix;
+    the previous regex rejected them with "Invalid NVMe host NQN", making
+    NVMe-TCP completely non-functional for affected hosts. Fix makes the
+    :identifier block optional in _nvme_untaint_cli_nqn; malformed NQNs
+    and shell metacharacters are still rejected.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 03 Jul 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.17+deb1) unstable; urgency=high
+
+  * Template / linked-clone support (plan C). Implements the PVE
+    template lifecycle end-to-end for both iSCSI and NVMe-TCP:
+      - parse_volname recognizes base-<vmid>-disk-N and the
+        slash-encoded "<base_volid>/<clone_volid>" form used by
+        linked clones.
+      - create_base renames vm-<vmid>-disk-N to base-<vmid>-disk-N
+        (pool.dataset.rename force=true), rewires the transport
+        share to the new zvol path, and snapshots the base as
+        @__base__. The iSCSI extent's naa and the NVMe namespace's
+        device_uuid/nguid stay stable across the rewire, so PVE's
+        /dev/disk/by-id and /dev/disk/by-path entries do not change.
+      - clone_image defaults snapname to __base__ when the source
+        is a base image, and both _clone_image_iscsi and
+        _clone_image_nvme now return the slash-encoded volname so
+        PVE records the parent relationship in the clone VM config.
+      - volume_has_feature advertises clone => {snap,base} and
+        template => {current}; the misleading clone => {current}
+        (which caused "clone not supported without snapshot") is
+        removed.
+      - free_image refuses to destroy a base while any linked clone
+        still derives from its @__base__ snapshot. The check queries
+        pool.dataset.query filtered by origin.parsed (TN's
+        pool.snapshot.query does not surface the ZFS `clones`
+        property in this release).
+
+  * NVMe create_base ordering fix. TN validates the current
+    device_path on every namespace.update, including {enabled:false}.
+    Renaming first invalidated the path and blocked the disable;
+    disabling first while the old path is still valid succeeds.
+    New order: disable → rename → rewire → re-enable, with
+    symmetric rollback paths that re-enable the namespace on failure.
+
+  * volume_rollback_is_possible: implement to refuse rollback to a
+    non-latest snapshot, matching ZFSPoolPlugin semantics. Previously
+    volume_snapshot_rollback silently destroyed newer snapshots via
+    recursive=1 (required by TN 25.10 rollback semantics), which
+    tripped disk_snapshot.pl test 9 ("snap1 and snap2 still present
+    after rollback"). PVE now blocks the request at the ORM layer.
+
+  * disk_purge.pl test 9 fix. After a purge, a different pvedaemon
+    worker's stale mapping cache still lists the vanished volume.
+    Two-part fix: clear the mapping cache on the purging worker
+    after delete, and in _list_images_iscsi treat the fresh
+    pool.dataset.query result as ground truth — skip any
+    targetextent mapping whose backing zvol no longer exists.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 29 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.16+deb1) unstable; urgency=high
+
+  * Critical fix in _iscsi_rescan_sd_capacity: was reading
+    $scfg->{target_iqn} instead of $scfg->{tn_target_iqn}. On this
+    branch the storage.cfg key is tn_target_iqn (the tn_ rename
+    landed in v2.1.0); the bare name returns undef, so the helper
+    fell through "return unless length $iqn" and did nothing. Every
+    call site wired into alloc_image / _clone_image_iscsi /
+    activate_volume since v2.1.14 has been hitting a no-op.
+    Multi-disk full clone failures with "qemu-img: output file is
+    smaller than input file" continued in v2.1.15 because the
+    intended SCSI READ CAPACITY rescan never ran on the recycled
+    sdX. Single-character fix.
+    Introduced by my cherry-pick of e9e8441 onto this branch: the
+    call-site conflicts were resolved to use tn_use_multipath but
+    the same rename inside the helper body was missed.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 26 Jun 2026 14:00:00 +0000
+
+truenas-proxmox-plugin (2.1.15+deb1) unstable; urgency=high
+
+  * Critical fix to _is_connection_error: remove the /x regex flag that
+    silently turned every multi-word alternative in the connection-error
+    pattern into a no-match. With /x, "broken pipe" compiles to
+    "brokenpipe", "WS read" to "WSread", "connection reset" to
+    "connectionreset", etc. None of the real-world errors matched, so:
+    - _api_call did NOT invalidate stale persistent WS connections on
+      framing/EPIPE failures
+    - _is_retryable_error returned 0 for connection errors, so the
+      retry-with-backoff path never fired
+    - storage status mis-marked transient connectivity as
+      non-recoverable
+    Cascade: when the persistent WS goes stale, the next preflight
+    sequence (core.ping + service.query + dataset.get + ...) all
+    inherited the broken cached connection. Each sub-check failed with
+    "WS write failed: Broken pipe" or "WS read hdr failed" and the
+    plugin gave up without ever reconnecting.
+    The /x flag was introduced by fe06ea1 ("fix: classify WS framing
+    errors as connection errors for reconnect"); fix is to drop /x and
+    keep the pattern on one logical line. Also adds "WS write" to the
+    alternation so write-side failures classify the same way.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 26 Jun 2026 11:00:00 +0000
+
+truenas-proxmox-plugin (2.1.14+deb1) unstable; urgency=medium
+
+  * Force SCSI READ CAPACITY on iSCSI sdX devices when LUN numbers are
+    recycled. When an iSCSI extent is deleted and a new extent reuses
+    the same lunid, the kernel retains the same sdX block device with
+    the OLD (smaller) capacity. iscsiadm -m session -R discovers new
+    LUNs but does not refresh capacity on existing sdX entries. qemu-img
+    convert during a multi-disk full clone then sees a destination
+    smaller than the source and aborts with "output file is smaller
+    than input file". New _iscsi_rescan_sd_capacity helper writes 1 to
+    /sys/block/sdX/device/rescan for every iSCSI-backed sdX in the
+    plugin's target_iqn session. Wired into alloc_image's deferred
+    block, _clone_image_iscsi's deferred block, and activate_volume.
+    Cheap, idempotent. Cherry-picked from broker-service e9e8441.
+  * Add --start N / --stop M flags to the dev-truenas-plugin-full-
+    function-test.sh runner and a diagnostic dump on multi-disk clone
+    failure (by-path symlinks, base+clone VM config, blockdev sizes per
+    proxmox-lun-*, TN iscsi.extent.query). Optional KEEP_ON_CLONE_FAIL=1
+    leaves state for inspection. Cherry-picked from broker-service
+    50414b8.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 25 Jun 2026 12:30:00 +0000
+
+truenas-proxmox-plugin (2.1.13+deb1) unstable; urgency=low
+
+  * Drop the interactive Auto-migrate/Skip prompt from postinst. lintian
+    flagged the `read -r answer </dev/tty` call as
+    `read-in-maintainer-script` (Debian Policy 6.3 forbids interactive
+    prompts in maintainer scripts; the official channel is debconf).
+    Postinst now always auto-migrates with a timestamped backup; operators
+    who want to opt out can restore <STORAGE_CFG>.bak.<ts> by hand. No
+    behaviour change in non-interactive installs (which already
+    auto-migrated). This unblocks the GitHub Actions build job, which
+    fails the lintian step on errors.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 24 Jun 2026 09:00:00 +0000
+
+truenas-proxmox-plugin (2.1.12+deb1) unstable; urgency=low
+
+  * Add t/rate-limit/08-concurrent-alloc.t. Drives N (default 10)
+    concurrent qm-create-with-disk operations from independent forked
+    PVE-side processes, then verifies all succeed, every child
+    completed within a per-child wall-clock budget (default 120s), and
+    total upstream auth.login_with_api_key count stays at <=1. The
+    earlier concurrent test (07) only used cheap read RPCs; this one
+    drives the full alloc path (pool.dataset.create +
+    iscsi.extent.create + iscsi.targetextent.create + PVE-side iSCSI
+    login/multipath/udev). Tunable via RL_CONCURRENT_N and
+    RL_CONCURRENT_BUDGET env vars. No code changes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 13:00:00 +0000
+
+truenas-proxmox-plugin (2.1.11+deb1) unstable; urgency=medium
+
+  * _broker_rpc now has a deadline-bounded round trip. Without this a
+    wedged broker (stuck upstream WS, lost middlewared, hung systemd
+    unit) blocked every PVE operation indefinitely because sysread on
+    the Unix socket would never return. Per-call timeout is governed by
+    tn_broker_timeout (seconds, default 30) and applies to the entire
+    round trip, not per sysread, so a slow-but-progressing TN response
+    won't trip it. IO::Select's can_write/can_read with remaining time
+    is used between every syscall; on timeout we die with a clear
+    "broker: read|write timeout after Ns" message that bubbles through
+    the normal error path.
+  * Add t/rate-limit/06-broker-restart.t and
+    t/rate-limit/07-concurrent-broker.t to the regression suite to
+    exercise (a) plugin recovery after the broker is restarted out
+    from under it and (b) broker behaviour under concurrent
+    in-process load (5 forked children x 4 calls each, asserting <=1
+    upstream auth across the whole burst).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 12:30:00 +0000
+
+truenas-proxmox-plugin (2.1.10+deb1) unstable; urgency=low
+
+  * truenas-plugin-broker: when a request is rejected for missing
+    api_host/api_key, log the actual incoming shape - decoded scfg
+    field values (api_host literal; api_key redacted to length only),
+    method name, full list of scfg keys present, top-level request
+    keys, and the raw request line truncated to 600 bytes with any
+    "api_key":"..." pattern redacted. Helped diagnose a wrapper test
+    that was sending {api_host:null, api_key:null} scfg envelopes;
+    keep it in place for future debugging.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.9+deb1) unstable; urgency=medium
+
+  * Fix snapshot rollback when intermediate snapshots exist. PVE's qm
+    rollback contract is to revert the disk to the target snapshot and
+    discard anything taken after. Plugin was passing recursive=0 to TN's
+    pool.snapshot.rollback, so any intermediate snapshot on the same
+    dataset blocked the rollback with TN 25.10's wrapped FileExistsError:
+      "Cannot rollback: more recent snapshots exist. Use recursive=True
+      to destroy them. [Errno 17] Failed to rollback ... File exists"
+    Two changes: volume_snapshot_rollback now passes recursive=1; the
+    _tn_snapshot_rollback fallback regex also matches the TN 25.10
+    wording (was matching only the old libzfs message). Verified against
+    TN 25.10 snapshot_rollback_impl.py: recursive=True triggers
+    _destroy_newer_snapshots on the target dataset and does not touch
+    clones (recursive_clones=False) or child datasets
+    (recursive_rollback=False). Matches PVE::Storage::ZFSPoolPlugin
+    semantics (which calls `zfs rollback -r`).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:30:00 +0000
+
+truenas-proxmox-plugin (2.1.8+deb1) unstable; urgency=medium
+
+  * Rename ZFS snapshot API calls from zfs.snapshot.* to pool.snapshot.*
+    to match TrueNAS 25.10 middleware. The legacy zfs.snapshot namespace
+    was removed in 25.10 and returns -32601 "Method does not exist",
+    breaking qm snapshot / qm rollback / volume_snapshot_delete /
+    bulk snapshot delete. Affects: pool.snapshot.query,
+    pool.snapshot.create, pool.snapshot.delete, pool.snapshot.clone,
+    pool.snapshot.rollback. Same fix already shipped on broker-service
+    via 35281fb; this commit ports it to fix/rate-limit-connection-reuse.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 23 Jun 2026 11:00:00 +0000
+
+truenas-proxmox-plugin (2.1.7+deb1) unstable; urgency=medium
+
+  * truenas-plugin-broker: log every error response (lwarn). Before this
+    change the daemon only logged WS lifecycle events (opened / reaping /
+    startup / shutdown) and was silent when upstream RPCs failed. After
+    a broker restart, the first upstream auth.login_with_api_key can be
+    rejected by TN's per-IP rate limiter from prior activity, and the
+    failure was invisible in the journal. Now broker logs bad request
+    JSON, missing scfg fields, no-method requests, upstream RPC
+    exceptions (including the dead-pool cleanup), no-response-from-
+    upstream conditions, and structured JSON-RPC errors returned by TN
+    (e.g. EBUSY / Rate Limit Exceeded). No behaviour change beyond logs.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.1.6+deb1) unstable; urgency=medium
+
+  * Add node-local session broker daemon (truenas-plugin-broker) that holds
+    one authenticated WebSocket per (host, api_key) pair and proxies
+    JSON-RPC for every plugin invocation via /run/truenas-plugin/broker.sock.
+    Eliminates per-process re-authentication from forked qm, pvesh and
+    pveproxy workers (D2). When the broker socket is absent the plugin
+    falls back to the existing per-process persistent WebSocket path with
+    no behavioural change.
+  * Ship truenas-plugin-broker.service systemd unit, enabled and started
+    by postinst before pvedaemon/pveproxy/pvestatd restart.
+  * Map this branch's tn_*-prefixed scfg keys to the broker daemon's
+    stable api_* wire format inside the plugin client so the broker
+    binary serves both this branch and the legacy api_*-keyed branch
+    without modification.
+  * See wiki/D2-per-process-reauth.md for design notes.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 22 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.5+deb1) unstable; urgency=low
+
+  * Classify WS framing errors (WS read/len/payload) as connection errors so
+    stale persistent connections are invalidated and reopened by the existing
+    retry path instead of failing permanently.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 16 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.4+deb1) unstable; urgency=low
+
+  * Remove proactive core.ping health check from _ws_get_persistent; dead
+    connections are detected reactively in _api_call's existing error path.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sun, 15 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.3+deb1) unstable; urgency=medium
+
+  * Reuse the fork-safe persistent WebSocket connection for mutations and
+    snapshot rollbacks, reducing authentication sessions under burst load.
+  * Stop retrying TrueNAS rate-limit responses inside the 60-second lockout
+    window.
+  * Report failed pre-flight target queries separately from confirmed target
+    absence.
+  * Remove obsolete ephemeral WebSocket helpers and duplicate API call paths.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 13 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.2+deb1) unstable; urgency=medium
+
+  * Implement LXC vzdump snapshot mode support (issue #42): activate_volume,
+    path, and deactivate_volume previously ignored the snapshot name and
+    returned the live block device, failing snapshot-mode backups. The plugin
+    now clones <zvol>@<snapname> into an ephemeral zvol and exposes it as its
+    own iSCSI LUN / NVMe-TCP namespace, tearing it down in
+    volume_snapshot_delete (and deactivate_volume as a fallback).
+  * Fix NVMe namespace lookup using the wrong query field: nvmet.namespace.query
+    nests the subsystem under subsys.id (subsys_id is create-only input).
+    Namespace lookups now query by the unique device_path; the namespace
+    counter in _free_image_nvme filters by subsys.id.
+  * Filter ephemeral vzdump-* snapshot clones from list_images to avoid
+    phantom vmid 0 volumes during backups.
+  * Fix NVMe/TCP connect failure when CPUs are offlined (issue #48): pass
+    --nr-io-queues to nvme connect to avoid kernel queue-to-CPU mapping
+    failures (EXDEV/-18) when CPU topology has gaps. Uses online CPU count
+    when all CPUs are online; floor(possible/2) when any CPU is offline.
+    Adds optional tn_nr_io_queues storage.cfg key (1-256) for manual override.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 06 Jun 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.1+deb1) unstable; urgency=medium
+
+  * Bump storage API version to 14 to match libpve-storage-perl 9.1.3+
+    (Proxmox VE 9.2+); eliminates "implementing an older storage API" warning
+    on every plugin load (issue #41).
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 29 May 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.1.0+deb1) unstable; urgency=medium
+
+  * Rename all storage.cfg option keys to tn_* prefix to avoid namespace
+    collisions with other PVE storage plugins; postinst migration script
+    handles existing configs automatically (with backup) or prompts for
+    manual migration when upgrading from versions prior to 2.1.0.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 07 May 2026 15:00:00 +0000
+
+truenas-proxmox-plugin (2.0.30+deb1) unstable; urgency=medium
+
+  * Reduce status latency and preserve operation-path safety (issue #30 phase 3):
+    add short-TTL storage-scoped status capacity cache, status-only bounded
+    retry override (retry_max=0), and conservative 60s preflight skip throttle
+    keyed by host+target identity
+  * Harden cache correctness after writes: invalidate status-capacity cache on
+    successful dataset create/update/delete/clone paths (helper and direct
+    callsites), and invalidate immediately on status read failure while keeping
+    inactive+zeroed status semantics
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 18 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.29+deb1) unstable; urgency=medium
+
+  * Reduce activate_storage latency (issue #30 phase 2): add 30s preflight
+    throttle, cache iscsi.target.query, eliminate unconditional extent
+    cache invalidation on happy path
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 16 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.28+deb1) unstable; urgency=medium
+
+  * Fix storage status/summary load latency (issue #30): skip discovery
+    probe in activate_storage path while retaining full verification in
+    deferred self-healing
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 16 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.27+deb1) unstable; urgency=medium
+
+  * Fix host-scoped cache key mismatches in preflight/target-id/NVMe portal
+    paths: use _cache_host_key consistently so targeted invalidation works
+    when api_host is unset
+  * Fix over-broad portal sync cache invalidation: clear portal-sync timestamp
+    only for the targeted host key on _clear_cache(storage_id)
+  * Refactor duplicated FK stale-extent recovery in _ensure_target_visible by
+    extracting shared _handle_fk_stale_extent helper
+  * Fix VM migration size mismatch (issue #25): alloc_image now steps
+    volblocksize down by powers of two to preserve exact requested bytes
+    instead of rounding zvol size upward
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sun, 13 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.26+deb1) unstable; urgency=medium
+
+  * Fix duplicate weight zvol creation when upgrading from pre-v2.0.20: step 2
+    of _ensure_target_visible now checks for legacy-named zvol and reuses it
+    instead of creating a new hash-named duplicate (GitHub issue #27 follow-up)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.25+deb1) unstable; urgency=low
+
+  * Code quality: Extract _cache_host_key and _invalidate_cache_key helpers
+  * Code quality: Use _api_call_write for extent creation (ephemeral connection)
+  * Code quality: Rename $stale_delete_ok to $stale_cleared
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.24+deb1) unstable; urgency=medium
+
+  * Fix FK/IntegrityError causing unnecessary 3 retries before failing: check
+    database integrity patterns before connection patterns in _is_retryable_error
+    to prevent Python traceback paths like "connection.py" false-matching
+  * Fix weight extent FK constraint failure not cleaning TrueNAS state: attempt
+    to delete stale extent on FK failure to force configfs/DB resync instead of
+    only clearing plugin cache (which left TrueNAS in inconsistent state)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.23+deb1) unstable; urgency=medium
+
+  * Fix extent delete in alloc/clone cleanup paths using read-path WebSocket
+    connection: _api_call replaced with _api_call_write for iscsi.extent.delete
+    in _alloc_image_iscsi and _clone_image_iscsi cleanup branches so failure is
+    not silently swallowed on persistent-connection setups
+  * Fix clone retry loop exhausting budget on warm dataset cache: invalidate
+    cache before _find_free_disk_name in retry branch of _clone_image_iscsi
+    and _clone_image_nvme so a fresh name is always resolved on collision
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 11 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.22+deb1) unstable; urgency=medium
+
+  * Fix orphaned zvol/extent in _alloc_image_iscsi: wrap extent.create and
+    targetextent.create in eval with cascading cleanup; replace bare _api_call
+    with _tn_targetextent_create for concurrent-node race recovery (C1)
+  * Fix silent zvol leak in free_image: re-raise non-"not found" dataset
+    deletion errors so Proxmox reports the failure (C2)
+  * Fix concurrent weight zvol create hard-dying in _ensure_target_visible:
+    treat "already exists" as idempotent success (M1)
+  * Fix _clone_image_iscsi missing _clear_cache and bare targetextent create (M2)
+  * Fix stale-mapping delete "not found" blocking correct mapping create (M3)
+  * Fix weight extent pointing to dead zvol after cross-dataset re-create (L1)
+  * Fix orphaned zvol in _alloc_image_nvme on namespace create failure (L2)
+  * Fix missing retry loop for "dataset already exists" in clone_image (L3)
+  * Fix _resolve_target_id process-lifetime cache: migrate to 60s TTL (L4)
+  * Fix global iSCSI rescan in volume_snapshot_rollback: scope to target IQN (L5)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.21+deb1) unstable; urgency=medium
+
+  * Fix FOREIGN KEY constraint failure when weight extent is deleted between
+    cache population and mapping: force-invalidate extents cache before step 5
+    ID lookup in _ensure_target_visible so stale cached IDs are never used for
+    iscsi.targetextent.create; add FOREIGN KEY error detection in mapping path
+    with cache-clearing recovery
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 10 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.20+deb1) unstable; urgency=medium
+
+  * Fix weight extent name collision across distinct iSCSI targets: append
+    8-char SHA1 of full IQN to weight extent name (pve-weight-<suffix>-<hash8>)
+    to prevent targets with colliding sanitized suffixes from sharing a weight
+    extent; legacy name format accepted via fallback lookup for existing clusters
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.19+deb1) unstable; urgency=medium
+
+  * Fix weight extent lookup failing when multiple storages share the same
+    iSCSI target: weight extent in _ensure_target_visible now matched by name
+    only (not name+disk), since the extent belongs to the target IQN and may
+    be created by a different storage with a different dataset path; also handle
+    "Extent name must be unique" gracefully as idempotent success
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.18+deb1) unstable; urgency=medium
+
+  * Fix "Extent is already in use" pre-flight failure in multi-node clusters:
+    _tn_targetextent_create now handles stale in-memory cache by force-refreshing
+    when TrueNAS reports "Extent is already in use", returning the existing mapping
+    if the extent is already correctly mapped to the target; prevents spurious
+    warnings when another cluster node created the weight mapping after the local
+    cache was last populated
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 08 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.17+deb1) unstable; urgency=medium
+
+  * Fix stale weight extent mapping left by cache-collision bug: _ensure_target_visible
+    now detects a weight extent mapped to the wrong target (created by older plugin
+    versions with the cache-collision bug), removes the stale mapping, and creates
+    the correct one; fixes "Extent is already in use" errors on pre-flight after
+    upgrading from v2.0.16
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 07 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.16+deb1) unstable; urgency=medium
+
+  * Fix extent/targetextent cache key collision: _tn_extents and _tn_targetextents
+    now key the API cache by api_host instead of storeid, preventing cross-host
+    cache contamination when multiple storages share a TrueNAS host
+  * Fix weight extent name-only lookup in _ensure_target_visible: both extent
+    search loops now also match on the zvol disk path to prevent false positives
+    from same-named extents on different datasets
+  * Fix _resolve_target_id cache collision: %_target_id_cache is now keyed by
+    "api_host:iqn" instead of iqn alone; _clear_cache deletes only matching
+    entries rather than wiping the entire hash
+  * Fix $_preflight_last_ok shared across all storages: converted to a per-host
+    hash %_preflight_last_ok keyed by api_host; _clear_cache clears only the
+    affected host entry
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 07 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.15+deb1) unstable; urgency=medium
+
+  * Always force-delete iSCSI targetextent/extent in free_image to fix cluster
+    disk move failures when other nodes have active sessions (Issue #24)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 03 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.14+deb1) unstable; urgency=medium
+
+  * Fix disk move with multipath: SCSI teardown before TrueNAS delete APIs + force=true
+    to bypass persistent-session "in use" check (Issue #15)
+  * Fix multipath flush in free_image: derive WWID from extent NAA instead of scsi_id
+    on DM device — resolves zombie ##,## mpath entries after every disk move (Issue #15)
+  * Fix race window in activate_volume: add udevadm settle after multipath -r (Issue #15)
+  * Fix force-logout retry skipped during disk moves when active_luns >= 2 (Issue #15)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Wed, 02 Apr 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.13+deb1) unstable; urgency=medium
+
+  * Skip disruptive iSCSI rescan during allocation when sessions already active (Issue #15)
+  * Invalidate targetextent cache in free_image for accurate LUN counts during disk moves
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 31 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.12+deb1) unstable; urgency=medium
+
+  * Sync NVMe portals when subsystem already exists (Issue #20)
+  * Port bindings are now created for portals added to storage.cfg
+    after initial NVMe/TCP storage setup
+  * Cache portal sync results per-storage (60s TTL) to reduce API
+    overhead during rapid disk allocation
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 27 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.11+deb1) unstable; urgency=medium
+
+  * Force NVMe subsystem configfs sync after namespace creation
+  * Workaround for TrueNAS middleware bug (NAS-140266) where namespaces
+    are not published to kernel configfs after creation
+  * Fixes "stopped: unexpected status" errors with NVMe/TCP (Issues #7, #12)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 25 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.10+deb1) unstable; urgency=medium
+
+  * Add ns-rescan to NVMe alloc deferred path (mirrors clone path)
+  * Improves namespace discovery when TrueNAS AEN is unavailable
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 21 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.9+deb1) unstable; urgency=medium
+
+  * Fix stale NVMe subsystem entry preventing connection (_nvme_is_connected
+    now checks for live TCP transport, not just NQN presence)
+  * Handle "already connected" errors during NVMe reconnect after service restart
+  * Include stderr in NVMe connect failure log messages
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 23:30:00 +0000
+
+truenas-proxmox-plugin (2.0.8+deb1) unstable; urgency=medium
+
+  * Deferred I/O after CFS lock release for improved concurrent operation throughput
+  * Batch disk name finding via single pool.dataset.query call
+  * Target ID caching to avoid redundant iscsi.target.query API calls
+  * LUN ID extraction from iscsi.targetextent.create response (saves API round-trip)
+  * 30-second preflight check caching for multi-disk VM creation
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.7+deb1) unstable; urgency=medium
+
+  * NVMe write operations (subsystem/port/namespace create) use ephemeral WebSocket connections
+  * Controller-specific NVMe disconnect with NQN-wide fallback
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 20 Mar 2026 00:00:00 +0000
+
+truenas-proxmox-plugin (2.0.6+deb2) unstable; urgency=medium
+
+  * Restart pvestatd on install/upgrade for fresh plugin code loading
+  * Add APT changelog support via Changelogs field in Release metadata
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 12 Mar 2026 18:00:00 +0000
+
+truenas-proxmox-plugin (2.0.6+deb1) unstable; urgency=medium
+
+  * Fix NVMe stale device NSID false-positive via NGUID cross-validation
+  * Add early stale NGUID reconnect trigger at i=10 (~1s recovery)
+  * Refactor NVMe namespace selector with structured results
+  * Fix WebSocket response desync via JSON-RPC request ID matching
+  * Untaint all NVMe CLI inputs (hosts, ports, NQNs, secrets)
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Thu, 12 Mar 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.0.5+deb1) unstable; urgency=medium
+
+  * NVMe stale NGUID recovery with fuser safety check
+  * NVMe clone reliability: pre-settle, rescan, and enhanced failure diagnostics
+  * Fix clone namespace creation to use ephemeral WebSocket connection
+  * Fix _free_image_nvme device path hash key
+  * Extract reusable NVMe helpers for controller rescan, device enumeration,
+    and in-use detection
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 10 Mar 2026 16:00:00 +0000
+
+truenas-proxmox-plugin (2.0.4+deb1) unstable; urgency=medium
+
+  * Add multipath-tools as a hard package dependency for default iSCSI installs
+  * Align Debian package version with plugin runtime version 2.0.4
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 10 Mar 2026 12:00:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb3) unstable; urgency=medium
+
+  * Fix GitHub Actions publish dependency install to use sudo on ubuntu runner
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 03 Mar 2026 01:40:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb2) unstable; urgency=medium
+
+  * Bump Debian packaging revision for GitHub Pages APT publish retry
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Mon, 02 Mar 2026 18:45:00 +0000
+
+truenas-proxmox-plugin (2.0.3+deb1) unstable; urgency=medium
+
+  * Initial Debian packaging setup for APT repository publishing
+  * Configure debhelper-compat 13 and Standards-Version 4.6.2
+  * Add perl build dependencies for Proxmox VE plugin architecture
+  * Prepare for automated Debian package builds and releases
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Tue, 24 Feb 2026 16:00:00 +0000
