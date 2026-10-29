@@ -90,4 +90,28 @@ subtest 'self round-trip' => sub {
     like $@, qr/does not extend client nonce/, "foreign server nonce rejected";
 };
 
+subtest 'known-answer vector against Python stdlib' => sub {
+    # Expected values were computed independently with Python hashlib/hmac/
+    # pbkdf2_hmac (see .superpowers/sdd/2026-10-29-scram-auth/compute-vector.py).
+    # Monkey-patch: SCRAM.pm imports urandom into its own namespace, so we
+    # override TrueNAS::SCRAM::urandom to return a fixed 32-byte client nonce.
+    no warnings 'redefine';
+    local *TrueNAS::SCRAM::urandom = sub { return "A" x 32 };
+    use warnings 'redefine';
+
+    my $server_first = "r=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==,s=MDEyMzQ1Njc4OWFiY2RlZg==,i=50000";
+    my $exp_final = "c=biws,r=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==,p=RajK7VTkIwW2jqC+BVVMmNSiw6h7boEx1SVd1HaFsW1doVh3vP1Yumdaht3Iq7fiv62e/0db/40VmRmpSmmQmw==";
+    my $server_final = "v=100k8G7PP/AmrdBCfvOEgpU6vwmMpY3JpeN5eVtJMFi3iOC+qIBrwgfIoiBSTqU+vlwcH/Va3YprRcpwitFuoQ==";
+
+    my ($state, $first) = scram_client_first("testuser", 1);
+    is $first, "n,,n=testuser:1,r=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=", "client-first matches vector";
+
+    scram_process_server_first($state, $server_first, "testsecret_for_vector_01");
+    is scram_client_final($state), $exp_final, "client-final (c=, r=, p=) matches Python vector";
+
+    my $ok = eval { scram_verify_server_final($state, $server_final) };
+    is $@, "", "server-final verification does not die";
+    ok $ok, "server signature v= matches Python vector";
+};
+
 done_testing;
