@@ -224,6 +224,32 @@ sub _do_t3_login {
     return 1;
 }
 
+# T2 login: auth.login_ex with mechanism API_KEY_PLAIN (TN 25.10+). Only
+# response_type SUCCESS counts as authenticated; anything else dies naming
+# the mechanism and the server's response_type. ws_rpc errors propagate so
+# the caller can classify "server lacks login_ex" from the error text.
+sub _do_t2_login {
+    my ($conn, $username, $api_key) = @_;
+    my $resp = ws_rpc($conn, {
+        jsonrpc => "2.0", id => $conn->{next_id}++,
+        method  => "auth.login_ex",
+        params  => [{
+            mechanism     => "API_KEY_PLAIN",
+            username      => $username,
+            api_key       => $api_key,
+            login_options => {},
+        }],
+    });
+    die "[TrueNAS] API_KEY_PLAIN login failed: no response from server\n"
+        unless defined $resp;
+    my $res = (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'HASH')
+        ? $resp->{result} : $resp;
+    my $rt = ref($res) eq 'HASH' ? $res->{response_type} : undef;
+    $rt = 'UNKNOWN' unless defined $rt && length $rt;
+    die "[TrueNAS] API_KEY_PLAIN login rejected: $rt\n" unless $rt eq 'SUCCESS';
+    return 1;
+}
+
 # True when an error string looks like TrueNAS's auth rate limiter, matching
 # the terraform provider's heuristic: APIError code 0/16/22/-32000, or the
 # message contains "rate limit" / "concurrent calls" (case-insensitive).

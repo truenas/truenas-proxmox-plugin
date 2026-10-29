@@ -71,4 +71,54 @@ subtest '_do_t3_login' => sub {
     }
 };
 
+subtest '_do_t2_login success' => sub {
+    my @calls;
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        push @calls, $_[1];
+        return {
+            response_type   => "SUCCESS",
+            user_info       => {},
+            authenticator   => "LEVEL_1",
+            reconnect_token => undef,
+        };
+    };
+    my $conn = { sock => undef, next_id => 1 };
+    ok eval { main::_do_t2_login($conn, "alice", "17-abc"); 1 }, "lives";
+    is scalar(@calls), 1, "one call";
+    is $calls[0]->{method}, "auth.login_ex";
+    is_deeply $calls[0]->{params}, [{
+        mechanism     => "API_KEY_PLAIN",
+        username      => "alice",
+        api_key       => "17-abc",
+        login_options => {},
+    }];
+};
+
+subtest '_do_t2_login refuses non-SUCCESS' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    for my $rt (qw(AUTH_ERR DENIED EXPIRED OTP_REQUIRED REDIRECT WEIRD)) {
+        local *main::ws_rpc = sub { return { response_type => $rt } };
+        eval { main::_do_t2_login($conn, "alice", "17-abc") };
+        like $@, qr/API_KEY_PLAIN login rejected: \Q$rt\E/, "$rt rejected";
+    }
+};
+
+subtest '_do_t2_login propagates ws_rpc die' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    local *main::ws_rpc = sub { die "Method 'auth.login_ex' not found\n" };
+    eval { main::_do_t2_login($conn, "alice", "17-abc") };
+    like $@, qr/not found/;
+};
+
+subtest '_do_t2_login no response' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    local *main::ws_rpc = sub { return undef };
+    eval { main::_do_t2_login($conn, "alice", "17-abc") };
+    like $@, qr/no response from server/;
+};
+
 done_testing;
