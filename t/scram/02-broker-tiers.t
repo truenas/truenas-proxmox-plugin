@@ -154,4 +154,91 @@ subtest '_do_t2_login JSON-RPC error envelope' => sub {
     like $@, qr/not found/, "server detail carried";
 };
 
+use TrueNAS::SCRAM ();
+
+my $KA_SERVER_FIRST = "r=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==,s=MDEyMzQ1Njc4OWFiY2RlZg==,i=50000";
+my $KA_SERVER_FINAL = "v=100k8G7PP/AmrdBCfvOEgpU6vwmMpY3JpeN5eVtJMFi3iOC+qIBrwgfIoiBSTqU+vlwcH/Va3YprRcpwitFuoQ==";
+
+sub _scram_env {
+    my ($type, $rfc) = @_;
+    return { jsonrpc => "2.0", id => 1, result => {
+        response_type => "SCRAM_RESPONSE", scram_type => $type,
+        rfc_str => $rfc, user_info => undef } };
+}
+
+subtest '_is_scram_unsupported_error' => sub {
+    ok  main::_is_scram_unsupported_error(q{EINVAL: login_data: Input tag 'SCRAM' found using 'mechanism' does not match any of the expected tags});
+    ok !main::_is_scram_unsupported_error("server signature verification failed");
+    ok !main::_is_scram_unsupported_error("Rate Limit Exceeded");
+    ok !main::_is_scram_unsupported_error(undef);
+};
+
+subtest '_do_t1_login happy path' => sub {
+    no warnings 'redefine';
+    local *TrueNAS::SCRAM::urandom = sub ($) { "A" x 32 };
+    my @calls;
+    local *main::ws_rpc = sub {
+        push @calls, $_[1];
+        my $p = $_[1]{params}[0];
+        return _scram_env("SERVER_FIRST_RESPONSE", $KA_SERVER_FIRST)
+            if $p->{scram_type} eq 'CLIENT_FIRST_MESSAGE';
+        return _scram_env("SERVER_FINAL_RESPONSE", $KA_SERVER_FINAL);
+    };
+    my $conn = { sock => undef, next_id => 1 };
+    ok eval { main::_do_t1_login($conn, "testuser", "1-testsecret_for_vector_01") }, "lives" or diag $@;
+    is scalar(@calls), 2, "two calls";
+    is $calls[0]{method}, "auth.login_ex";
+    is $calls[0]{params}[0]{mechanism}, "SCRAM";
+    is $calls[0]{params}[0]{scram_type}, "CLIENT_FIRST_MESSAGE";
+    is $calls[1]{params}[0]{scram_type}, "CLIENT_FINAL_MESSAGE";
+    like $calls[1]{params}[0]{rfc_str}, qr/,p=/, "client-final carries proof";
+};
+
+subtest '_do_t1_login server signature mismatch' => sub {
+    no warnings 'redefine';
+    local *TrueNAS::SCRAM::urandom = sub ($) { "A" x 32 };
+    (my $bad = $KA_SERVER_FINAL) =~ s/^v=./v=Z/;
+    local *main::ws_rpc = sub {
+        return $_[1]{params}[0]{scram_type} eq 'CLIENT_FIRST_MESSAGE'
+            ? _scram_env("SERVER_FIRST_RESPONSE", $KA_SERVER_FIRST)
+            : _scram_env("SERVER_FINAL_RESPONSE", $bad);
+    };
+    eval { main::_do_t1_login({ next_id => 1 }, "testuser", "1-testsecret_for_vector_01") };
+    like $@, qr/SCRAM auth failed: (?:scram: )?server signature verification failed/;
+};
+
+subtest '_do_t1_login SCRAM-unsupported (ws_rpc die path)' => sub {
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        die "Method 'auth.login_ex' error: EINVAL: login_data: Input tag 'SCRAM' found using 'mechanism' does not match any of the expected tags\n";
+    };
+    eval { main::_do_t1_login({ next_id => 1 }, "testuser", "1-testsecret_for_vector_01") };
+    like $@, qr/SCRAM unsupported by server/;
+};
+
+subtest '_do_t1_login SCRAM-unsupported (envelope-error path)' => sub {
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        return { jsonrpc => "2.0", id => 1, error => { code => 22,
+            message => "[EINVAL] login_data: Input tag 'SCRAM' found using 'mechanism' does not match any of the expected tags" } };
+    };
+    eval { main::_do_t1_login({ next_id => 1 }, "testuser", "1-testsecret_for_vector_01") };
+    like $@, qr/SCRAM unsupported by server/;
+    like $@, qr/does not match any of the expected tags/, "server text carried";
+};
+
+subtest '_do_t1_login undef response' => sub {
+    no warnings 'redefine';
+    local *main::ws_rpc = sub { return undef };
+    eval { main::_do_t1_login({ next_id => 1 }, "testuser", "1-testsecret_for_vector_01") };
+    like $@, qr/no response from server/;
+};
+
+subtest '_do_t1_login malformed server-first' => sub {
+    no warnings 'redefine';
+    local *main::ws_rpc = sub { return _scram_env("SERVER_FIRST_RESPONSE", "garbage") };
+    eval { main::_do_t1_login({ next_id => 1 }, "testuser", "1-testsecret_for_vector_01") };
+    ok $@, "dies" and diag $@;
+};
+
 done_testing;

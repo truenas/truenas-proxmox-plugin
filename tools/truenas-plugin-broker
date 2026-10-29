@@ -37,6 +37,8 @@ use MIME::Base64 qw(encode_base64);
 use JSON::PP;
 use Socket;
 use Time::HiRes qw(time);
+use TrueNAS::SCRAM qw(scram_split_api_key scram_client_first scram_process_server_first
+                      scram_client_final scram_verify_server_final);
 
 my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
 my $PIDFILE        = '/run/truenas-plugin/broker.pid';
@@ -253,6 +255,70 @@ sub _do_t2_login {
     my $rt = ref($res) eq 'HASH' ? $res->{response_type} : undef;
     $rt = 'UNKNOWN' unless defined $rt && length $rt;
     die "[TrueNAS] API_KEY_PLAIN login rejected: $rt\n" unless $rt eq 'SUCCESS';
+    return 1;
+}
+
+# True when the server rejected the SCRAM mechanism (TN 25.10 lacks it).
+sub _is_scram_unsupported_error {
+    my ($err) = @_;
+    return 0 unless defined $err;
+    return $err =~ /Input tag 'SCRAM'.*does not match/s ? 1 : 0;
+}
+
+# One SCRAM auth.login_ex round trip. Returns the unwrapped result hash;
+# dies "SCRAM unsupported by server" (classifiable by the caller) or
+# "SCRAM auth failed" on any problem. Non-SCRAM ws_rpc failures propagate.
+sub _scram_step {
+    my ($conn, $scram_type, $rfc_str, $want_type) = @_;
+    my $resp = eval {
+        ws_rpc($conn, {
+            jsonrpc => "2.0", id => $conn->{next_id}++,
+            method  => "auth.login_ex",
+            params  => [{ mechanism => "SCRAM", scram_type => $scram_type,
+                          rfc_str => $rfc_str }],
+        });
+    };
+    if (my $err = $@) {
+        die "[TrueNAS] SCRAM unsupported by server: $err"
+            if _is_scram_unsupported_error($err);
+        die $err;
+    }
+    die "[TrueNAS] SCRAM auth failed: no response from server\n"
+        unless defined $resp;
+    if (ref($resp) eq 'HASH' && exists $resp->{error}) {
+        my $msg = ref($resp->{error}) eq 'HASH' ? ($resp->{error}{message} // "") : "";
+        die "[TrueNAS] SCRAM unsupported by server: " . encode_json($resp->{error}) . "\n"
+            if _is_scram_unsupported_error($msg);
+        die "[TrueNAS] SCRAM auth failed: " . encode_json($resp->{error}) . "\n";
+    }
+    my $res = (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'HASH')
+        ? $resp->{result} : $resp;
+    unless (ref($res) eq 'HASH'
+            && ($res->{response_type} // '') eq 'SCRAM_RESPONSE'
+            && ($res->{scram_type} // '') eq $want_type) {
+        die "[TrueNAS] SCRAM auth failed: unexpected response: "
+            . encode_json(ref($res) ? $res : { raw => $res }) . "\n";
+    }
+    return $res;
+}
+
+# T1 login: SCRAM-SHA-512 over auth.login_ex. The secret never goes on the
+# wire; the server's signature is verified before success is returned.
+sub _do_t1_login {
+    my ($conn, $username, $api_key) = @_;
+    my ($key_id, $secret) = scram_split_api_key($api_key);
+    my ($state, $first_wire) = scram_client_first($username, $key_id);
+
+    my $r1 = _scram_step($conn, "CLIENT_FIRST_MESSAGE", $first_wire, "SERVER_FIRST_RESPONSE");
+    scram_process_server_first($state, $r1->{rfc_str}, $secret);
+    my $final_wire = scram_client_final($state);
+
+    my $r2 = _scram_step($conn, "CLIENT_FINAL_MESSAGE", $final_wire, "SERVER_FINAL_RESPONSE");
+    eval { scram_verify_server_final($state, $r2->{rfc_str}); 1 }
+        or die "[TrueNAS] SCRAM auth failed: $@";
+
+    $state->{saltedPassword} = "\0" x length($state->{saltedPassword} // '');
+    $secret = "\0" x length($secret);
     return 1;
 }
 
