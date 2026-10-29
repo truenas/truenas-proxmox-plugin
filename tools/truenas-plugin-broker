@@ -196,13 +196,45 @@ sub ws_open {
     die "WS handshake invalid accept key" if ($accept // '') ne $expect;
 
     my $conn = { sock => $sock, next_id => 1 };
+    _do_t3_login($conn, $scfg->{api_key});
+    return $conn;
+}
+
+# Legacy (T3) login: one auth.login_with_api_key call. Dies "TrueNAS
+# authentication failed" when there is no response (unchanged baseline),
+# dies "legacy API-key login rejected" on a false result, and dies with the
+# serialized JSON-RPC error on an error envelope so _is_rate_limited can
+# classify it. Accepts either the full JSON-RPC envelope (what ws_rpc
+# returns) or a bare boolean.
+sub _do_t3_login {
+    my ($conn, $api_key) = @_;
     my $auth = ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
-        params  => [ $scfg->{api_key} ],
+        params  => [ $api_key ],
     });
-    die "TrueNAS authentication failed" unless $auth;
-    return $conn;
+    die "TrueNAS authentication failed" unless defined $auth;
+    my $result = $auth;
+    if (ref($auth) eq 'HASH') {
+        die "legacy API-key login error: " . encode_json($auth->{error}) . "\n"
+            if exists $auth->{error};
+        $result = $auth->{result};
+    }
+    die "legacy API-key login rejected\n" unless $result;
+    return 1;
+}
+
+# True when an error string looks like TrueNAS's auth rate limiter, matching
+# the terraform provider's heuristic: APIError code 0/16/22/-32000, or the
+# message contains "rate limit" / "concurrent calls" (case-insensitive).
+sub _is_rate_limited {
+    my ($err) = @_;
+    return 0 unless defined $err && length $err;
+    return 1 if $err =~ /"code"\s*:\s*(?:0|16|22|-32000)\b/;
+    return 1 if $err =~ /\bcode\s*[:=]?\s*(?:0|16|22|-32000)\b/i;
+    my $l = lc $err;
+    return 1 if index($l, 'rate limit') >= 0 || index($l, 'concurrent calls') >= 0;
+    return 0;
 }
 
 sub xor_mask {
@@ -538,32 +570,13 @@ sub handle_request {
 }
 
 # ---------------- main ----------------
-ensure_rundir();
-daemonize();
-write_pidfile();
-linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
-
-$SIG{PIPE} = 'IGNORE';
-# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
-# also propagate to the worker pool. Workers install their own TERM
-# handler in spawn_worker so they close their local %POOL WS connections
-# and exit cleanly without touching parent's socket / pidfile.
-
-my $srv = make_listener();
-
-# The listen fd is now bound and listening. Workers haven't been forked
-# yet, but the kernel will queue incoming connections until one does
-# accept(). From a client's perspective the socket is ready, so this is
-# the right moment to tell systemd we're up (Type=notify). See
-# sd_notify_ready() comment for the ordering rationale.
-sd_notify_ready();
+my $srv;
+my %WORKER_PIDS;   # pid => 1
 
 # Prefork the worker pool. Parent creates listen fd, forks N children; each
 # child re-runs the accept loop against the shared fd. Kernel serializes
 # accept() among children so no race. Parent then waits and re-spawns any
 # child that dies.
-my %WORKER_PIDS;   # pid => 1
-
 sub spawn_worker {
     my $pid = fork();
     if (!defined $pid) {
@@ -610,6 +623,28 @@ sub worker_loop {
     }
 }
 
+sub main {
+ensure_rundir();
+daemonize();
+write_pidfile();
+linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
+
+$SIG{PIPE} = 'IGNORE';
+# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
+# also propagate to the worker pool. Workers install their own TERM
+# handler in spawn_worker so they close their local %POOL WS connections
+# and exit cleanly without touching parent's socket / pidfile.
+
+$srv = make_listener();
+
+# The listen fd is now bound and listening. Workers haven't been forked
+# yet, but the kernel will queue incoming connections until one does
+# accept(). From a client's perspective the socket is ready, so this is
+# the right moment to tell systemd we're up (Type=notify). See
+# sd_notify_ready() comment for the ordering rationale.
+sd_notify_ready();
+
+
 # Parent: spawn N workers, then supervise
 for (1..$PREFORK_N) { spawn_worker(); }
 linfo("prefork pool up (N=$PREFORK_N)");
@@ -641,3 +676,6 @@ while (1) {
         spawn_worker();
     }
 }
+}
+
+main() unless caller;
