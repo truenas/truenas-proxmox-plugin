@@ -121,4 +121,37 @@ subtest '_do_t2_login no response' => sub {
     like $@, qr/no response from server/;
 };
 
+subtest '_do_t2_login success with envelope shape' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        return { jsonrpc => "2.0", id => 1, result => {
+            response_type => "SUCCESS", user_info => {},
+            authenticator => "LEVEL_1", reconnect_token => undef } };
+    };
+    ok eval { main::_do_t2_login($conn, "alice", "17-abc"); 1 }, "lives";
+};
+
+subtest '_do_t2_login AUTH_ERR with envelope shape' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        return { jsonrpc => "2.0", id => 1, result => { response_type => "AUTH_ERR" } };
+    };
+    eval { main::_do_t2_login($conn, "alice", "17-abc") };
+    like $@, qr/API_KEY_PLAIN login rejected.*AUTH_ERR/;
+};
+
+subtest '_do_t2_login JSON-RPC error envelope' => sub {
+    my $conn = { sock => undef, next_id => 1 };
+    no warnings 'redefine';
+    local *main::ws_rpc = sub {
+        return { jsonrpc => "2.0", id => 1,
+                 error => { code => -32601, message => "Method 'auth.login_ex' not found" } };
+    };
+    eval { main::_do_t2_login($conn, "alice", "17-abc") };
+    like $@, qr/API_KEY_PLAIN login error/, "error prefix";
+    like $@, qr/not found/, "server detail carried";
+};
+
 done_testing;

@@ -242,6 +242,12 @@ sub _do_t2_login {
     });
     die "[TrueNAS] API_KEY_PLAIN login failed: no response from server\n"
         unless defined $resp;
+    # ws_rpc returns the whole JSON-RPC envelope and does not die on server
+    # errors; handle the error envelope explicitly so the server's detail
+    # (code/message) reaches the caller for classification.
+    if (ref($resp) eq 'HASH' && exists $resp->{error}) {
+        die "[TrueNAS] API_KEY_PLAIN login error: " . encode_json($resp->{error}) . "\n";
+    }
     my $res = (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'HASH')
         ? $resp->{result} : $resp;
     my $rt = ref($res) eq 'HASH' ? $res->{response_type} : undef;
