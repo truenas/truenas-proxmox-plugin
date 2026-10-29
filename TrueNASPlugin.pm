@@ -672,6 +672,17 @@ sub properties {
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
+        tn_api_username => {
+            description => "TrueNAS account that owns the API key. Required to enable SCRAM-SHA-512 authentication; leaving it empty forces legacy plain-key login.",
+            type => 'string', optional => 1,
+            format_description => 'account',
+        },
+        tn_auth_mechanism => {
+            description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'plain' never attempts SCRAM.",
+            type => 'string', optional => 1,
+            enum => ['auto','scram','plain'],
+            default => 'auto',
+        },
         tn_api_scheme => {
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
@@ -941,6 +952,8 @@ sub options {
         # Connection (fixed to avoid orphaning volumes)
         tn_api_host      => { fixed => 1 },
         tn_api_key       => { fixed => 1 },
+        tn_api_username  => { optional => 1 },
+        tn_auth_mechanism => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
         tn_api_transport => { optional => 1, fixed => 1 },
         tn_api_port      => { optional => 1, fixed => 1 },
@@ -1139,6 +1152,10 @@ sub check_config {
         );
     }
 
+    if (defined $opts->{tn_api_username} && $opts->{tn_api_username} =~ /:/) {
+        die "tn_api_username must not contain ':'\n";
+    }
+
     # Required-field and transport-specific checks only run on create. On
     # edit (`pvesm set <id> -<flag>`) PVE calls check_config with just the
     # submitted delta, not the merged stored config, so demanding required
@@ -1149,6 +1166,9 @@ sub check_config {
         }
         if (!$opts->{tn_api_key}) {
             die "tn_api_key is required\n";
+        }
+        if (($opts->{tn_auth_mechanism} // '') eq 'scram' && !$opts->{tn_api_username}) {
+            die "tn_auth_mechanism=scram requires tn_api_username\n";
         }
         if (!$opts->{tn_dataset}) {
             die "tn_dataset is required\n";
@@ -1513,6 +1533,8 @@ sub _broker_rpc {
         scfg => {
             api_host     => $scfg->{tn_api_host},
             api_key      => $scfg->{tn_api_key},
+            api_username   => $scfg->{tn_api_username},
+            auth_mechanism => $scfg->{tn_auth_mechanism},
             api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
             api_port     => $scfg->{tn_api_port},
             api_insecure => $scfg->{tn_api_insecure} // 0,
