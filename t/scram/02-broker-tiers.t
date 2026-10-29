@@ -13,6 +13,8 @@ subtest '_is_rate_limited' => sub {
     ok  main::_is_rate_limited(q{code -32000: rate limit});
     ok  main::_is_rate_limited(q{{"code":16,"message":"EBUSY"}}), 'JSON-serialized error, code only';
     ok  main::_is_rate_limited(q{broker: {"code":-32000,"message":"x"}});
+    ok  main::_is_rate_limited(q{Rate Limit Exceeded}), "substring-only: Rate Limit Exceeded (no code)";
+    ok  main::_is_rate_limited(q{too many concurrent calls}), "substring-only: concurrent calls (no code)";
     ok !main::_is_rate_limited(q{Method 'auth.mechanism_choices' not found});
     ok !main::_is_rate_limited(q{EINVAL: login_data: Input tag 'SCRAM'});
     ok !main::_is_rate_limited(q{{"code":-32601,"message":"Method not found"}});
