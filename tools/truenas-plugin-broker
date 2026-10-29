@@ -240,12 +240,31 @@ sub _authenticate {
         # SCRAM itself; any other T1 failure is fatal (no fail-open).
         my $unsupported = _is_scram_unsupported_error($err)
                           || $err =~ /SCRAM unsupported by server/;
-        die $err if $mech ne 'auto' || !$unsupported;
-        lwarn("auth: SCRAM unsupported by server, falling back to API_KEY_PLAIN");
-        return _do_t2_login($conn, $username, $api_key);
+        my $nomethod = _is_method_not_found($err);
+        die $err if $mech ne 'auto' || !($unsupported || $nomethod);
+        lwarn("auth: SCRAM unavailable on server, falling back to API_KEY_PLAIN");
+        $tier = 'T2';
     }
-    return _do_t2_login($conn, $username, $api_key) if $tier eq 'T2';
+    if ($tier eq 'T2') {
+        return 1 if eval { _do_t2_login($conn, $username, $api_key); 1 };
+        my $err = $@;
+        # Only a missing login_ex (pre-25.10 server) falls to the legacy
+        # floor; AUTH_ERR, DENIED, rate-limit etc. stay fatal.
+        die $err if $mech eq 'scram' || !_is_method_not_found($err);
+        lwarn("auth: auth.login_ex not available, falling back to legacy API-key login");
+    }
     return _do_t3_login($conn, $api_key);
+}
+
+# True when the server reported a missing JSON-RPC method. Narrow on
+# purpose: generic "not found" text does not count.
+sub _is_method_not_found {
+    my ($err) = @_;
+    return 0 unless defined $err;
+    return 1 if $err =~ /Method\s+'[^']+'\s+not found/i;
+    return 1 if $err =~ /method not found/i;
+    return 1 if $err =~ /unknown method/i;
+    return 0;
 }
 
 # Pure tier selector. T1=SCRAM, T2=API_KEY_PLAIN login_ex, T3=legacy

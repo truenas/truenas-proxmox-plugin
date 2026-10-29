@@ -270,4 +270,84 @@ subtest '_select_mechanism: unsupported is checked before rate-limit' => sub {
     like $@, qr/server does not support SCRAM/, "forced scram dies rather than attempting T1";
 };
 
+subtest '_is_method_not_found' => sub {
+    ok  main::_is_method_not_found(q{Method 'auth.login_ex' not found});
+    ok  main::_is_method_not_found(q{{"code":-32601,"message":"Method not found"}});
+    ok  main::_is_method_not_found(q{unknown method auth.login_ex});
+    ok !main::_is_method_not_found(q{user not found});
+    ok !main::_is_method_not_found(q{API_KEY_PLAIN login rejected: AUTH_ERR});
+    ok !main::_is_method_not_found(undef);
+};
+
+subtest '_authenticate' => sub {
+    no warnings qw(redefine once);
+    my @calls;
+    my ($probe, $t1, $t2, $t3);
+    local *main::linfo = sub { };
+    local *main::lwarn = sub { };
+    local *main::ws_rpc = sub { return $probe };
+    local *main::_do_t1_login = sub { push @calls, 'T1'; die $t1 if defined $t1; 1 };
+    local *main::_do_t2_login = sub { push @calls, 'T2'; die $t2 if defined $t2; 1 };
+    local *main::_do_t3_login = sub { push @calls, 'T3'; die $t3 if defined $t3; 1 };
+    my $run = sub {
+        my ($scfg, %o) = @_;
+        @calls = ();
+        $probe = $o{probe} // { result => ["SCRAM","API_KEY_PLAIN"] };
+        ($t1, $t2, $t3) = @o{qw(t1 t2 t3)};
+        my $conn = { sock => undef, next_id => 1 };
+        my $ok = eval { main::_authenticate($conn, { api_key => "1-k", api_username => "alice", %$scfg }); 1 };
+        return ($ok, $@);
+    };
+    my $unsup = "[TrueNAS] SCRAM unsupported by server: Input tag 'SCRAM' found using 'mechanism' does not match any of the expected tags\n";
+
+    my ($ok, $err) = $run->({}, t1 => "[TrueNAS] SCRAM auth failed: AUTH_ERR\n");
+    ok !$ok, "1: T1 hard failure dies"; like $err, qr/AUTH_ERR/;
+    is_deeply \@calls, ['T1'], "1: no fallback";
+
+    ($ok, $err) = $run->({}, t1 => $unsup);
+    ok $ok, "2: T1 unsupported (auto) falls back to T2";
+    is_deeply \@calls, ['T1','T2'], "2: T2 once, T3 not called";
+
+    ($ok, $err) = $run->({ auth_mechanism => 'scram' }, t1 => $unsup);
+    ok !$ok, "3: T1 unsupported in scram mode dies";
+    is_deeply \@calls, ['T1'], "3: T2 not called";
+
+    ($ok, $err) = $run->({}, t1 => "Method 'auth.login_ex' not found\n");
+    ok $ok, "4: T1 method-not-found (auto) falls back to T2";
+    is_deeply \@calls, ['T1','T2'], "4: T1 then T2";
+
+    ($ok, $err) = $run->({ auth_mechanism => 'scram' }, t1 => "Method 'auth.login_ex' not found\n");
+    ok !$ok, "4b: T1 method-not-found in scram mode dies";
+    is_deeply \@calls, ['T1'];
+
+    ($ok, $err) = $run->({}, t1 => $unsup, t2 => "[TrueNAS] API_KEY_PLAIN login rejected: AUTH_ERR\n");
+    ok !$ok, "5: T2 AUTH_ERR dies"; like $err, qr/AUTH_ERR/;
+    is_deeply \@calls, ['T1','T2'], "5: T3 not called";
+
+    ($ok, $err) = $run->({}, t1 => $unsup, t2 => "Method 'auth.login_ex' not found\n");
+    ok $ok, "6: T2 method-not-found falls back to T3";
+    is_deeply \@calls, ['T1','T2','T3'], "6: T1,T2,T3";
+
+    ($ok, $err) = $run->({ auth_mechanism => 'plain' }, probe => { result => ["API_KEY_PLAIN"] },
+                         t2 => "Method 'auth.login_ex' not found\n");
+    ok $ok, "6b: plain mode T2 method-not-found falls to T3";
+    is_deeply \@calls, ['T2','T3'];
+
+    ($ok, $err) = $run->({ auth_mechanism => 'scram' }, probe => { result => ["API_KEY_PLAIN"] });
+    ok !$ok, "6c: scram on server without SCRAM dies before any login";
+    is_deeply \@calls, [];
+
+    ($ok, $err) = $run->({}, probe => { result => [] });
+    ok $ok, "7: empty mechanism list -> T3";
+    is_deeply \@calls, ['T3'];
+
+    ($ok, $err) = $run->({ api_username => undef });
+    ok $ok, "7b: no username -> T3";
+    is_deeply \@calls, ['T3'];
+
+    ($ok, $err) = $run->({}, probe => { error => { code => -32601, message => "Method not found" } });
+    ok $ok, "7c: probe method-not-found -> T3";
+    is_deeply \@calls, ['T3'];
+};
+
 done_testing;
