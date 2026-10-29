@@ -279,7 +279,7 @@ sub _select_mechanism {
     my $limited = 0;
     if (defined $probe_err) {
         my $unsupported = _is_scram_unsupported_error($probe_err)
-                          || $probe_err =~ /not found/i;
+                          || _is_method_not_found($probe_err);
         $limited = 1 if !$unsupported && _is_rate_limited($probe_err);
     }
     my %have = map { $_ => 1 } (ref($probe_result) eq 'ARRAY' ? @$probe_result : ());
@@ -414,7 +414,7 @@ sub _do_t1_login {
 
     my $r2 = _scram_step($conn, "CLIENT_FINAL_MESSAGE", $final_wire, "SERVER_FINAL_RESPONSE");
     eval { scram_verify_server_final($state, $r2->{rfc_str}); 1 }
-        or die "[TrueNAS] SCRAM auth failed: $@";
+        or do { my $m = $@; $m =~ s/^scram:\s*//; die "[TrueNAS] SCRAM auth failed: $m"; };
 
     $state->{saltedPassword} = "\0" x length($state->{saltedPassword} // '');
     $secret = "\0" x length($secret);

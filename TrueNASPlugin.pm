@@ -673,7 +673,7 @@ sub properties {
             type => 'string',
         },
         tn_api_username => {
-            description => "TrueNAS account that owns the API key. Required to enable SCRAM-SHA-512 authentication; leaving it empty forces legacy plain-key login.",
+            description => "TrueNAS account that owns the API key. Required to enable SCRAM-SHA-512 authentication; leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
             type => 'string', optional => 1,
             format_description => 'account',
         },
@@ -1652,7 +1652,10 @@ sub _ws_get_persistent($scfg) {
     _log($scfg, 0, 'warning',
         "[TrueNAS] broker socket missing; TRUENAS_PLUGIN_ALLOW_DIRECT_WS is set, " .
         "using direct WS. This bypasses D2/D3 rate-limit protection and is not " .
-        "supported in production."
+        "supported in production. The direct-WS path still uses the legacy " .
+        "auth.login_with_api_key call, which is scheduled for removal in a " .
+        "future TrueNAS release; the broker is the only path that migrates to " .
+        "auth.login_ex (SCRAM / API_KEY_PLAIN)."
     );
 
     # Fork detection: if we're in a child process, inherited connections are invalid

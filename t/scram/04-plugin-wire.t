@@ -34,7 +34,7 @@ subtest 'schema accepts new fields' => sub {
     ok exists $props->{tn_auth_mechanism}, 'tn_auth_mechanism present';
     is_deeply $props->{tn_auth_mechanism}{enum}, ['auto','scram','plain'];
     is $props->{tn_auth_mechanism}{default}, 'auto';
-    like $props->{tn_api_username}{description}, qr/empty forces legacy plain/;
+    like $props->{tn_api_username}{description}, qr/legacy auth\.login_with_api_key/;
 };
 
 subtest 'options() allows new fields and leaves them unfixed' => sub {
