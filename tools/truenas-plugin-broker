@@ -198,8 +198,88 @@ sub ws_open {
     die "WS handshake invalid accept key" if ($accept // '') ne $expect;
 
     my $conn = { sock => $sock, next_id => 1 };
-    _do_t3_login($conn, $scfg->{api_key});
+    _authenticate($conn, $scfg);
     return $conn;
+}
+
+# Probe auth.mechanism_choices, pick a tier, and log in. Probe failures are
+# classified by _select_mechanism (pure); this sub does the I/O.
+sub _authenticate {
+    my ($conn, $scfg) = @_;
+    my $username = $scfg->{api_username};
+    $username = undef if defined $username && !length $username;
+    my $mech = $scfg->{auth_mechanism} || 'auto';
+    my $api_key = $scfg->{api_key};
+
+    my ($probe_result, $probe_err);
+    if (defined $username) {
+        my $resp = eval {
+            ws_rpc($conn, {
+                jsonrpc => "2.0", id => $conn->{next_id}++,
+                method  => "auth.mechanism_choices", params => [],
+            });
+        };
+        if ($@) { $probe_err = "$@"; }
+        elsif (ref($resp) eq 'HASH' && exists $resp->{error}) {
+            $probe_err = encode_json($resp->{error});
+        } elsif (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'ARRAY') {
+            $probe_result = $resp->{result};
+        } elsif (ref($resp) eq 'ARRAY') {
+            $probe_result = $resp;
+        } else {
+            $probe_err = "auth.mechanism_choices: no usable response";
+        }
+    }
+
+    my $tier = _select_mechanism($username, $mech, $probe_result, $probe_err);
+    linfo("auth: using tier $tier (mechanism=$mech)");
+    if ($tier eq 'T1') {
+        return 1 if eval { _do_t1_login($conn, $username, $api_key); 1 };
+        my $err = $@;
+        # Only auto mode may fall back, and only when the server rejected
+        # SCRAM itself; any other T1 failure is fatal (no fail-open).
+        my $unsupported = _is_scram_unsupported_error($err)
+                          || $err =~ /SCRAM unsupported by server/;
+        die $err if $mech ne 'auto' || !$unsupported;
+        lwarn("auth: SCRAM unsupported by server, falling back to API_KEY_PLAIN");
+        return _do_t2_login($conn, $username, $api_key);
+    }
+    return _do_t2_login($conn, $username, $api_key) if $tier eq 'T2';
+    return _do_t3_login($conn, $api_key);
+}
+
+# Pure tier selector. T1=SCRAM, T2=API_KEY_PLAIN login_ex, T3=legacy
+# login_with_api_key. Probe errors are classified here: an "unavailable"
+# error is checked BEFORE rate-limit, because the unsupported envelope can
+# carry a code that _is_rate_limited also matches.
+sub _select_mechanism {
+    my ($username, $mech, $probe_result, $probe_err) = @_;
+    $mech = 'auto' unless defined $mech && length $mech;
+    $username = undef if defined $username && !length $username;
+
+    my $limited = 0;
+    if (defined $probe_err) {
+        my $unsupported = _is_scram_unsupported_error($probe_err)
+                          || $probe_err =~ /not found/i;
+        $limited = 1 if !$unsupported && _is_rate_limited($probe_err);
+    }
+    my %have = map { $_ => 1 } (ref($probe_result) eq 'ARRAY' ? @$probe_result : ());
+
+    if ($mech eq 'scram') {
+        die "tn_auth_mechanism=scram requires tn_api_username\n" unless defined $username;
+        return 'T1' if $have{SCRAM} || $limited;
+        die "tn_auth_mechanism=scram but server does not support SCRAM\n";
+    }
+    if ($mech eq 'plain') {
+        return 'T3' unless defined $username;
+        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited;
+        return 'T3';
+    }
+    return 'T3' unless defined $username;
+    return 'T1' if $have{SCRAM};
+    return 'T2' if $have{API_KEY_PLAIN};
+    return 'T1' if $limited;
+    return 'T3';
 }
 
 # Legacy (T3) login: one auth.login_with_api_key call. Dies "TrueNAS
@@ -437,8 +517,11 @@ sub scfg_key {
     my ($scfg) = @_;
     my $host = $scfg->{api_host} // '';
     my $key  = $scfg->{api_key}  // '';
-    # Don't put raw api_key in memory key; hash it
-    return $host . ':' . sha1_hex($key);
+    my $user = $scfg->{api_username} // '';
+    my $mech = $scfg->{auth_mechanism} || 'auto';
+    # Don't put raw api_key in memory key; hash it with username+mechanism so
+    # two storages on one host with different identities get separate pools.
+    return $host . ':' . sha1_hex($key . '|' . $user . '|' . $mech);
 }
 
 sub get_or_open_ws {

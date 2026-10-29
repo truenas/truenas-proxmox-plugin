@@ -241,4 +241,33 @@ subtest '_do_t1_login malformed server-first' => sub {
     ok $@, "dies" and diag $@;
 };
 
+subtest '_select_mechanism' => sub {
+    is main::_select_mechanism("alice", "auto", ["SCRAM","API_KEY_PLAIN"], undef), "T1";
+    is main::_select_mechanism("alice", "auto", ["API_KEY_PLAIN"], undef), "T2";
+    is main::_select_mechanism(undef,   "auto", ["API_KEY_PLAIN"], undef), "T3", "no username -> T3 even on new TN";
+    is main::_select_mechanism("alice", "auto", undef, "Method 'auth.mechanism_choices' not found"), "T3";
+    is main::_select_mechanism("alice", "auto", undef, "Rate Limit Exceeded"), "T1", "rate-limited probe + username -> attempt T1";
+    is main::_select_mechanism(undef,   "auto", undef, "Rate Limit Exceeded"), "T3", "rate-limited probe, no user -> T3 (floor)";
+    is main::_select_mechanism("alice", "plain", ["SCRAM"], undef), "T2", "plain never picks SCRAM";
+    is main::_select_mechanism("alice", "plain", undef, "method not found"), "T3";
+
+    eval { main::_select_mechanism(undef, "scram", ["SCRAM"], undef) };
+    like $@, qr/tn_auth_mechanism=scram requires tn_api_username/, "scram without username -> die";
+    eval { main::_select_mechanism("alice", "scram", ["API_KEY_PLAIN"], undef) };
+    like $@, qr/server does not support SCRAM/, "scram-forced on no-SCRAM server -> die";
+    eval { main::_select_mechanism("alice", "scram", undef, "method not found") };
+    like $@, qr/server does not support SCRAM/, "scram-forced on pre-login_ex -> die";
+};
+
+subtest '_select_mechanism: unsupported is checked before rate-limit' => sub {
+    my $both = q{{"code":22,"message":"Method 'auth.mechanism_choices' not found"}};
+    ok  main::_is_rate_limited($both), "fixture matches the rate-limit heuristic";
+    my $scram = q{{"code":22,"message":"Input tag 'SCRAM' found using 'mechanism' does not match any of the expected tags"}};
+    ok  main::_is_rate_limited($scram), "SCRAM-tag fixture also matches rate-limit";
+    is main::_select_mechanism("alice", "auto", undef, $both),  "T3", "not-found + code 22 -> fallback, not T1";
+    is main::_select_mechanism("alice", "auto", undef, $scram), "T3", "SCRAM-unsupported + code 22 -> fallback, not T1";
+    eval { main::_select_mechanism("alice", "scram", undef, $both) };
+    like $@, qr/server does not support SCRAM/, "forced scram dies rather than attempting T1";
+};
+
 done_testing;
