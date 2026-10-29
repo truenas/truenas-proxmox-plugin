@@ -300,15 +300,15 @@ tn_storage_lock_timeout 300
 **Technical Details**: This property controls the timeout for `PVE::Storage::lock_storage()` calls, which serialize access to the storage configuration file during write operations. When concurrent operations exceed this timeout, they fail with a "lock timeout" error. Typical disk allocation operations take 10-15 seconds on standard hardware, so the default 120-second timeout provides ample time for 8+ concurrent operations.
 
 ### `tn_api_username`
-**Description**: TrueNAS username that owns `tn_api_key`
-**Required**: For SCRAM and `API_KEY_PLAIN` login. When unset, the broker uses the legacy `auth.login_with_api_key` call.
+**Description**: TrueNAS account that owns `tn_api_key`
+**Required**: Only when `tn_auth_mechanism` is `scram` (hard failure if unset). Otherwise optional: both `auto` and `plain` fall back to the legacy `auth.login_with_api_key` call when no username is configured. Set it to opt in to SCRAM under `auto`, or to use `auth.login_ex` + `API_KEY_PLAIN` under `plain`.
 
 ### `tn_auth_mechanism`
 **Default**: `auto`
 
-- `auto`: SCRAM-SHA-512 when the server supports it, otherwise `API_KEY_PLAIN`, otherwise legacy login.
-- `scram`: SCRAM-SHA-512 only. Refuses to authenticate against older servers.
-- `plain`: never attempts SCRAM. Uses `API_KEY_PLAIN` on TrueNAS 25.10+, legacy login below.
+- `auto`: SCRAM-SHA-512 when `tn_api_username` is set and the server supports it; otherwise `API_KEY_PLAIN`; otherwise legacy `auth.login_with_api_key`. When `tn_api_username` is unset, always uses legacy login.
+- `scram`: SCRAM-SHA-512 only. Requires `tn_api_username`; refuses to authenticate against servers that do not advertise SCRAM.
+- `plain`: never attempts SCRAM. Uses `API_KEY_PLAIN` on TrueNAS 25.10+ (with `tn_api_username` set), legacy login otherwise.
 
 | TrueNAS version | Tiers available |
 |---|---|
@@ -316,9 +316,9 @@ tn_storage_lock_timeout 300
 | 25.10 | `API_KEY_PLAIN`, legacy |
 | 26.0+ | SCRAM, `API_KEY_PLAIN`, legacy |
 
-TrueNAS 27 removes `auth.login_with_api_key`, so set `tn_api_username` on every storage entry before upgrading to it.
+`auth.login_with_api_key` is deprecated upstream and is expected to be removed in a future TrueNAS release. Setting `tn_api_username` on every storage entry today keeps the plugin forward-compatible with that change.
 
-SCRAM runs PBKDF2, which costs about 60 ms on the first authentication of each session (including reconnects after session expiry).
+SCRAM runs PBKDF2 on each first authentication of a WebSocket session (including reconnects after session expiry), which adds a one-time latency cost on the order of tens of milliseconds. Steady-state calls are unaffected.
 
 ```ini
 truenasplugin: truenas-scram
