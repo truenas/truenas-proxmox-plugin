@@ -256,6 +256,113 @@ sub _authenticate {
     return _do_t3_login($conn, $api_key);
 }
 
+# --- RFC 5929 tls-server-end-point support --------------------------------
+
+# Signature-algorithm OID (dotted) -> OpenSSL long name. Used because
+# Net::SSLeay::X509_get_signature_nid is absent on bookworm.
+my %SIG_OID_NAME = (
+    '1.2.840.113549.1.1.4'  => 'md5WithRSAEncryption',
+    '1.2.840.113549.1.1.5'  => 'sha1WithRSAEncryption',
+    '1.2.840.113549.1.1.14' => 'sha224WithRSAEncryption',
+    '1.2.840.113549.1.1.11' => 'sha256WithRSAEncryption',
+    '1.2.840.113549.1.1.12' => 'sha384WithRSAEncryption',
+    '1.2.840.113549.1.1.13' => 'sha512WithRSAEncryption',
+    '1.2.840.113549.1.1.10' => 'rsassaPss',
+    '1.2.840.10045.4.1'     => 'ecdsa-with-SHA1',
+    '1.2.840.10045.4.3.1'   => 'ecdsa-with-SHA224',
+    '1.2.840.10045.4.3.2'   => 'ecdsa-with-SHA256',
+    '1.2.840.10045.4.3.3'   => 'ecdsa-with-SHA384',
+    '1.2.840.10045.4.3.4'   => 'ecdsa-with-SHA512',
+    '1.2.840.10040.4.3'     => 'dsaWithSHA1',
+    '2.16.840.1.101.3.4.3.1' => 'dsa_with_SHA224',
+    '2.16.840.1.101.3.4.3.2' => 'dsa_with_SHA256',
+    '1.3.101.112'           => 'ED25519',
+    '1.3.101.113'           => 'ED448',
+);
+
+# RFC 5929 section 4.1: hash of the cert's signature algorithm; MD5/SHA-1
+# become SHA-256. undef = unsupported/unknown (caller must refuse).
+sub _cb_digest_for_sig_alg {
+    my ($sig) = @_;
+    return undef unless defined $sig && length $sig;
+    return 'sha256' if $sig =~ /^(?:md5|sha1)WithRSA/i
+                    || $sig =~ /^(?:ecdsa-with-SHA1|dsaWithSHA1|RSA-SHA1|RSA-MD5)$/i;
+    return 'sha224' if $sig =~ /sha-?224/i;
+    return 'sha256' if $sig =~ /sha-?256/i;
+    return 'sha384' if $sig =~ /sha-?384/i;
+    return 'sha512' if $sig =~ /sha-?512/i;
+    return undef;
+}
+
+# Read the signatureAlgorithm OID out of a DER X.509 and return its
+# OpenSSL name (or dotted OID if not in the table); undef on parse failure.
+sub _sig_alg_name_from_der {
+    my ($der) = @_;
+    return undef unless defined $der && length $der;
+    my $pos = 0;
+    my $hdr = sub {    # -> (tag, header_len, content_len) at $pos
+        return () if $pos + 2 > length $der;
+        my ($t, $l) = unpack('CC', substr($der, $pos, 2));
+        my $n = 2;
+        if ($l & 0x80) {
+            my $k = $l & 0x7f;
+            return () if $k < 1 || $k > 4 || $pos + 2 + $k > length $der;
+            $l = 0; $l = ($l << 8) | $_ for unpack('C*', substr($der, $pos + 2, $k));
+            $n += $k;
+        }
+        return ($t, $n, $l);
+    };
+    my ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n;                                   # into Certificate
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n + $l;                              # skip tbsCertificate
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n;                                   # into AlgorithmIdentifier
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x06 && $l > 0
+                     && $pos + $n + $l <= length $der;
+    my @b = unpack('C*', substr($der, $pos + $n, $l));
+    my $first = shift @b;
+    my @arc = (int($first / 40), $first % 40);
+    my $v = 0;
+    for my $b (@b) { $v = ($v << 7) | ($b & 0x7f); unless ($b & 0x80) { push @arc, $v; $v = 0 } }
+    my $oid = join '.', @arc;
+    return $SIG_OID_NAME{$oid} // $oid;
+}
+
+# Returns ($cb_raw, undef) or (undef, $err_text).
+sub _extract_tls_server_end_point {
+    my ($sock) = @_;
+    my $x509 = eval { $sock->peer_certificate };
+    return (undef, "no peer certificate") unless $x509;
+    my $sig;
+    my $nid = eval { Net::SSLeay::X509_get_signature_nid($x509) };
+    if ($nid) {
+        $sig = Net::SSLeay::OBJ_nid2ln($nid);
+    } else {
+        # See spec "What's left to the builder": DER-OID parse fallback
+        # (X509_get_signature_nid is missing on bookworm; i2d_X509 too, so
+        # take the DER from the PEM form).
+        my $pem = eval { Net::SSLeay::PEM_get_string_X509($x509) };
+        my $der;
+        if (defined $pem && $pem =~ /-----BEGIN CERTIFICATE-----(.*?)-----END/s) {
+            require MIME::Base64;
+            $der = MIME::Base64::decode_base64($1);
+        }
+        $sig = _sig_alg_name_from_der($der);
+    }
+    my $hash = _cb_digest_for_sig_alg($sig);
+    return (undef, "unsupported certificate signature algorithm: " . ($sig // 'unknown'))
+        unless defined $hash;
+    my $raw = eval { $sock->get_fingerprint_bin($hash) };
+    return (undef, "could not compute $hash certificate fingerprint")
+        unless defined $raw && length $raw;
+    return ($raw, undef);
+}
+
 # True when the server reported a missing JSON-RPC method. Narrow on
 # purpose: generic "not found" text does not count.
 sub _is_method_not_found {

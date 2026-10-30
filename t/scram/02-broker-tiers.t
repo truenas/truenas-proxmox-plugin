@@ -350,4 +350,52 @@ subtest '_authenticate' => sub {
     is_deeply \@calls, ['T3'];
 };
 
+subtest '_cb_digest_for_sig_alg' => sub {
+    is main::_cb_digest_for_sig_alg('sha256WithRSAEncryption'), 'sha256';
+    is main::_cb_digest_for_sig_alg('ecdsa-with-SHA256'),       'sha256';
+    is main::_cb_digest_for_sig_alg('sha384WithRSAEncryption'), 'sha384';
+    is main::_cb_digest_for_sig_alg('sha512WithRSAEncryption'), 'sha512';
+    is main::_cb_digest_for_sig_alg('sha1WithRSAEncryption'),   'sha256', 'weak sig -> sha256 per RFC 5929 4.1';
+    is main::_cb_digest_for_sig_alg('md5WithRSAEncryption'),    'sha256', 'md5 sig -> sha256';
+    is main::_cb_digest_for_sig_alg('ed25519'),                 undef,    'ed25519 -> undef';
+    is main::_cb_digest_for_sig_alg('rsassaPss'),               undef,    'rsassa-pss -> undef';
+    is main::_cb_digest_for_sig_alg(''),                        undef,    'empty -> undef';
+};
+
+subtest '_sig_alg_name_from_der' => sub {
+    open my $fh, '<:raw', 't/scram/certs/sha384.der' or die "fixture: $!";
+    local $/; my $der = <$fh>; close $fh;
+    is main::_sig_alg_name_from_der($der), 'sha384WithRSAEncryption';
+    is main::_cb_digest_for_sig_alg(main::_sig_alg_name_from_der($der)), 'sha384';
+    is main::_sig_alg_name_from_der('garbage'), undef;
+    is main::_sig_alg_name_from_der(undef), undef;
+};
+
+subtest '_extract_tls_server_end_point' => sub {
+    my $no_cert_sock = bless {}, 'main::StubSock';
+    { no warnings "once"; *main::StubSock::peer_certificate = sub { undef }; }
+    my ($raw, $err) = main::_extract_tls_server_end_point($no_cert_sock);
+    is $raw, undef;
+    like $err, qr/no peer certificate/i;
+
+    # Real X509 handle from the SHA-384 fixture, stub fingerprint method.
+    require Net::SSLeay;
+    open my $fh, '<:raw', 't/scram/certs/sha384.der' or die "fixture: $!";
+    local $/; my $der = <$fh>; close $fh;
+    my $bio = Net::SSLeay::BIO_new(Net::SSLeay::BIO_s_mem());
+    Net::SSLeay::BIO_write($bio, $der);
+    my $x509 = Net::SSLeay::d2i_X509_bio($bio);
+    ok $x509, 'parsed fixture';
+    my $asked;
+    my $sock = bless {}, 'main::StubSock2';
+    no warnings "once";
+    *main::StubSock2::peer_certificate = sub { $x509 };
+    *main::StubSock2::get_fingerprint_bin = sub { $asked = $_[1]; "RAWDIGEST" };
+    ($raw, $err) = main::_extract_tls_server_end_point($sock);
+    is $raw, "RAWDIGEST";
+    is $err, undef;
+    is $asked, 'sha384', 'digest chosen from cert signature alg';
+    Net::SSLeay::BIO_free($bio);
+};
+
 done_testing;
