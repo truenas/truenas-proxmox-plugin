@@ -37,6 +37,8 @@ use MIME::Base64 qw(encode_base64);
 use JSON::PP;
 use Socket;
 use Time::HiRes qw(time);
+use TrueNAS::SCRAM qw(scram_split_api_key scram_client_first scram_process_server_first
+                      scram_client_final scram_verify_server_final);
 
 my $SOCKET_PATH    = '/run/truenas-plugin/broker.sock';
 my $PIDFILE        = '/run/truenas-plugin/broker.pid';
@@ -196,13 +198,371 @@ sub ws_open {
     die "WS handshake invalid accept key" if ($accept // '') ne $expect;
 
     my $conn = { sock => $sock, next_id => 1 };
+    _authenticate($conn, $scfg);
+    return $conn;
+}
+
+# Probe auth.mechanism_choices, pick a tier, and log in. Probe failures are
+# classified by _select_mechanism (pure); this sub does the I/O.
+sub _authenticate {
+    my ($conn, $scfg) = @_;
+    my $username = $scfg->{api_username};
+    $username = undef if defined $username && !length $username;
+    my $mech = $scfg->{auth_mechanism} || 'auto';
+    my $api_key = $scfg->{api_key};
+
+    my ($probe_result, $probe_err);
+    if (defined $username) {
+        my $resp = eval {
+            ws_rpc($conn, {
+                jsonrpc => "2.0", id => $conn->{next_id}++,
+                method  => "auth.mechanism_choices", params => [],
+            });
+        };
+        if ($@) { $probe_err = "$@"; }
+        elsif (ref($resp) eq 'HASH' && exists $resp->{error}) {
+            $probe_err = encode_json($resp->{error});
+        } elsif (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'ARRAY') {
+            $probe_result = $resp->{result};
+        } elsif (ref($resp) eq 'ARRAY') {
+            $probe_result = $resp;
+        } else {
+            $probe_err = "auth.mechanism_choices: no usable response";
+        }
+    }
+
+    my $cb_raw;
+    if ($mech eq 'scram-plus') {
+        my ($cb, $cb_err) = _extract_tls_server_end_point($conn->{sock});
+        die "[TrueNAS] tn_auth_mechanism=scram-plus: TLS peer certificate not available for channel binding: $cb_err\n"
+            unless defined $cb;
+        $cb_raw = $cb;
+    }
+
+    my $tier = _select_mechanism($username, $mech, $probe_result, $probe_err, defined $cb_raw ? 1 : 0);
+    linfo("auth: using tier $tier (mechanism=$mech)");
+    if ($tier eq 'T1') {
+        return 1 if eval { _do_t1_login($conn, $username, $api_key); 1 };
+        my $err = $@;
+        # Only auto mode may fall back, and only when the server rejected
+        # SCRAM itself; any other T1 failure is fatal (no fail-open).
+        my $unsupported = _is_scram_unsupported_error($err)
+                          || $err =~ /SCRAM unsupported by server/;
+        my $nomethod = _is_method_not_found($err);
+        die $err if $mech ne 'auto' || !($unsupported || $nomethod);
+        lwarn("auth: SCRAM unavailable on server, falling back to API_KEY_PLAIN");
+        $tier = 'T2';
+    }
+    if ($tier eq 'T2') {
+        return 1 if eval { _do_t2_login($conn, $username, $api_key); 1 };
+        my $err = $@;
+        # Only a missing login_ex (pre-25.10 server) falls to the legacy
+        # floor; AUTH_ERR, DENIED, rate-limit etc. stay fatal.
+        die $err if $mech eq 'scram' || !_is_method_not_found($err);
+        lwarn("auth: auth.login_ex not available, falling back to legacy API-key login");
+    }
+    if ($tier eq 'T1-PLUS') {
+        _do_t1_login($conn, $username, $api_key, channel_binding => $cb_raw);
+        return 1;
+    }
+    return _do_t3_login($conn, $api_key);
+}
+
+# --- RFC 5929 tls-server-end-point support --------------------------------
+
+# Signature-algorithm OID (dotted) -> OpenSSL long name. Used because
+# Net::SSLeay::X509_get_signature_nid is absent on bookworm.
+my %SIG_OID_NAME = (
+    '1.2.840.113549.1.1.4'  => 'md5WithRSAEncryption',
+    '1.2.840.113549.1.1.5'  => 'sha1WithRSAEncryption',
+    '1.2.840.113549.1.1.14' => 'sha224WithRSAEncryption',
+    '1.2.840.113549.1.1.11' => 'sha256WithRSAEncryption',
+    '1.2.840.113549.1.1.12' => 'sha384WithRSAEncryption',
+    '1.2.840.113549.1.1.13' => 'sha512WithRSAEncryption',
+    '1.2.840.113549.1.1.10' => 'rsassaPss',
+    '1.2.840.10045.4.1'     => 'ecdsa-with-SHA1',
+    '1.2.840.10045.4.3.1'   => 'ecdsa-with-SHA224',
+    '1.2.840.10045.4.3.2'   => 'ecdsa-with-SHA256',
+    '1.2.840.10045.4.3.3'   => 'ecdsa-with-SHA384',
+    '1.2.840.10045.4.3.4'   => 'ecdsa-with-SHA512',
+    '1.2.840.10040.4.3'     => 'dsaWithSHA1',
+    '2.16.840.1.101.3.4.3.1' => 'dsa_with_SHA224',
+    '2.16.840.1.101.3.4.3.2' => 'dsa_with_SHA256',
+    '1.3.101.112'           => 'ED25519',
+    '1.3.101.113'           => 'ED448',
+);
+
+# RFC 5929 section 4.1: hash of the cert's signature algorithm; MD5/SHA-1
+# become SHA-256. undef = unsupported/unknown (caller must refuse).
+sub _cb_digest_for_sig_alg {
+    my ($sig) = @_;
+    return undef unless defined $sig && length $sig;
+    return 'sha256' if $sig =~ /^(?:md5|sha1)WithRSA/i
+                    || $sig =~ /^(?:ecdsa-with-SHA1|dsaWithSHA1|RSA-SHA1|RSA-MD5)$/i;
+    return 'sha224' if $sig =~ /sha-?224/i;
+    return 'sha256' if $sig =~ /sha-?256/i;
+    return 'sha384' if $sig =~ /sha-?384/i;
+    return 'sha512' if $sig =~ /sha-?512/i;
+    return undef;
+}
+
+# Read the signatureAlgorithm OID out of a DER X.509 and return its
+# OpenSSL name (or dotted OID if not in the table); undef on parse failure.
+sub _sig_alg_name_from_der {
+    my ($der) = @_;
+    return undef unless defined $der && length $der;
+    my $pos = 0;
+    my $hdr = sub {    # -> (tag, header_len, content_len) at $pos
+        return () if $pos + 2 > length $der;
+        my ($t, $l) = unpack('CC', substr($der, $pos, 2));
+        my $n = 2;
+        if ($l & 0x80) {
+            my $k = $l & 0x7f;
+            return () if $k < 1 || $k > 4 || $pos + 2 + $k > length $der;
+            $l = 0; $l = ($l << 8) | $_ for unpack('C*', substr($der, $pos + 2, $k));
+            $n += $k;
+        }
+        return ($t, $n, $l);
+    };
+    my ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n;                                   # into Certificate
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n + $l;                              # skip tbsCertificate
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x30;
+    $pos += $n;                                   # into AlgorithmIdentifier
+    ($t, $n, $l) = $hdr->();
+    return undef unless defined $t && $t == 0x06 && $l > 0
+                     && $pos + $n + $l <= length $der;
+    my @b = unpack('C*', substr($der, $pos + $n, $l));
+    my $first = shift @b;
+    my @arc = (int($first / 40), $first % 40);
+    my $v = 0;
+    for my $b (@b) { $v = ($v << 7) | ($b & 0x7f); unless ($b & 0x80) { push @arc, $v; $v = 0 } }
+    my $oid = join '.', @arc;
+    return $SIG_OID_NAME{$oid} // $oid;
+}
+
+# Returns ($cb_raw, undef) or (undef, $err_text).
+sub _extract_tls_server_end_point {
+    my ($sock) = @_;
+    my $x509 = eval { $sock->peer_certificate };
+    return (undef, "no peer certificate") unless $x509;
+    my $sig;
+    my $nid = eval { Net::SSLeay::X509_get_signature_nid($x509) };
+    if ($nid) {
+        $sig = Net::SSLeay::OBJ_nid2ln($nid);
+    } else {
+        # See spec "What's left to the builder": DER-OID parse fallback
+        # (X509_get_signature_nid is missing on bookworm; i2d_X509 too, so
+        # take the DER from the PEM form).
+        my $pem = eval { Net::SSLeay::PEM_get_string_X509($x509) };
+        my $der;
+        if (defined $pem && $pem =~ /-----BEGIN CERTIFICATE-----(.*?)-----END/s) {
+            require MIME::Base64;
+            $der = MIME::Base64::decode_base64($1);
+        }
+        $sig = _sig_alg_name_from_der($der);
+    }
+    my $hash = _cb_digest_for_sig_alg($sig);
+    return (undef, "unsupported certificate signature algorithm: " . ($sig // 'unknown'))
+        unless defined $hash;
+    my $raw = eval { $sock->get_fingerprint_bin($hash) };
+    return (undef, "could not compute $hash certificate fingerprint")
+        unless defined $raw && length $raw;
+    return ($raw, undef);
+}
+
+# True when the server reported a missing JSON-RPC method. Narrow on
+# purpose: generic "not found" text does not count.
+sub _is_method_not_found {
+    my ($err) = @_;
+    return 0 unless defined $err;
+    return 1 if $err =~ /Method\s+'[^']+'\s+not found/i;
+    return 1 if $err =~ /method not found/i;
+    return 1 if $err =~ /unknown method/i;
+    return 0;
+}
+
+# Pure tier selector. T1=SCRAM, T1-PLUS=SCRAM with channel binding,
+# T2=API_KEY_PLAIN login_ex, T3=legacy login_with_api_key. Probe errors are classified here: an "unavailable"
+# error is checked BEFORE rate-limit, because the unsupported envelope can
+# carry a code that _is_rate_limited also matches.
+# The fifth arg, $cb_available, is a boolean the caller sets after
+# extracting the TLS peer-cert digest. In the current tree it is not
+# consumed by any branch (scram-plus's CB readiness is checked in the
+# caller before dispatch, which Task 4 adds). The arg exists so a later
+# extension can read it without changing the signature again.
+sub _select_mechanism {
+    my ($username, $mech, $probe_result, $probe_err, $cb_available) = @_;
+    $mech = 'auto' unless defined $mech && length $mech;
+    $username = undef if defined $username && !length $username;
+
+    my $limited = 0;
+    if (defined $probe_err) {
+        my $unsupported = _is_scram_unsupported_error($probe_err)
+                          || _is_method_not_found($probe_err);
+        $limited = 1 if !$unsupported && _is_rate_limited($probe_err);
+    }
+    my %have = map { $_ => 1 } (ref($probe_result) eq 'ARRAY' ? @$probe_result : ());
+
+    if ($mech eq 'scram') {
+        die "tn_auth_mechanism=scram requires tn_api_username\n" unless defined $username;
+        return 'T1' if $have{SCRAM} || $limited;
+        die "tn_auth_mechanism=scram but server does not support SCRAM\n";
+    }
+    if ($mech eq 'plain') {
+        return 'T3' unless defined $username;
+        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited;
+        return 'T3';
+    }
+    if ($mech eq 'scram-plus') {
+        die "tn_auth_mechanism=scram-plus requires tn_api_username\n" unless defined $username;
+        return 'T1-PLUS' if $have{SCRAM} || $limited;
+        die "tn_auth_mechanism=scram-plus but server does not advertise SCRAM\n";
+    }
+    die "tn_auth_mechanism=$mech: unknown mechanism\n" unless $mech eq 'auto';
+    return 'T3' unless defined $username;
+    return 'T1' if $have{SCRAM};
+    return 'T2' if $have{API_KEY_PLAIN};
+    return 'T1' if $limited;
+    return 'T3';
+}
+
+# Legacy (T3) login: one auth.login_with_api_key call. Dies "TrueNAS
+# authentication failed" when there is no response (unchanged baseline),
+# dies "legacy API-key login rejected" on a false result, and dies with the
+# serialized JSON-RPC error on an error envelope so _is_rate_limited can
+# classify it. Accepts either the full JSON-RPC envelope (what ws_rpc
+# returns) or a bare boolean.
+sub _do_t3_login {
+    my ($conn, $api_key) = @_;
     my $auth = ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
-        params  => [ $scfg->{api_key} ],
+        params  => [ $api_key ],
     });
-    die "TrueNAS authentication failed" unless $auth;
-    return $conn;
+    die "TrueNAS authentication failed" unless defined $auth;
+    my $result = $auth;
+    if (ref($auth) eq 'HASH') {
+        die "legacy API-key login error: " . encode_json($auth->{error}) . "\n"
+            if exists $auth->{error};
+        $result = $auth->{result};
+    }
+    die "legacy API-key login rejected\n" unless $result;
+    return 1;
+}
+
+# T2 login: auth.login_ex with mechanism API_KEY_PLAIN (TN 25.10+). Only
+# response_type SUCCESS counts as authenticated; anything else dies naming
+# the mechanism and the server's response_type. ws_rpc errors propagate so
+# the caller can classify "server lacks login_ex" from the error text.
+sub _do_t2_login {
+    my ($conn, $username, $api_key) = @_;
+    my $resp = ws_rpc($conn, {
+        jsonrpc => "2.0", id => $conn->{next_id}++,
+        method  => "auth.login_ex",
+        params  => [{
+            mechanism     => "API_KEY_PLAIN",
+            username      => $username,
+            api_key       => $api_key,
+            login_options => {},
+        }],
+    });
+    die "[TrueNAS] API_KEY_PLAIN login failed: no response from server\n"
+        unless defined $resp;
+    # ws_rpc returns the whole JSON-RPC envelope and does not die on server
+    # errors; handle the error envelope explicitly so the server's detail
+    # (code/message) reaches the caller for classification.
+    if (ref($resp) eq 'HASH' && exists $resp->{error}) {
+        die "[TrueNAS] API_KEY_PLAIN login error: " . encode_json($resp->{error}) . "\n";
+    }
+    my $res = (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'HASH')
+        ? $resp->{result} : $resp;
+    my $rt = ref($res) eq 'HASH' ? $res->{response_type} : undef;
+    $rt = 'UNKNOWN' unless defined $rt && length $rt;
+    die "[TrueNAS] API_KEY_PLAIN login rejected: $rt\n" unless $rt eq 'SUCCESS';
+    return 1;
+}
+
+# True when the server rejected the SCRAM mechanism (TN 25.10 lacks it).
+sub _is_scram_unsupported_error {
+    my ($err) = @_;
+    return 0 unless defined $err;
+    return $err =~ /Input tag 'SCRAM'.*does not match/s ? 1 : 0;
+}
+
+# One SCRAM auth.login_ex round trip. Returns the unwrapped result hash;
+# dies "SCRAM unsupported by server" (classifiable by the caller) or
+# "SCRAM auth failed" on any problem. Non-SCRAM ws_rpc failures propagate.
+sub _scram_step {
+    my ($conn, $scram_type, $rfc_str, $want_type) = @_;
+    my $resp = eval {
+        ws_rpc($conn, {
+            jsonrpc => "2.0", id => $conn->{next_id}++,
+            method  => "auth.login_ex",
+            params  => [{ mechanism => "SCRAM", scram_type => $scram_type,
+                          rfc_str => $rfc_str }],
+        });
+    };
+    if (my $err = $@) {
+        die "[TrueNAS] SCRAM unsupported by server: $err"
+            if _is_scram_unsupported_error($err);
+        die $err;
+    }
+    die "[TrueNAS] SCRAM auth failed: no response from server\n"
+        unless defined $resp;
+    if (ref($resp) eq 'HASH' && exists $resp->{error}) {
+        my $msg = ref($resp->{error}) eq 'HASH' ? ($resp->{error}{message} // "") : "";
+        die "[TrueNAS] SCRAM unsupported by server: " . encode_json($resp->{error}) . "\n"
+            if _is_scram_unsupported_error($msg);
+        die "[TrueNAS] SCRAM auth failed: " . encode_json($resp->{error}) . "\n";
+    }
+    my $res = (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'HASH')
+        ? $resp->{result} : $resp;
+    unless (ref($res) eq 'HASH'
+            && ($res->{response_type} // '') eq 'SCRAM_RESPONSE'
+            && ($res->{scram_type} // '') eq $want_type) {
+        die "[TrueNAS] SCRAM auth failed: unexpected response: "
+            . encode_json(ref($res) ? $res : { raw => $res }) . "\n";
+    }
+    return $res;
+}
+
+# T1 login: SCRAM-SHA-512 over auth.login_ex. The secret never goes on the
+# wire; the server's signature is verified before success is returned.
+sub _do_t1_login {
+    my ($conn, $username, $api_key, %opts) = @_;
+    my ($key_id, $secret) = scram_split_api_key($api_key);
+    my ($state, $first_wire) = scram_client_first($username, $key_id,
+        (defined $opts{channel_binding} ? (channel_binding => $opts{channel_binding}) : ()));
+
+    my $r1 = _scram_step($conn, "CLIENT_FIRST_MESSAGE", $first_wire, "SERVER_FIRST_RESPONSE");
+    scram_process_server_first($state, $r1->{rfc_str}, $secret);
+    my $final_wire = scram_client_final($state);
+
+    my $r2 = _scram_step($conn, "CLIENT_FINAL_MESSAGE", $final_wire, "SERVER_FINAL_RESPONSE");
+    eval { scram_verify_server_final($state, $r2->{rfc_str}); 1 }
+        or do { my $m = $@; $m =~ s/^scram:\s*//; die "[TrueNAS] SCRAM auth failed: $m"; };
+
+    $state->{saltedPassword} = "\0" x length($state->{saltedPassword} // '');
+    $secret = "\0" x length($secret);
+    return 1;
+}
+
+# True when an error string looks like TrueNAS's auth rate limiter, matching
+# the terraform provider's heuristic: APIError code 0/16/22/-32000, or the
+# message contains "rate limit" / "concurrent calls" (case-insensitive).
+sub _is_rate_limited {
+    my ($err) = @_;
+    return 0 unless defined $err && length $err;
+    return 1 if $err =~ /"code"\s*:\s*(?:0|16|22|-32000)\b/;
+    return 1 if $err =~ /\bcode\s*[:=]?\s*(?:0|16|22|-32000)\b/i;
+    my $l = lc $err;
+    return 1 if index($l, 'rate limit') >= 0 || index($l, 'concurrent calls') >= 0;
+    return 0;
 }
 
 sub xor_mask {
@@ -307,8 +667,11 @@ sub scfg_key {
     my ($scfg) = @_;
     my $host = $scfg->{api_host} // '';
     my $key  = $scfg->{api_key}  // '';
-    # Don't put raw api_key in memory key; hash it
-    return $host . ':' . sha1_hex($key);
+    my $user = $scfg->{api_username} // '';
+    my $mech = $scfg->{auth_mechanism} || 'auto';
+    # Don't put raw api_key in memory key; hash it with username+mechanism so
+    # two storages on one host with different identities get separate pools.
+    return $host . ':' . sha1_hex($key . '|' . $user . '|' . $mech);
 }
 
 sub get_or_open_ws {
@@ -538,32 +901,13 @@ sub handle_request {
 }
 
 # ---------------- main ----------------
-ensure_rundir();
-daemonize();
-write_pidfile();
-linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
-
-$SIG{PIPE} = 'IGNORE';
-# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
-# also propagate to the worker pool. Workers install their own TERM
-# handler in spawn_worker so they close their local %POOL WS connections
-# and exit cleanly without touching parent's socket / pidfile.
-
-my $srv = make_listener();
-
-# The listen fd is now bound and listening. Workers haven't been forked
-# yet, but the kernel will queue incoming connections until one does
-# accept(). From a client's perspective the socket is ready, so this is
-# the right moment to tell systemd we're up (Type=notify). See
-# sd_notify_ready() comment for the ordering rationale.
-sd_notify_ready();
+my $srv;
+my %WORKER_PIDS;   # pid => 1
 
 # Prefork the worker pool. Parent creates listen fd, forks N children; each
 # child re-runs the accept loop against the shared fd. Kernel serializes
 # accept() among children so no race. Parent then waits and re-spawns any
 # child that dies.
-my %WORKER_PIDS;   # pid => 1
-
 sub spawn_worker {
     my $pid = fork();
     if (!defined $pid) {
@@ -610,6 +954,28 @@ sub worker_loop {
     }
 }
 
+sub main {
+ensure_rundir();
+daemonize();
+write_pidfile();
+linfo("truenas-plugin-broker starting (pid=$$, socket=$SOCKET_PATH)");
+
+$SIG{PIPE} = 'IGNORE';
+# NOTE: parent SIG{TERM}/INT is set AFTER the prefork below so it can
+# also propagate to the worker pool. Workers install their own TERM
+# handler in spawn_worker so they close their local %POOL WS connections
+# and exit cleanly without touching parent's socket / pidfile.
+
+$srv = make_listener();
+
+# The listen fd is now bound and listening. Workers haven't been forked
+# yet, but the kernel will queue incoming connections until one does
+# accept(). From a client's perspective the socket is ready, so this is
+# the right moment to tell systemd we're up (Type=notify). See
+# sd_notify_ready() comment for the ordering rationale.
+sd_notify_ready();
+
+
 # Parent: spawn N workers, then supervise
 for (1..$PREFORK_N) { spawn_worker(); }
 linfo("prefork pool up (N=$PREFORK_N)");
@@ -641,3 +1007,6 @@ while (1) {
         spawn_worker();
     }
 }
+}
+
+main() unless caller;

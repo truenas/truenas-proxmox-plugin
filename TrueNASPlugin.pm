@@ -672,6 +672,17 @@ sub properties {
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
+        tn_api_username => {
+            description => "TrueNAS account that owns the API key. Required by the SCRAM and SCRAM-PLUS authentication mechanisms (tn_auth_mechanism=scram or scram-plus); leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
+            type => 'string', optional => 1,
+            format_description => 'account',
+        },
+        tn_auth_mechanism => {
+            description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'scram-plus' is the strict option: it requires SCRAM-SHA-512 with channel binding (tls-server-end-point) and refuses to connect otherwise. 'plain' never attempts SCRAM.",
+            type => 'string', optional => 1,
+            enum => ['auto','scram','scram-plus','plain'],
+            default => 'auto',
+        },
         tn_api_scheme => {
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
@@ -941,6 +952,8 @@ sub options {
         # Connection (fixed to avoid orphaning volumes)
         tn_api_host      => { fixed => 1 },
         tn_api_key       => { fixed => 1 },
+        tn_api_username  => { optional => 1 },
+        tn_auth_mechanism => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
         tn_api_transport => { optional => 1, fixed => 1 },
         tn_api_port      => { optional => 1, fixed => 1 },
@@ -1139,6 +1152,10 @@ sub check_config {
         );
     }
 
+    if (defined $opts->{tn_api_username} && $opts->{tn_api_username} =~ /:/) {
+        die "tn_api_username must not contain ':'\n";
+    }
+
     # Required-field and transport-specific checks only run on create. On
     # edit (`pvesm set <id> -<flag>`) PVE calls check_config with just the
     # submitted delta, not the merged stored config, so demanding required
@@ -1149,6 +1166,10 @@ sub check_config {
         }
         if (!$opts->{tn_api_key}) {
             die "tn_api_key is required\n";
+        }
+        my $mech = $opts->{tn_auth_mechanism} // '';
+        if ($mech =~ /\Ascram(-plus)?\z/ && !$opts->{tn_api_username}) {
+            die "tn_auth_mechanism=$mech requires tn_api_username\n";
         }
         if (!$opts->{tn_dataset}) {
             die "tn_dataset is required\n";
@@ -1513,6 +1534,8 @@ sub _broker_rpc {
         scfg => {
             api_host     => $scfg->{tn_api_host},
             api_key      => $scfg->{tn_api_key},
+            api_username   => $scfg->{tn_api_username},
+            auth_mechanism => $scfg->{tn_auth_mechanism},
             api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
             api_port     => $scfg->{tn_api_port},
             api_insecure => $scfg->{tn_api_insecure} // 0,
@@ -1630,7 +1653,10 @@ sub _ws_get_persistent($scfg) {
     _log($scfg, 0, 'warning',
         "[TrueNAS] broker socket missing; TRUENAS_PLUGIN_ALLOW_DIRECT_WS is set, " .
         "using direct WS. This bypasses D2/D3 rate-limit protection and is not " .
-        "supported in production."
+        "supported in production. The direct-WS path still uses the legacy " .
+        "auth.login_with_api_key call, which is scheduled for removal in a " .
+        "future TrueNAS release; the broker is the only path that migrates to " .
+        "auth.login_ex (SCRAM / API_KEY_PLAIN)."
     );
 
     # Fork detection: if we're in a child process, inherited connections are invalid
