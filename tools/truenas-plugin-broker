@@ -253,6 +253,9 @@ sub _authenticate {
         die $err if $mech eq 'scram' || !_is_method_not_found($err);
         lwarn("auth: auth.login_ex not available, falling back to legacy API-key login");
     }
+    if ($tier eq 'T1-PLUS') {
+        die "[TrueNAS] T1-PLUS dispatch not yet implemented (Task 4 wires it up)\n";
+    }
     return _do_t3_login($conn, $api_key);
 }
 
@@ -374,15 +377,15 @@ sub _is_method_not_found {
     return 0;
 }
 
-# Pure tier selector. T1=SCRAM, T2=API_KEY_PLAIN login_ex, T3=legacy
-# login_with_api_key. Probe errors are classified here: an "unavailable"
+# Pure tier selector. T1=SCRAM, T1-PLUS=SCRAM with channel binding,
+# T2=API_KEY_PLAIN login_ex, T3=legacy login_with_api_key. Probe errors are classified here: an "unavailable"
 # error is checked BEFORE rate-limit, because the unsupported envelope can
 # carry a code that _is_rate_limited also matches.
-# $cb_available is a boolean: true when the caller extracted TLS
-# channel-binding data for this connection. It is NOT read by the scram-plus
-# branch; CB readiness is checked in _authenticate before this selector runs
-# (that is where a missing peer cert dies). It is accepted so a later
-# extension can branch on it without changing the signature.
+# The fifth arg, $cb_available, is a boolean the caller sets after
+# extracting the TLS peer-cert digest. In the current tree it is not
+# consumed by any branch (scram-plus's CB readiness is checked in the
+# caller before dispatch, which Task 4 adds). The arg exists so a later
+# extension can read it without changing the signature again.
 sub _select_mechanism {
     my ($username, $mech, $probe_result, $probe_err, $cb_available) = @_;
     $mech = 'auto' unless defined $mech && length $mech;

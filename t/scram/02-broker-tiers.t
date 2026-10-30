@@ -424,4 +424,21 @@ subtest '_select_mechanism: auto/scram/plain unaffected by cb arg' => sub {
     is main::_select_mechanism('alice', 'plain', ['SCRAM'], undef, 1), 'T2';
 };
 
+subtest '_authenticate scram-plus guard' => sub {
+    no warnings qw(redefine once);
+    my @calls;
+    local *main::linfo = sub { };
+    local *main::lwarn = sub { };
+    local *main::ws_rpc = sub { return { result => ['SCRAM','API_KEY_PLAIN'] } };
+    local *main::_do_t1_login = sub { push @calls, 'T1'; 1 };
+    local *main::_do_t2_login = sub { push @calls, 'T2'; 1 };
+    local *main::_do_t3_login = sub { push @calls, 'T3'; die "T3 must not be called\n" };
+    my $conn = { sock => undef, next_id => 1 };
+    my $ok = eval { main::_authenticate($conn, { api_key => '1-k', api_username => 'alice', auth_mechanism => 'scram-plus' }); 1 };
+    my $err = $@;
+    ok !$ok, 'scram-plus on SCRAM-capable server dies instead of falling through';
+    like $err, qr/T1-PLUS dispatch not yet implemented/, 'guard message';
+    is_deeply \@calls, [], 'no T1, T2, or T3 login attempted';
+};
+
 done_testing;
