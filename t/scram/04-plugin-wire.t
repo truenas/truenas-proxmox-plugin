@@ -32,9 +32,43 @@ subtest 'schema accepts new fields' => sub {
     my $props = $plugin->properties;
     ok exists $props->{tn_api_username}, 'tn_api_username present';
     ok exists $props->{tn_auth_mechanism}, 'tn_auth_mechanism present';
-    is_deeply $props->{tn_auth_mechanism}{enum}, ['auto','scram','plain'];
+    is_deeply $props->{tn_auth_mechanism}{enum}, ['auto','scram','scram-plus','plain'];
     is $props->{tn_auth_mechanism}{default}, 'auto';
     like $props->{tn_api_username}{description}, qr/legacy auth\.login_with_api_key/;
+};
+
+subtest 'scram-plus enum + check_config' => sub {
+    # Create-time: scram-plus without username is refused
+    eval {
+        $plugin->check_config('s1', {
+            type=>'truenasplugin', tn_api_host=>'h', tn_api_key=>'k',
+            tn_auth_mechanism=>'scram-plus',
+        }, 1, 0);
+    };
+    like $@, qr/tn_auth_mechanism=scram-plus requires tn_api_username/;
+
+    # Create-time: scram-plus WITH username is accepted (iSCSI create also
+    # needs dataset + target IQN + discovery portal).
+    my %full = (
+        type=>'truenasplugin', tn_api_host=>'h', tn_api_key=>'k',
+        tn_api_username=>'root', tn_auth_mechanism=>'scram-plus',
+        tn_dataset=>'tank/pve', tn_target_iqn=>'iqn.2005-10.org.example:t',
+        tn_discovery_portal=>'192.0.2.1',
+    );
+    my $ok = eval { $plugin->check_config('s1', { %full }, 1, 0); 1 };
+    ok $ok, "scram-plus + username passes check_config"
+        or diag $@;
+
+    # tn_api_insecure=1 + scram-plus is allowed (spec Goal 7)
+    my $ok2 = eval {
+        $plugin->check_config('s1', { %full, tn_api_insecure=>1 }, 1, 0);
+        1;
+    };
+    ok $ok2, "scram-plus + tn_api_insecure=1 passes check_config";
+
+    # Edit delta: mechanism alone must not trip the create-only requirement.
+    eval { $plugin->check_config('s1', { tn_auth_mechanism=>'scram-plus' }, 0, 0) };
+    unlike $@ // '', qr/requires tn_api_username/, 'scram-plus edit delta not refused';
 };
 
 subtest 'options() allows new fields and leaves them unfixed' => sub {

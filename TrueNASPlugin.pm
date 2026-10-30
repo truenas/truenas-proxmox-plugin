@@ -673,14 +673,14 @@ sub properties {
             type => 'string',
         },
         tn_api_username => {
-            description => "TrueNAS account that owns the API key. Required to enable SCRAM-SHA-512 authentication; leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
+            description => "TrueNAS account that owns the API key. Required by the SCRAM and SCRAM-PLUS authentication mechanisms (tn_auth_mechanism=scram or scram-plus); leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
             type => 'string', optional => 1,
             format_description => 'account',
         },
         tn_auth_mechanism => {
-            description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'plain' never attempts SCRAM.",
+            description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'scram-plus' is the strict option: it requires SCRAM-SHA-512 with channel binding (tls-server-end-point) and refuses to connect otherwise. 'plain' never attempts SCRAM.",
             type => 'string', optional => 1,
-            enum => ['auto','scram','plain'],
+            enum => ['auto','scram','scram-plus','plain'],
             default => 'auto',
         },
         tn_api_scheme => {
@@ -1167,8 +1167,9 @@ sub check_config {
         if (!$opts->{tn_api_key}) {
             die "tn_api_key is required\n";
         }
-        if (($opts->{tn_auth_mechanism} // '') eq 'scram' && !$opts->{tn_api_username}) {
-            die "tn_auth_mechanism=scram requires tn_api_username\n";
+        my $mech = $opts->{tn_auth_mechanism} // '';
+        if ($mech =~ /\Ascram(-plus)?\z/ && !$opts->{tn_api_username}) {
+            die "tn_auth_mechanism=$mech requires tn_api_username\n";
         }
         if (!$opts->{tn_dataset}) {
             die "tn_dataset is required\n";
