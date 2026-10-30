@@ -231,7 +231,15 @@ sub _authenticate {
         }
     }
 
-    my $tier = _select_mechanism($username, $mech, $probe_result, $probe_err);
+    my $cb_raw;
+    if ($mech eq 'scram-plus') {
+        my ($cb, $cb_err) = _extract_tls_server_end_point($conn->{sock});
+        die "[TrueNAS] tn_auth_mechanism=scram-plus: TLS peer certificate not available for channel binding: $cb_err\n"
+            unless defined $cb;
+        $cb_raw = $cb;
+    }
+
+    my $tier = _select_mechanism($username, $mech, $probe_result, $probe_err, defined $cb_raw ? 1 : 0);
     linfo("auth: using tier $tier (mechanism=$mech)");
     if ($tier eq 'T1') {
         return 1 if eval { _do_t1_login($conn, $username, $api_key); 1 };
@@ -254,7 +262,8 @@ sub _authenticate {
         lwarn("auth: auth.login_ex not available, falling back to legacy API-key login");
     }
     if ($tier eq 'T1-PLUS') {
-        die "[TrueNAS] T1-PLUS dispatch not yet implemented (Task 4 wires it up)\n";
+        _do_t1_login($conn, $username, $api_key, channel_binding => $cb_raw);
+        return 1;
     }
     return _do_t3_login($conn, $api_key);
 }
@@ -525,9 +534,10 @@ sub _scram_step {
 # T1 login: SCRAM-SHA-512 over auth.login_ex. The secret never goes on the
 # wire; the server's signature is verified before success is returned.
 sub _do_t1_login {
-    my ($conn, $username, $api_key) = @_;
+    my ($conn, $username, $api_key, %opts) = @_;
     my ($key_id, $secret) = scram_split_api_key($api_key);
-    my ($state, $first_wire) = scram_client_first($username, $key_id);
+    my ($state, $first_wire) = scram_client_first($username, $key_id,
+        (defined $opts{channel_binding} ? (channel_binding => $opts{channel_binding}) : ()));
 
     my $r1 = _scram_step($conn, "CLIENT_FIRST_MESSAGE", $first_wire, "SERVER_FIRST_RESPONSE");
     scram_process_server_first($state, $r1->{rfc_str}, $secret);

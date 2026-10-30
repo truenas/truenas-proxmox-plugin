@@ -424,21 +424,51 @@ subtest '_select_mechanism: auto/scram/plain unaffected by cb arg' => sub {
     is main::_select_mechanism('alice', 'plain', ['SCRAM'], undef, 1), 'T2';
 };
 
-subtest '_authenticate scram-plus guard' => sub {
+subtest '_authenticate scram-plus' => sub {
     no warnings qw(redefine once);
-    my @calls;
+    my @t1_calls;
     local *main::linfo = sub { };
     local *main::lwarn = sub { };
+    local *main::_do_t1_login = sub { push @t1_calls, {@_[3..$#_]}; 1 };
+    local *main::_do_t2_login = sub { die "T2 should not be called in scram-plus\n" };
+    local *main::_do_t3_login = sub { die "T3 should not be called in scram-plus\n" };
     local *main::ws_rpc = sub { return { result => ['SCRAM','API_KEY_PLAIN'] } };
-    local *main::_do_t1_login = sub { push @calls, 'T1'; 1 };
-    local *main::_do_t2_login = sub { push @calls, 'T2'; 1 };
-    local *main::_do_t3_login = sub { push @calls, 'T3'; die "T3 must not be called\n" };
+    local *main::_extract_tls_server_end_point = sub { return ("\0" x 32, undef) };
+
     my $conn = { sock => undef, next_id => 1 };
-    my $ok = eval { main::_authenticate($conn, { api_key => '1-k', api_username => 'alice', auth_mechanism => 'scram-plus' }); 1 };
-    my $err = $@;
-    ok !$ok, 'scram-plus on SCRAM-capable server dies instead of falling through';
-    like $err, qr/T1-PLUS dispatch not yet implemented/, 'guard message';
-    is_deeply \@calls, [], 'no T1, T2, or T3 login attempted';
+    my $scfg = { api_username => 'alice', api_key => '1-abcdef', auth_mechanism => 'scram-plus' };
+    ok main::_authenticate($conn, $scfg), 'returns true';
+    is scalar @t1_calls, 1, 'T1-PLUS dispatched once';
+    is $t1_calls[0]{channel_binding}, "\0" x 32, 'channel_binding passed through';
+
+    {
+        local *main::_extract_tls_server_end_point = sub { return (undef, "no peer certificate") };
+        eval { main::_authenticate($conn, $scfg) };
+        like $@, qr/TLS peer certificate not available for channel binding: no peer certificate/;
+    }
+
+    {
+        local *main::ws_rpc = sub { return { result => ['API_KEY_PLAIN'] } };
+        eval { main::_authenticate($conn, $scfg) };
+        like $@, qr/does not advertise SCRAM/;
+    }
+
+    {
+        local *main::_do_t1_login = sub { die "[TrueNAS] SCRAM auth failed: {\"response_type\":\"AUTH_ERR\"}\n" };
+        eval { main::_authenticate($conn, $scfg) };
+        like $@, qr/AUTH_ERR/, 'T1-PLUS login failure propagates';
+    }
+
+    # Non-plus mechanisms must not extract the cert digest.
+    {
+        my $extracted = 0;
+        local *main::_extract_tls_server_end_point = sub { $extracted++; return (undef, 'x') };
+        @t1_calls = ();
+        main::_authenticate($conn, { %$scfg, auth_mechanism => 'scram' });
+        is $extracted, 0, 'no CB extraction for scram';
+        is scalar @t1_calls, 1, 'T1 dispatched';
+        ok !exists $t1_calls[0]{channel_binding}, 'no channel_binding for plain scram';
+    }
 };
 
 done_testing;
