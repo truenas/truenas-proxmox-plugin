@@ -301,13 +301,14 @@ tn_storage_lock_timeout 300
 
 ### `tn_api_username`
 **Description**: TrueNAS account that owns `tn_api_key`
-**Required**: Only when `tn_auth_mechanism` is `scram` (hard failure if unset). Otherwise optional: both `auto` and `plain` fall back to the legacy `auth.login_with_api_key` call when no username is configured. Set it to opt in to SCRAM under `auto`, or to use `auth.login_ex` + `API_KEY_PLAIN` under `plain`.
+**Required**: Only when `tn_auth_mechanism` is `scram` or `scram-plus` (hard failure if unset). Otherwise optional: both `auto` and `plain` fall back to the legacy `auth.login_with_api_key` call when no username is configured. Set it to opt in to SCRAM under `auto`, or to use `auth.login_ex` + `API_KEY_PLAIN` under `plain`.
 
 ### `tn_auth_mechanism`
 **Default**: `auto`
 
 - `auto`: SCRAM-SHA-512 when `tn_api_username` is set and the server supports it; otherwise `API_KEY_PLAIN`; otherwise legacy `auth.login_with_api_key`. When `tn_api_username` is unset, always uses legacy login.
 - `scram`: SCRAM-SHA-512 only. Requires `tn_api_username`; refuses to authenticate against servers that do not advertise SCRAM.
+- `scram-plus`: SCRAM-SHA-512 with TLS channel binding (`tls-server-end-point`, RFC 5929). Strict: refuses to authenticate if the server does not advertise SCRAM or if the TLS peer certificate cannot be read. Does not fall back to plain SCRAM, `API_KEY_PLAIN`, or legacy under any circumstance. Allowed together with `tn_api_insecure=1` (channel binding ties the SCRAM exchange to the certificate the client saw, defeating a relaying MITM even without CA validation).
 - `plain`: never attempts SCRAM. Uses `API_KEY_PLAIN` on TrueNAS 25.10+ (with `tn_api_username` set), legacy login otherwise.
 
 | TrueNAS version | Tiers available |
@@ -315,6 +316,8 @@ tn_storage_lock_timeout 300
 | 24.10, 25.04 | legacy only |
 | 25.10 | `API_KEY_PLAIN`, legacy |
 | 26.0+ | SCRAM, `API_KEY_PLAIN`, legacy |
+| 26.0+ | `scram-plus` (username set): SCRAM with channel binding on |
+| 26.0+ | `scram-plus` (username unset): dies, requires `tn_api_username` |
 
 `auth.login_with_api_key` is deprecated upstream and is expected to be removed in a future TrueNAS release. Setting `tn_api_username` on every storage entry today keeps the plugin forward-compatible with that change.
 
