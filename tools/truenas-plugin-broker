@@ -378,8 +378,13 @@ sub _is_method_not_found {
 # login_with_api_key. Probe errors are classified here: an "unavailable"
 # error is checked BEFORE rate-limit, because the unsupported envelope can
 # carry a code that _is_rate_limited also matches.
+# $cb_available is a boolean: true when the caller extracted TLS
+# channel-binding data for this connection. It is NOT read by the scram-plus
+# branch; CB readiness is checked in _authenticate before this selector runs
+# (that is where a missing peer cert dies). It is accepted so a later
+# extension can branch on it without changing the signature.
 sub _select_mechanism {
-    my ($username, $mech, $probe_result, $probe_err) = @_;
+    my ($username, $mech, $probe_result, $probe_err, $cb_available) = @_;
     $mech = 'auto' unless defined $mech && length $mech;
     $username = undef if defined $username && !length $username;
 
@@ -401,6 +406,12 @@ sub _select_mechanism {
         return 'T2' if ref($probe_result) eq 'ARRAY' || $limited;
         return 'T3';
     }
+    if ($mech eq 'scram-plus') {
+        die "tn_auth_mechanism=scram-plus requires tn_api_username\n" unless defined $username;
+        return 'T1-PLUS' if $have{SCRAM} || $limited;
+        die "tn_auth_mechanism=scram-plus but server does not advertise SCRAM\n";
+    }
+    die "tn_auth_mechanism=$mech: unknown mechanism\n" unless $mech eq 'auto';
     return 'T3' unless defined $username;
     return 'T1' if $have{SCRAM};
     return 'T2' if $have{API_KEY_PLAIN};

@@ -398,4 +398,30 @@ subtest '_extract_tls_server_end_point' => sub {
     Net::SSLeay::BIO_free($bio);
 };
 
+subtest '_select_mechanism scram-plus' => sub {
+    is main::_select_mechanism('alice', 'scram-plus', ['SCRAM','API_KEY_PLAIN'], undef, 1), 'T1-PLUS';
+    is main::_select_mechanism('alice', 'scram-plus', ['SCRAM'],                 undef, 1), 'T1-PLUS';
+    is main::_select_mechanism('alice', 'scram-plus', undef, 'Rate Limit Exceeded', 1), 'T1-PLUS',
+        'rate-limited probe + username -> attempt T1-PLUS (mirrors scram)';
+
+    eval { main::_select_mechanism(undef, 'scram-plus', ['SCRAM'], undef, 1) };
+    like $@, qr/tn_auth_mechanism=scram-plus requires tn_api_username/;
+
+    eval { main::_select_mechanism('alice', 'scram-plus', ['API_KEY_PLAIN'], undef, 1) };
+    like $@, qr/scram-plus but server does not advertise SCRAM/;
+
+    eval { main::_select_mechanism('alice', 'scram-plus', undef, 'Method not found', 1) };
+    like $@, qr/scram-plus but server does not advertise SCRAM/;
+
+    eval { main::_select_mechanism('alice', 'bogus', ['SCRAM'], undef, 1) };
+    like $@, qr/unknown mechanism/;
+    is $@, "tn_auth_mechanism=bogus: unknown mechanism\n", 'unknown mechanism die message is exact';
+};
+
+subtest '_select_mechanism: auto/scram/plain unaffected by cb arg' => sub {
+    is main::_select_mechanism('alice', 'auto',  ['SCRAM'], undef, 1), 'T1';
+    is main::_select_mechanism('alice', 'scram', ['SCRAM'], undef, 1), 'T1';
+    is main::_select_mechanism('alice', 'plain', ['SCRAM'], undef, 1), 'T2';
+};
+
 done_testing;
