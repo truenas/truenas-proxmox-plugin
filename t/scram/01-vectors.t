@@ -114,4 +114,36 @@ subtest 'known-answer vector against Python stdlib' => sub {
     ok $ok, "server signature v= matches Python vector";
 };
 
+subtest 'SCRAM-PLUS known-answer vector' => sub {
+    # Expected values computed independently with Python stdlib (see
+    # .superpowers/sdd/2026-10-29-scram-plus/compute-plus-vector.py).
+    no warnings 'redefine';
+    local *TrueNAS::SCRAM::urandom = sub { return "A" x 32 };
+    use warnings 'redefine';
+
+    my $cb_raw = "C" x 32;
+    my $combined = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQg==";
+    my $server_first = "r=$combined,s=MDEyMzQ1Njc4OWFiY2RlZg==,i=50000";
+    my $exp_cattr = "cD10bHMtc2VydmVyLWVuZC1wb2ludCwsQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=";
+    my $exp_p     = "jm6KoNj3mliOFSct6NXOHnSlAMS8wcY/FTC4IQAnMMLP781LVOzrLm/s02c3G+tEISfMVNFH/kuA9+z1CMi6ow==";
+    my $exp_v     = "VEnNF6wqjX+M9w+iVSYJlTB8AgkSwZYM6Gb4u705ouOhH2wikou8D4fYSuPwbjHF0y1X6DYDVDnyqU92Tnv3HA==";
+
+    my ($state, $first) = scram_client_first("testuser", 1, channel_binding => $cb_raw);
+    is $first, "p=tls-server-end-point,,n=testuser:1,r=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=",
+        "PLUS client-first uses p=tls-server-end-point GS2 header";
+    is $state->{gs2_header}, "p=tls-server-end-point,,", "state records PLUS gs2_header";
+
+    scram_process_server_first($state, $server_first, "testsecret_for_vector_01");
+    my $final = scram_client_final($state);
+    is $final, "c=$exp_cattr,r=$combined,p=$exp_p", "PLUS client-final (c=, r=, p=) matches Python vector";
+
+    my $ok = eval { scram_verify_server_final($state, "v=$exp_v") };
+    is $@, "", "PLUS server-final verification does not die";
+    ok $ok, "PLUS server signature matches Python vector";
+
+    # plain SCRAM state still records n,,
+    my ($plain) = scram_client_first("testuser", 1);
+    is $plain->{gs2_header}, "n,,", "plain SCRAM gs2_header is n,,";
+};
+
 done_testing;

@@ -64,22 +64,28 @@ sub scram_split_api_key {
     return (int($id), $secret);
 }
 
-=head2 scram_client_first($username, $key_id)
+=head2 scram_client_first($username, $key_id, %opts)
 
 Generates a 32-byte nonce and returns C<($state, $wire)> where C<$wire> is
-C<n,,n=E<lt>userE<gt>:E<lt>kidE<gt>,r=E<lt>base64E<gt>>.
+C<n,,n=E<lt>userE<gt>:E<lt>kidE<gt>,r=E<lt>base64E<gt>>. With
+C<< channel_binding => $cb_raw >> the GS2 header is
+C<p=tls-server-end-point,,> and C<$cb_raw> is kept in the state for the
+C<c=> attribute of client-final.
 
 =cut
 
 sub scram_client_first {
-    my ($username, $key_id) = @_;
+    my ($username, $key_id, %opts) = @_;
     my $nonce = urandom(NONCE_LEN);
     my $bare  = "n=$username:$key_id,r=" . _b64($nonce);
+    my $gs2   = defined $opts{channel_binding} ? 'p=tls-server-end-point,,' : 'n,,';
     my $state = {
         clientFirstBare => $bare,
         clientNonceRaw  => $nonce,
+        gs2_header      => $gs2,
     };
-    return ($state, "n,,$bare");
+    $state->{cb_raw} = $opts{channel_binding} if defined $opts{channel_binding};
+    return ($state, "$gs2$bare");
 }
 
 =head2 scram_process_server_first($state, $server_first, $secret)
@@ -136,7 +142,8 @@ sub scram_process_server_first {
 
 sub _client_final_without_proof {
     my ($state) = @_;
-    return 'c=' . _b64('n,,') . ',r=' . $state->{serverNonceB64};
+    my $gs2 = $state->{gs2_header} // 'n,,';
+    return 'c=' . _b64($gs2 . ($state->{cb_raw} // '')) . ',r=' . $state->{serverNonceB64};
 }
 
 sub _auth_message {
