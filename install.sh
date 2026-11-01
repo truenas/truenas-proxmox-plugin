@@ -1836,10 +1836,22 @@ restart_pve_services() {
     local failed=false
 
     for service in "${services[@]}"; do
-        if systemctl restart "$service" 2>/dev/null; then
+        # ORIGINAL (preserved, not deleted — disabled by comment):
+        # if systemctl restart "$service" 2>/dev/null; then
+        #     success "Restarted $service"
+        # else
+        #     error "Failed to restart $service"
+        #     failed=true
+        # fi
+        if timeout 60 systemctl restart "$service" 2>/dev/null; then
             success "Restarted $service"
         else
-            error "Failed to restart $service"
+            local restart_status=$?
+            if [[ "$restart_status" -eq 124 ]]; then
+                error "Timed out restarting $service after 60 seconds; check systemctl status and journalctl for this unit"
+            else
+                error "Failed to restart $service (exit code $restart_status)"
+            fi
             failed=true
         fi
     done
