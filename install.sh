@@ -1760,6 +1760,15 @@ install_plugin_file() {
     return 0
 }
 
+# Bound every local-node `systemctl restart` call (issue #133). Without a
+# bound, a wedged systemd job queue leaves the installer waiting until the
+# target unit's TimeoutStopSec expires -- 90s on PVE's own units, unbounded
+# elsewhere -- which users observe as an indefinite hang on "Restarting
+# Proxmox services...". 60s is below PVE's own default so a stuck unit
+# surfaces here with a diagnosable error instead of silently waiting out
+# systemd's own kill.
+SYSTEMCTL_RESTART_TIMEOUT_SECS=60
+
 # True if a deferred pveproxy restart timer is already pending on this host.
 # The transient unit is shared by every code path that defers pveproxy
 # (postinst, restart_pve_services, the remote one-liners): a second
@@ -1793,11 +1802,16 @@ schedule_pveproxy_deferred_restart() {
         fi
         warning "systemd-run scheduling failed; restarting pveproxy immediately"
     fi
-    if systemctl restart pveproxy 2>/dev/null; then
+    if timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart pveproxy 2>/dev/null; then
         success "Restarted pveproxy"
         return 0
     fi
-    error "Failed to restart pveproxy"
+    local rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+        error "Timed out restarting pveproxy after ${SYSTEMCTL_RESTART_TIMEOUT_SECS}s; check 'systemctl status pveproxy' and the unit journal"
+    else
+        error "Failed to restart pveproxy (exit code $rc)"
+    fi
     return 1
 }
 
@@ -1836,10 +1850,15 @@ restart_pve_services() {
     local failed=false
 
     for service in "${services[@]}"; do
-        if systemctl restart "$service" 2>/dev/null; then
+        if timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart "$service" 2>/dev/null; then
             success "Restarted $service"
         else
-            error "Failed to restart $service"
+            local rc=$?
+            if [[ "$rc" -eq 124 ]]; then
+                error "Timed out restarting $service after ${SYSTEMCTL_RESTART_TIMEOUT_SECS}s; check 'systemctl status $service' and the unit journal"
+            else
+                error "Failed to restart $service (exit code $rc)"
+            fi
             failed=true
         fi
     done
