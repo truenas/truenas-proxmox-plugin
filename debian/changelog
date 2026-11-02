@@ -1,3 +1,36 @@
+truenas-proxmox-plugin (2.1.24~beta7) unstable; urgency=medium
+
+  * feat(auth): migrate TrueNAS authentication from auth.login_with_api_key
+    to auth.login_ex with explicit tier selection via tn_auth_mechanism
+    (auto|scram|scram-plus|plain, default auto). Adds base SCRAM-SHA-512
+    plus API_KEY_PLAIN plus legacy fallback, with per-storage opt-in.
+    New tn_api_username scfg field. Broker pool key hashes host, api_key,
+    api_username, and mechanism so distinct auth configs get distinct
+    worker pools. Live-verified across TrueNAS 26.0 BETA.3 and 28.0 MASTER
+    on four PVE 9.2.21 nodes; dev full-function sweep (50/50 PASS, 1 SKIP)
+    and lifecycle tests (7 PASS + 1 SKIP) green with
+    tn_auth_mechanism=scram.
+  * feat(auth): SCRAM-PLUS strict channel binding to tls-server-end-point
+    (RFC 5929) via tn_auth_mechanism=scram-plus. Picks the SHA digest per
+    cert signature algorithm per RFC 5929 section 4.1; refuses to connect
+    when the server does not advertise SCRAM, when the TLS peer cert
+    cannot be read, or when the server rejects the c= attribute. No
+    fallback to plain SCRAM under any circumstance. tn_api_insecure=1
+    allowed with scram-plus. Pure-Perl crypto in lib/TrueNAS/SCRAM.pm
+    with Python-stdlib known-answer vectors.
+  * fix(#133): bound every local-node systemctl restart call in
+    install.sh through SYSTEMCTL_RESTART_TIMEOUT_SECS (60 s). A wedged
+    systemd job queue previously left the installer waiting out the
+    unit's TimeoutStopSec, which users observed as an indefinite hang
+    on "Restarting Proxmox services...". The timeout now surfaces the
+    stuck unit with a diagnosable error and the exact systemctl status
+    command. Covers restart_pve_services and the pveproxy immediate
+    fallback in schedule_pveproxy_deferred_restart.
+  * dep: adds libcrypt-pbkdf2-perl and libcrypt-urandom-perl to Depends
+    (both present in bookworm and trixie).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 02 Nov 2026 09:30:00 -0500
+
 truenas-proxmox-plugin (2.1.24~beta6) unstable; urgency=medium
 
   * fix(#135): drop the full-NAS snapshot scan from
