@@ -24,6 +24,8 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_api_budget_s](#tn_api_budget_s)
   - [tn_status_probe_backoff_s](#tn_status_probe_backoff_s)
   - [tn_storage_lock_timeout](#tn_storage_lock_timeout)
+  - [tn_api_username](#tn_api_username)
+  - [tn_auth_mechanism](#tn_auth_mechanism)
 - [Network Configuration](#network-configuration)
   - [tn_prefer_ipv4](#tn_prefer_ipv4)
   - [tn_portals](#tn_portals)
@@ -296,6 +298,45 @@ tn_storage_lock_timeout 300
 ```
 
 **Technical Details**: This property controls the timeout for `PVE::Storage::lock_storage()` calls, which serialize access to the storage configuration file during write operations. When concurrent operations exceed this timeout, they fail with a "lock timeout" error. Typical disk allocation operations take 10-15 seconds on standard hardware, so the default 120-second timeout provides ample time for 8+ concurrent operations.
+
+### `tn_api_username`
+**Description**: TrueNAS account that owns `tn_api_key`
+**Required**: Only when `tn_auth_mechanism` is `scram` or `scram-plus` (hard failure if unset). Otherwise optional: both `auto` and `plain` fall back to the legacy `auth.login_with_api_key` call when no username is configured. Set it to opt in to SCRAM under `auto`, or to use `auth.login_ex` + `API_KEY_PLAIN` under `plain`.
+
+### `tn_auth_mechanism`
+**Default**: `auto`
+
+- `auto`: SCRAM-SHA-512 when `tn_api_username` is set and the server supports it; otherwise `API_KEY_PLAIN`; otherwise legacy `auth.login_with_api_key`. When `tn_api_username` is unset, always uses legacy login.
+- `scram`: SCRAM-SHA-512 only. Requires `tn_api_username`; refuses to authenticate against servers that do not advertise SCRAM.
+- `scram-plus`: SCRAM-SHA-512 with TLS channel binding (`tls-server-end-point`, RFC 5929). Strict: refuses to authenticate if the server does not advertise SCRAM or if the TLS peer certificate cannot be read. Does not fall back to plain SCRAM, `API_KEY_PLAIN`, or legacy under any circumstance. Allowed together with `tn_api_insecure=1` (channel binding ties the SCRAM exchange to the certificate the client saw, defeating a relaying MITM even without CA validation).
+- `plain`: never attempts SCRAM. Uses `API_KEY_PLAIN` on TrueNAS 25.10+ (with `tn_api_username` set), legacy login otherwise.
+
+| TrueNAS version | Tiers available |
+|---|---|
+| 24.10, 25.04 | legacy only |
+| 25.10 | `API_KEY_PLAIN`, legacy |
+| 26.0+ | SCRAM, `API_KEY_PLAIN`, legacy |
+| 26.0+ | `scram-plus` (username set): SCRAM with channel binding on |
+| 26.0+ | `scram-plus` (username unset): dies, requires `tn_api_username` |
+
+`auth.login_with_api_key` is deprecated upstream and is expected to be removed in a future TrueNAS release. Setting `tn_api_username` on every storage entry today keeps the plugin forward-compatible with that change.
+
+SCRAM runs PBKDF2 on each first authentication of a WebSocket session (including reconnects after session expiry), which adds a one-time latency cost measured at roughly 1-3 seconds against TrueNAS 26.0 BETA.3 and 28.0 MASTER (the server stores API keys at 500 000 PBKDF2-SHA512 iterations). Steady-state calls are unaffected.
+
+Legacy (pre-25.10) API keys in the `id-token` format are not bound to SCRAM credentials on the server. If `tn_api_username` is set against such a key, SCRAM and `API_KEY_PLAIN` both fail with `AUTH_ERR`. Either leave `tn_api_username` unset (falls back to `auth.login_with_api_key`) or regenerate the key against TrueNAS 25.10+ (the newer `user_id-token` format carries SCRAM state).
+
+```ini
+truenasplugin: truenas-scram
+    tn_api_host 192.168.1.70
+    tn_api_key 1-your-api-key-here
+    tn_api_username root
+    tn_auth_mechanism scram
+    tn_dataset tank/proxmox
+    tn_target_iqn iqn.2005-10.org.freenas.ctl:proxmox
+    tn_discovery_portal 192.168.1.70:3260
+    content images
+    shared 1
+```
 
 ## Network Configuration
 

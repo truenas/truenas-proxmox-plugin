@@ -1,4 +1,5 @@
 TrueNASPlugin.pm usr/share/perl5/PVE/Storage/Custom/
+lib/TrueNAS/SCRAM.pm usr/share/perl5/TrueNAS/
 install.sh usr/share/truenas-proxmox-plugin/
 tools/truenas-plugin-broker usr/sbin/
 tools/truenas-plugin-lvm-filter usr/sbin/
