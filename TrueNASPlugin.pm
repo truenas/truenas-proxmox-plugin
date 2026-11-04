@@ -4351,21 +4351,84 @@ sub _resolve_target_id {
 }
 
 # ======== Portal normalization & reachability ========
-sub _normalize_portal($p) {
+# ---- iSCSI portal strings and IPv6 (issue #140) ----------------------------
+#
+# An iSCSI portal is written "host:port", "[v6]:port", a bare host or a bare
+# "[v6]"; iscsiadm prints sessions and node records as "[v6]:port,tpgt" and
+# needs the brackets back on -p. Until 2.1.24 the plugin stripped the brackets
+# ("fd00::1:3260"), probed with the IPv4-only IO::Socket::INET and matched
+# session lines by substring, so an IPv6 portal failed at the reachability
+# probe and would have been unusable past it. Everything below works on one
+# parsed (host, port) pair and renders the bracketed form where a tool wants a
+# single string.
+
+# _parse_portal: portal string -> (host without brackets, port or undef).
+# A trailing ",tpgt" (as iscsiadm prints it) is dropped. Without brackets a
+# string with more than one ':' is a bare IPv6 address (no port).
+sub _parse_portal($p) {
     $p //= '';
     $p =~ s/^\s+|\s+$//g;
-    return $p if !$p;
-    # strip IPv6 brackets for by-path normalization
-    $p = ($p =~ /^\[(.+)\]:(\d+)$/) ? "$1:$2" : $p;
-    # strip trailing ",TPGT"
     $p =~ s/,\d+$//;
-    return $p;
+    return (undef, undef) if $p eq '';
+    return ($1, $2)    if $p =~ /^\[([^\]]+)\]:(\d+)$/;
+    return ($1, undef) if $p =~ /^\[([^\]]+)\]$/;
+    return ($p, undef) if ($p =~ tr/:/:/) > 1;      # bare IPv6
+    return ($1, $2)    if $p =~ /^([^:]+):(\d+)$/;
+    return ($p, undef);
 }
+
+# _portal_is_ipv6: a host that contains ':' is an IPv6 literal (zone index
+# allowed).
+sub _portal_is_ipv6($host) { return defined($host) && index($host, ':') >= 0 ? 1 : 0; }
+
+# _format_portal: (host, port) -> the string iscsiadm accepts and prints.
+sub _format_portal($host, $port) {
+    return '' if !defined($host) || $host eq '';
+    my $h = _portal_is_ipv6($host) ? "[$host]" : $host;
+    return defined($port) ? "$h:$port" : $h;
+}
+
+# _normalize_portal: canonical spelling of a configured portal for use as an
+# iscsiadm -p argument and as a comparison key: trimmed, ",tpgt" dropped,
+# IPv6 bracketed, no default port added (iscsiadm applies 3260 itself and the
+# node list echoes whatever was discovered).
+sub _normalize_portal($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    return _format_portal($host, $port);
+}
+
+# _portal_key: comparison key that also folds equivalent IPv6 spellings
+# (2001:db8:0:0::1 vs 2001:db8::1, case) and a missing port to 3260, so a
+# configured portal matches the session line iscsiadm prints for it.
+sub _portal_key($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    if (_portal_is_ipv6($host)) {
+        my $canon = _nvme_normalize_addr($host);
+        $host = $canon if defined $canon && $canon ne '';
+    }
+    return _format_portal($host, $port // 3260);
+}
+
+# _bypath_portal: the portal as udev spells it inside a /dev/disk/by-path name,
+# "ip-<host>:<port>-iscsi-<iqn>-lun-<n>": the host is NOT bracketed for IPv6
+# (observed: ip-fd42:7f7f:1::70:3260-iscsi-...), and the port is always
+# present (3260 when the configuration left it out).
+sub _bypath_portal($p) {
+    my ($host, $port) = _parse_portal($p);
+    return '' if !defined $host;
+    return "$host:" . ($port // 3260);
+}
+
 sub _probe_portal($portal) {
-    my ($h,$port) = $portal =~ /^(.+):(\d+)$/;
-    return 1 if !$h || !$port; # nothing to probe
-    my $sock = IO::Socket::INET->new(PeerHost=>$h, PeerPort=>$port, Proto=>'tcp', Timeout=>5);
-    die "iSCSI portal $portal is not reachable (TCP connect failed)\n" if !$sock;
+    my ($h, $port) = _parse_portal($portal);
+    return 1 if !defined $h || !defined $port; # nothing to probe
+    # IO::Socket::IP speaks both address families; IO::Socket::INET is IPv4
+    # only and made every IPv6 portal "not reachable" (issue #140).
+    require IO::Socket::IP;
+    my $sock = IO::Socket::IP->new(PeerHost=>$h, PeerPort=>$port, Proto=>'tcp', Timeout=>5);
+    die "iSCSI portal $portal is not reachable (TCP connect failed: " . ($@ || $!) . ")\n" if !$sock;
     close $sock;
     return 1;
 }
@@ -4414,21 +4477,17 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     my $iqn = $scfg->{tn_target_iqn};
     my $norm_portal = _normalize_portal($portal);
 
-    # An FQDN portal in storage.cfg never matches iscsiadm's session
-    # line, which always reports the resolved IPv4 (issue #102).
-    # Precompute the IP-resolved form so a session on 192.0.2.10:3260
-    # still counts as "connected" for a configured portal like
-    # storage.example.com:3260. On IP literals _host_ipv4 is a no-op
-    # so this costs nothing there. Failures resolve back to the
-    # original host (fallback in _host_ipv4), which just falls
-    # through to the existing literal-compare path.
-    my $ip_portal = $norm_portal;
-    if ($norm_portal =~ /^(.+):(\d+)$/) {
-        my ($host, $port) = ($1, $2);
-        # Skip IPv6 literals ($host still contains ':' after strip)
-        if ($host !~ /:/) {
+    # Keys to match the session line against: the configured portal itself,
+    # and, for a hostname, its resolved IPv4 (an FQDN in storage.cfg never
+    # matches iscsiadm's session line, which reports the address; issue
+    # #102). IPv6 literals are matched through _portal_key, which folds
+    # equivalent spellings (issue #140).
+    my %want = (_portal_key($norm_portal) => 1);
+    {
+        my ($host, $port) = _parse_portal($norm_portal);
+        if (defined $host && !_portal_is_ipv6($host)) {
             my $ip = _host_ipv4($host);
-            $ip_portal = "$ip:$port" if $ip && $ip ne $host;
+            $want{_portal_key(_format_portal($ip, $port))} = 1 if $ip && $ip ne $host;
         }
     }
 
@@ -4447,13 +4506,11 @@ sub _portal_connected($scfg, $portal, $session_lines_ref = undef) {
     # ...:proxmox-nvme-protected via bare substring).
     for my $line (@session_lines) {
         # Session line format: tcp: [1] 10.15.14.172:3260,1 iqn.2005-10.org.freenas.ctl:target0
-        if ($line =~ /\Q$norm_portal\E.*\Q$iqn\E(?![\w.:-])/) {
-            return 1;
-        }
-        if ($ip_portal ne $norm_portal
-            && $line =~ /\Q$ip_portal\E.*\Q$iqn\E(?![\w.:-])/) {
-            return 1;
-        }
+        # IPv6:                tcp: [2] [fd00::1]:3260,1 iqn.2005-10.org.freenas.ctl:target0
+        next unless $line =~ /^\s*\S+:\s+\[\d+\]\s+(\S+?)(?:,\d+)?\s+(\S+)/;
+        my ($sess_portal, $sess_iqn) = ($1, $2);
+        next unless $sess_iqn eq $iqn;
+        return 1 if $want{_portal_key($sess_portal)};
     }
     return 0;
 }
@@ -7543,7 +7600,10 @@ sub path {
                 # first, which authoritatively waits for the device.
                 my $resolved_lun = defined $real_lun ? $real_lun : $lun;
                 if (defined $resolved_lun) {
-                    my $portal = $scfg->{tn_discovery_portal} // '';
+                    # udev spells the portal without IPv6 brackets and always
+                    # with the port; the configured string may have either
+                    # (issue #140), so render it the way udev does.
+                    my $portal = _bypath_portal($scfg->{tn_discovery_portal} // '');
                     my $iqn    = $scfg->{tn_target_iqn}       // '';
                     if ($portal ne '' && $iqn ne '') {
                         $dev = "/dev/disk/by-path/ip-${portal}-iscsi-${iqn}-lun-${resolved_lun}";

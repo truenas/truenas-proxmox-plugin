@@ -1,3 +1,24 @@
+truenas-proxmox-plugin (2.1.24~beta8) unstable; urgency=medium
+
+  * fix(#140): IPv6 iSCSI portals. A portal written as "[fd00::1]:3260"
+    was normalised to "fd00::1:3260", probed with the IPv4-only
+    IO::Socket::INET (always "not reachable") and compared with iscsiadm
+    session lines by substring, so an IPv6 portal could not be used.
+    Portals are now parsed once into host and port, kept bracketed for
+    every iscsiadm -p argument, probed with IO::Socket::IP (both address
+    families), and matched against sessions and node records by parsed
+    value, with equivalent IPv6 spellings (2001:db8:0:0::1 vs 2001:db8::1)
+    treated as the same portal. IPv4 and hostname portals behave as
+    before, including the FQDN-to-IPv4 session match from #102 and the
+    longer-IQN guard from #124. path() used to synthesise a by-path name
+    from the configured portal string verbatim; udev spells an IPv6
+    portal without brackets (ip-fd42::70:3260-iscsi-...), so the
+    synthesised name is now rendered that way too. Unit tests in t/ipv6;
+    verified live from Proxmox VE 9 to TrueNAS 28.0 over a ULA portal
+    (discovery, login, alloc, activate, path, free).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Wed, 04 Nov 2026 12:00:00 -0500
+
 truenas-proxmox-plugin (2.1.24~beta7) unstable; urgency=medium
 
   * feat(auth): migrate TrueNAS authentication from auth.login_with_api_key
