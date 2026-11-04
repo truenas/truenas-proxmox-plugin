@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.24~beta7';
+our $VERSION = '2.1.24~beta8';
 # Highest Proxmox storage API version this plugin is validated against.
 our $TESTED_APIVER = 16;
 use JSON::PP qw(encode_json decode_json);

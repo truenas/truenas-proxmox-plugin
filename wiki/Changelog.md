@@ -1,5 +1,21 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.24~beta8 (November 4, 2026)
+
+### Bug Fixes
+
+- **#140 — IPv6 iSCSI portals**. A portal written as `[fd00::1]:3260` was normalised to `fd00::1:3260`, probed with the IPv4-only `IO::Socket::INET` (always "not reachable") and matched against `iscsiadm` session lines by substring, so an IPv6 portal could not be used at all. Portals are now parsed once into host and port, kept bracketed for every `iscsiadm -p` argument, probed with `IO::Socket::IP` (both address families), and matched against sessions and node records by parsed value, so equivalent IPv6 spellings (`2001:db8:0:0::1` vs `2001:db8::1`) count as the same portal. IPv4 and hostname portals behave as before, including the FQDN-to-IPv4 session match from #102 and the longer-IQN guard from #124. `path()` now renders the synthesised by-path name the way udev spells an IPv6 portal (`ip-fd42::70:3260-iscsi-...`, no brackets). Unit tests in `t/ipv6`.
+- **Log into configured iSCSI portals only**. After SendTargets discovery, open-iscsi holds a node record for every address the target advertises, and a TrueNAS portal bound to `0.0.0.0` or `::` advertises every address on the box (docker and VM bridges, link-local and public IPv6). `_iscsi_login_all` logged into all of them, and each unreachable address blocked for open-iscsi's whole login retry budget (about two minutes), serially, on the first login and on every reconnect after a session drop. The loop now logs into the portals listed in `tn_discovery_portal` and `tn_portals` only, logs the skipped discovered portals once, and keeps the direct fallback login for configured portals missing from the node list (#91). Unit test in `t/login`.
+
+### Behaviour Change
+
+- A host that configured only `tn_discovery_portal` against a TrueNAS with several reachable storage interfaces used to get a session on each of them implicitly. It now gets one, and a warning in the journal names the portals that were skipped. List the extra portals in `tn_portals` to keep the additional paths.
+
+### Notes
+
+- Live-verified from Proxmox VE 9 to TrueNAS 28.0 MASTER: plain, CHAP, hostname, portless, multipath (two IPv4 portals), multipath + CHAP, IPv6 (ULA), IPv6 + CHAP, IPv6 + IPv4 mixed, and IPv4 regression. On a portal bound to `0.0.0.0` advertising 8 addresses (7 unreachable), first login took 858 s before and 4 s after; reconnect after a session drop 856 s before and 1-2 s after; boot-style `--loginall=automatic` 122 s before and 0 s after, with the same usable sessions in every case. Only the configured portals' node records are marked `startup=automatic` now.
+- Unit suites `t/ipv6`, `t/login`, `t/scram` and `t/nvme` run on this release with the same results as beta7 (the one pre-existing `t/nvme/06` failure is unchanged).
+
 ## Version 2.1.24~beta7 (November 2, 2026)
 
 ### New Features

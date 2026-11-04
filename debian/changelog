@@ -20,7 +20,6 @@ truenas-proxmox-plugin (2.1.24~beta8) unstable; urgency=medium
     warning names the portals that were skipped. List the extra portals
     in tn_portals to keep the additional paths.
 
-
   * fix(#140): IPv6 iSCSI portals. A portal written as "[fd00::1]:3260"
     was normalised to "fd00::1:3260", probed with the IPv4-only
     IO::Socket::INET (always "not reachable") and compared with iscsiadm
