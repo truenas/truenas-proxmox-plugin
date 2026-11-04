@@ -1,5 +1,26 @@
 truenas-proxmox-plugin (2.1.24~beta8) unstable; urgency=medium
 
+  * fix: log into configured iSCSI portals only. After SendTargets
+    discovery, open-iscsi holds a node record for every address the
+    target advertises, and a TrueNAS portal bound to 0.0.0.0 or ::
+    advertises every address on the box (docker and VM bridges,
+    link-local and public IPv6). _iscsi_login_all logged into all of
+    them; each unreachable address blocks for open-iscsi's whole login
+    retry budget (about two minutes), serially, on the first login and
+    on every reconnect after a session drop. The loop now logs into the
+    portals listed in tn_discovery_portal and tn_portals only, logs the
+    skipped discovered portals once, and keeps the direct fallback login
+    for configured portals missing from the node list (#91). Unit test
+    in t/login. Measured live (Proxmox VE 9 -> TrueNAS 28.0, portal on
+    0.0.0.0 advertising 8 addresses, 7 unreachable): first login took
+    858 s before and 4 s after, with the same single usable session.
+    Behaviour change: a host that configured only tn_discovery_portal
+    against a TrueNAS with several reachable storage interfaces used to
+    get a session on each of them implicitly; it now gets one, and a
+    warning names the portals that were skipped. List the extra portals
+    in tn_portals to keep the additional paths.
+
+
   * fix(#140): IPv6 iSCSI portals. A portal written as "[fd00::1]:3260"
     was normalised to "fd00::1:3260", probed with the IPv4-only
     IO::Socket::INET (always "not reachable") and compared with iscsiadm

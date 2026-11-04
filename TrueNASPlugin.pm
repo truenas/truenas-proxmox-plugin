@@ -4595,11 +4595,35 @@ sub _iscsi_login_all($scfg) {
     # Get current session list once for efficiency
     my @session_lines = eval { _run_lines(['iscsiadm', '-m', 'session']) };
 
-    # Login to all discovered portals for this IQN; ensure node.startup=automatic
+    # Only the portals the operator configured are logged into. SendTargets
+    # makes open-iscsi record a node for EVERY address the target advertises,
+    # and a TrueNAS portal on 0.0.0.0 / :: advertises every address on the
+    # box: docker and VM bridges, link-local and public IPv6. A --login to an
+    # address this host cannot reach blocks for open-iscsi's whole retry
+    # budget (about two minutes each, serially) before the loop reaches a
+    # real portal - on the very first login and on every reconnect after a
+    # session drop. Multipath users list their portals in tn_portals, so the
+    # configured set is the wanted set; unconfigured records are left alone.
+    #
+    # Keys: _portal_key (default port filled in, IPv6 spellings folded) of
+    # the configured portal, plus its resolved IPv4 for a hostname (#102),
+    # since the node record carries the address.
+    my %configured;
+    for my $cp (grep { length } ($primary, @extra)) {
+        $configured{_portal_key($cp)} = 1;
+        my ($host, $port) = _parse_portal($cp);
+        next if !defined $host || _portal_is_ipv6($host);
+        my $ip = _host_ipv4($host);
+        $configured{_portal_key(_format_portal($ip, $port))} = 1 if $ip && $ip ne $host;
+    }
+    my @skipped;
+
+    # Login to the configured portals for this IQN; ensure node.startup=automatic
     for my $n (@nodes) {
         # the list form is "192.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
         next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
         my $portal = _normalize_portal($1);
+        if (!$configured{_portal_key($portal)}) { push @skipped, $portal; next; }
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
         if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
@@ -4614,6 +4638,13 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
+    # Always visible (level 0): an operator who relied on discovery adding
+    # paths implicitly must see that those portals are now ignored and list
+    # them in tn_portals if they want them.
+    _log($scfg, 0, 'warning',
+        "[TrueNAS] iscsi login: skipped " . scalar(@skipped) . " discovered portal(s) not in " .
+        "tn_discovery_portal/tn_portals (add them to tn_portals to use them): " . join(', ', @skipped)) if @skipped;
+
     # attempt direct login for any configured portal not already in -m node.
     # $primary must get the same guaranteed fallback as @extra, otherwise it
     # silently ends up with no session if sendtargets discovery from it alone
