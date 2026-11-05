@@ -1370,6 +1370,21 @@ get_plugin_download_url() {
     echo "$plugin_url"
 }
 
+# Get download URL for the .deb asset in a release, if the release ships one.
+# Returns 1 when the release has no package asset (releases before 2.1.21).
+get_deb_download_url() {
+    local release_data="$1"
+    local deb_url
+
+    deb_url=$(echo "$release_data" | \
+        grep -Po '"browser_download_url":\s*"\K[^"]*truenas-proxmox-plugin_[^"]*_all\.deb(?=")' | head -1)
+
+    if [[ -z "$deb_url" ]]; then
+        return 1
+    fi
+    echo "$deb_url"
+}
+
 # Compare two semantic versions
 # Returns: 0 if equal, 1 if v1 > v2, 2 if v1 < v2
 compare_versions() {
@@ -1727,6 +1742,19 @@ install_plugin_file() {
         }
     fi
 
+    # A release that carries the session broker cannot run from the .pm file
+    # alone: _ws_get_persistent() dies when /run/truenas-plugin/broker.sock is
+    # absent, so a file-only install breaks every storage operation (issue
+    # #133). Refuse instead of installing a plugin that cannot work.
+    if grep -q 'BROKER_SOCKET_PATH' "$source" 2>/dev/null && \
+       [[ ! -f /usr/lib/systemd/system/truenas-plugin-broker.service ]]; then
+        error "This plugin version requires the truenas-plugin-broker service,"
+        error "but the service is not installed on this node."
+        error "Install the Debian package instead of copying TrueNASPlugin.pm:"
+        error "  apt install /path/to/truenas-proxmox-plugin_<version>_all.deb"
+        return 1
+    fi
+
     # Validate plugin before installation
     if ! validate_plugin "$source"; then
         error "Plugin validation failed. Installation aborted."
@@ -1758,6 +1786,102 @@ install_plugin_file() {
     success "Plugin installed successfully"
     log "INFO" "Plugin installed to $PLUGIN_FILE"
     return 0
+}
+
+# Wait for the broker to publish its socket after a package install.
+wait_for_broker_socket() {
+    local tries="${1:-30}"
+    local i
+    for ((i = 0; i < tries; i++)); do
+        [[ -S /run/truenas-plugin/broker.sock ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Install the Debian package locally, which supplies the plugin module, the
+# broker, the LVM filter helper and the systemd unit. apt resolves the
+# dependency tree that dpkg alone cannot (issue #133).
+install_package_file() {
+    local package="$1"
+    local install_log="/tmp/truenas-plugin-install.$$.log"
+
+    if [[ ! -f "$package" ]]; then
+        error "Package file not found: $package"
+        return 1
+    fi
+
+    backup_plugin || {
+        error "Backup failed. Installation aborted for safety."
+        return 1
+    }
+
+    info "Installing package $(basename "$package")..."
+    if ! DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y --allow-downgrades -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold "$package" >"$install_log" 2>&1; then
+        warning "apt install failed; retrying with dpkg and dependency repair"
+        if ! dpkg -i "$package" >>"$install_log" 2>&1; then
+            error "Package installation failed. Last lines of $install_log:"
+            tail -n 20 "$install_log" >&2
+            return 1
+        fi
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -f install -y >>"$install_log" 2>&1; then
+            error "Dependency repair failed. Last lines of $install_log:"
+            tail -n 20 "$install_log" >&2
+            return 1
+        fi
+    fi
+
+    local installed_version
+    installed_version=$(dpkg-query -W -f='${Version}' truenas-proxmox-plugin 2>/dev/null || true)
+    if [[ -z "$installed_version" ]]; then
+        error "truenas-proxmox-plugin is not registered with dpkg after install"
+        return 1
+    fi
+    success "Package installed: truenas-proxmox-plugin $installed_version"
+
+    # The broker is mandatory from 2.1.21 onward. Start it and prove the
+    # socket exists before reporting success, otherwise the next storage
+    # operation fails with a missing-broker error (issue #133).
+    systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
+    if ! timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart truenas-plugin-broker 2>/dev/null; then
+        error "Failed to start truenas-plugin-broker.service"
+        error "Run: systemctl status truenas-plugin-broker"
+        return 1
+    fi
+    if ! wait_for_broker_socket 30; then
+        error "truenas-plugin-broker did not create /run/truenas-plugin/broker.sock"
+        return 1
+    fi
+    success "Broker socket present: /run/truenas-plugin/broker.sock"
+    log "INFO" "Package installed: $installed_version"
+    return 0
+}
+
+# Install either artifact kind without duplicating the caller branches.
+install_artifact() {
+    local kind="$1"
+    local file="$2"
+
+    if [[ "$kind" == "deb" ]]; then
+        install_package_file "$file"
+    else
+        install_plugin_file "$file"
+    fi
+}
+
+install_artifact_on_remote_node() {
+    local kind="$1"
+    local node_ip="$2"
+    local file="$3"
+    local version="$4"
+
+    if [[ "$kind" == "deb" ]]; then
+        install_package_on_remote_node "$node_ip" "$file" "$version"
+    else
+        install_plugin_on_remote_node "$node_ip" "$file" "$version"
+    fi
 }
 
 # Bound every local-node `systemctl restart` call (issue #133). Without a
@@ -1999,6 +2123,85 @@ install_plugin_on_remote_node() {
         return 2  # Special return code: installed but needs manual service restart
     fi
     log "INFO" "Remote installation to $node_ip: Services restarted successfully"
+
+    return 0
+}
+
+# Install the Debian package on a remote node over SSH. Mirrors the .pm
+# installer's return codes: 0 on success, 1 on failure, 2 when the package
+# installed but the node still needs a manual service restart. The package
+# carries the broker, so this is the only supported path from 2.1.21 onward
+# (issue #133).
+install_package_on_remote_node() {
+    local node_ip="$1"
+    local package="$2"
+    local version="$3"
+
+    if [[ -z "$node_ip" || ! -f "$package" ]]; then
+        log "ERROR" "Remote package installation: Invalid parameters (ip=$node_ip, file=$package)"
+        return 1
+    fi
+
+    local remote_pkg="/tmp/truenas-proxmox-plugin.$$.deb"
+    log "INFO" "Starting remote package installation to $node_ip (version $version)"
+
+    if ! scp -o ConnectTimeout=10 -o BatchMode=yes -q "$package" "root@${node_ip}:${remote_pkg}" 2>/dev/null; then
+        log "ERROR" "Remote package installation to $node_ip: transfer failed"
+        echo "Transfer failed"
+        return 1
+    fi
+
+    # Back up the current module so a rollback keeps the previous file.
+    ssh "root@${node_ip}" "mkdir -p ${BACKUP_DIR} && \
+        if [[ -f ${PLUGIN_FILE} ]]; then \
+            cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\$(date +%Y%m%d_%H%M%S); \
+        fi" >/dev/null 2>&1 || true
+
+    local install_output
+    if ! install_output=$(ssh "root@${node_ip}" "
+        set -e
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+            -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+            ${remote_pkg} >/tmp/truenas-plugin-remote-install.log 2>&1 || {
+            tail -n 20 /tmp/truenas-plugin-remote-install.log
+            rm -f ${remote_pkg}
+            exit 1
+        }
+        rm -f ${remote_pkg}
+        systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
+        systemctl restart truenas-plugin-broker
+        for _ in {1..30}; do
+            [[ -S /run/truenas-plugin/broker.sock ]] && break
+            sleep 1
+        done
+        [[ -S /run/truenas-plugin/broker.sock ]] || { echo 'broker socket missing'; exit 1; }
+        echo 'package installed'
+    " 2>&1); then
+        log "ERROR" "Remote package installation to $node_ip failed: $install_output"
+        echo "${install_output:-Package installation failed}"
+        return 1
+    fi
+    log "INFO" "Remote package installation to $node_ip: package installed"
+
+    if ! ssh "root@${node_ip}" "
+        if ! systemctl restart pvedaemon pvestatd pvescheduler 2>/dev/null; then
+            echo 'daemon restart failed'
+            exit 1
+        fi
+        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit=truenas-pveproxy-restart systemctl try-restart pveproxy >/dev/null 2>&1 || \
+                    systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            else
+                systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
+            fi
+        fi
+    " 2>/dev/null; then
+        log "WARNING" "Remote package installation to $node_ip: service restart failed"
+        echo "Service restart failed - manual restart required"
+        return 2
+    fi
+    log "INFO" "Remote package installation to $node_ip: services restarted successfully"
 
     return 0
 }
@@ -2279,12 +2482,22 @@ perform_cluster_wide_installation() {
         fi
     fi
 
+    local artifact_kind="pm"
     local download_url
-    download_url=$(get_plugin_download_url "$release_data")
+    if download_url=$(get_deb_download_url "$release_data"); then
+        artifact_kind="deb"
+    else
+        download_url=$(get_plugin_download_url "$release_data")
+    fi
 
-    local temp_file="/tmp/TrueNASPlugin.pm.$$"
+    local temp_file
+    if [[ "$artifact_kind" == "deb" ]]; then
+        temp_file="/tmp/truenas-proxmox-plugin.$$.deb"
+    else
+        temp_file="/tmp/TrueNASPlugin.pm.$$"
+    fi
     if ! download_plugin "$download_url" "$temp_file"; then
-        error "Failed to download plugin"
+        error "Failed to download ${artifact_kind} artifact"
         rm -f "$temp_file"
         return 1
     fi
@@ -2299,7 +2512,7 @@ perform_cluster_wide_installation() {
         echo
         info "Installing on local node ($current_node)..."
 
-        if install_plugin_file "$temp_file"; then
+        if install_artifact "$artifact_kind" "$temp_file"; then
             if restart_pve_services; then
                 success "Local node installation completed"
                 successful_nodes+=("$current_node")
@@ -2332,7 +2545,7 @@ perform_cluster_wide_installation() {
         start_spinner
 
         local error_msg
-        error_msg=$(install_plugin_on_remote_node "$node_ip" "$temp_file" "$install_version" 2>&1)
+        error_msg=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$temp_file" "$install_version" 2>&1)
         local result=$?
 
         stop_spinner
@@ -2363,7 +2576,12 @@ perform_cluster_wide_installation() {
             sleep 5
 
             # Download plugin again for retry
-            local retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
+            local retry_temp
+            if [[ "$artifact_kind" == "deb" ]]; then
+                retry_temp="/tmp/truenas-proxmox-plugin.retry.$$.deb"
+            else
+                retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
+            fi
             if download_plugin "$download_url" "$retry_temp"; then
                 echo
                 info "Retrying failed nodes..."
@@ -2392,7 +2610,7 @@ perform_cluster_wide_installation() {
                     printf "  %s (%s): " "$node_name" "$node_ip"
 
                     local retry_error
-                    retry_error=$(install_plugin_on_remote_node "$node_ip" "$retry_temp" "$install_version" 2>&1)
+                    retry_error=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$retry_temp" "$install_version" 2>&1)
                     local retry_result=$?
 
                     if [[ $retry_result -eq 0 ]]; then
@@ -2521,21 +2739,32 @@ perform_installation() {
         fi
     fi
 
-    # Get download URL
+    # Prefer the package: it carries the broker that releases from 2.1.21
+    # onward require (issue #133).
+    local artifact_kind="pm"
     local download_url
-    download_url=$(get_plugin_download_url "$release_data")
+    if download_url=$(get_deb_download_url "$release_data"); then
+        artifact_kind="deb"
+    else
+        download_url=$(get_plugin_download_url "$release_data")
+    fi
     info "Download URL: $download_url"
 
     # Download to temporary location
-    local temp_file="/tmp/TrueNASPlugin.pm.$$"
+    local temp_file
+    if [[ "$artifact_kind" == "deb" ]]; then
+        temp_file="/tmp/truenas-proxmox-plugin.$$.deb"
+    else
+        temp_file="/tmp/TrueNASPlugin.pm.$$"
+    fi
     if ! download_plugin "$download_url" "$temp_file"; then
-        error "Failed to download plugin"
+        error "Failed to download ${artifact_kind} artifact"
         rm -f "$temp_file"
         return 1
     fi
 
     # Install the plugin
-    if ! install_plugin_file "$temp_file"; then
+    if ! install_artifact "$artifact_kind" "$temp_file"; then
         error "Installation failed"
         rm -f "$temp_file"
         return 1
