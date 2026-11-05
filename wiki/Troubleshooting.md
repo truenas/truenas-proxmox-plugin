@@ -19,7 +19,7 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
   - ["Could not connect to TrueNAS API"](#could-not-connect-to-truenas-api)
   - [API Rate Limiting](#api-rate-limiting)
 - [iSCSI Discovery and Connection Issues](#iscsi-discovery-and-connection-issues)
-  - ["Could not discover iSCSI targets"](#could-not-discover-iscsi-targets)
+  - ["iSCSI discovery failed"](#iscsi-discovery-failed)
   - ["Could not resolve iSCSI target ID for configured IQN"](#could-not-resolve-iscsi-target-id-for-configured-iqn)
   - [iSCSI Session Issues](#iscsi-session-issues)
 - [NVMe/TCP Connection Issues](#nvmetcp-connection-issues)
@@ -31,12 +31,12 @@ Common issues and solutions for the TrueNAS Proxmox VE Storage Plugin.
 - [NVMe/TCP Namespace Issues](#nvmetcp-namespace-issues)
   - ["Could not locate NVMe device for UUID"](#could-not-locate-nvme-device-for-uuid)
   - [Namespace Creation Fails](#namespace-creation-fails)
-  - ["WebSocket transport required"](#websocket-transport-required)
+  - [API scheme (`tn_api_scheme`) required for NVMe/TCP operations](#api-scheme-tn_api_scheme-required-for-nvmetcp-operations)
 - [Volume Creation Issues](#volume-creation-issues)
   - ["Failed to create iSCSI extent for disk"](#failed-to-create-iscsi-extent-for-disk)
   - ["Insufficient space on dataset"](#insufficient-space-on-dataset)
   - ["Unable to find free disk name after 1000 attempts"](#unable-to-find-free-disk-name-after-1000-attempts)
-  - ["Volume created but device not accessible after 10 seconds"](#volume-created-but-device-not-accessible-after-10-seconds)
+  - ["Could not locate by-path device for LUN"](#could-not-locate-by-path-device-for-lun)
 - [VM Deletion Issues](#vm-deletion-issues)
   - [Orphaned Volumes After VM Deletion](#orphaned-volumes-after-vm-deletion)
   - [Stale NVMe Namespaces](#stale-nvme-namespaces)
@@ -422,11 +422,10 @@ truenasplugin: truenas-storage
 
 **Common Errors**:
 ```bash
-✗ TrueNAS WebSocket connection failed
-Could not connect to wss://192.168.1.100/api/current/websocket
+WebSocket secure connection failed (wss://): SSL connect attempt failed
+  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.
 
-ERROR: WebSocket transport required for API operations
-Please ensure TrueNAS 25.10+ is installed and WebSocket port is accessible
+WebSocket handshake failed (no HTTP 101 response). Ensure TrueNAS 25.10+ is running with WebSocket API enabled.
 ```
 
 **Solutions**:
@@ -498,9 +497,10 @@ tn_api_scheme wss  # for secure WebSocket (recommended)
 # OR
 tn_api_scheme ws   # for insecure WebSocket (testing only)
 
-# Common mistake: Using http/https scheme instead of ws/wss
-# WRONG:
-# tn_api_scheme https  # Not supported
+# Common mistake: writing the HTTP scheme instead of the WebSocket one.
+# https/http are accepted as aliases and normalised (https -> wss,
+# http -> ws), but write the WebSocket scheme so the config says what
+# it does:
 # CORRECT:
 # tn_api_scheme wss    # This is for WebSocket
 ```
@@ -800,9 +800,17 @@ tn_enable_bulk_operations 1
 
 ## iSCSI Discovery and Connection Issues
 
-### "Could not discover iSCSI targets"
+### "iSCSI discovery failed"
 
-**Symptom**: iSCSI target discovery fails
+**Symptom**: SendTargets discovery against the configured portal fails
+
+**Error Message**:
+```
+iSCSI discovery failed (primary)
+```
+
+`primary` is `tn_discovery_portal`; each entry in `tn_portals` is
+reported with its own portal string as the label.
 
 **Diagnosis**:
 ```bash
@@ -932,8 +940,7 @@ These issues are specific to `transport_mode nvme-tcp` configurations. For iSCSI
 
 **Error Message**:
 ```
-ERROR: nvme-cli is not installed on this system
-NVMe/TCP transport requires nvme-cli package
+nvme-cli is not installed. Please install it: apt-get install nvme-cli
 ```
 
 **Solution**:
@@ -962,8 +969,7 @@ apt-get install --reinstall nvme-cli
 
 **Error Message**:
 ```
-ERROR: Could not determine host NQN
-No hostnqn configured and /etc/nvme/hostnqn does not exist
+Could not determine host NQN: /etc/nvme/hostnqn not found and hostnqn not configured
 ```
 
 **Diagnosis**:
@@ -1001,9 +1007,7 @@ tn_hostnqn nqn.2014-08.org.nvmexpress:uuid:your-custom-uuid
 
 **Error Message**:
 ```
-ERROR: Failed to connect to any NVMe/TCP portal
-Attempted portals:
-  - 192.168.1.100:4420 (failed: connection refused)
+Failed to connect to any NVMe/TCP portal for subsystem nqn.2005-10.org.freenas.ctl:proxmox-test
 ```
 
 **Diagnosis**:
@@ -1139,8 +1143,8 @@ nvme connect -t tcp -a <portal_ip> -s 4420 -n "$NQN" \
 
 **Error Message**:
 ```
-ERROR: NVMe connect failed: authentication failed
-Controller rejected host authentication
+[TrueNAS] nvme_connect: failed to connect to portal 192.168.1.100:4420: ...
+Failed to connect to any NVMe/TCP portal for subsystem nqn.2005-10.org.freenas.ctl:proxmox-test
 ```
 
 **Diagnosis**:
@@ -1212,8 +1216,15 @@ systemctl restart pvedaemon
 
 **Error Message**:
 ```
-ERROR: Could not locate NVMe device for UUID after 5 seconds
-Expected device: /dev/disk/by-id/nvme-uuid.550e8400-e29b-41d4-a716-446655440000
+Could not locate NVMe device for TrueNAS UUID 550e8400-e29b-41d4-a716-446655440000
+  Subsystem NQN: nqn.2005-10.org.freenas.ctl:proxmox-test
+```
+
+The activation path appends numbered troubleshooting steps after those
+two lines. The `path()` lookup uses the shorter one-line form:
+
+```
+Could not locate NVMe device for UUID 550e8400-e29b-41d4-a716-446655440000
 ```
 
 **Background**: The plugin uses a three-tier device matching strategy:
@@ -1315,8 +1326,8 @@ journalctl -f | grep '\[TrueNAS\].*nvme_find_device'
 
 **Error Messages**:
 ```
-ERROR: Failed to create NVMe namespace
-TrueNAS API returned error: subsystem not found
+Failed to create NVMe namespace for disk 'vm-100-disk-0': TrueNAS API returned error: ...
+nvme_ensure_subsystem: failed to create subsystem nqn.2005-10.org.freenas.ctl:proxmox-test: ...
 ```
 
 **Solutions**:
@@ -1337,12 +1348,12 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Replace tank/proxmox with your dataset path
 ```
 
-#### 3. Verify WebSocket API Transport
+#### 3. Verify API Scheme
 ```bash
-# WebSocket is the only supported transport for TrueNAS 25.10+
-# Verify your configuration uses ws/wss schemes:
-grep api_scheme /etc/pve/storage.cfg
-# REST API fallback has been removed
+# WebSocket is the only transport. See "API scheme (tn_api_scheme)
+# required for NVMe/TCP operations" below for the setting and its
+# accepted values.
+grep tn_api_scheme /etc/pve/storage.cfg
 ```
 
 #### 4. Check Subsystem Exists
@@ -1354,36 +1365,46 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Plugin should auto-create it, but may fail if service issues
 ```
 
-### "WebSocket transport required"
+### API scheme (`tn_api_scheme`) required for NVMe/TCP operations
 
-**Symptom**: NVMe operations fail with API transport error
+**Symptom**: NVMe/TCP operations fail during the WebSocket handshake or
+API authentication.
 
-**Error Message**:
+**Error Messages**:
 ```
-ERROR: WebSocket transport required for NVMe-oF operations
-NVMe namespace management requires WebSocket transport (TrueNAS 25.10+)
-Ensure api_scheme is set to wss (or ws for non-TLS) in storage configuration
+WebSocket handshake failed (no HTTP 101 response). Ensure TrueNAS 25.10+ is running with WebSocket API enabled.
+TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.
 ```
+
+**Cause**: the plugin has no REST path; every call goes over
+WebSocket JSON-RPC. `tn_api_scheme` selects the scheme and defaults to
+`wss`; `ws` is for non-TLS access. `https`/`http` are accepted as
+aliases and normalised to `wss`/`ws`. `tn_api_transport` is deprecated
+and ignored.
 
 **Solution**:
 ```bash
 # Edit storage configuration
 nano /etc/pve/storage.cfg
+```
 
-# Find your NVMe storage configuration
-# Verify WebSocket scheme:
+```ini
 truenasplugin: truenas-nvme
     tn_api_scheme wss
     # ... other parameters
+```
 
+`ws` sends the API key and all payloads in cleartext; use it only on a
+trusted link or for testing.
+
+```bash
 # Restart Proxmox services
 systemctl restart pvedaemon pveproxy
 ```
 
 **Why WebSocket is Required**:
 - TrueNAS 25.10+ removed REST API support for all API operations
-- WebSocket is now the only supported transport
-- All API endpoints require WebSocket connection for TrueNAS 25.10+
+- WebSocket is the only supported transport for TrueNAS 25.10+
 
 ## Volume Creation Issues
 
@@ -1437,8 +1458,7 @@ zfs list -t volume | grep proxmox
 
 **Example Error**:
 ```
-Insufficient space on dataset 'tank/proxmox':
-need 120.00 GB (with 20% overhead), have 80.00 GB available
+Insufficient space on dataset 'tank/proxmox': need 120.00 GB (with 20% overhead), have 80.00 GB available
 ```
 
 **Solutions**:
@@ -1497,9 +1517,15 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 # Should return ok if the call succeeds
 ```
 
-### "Volume created but device not accessible after 10 seconds"
+### "Could not locate by-path device for LUN"
 
-**Symptom**: Zvol created on TrueNAS but Linux can't see the device
+**Symptom**: Zvol created on TrueNAS but the LUN has no device under
+`/dev/disk/by-path`
+
+**Error Message**:
+```
+Could not locate by-path device for LUN 1 (IQN iqn.2005-10.org.freenas.ctl:proxmox, retries 5). Sessions: tcp: [1] 192.168.1.100:3260,1 iqn.2005-10.org.freenas.ctl:proxmox. by-path: none
+```
 
 **Solutions**:
 

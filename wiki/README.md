@@ -173,6 +173,6 @@ For issues not covered in documentation:
 
 ## Version Information
 
-**Version**: 2.1.23
-**Last Updated**: August 5, 2026
+**Version**: 2.1.24~beta8
+**Last Updated**: November 4, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+

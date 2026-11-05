@@ -25,13 +25,17 @@ Advanced configuration, performance tuning, clustering, and security features of
 - [Snapshot Features](#snapshot-features)
   - [Live Snapshots](#live-snapshots)
   - [Volume Snapshot Chains](#volume-snapshot-chains)
+  - [LXC Snapshot-Mode Backups](#lxc-snapshot-mode-backups)
+  - [Snapshot Enumeration](#snapshot-enumeration)
   - [Snapshot Best Practices](#snapshot-best-practices)
+- [Templates and Linked Clones](#templates-and-linked-clones)
 - [Pre-flight Validation](#pre-flight-validation)
 - [Automatic Target Visibility](#automatic-target-visibility)
 - [Storage Status and Health Monitoring](#storage-status-and-health-monitoring)
 - [Orphan Resource Cleanup](#orphan-resource-cleanup)
+- [Host LVM Filtering](#host-lvm-filtering)
 - [Advanced Troubleshooting](#advanced-troubleshooting)
-  - [Force Delete on In-Use](#force-delete-on-inuse)
+  - [Force Delete on In-Use](#force-delete-on-in-use)
   - [Logout on Free](#logout-on-free)
 - [Custom Configurations](#custom-configurations)
   - [IPv6 Setup](#ipv6-setup)
@@ -1214,6 +1218,18 @@ tn_snapshot_volume_chains 1
 - Improved rollback performance
 - Native ZFS snapshot integration
 
+### LXC Snapshot-Mode Backups
+
+For containers, `vzdump` in snapshot mode calls `activate_volume` with the snapshot name set. The plugin creates a deterministic clone zvol named `vzdump-<zname>-<snapname>-<hash>`, attaches it as its own iSCSI LUN or NVMe/TCP namespace, and leaves it active for the backup; `path()` resolves the same clone.
+
+`deactivate_volume` tears the clone down after the backup. `volume_snapshot_delete` tears it down as a fallback and refuses to delete the source snapshot while the clone cannot be removed. These `vzdump-*` clones are filtered from `list_images` and from orphan detection.
+
+### Snapshot Enumeration
+
+`volume_snapshot_info` asks TrueNAS for one dataset at a time: `pool.snapshot.query` is called with a `dataset in [<dataset>]` filter and `extra.properties => ['creation']`, so the middleware filters server-side and returns only the creation property. The plugin does not fetch every snapshot on the NAS and filter client-side.
+
+The earlier whole-NAS approach pulled roughly 20 MB of JSON and took about 33 s per call on a NAS with several thousand snapshots. `qm rollback` makes several of these calls, so a rollback took minutes. The per-dataset query answers in roughly 1-2 s (GitHub #135).
+
 ### Snapshot Best Practices
 
 **Space Management**:
@@ -1234,6 +1250,14 @@ qm delsnapshot 100 old-snapshot
 - Snapshots are instant (ZFS copy-on-write)
 - Minimal space overhead initially
 - Space grows as data diverges from snapshot
+
+## Templates and Linked Clones
+
+`create_base` (`qm template`) prepares a volume to serve as the anchor for linked clones. It renames the volume's dataset from `vm-<vmid>-disk-N` to `base-<vmid>-disk-N` (`pool.dataset.rename` with `force=true`), rewires the iSCSI extent or NVMe namespace to the new zvol path, and creates the `@__base__` snapshot that clones derive from. The returned volname keeps the transport identifier unchanged: `vol-base-<vmid>-disk-N-lun<M>` for iSCSI, `vol-base-<vmid>-disk-N-ns<uuid>` for NVMe/TCP.
+
+`clone_image` creates ZFS linked clones for both transports (`_clone_image_iscsi` and `_clone_image_nvme`). For a base volume with no explicit snapshot name it defaults to `__base__`; a clone request for a non-base volume without a snapshot is refused.
+
+`free_image` refuses to delete a base volume while any dataset's `origin.parsed` property points at `<base>@__base__`. The error lists the dependent clone datasets; destroy them first, or run `pool.dataset.promote` on one clone to break the dependency.
 
 ## Pre-flight Validation
 
@@ -1524,6 +1548,30 @@ Cleanup complete!
 ### See Also
 
 - [Troubleshooting - Orphaned Volumes After VM Deletion](Troubleshooting.md#orphaned-volumes-after-vm-deletion)
+
+## Host LVM Filtering
+
+The package installs `/usr/sbin/truenas-plugin-lvm-filter`. The helper adds LVM `global_filter` reject entries for the block devices TrueNAS serves, so the host LVM scanner stops reading guest PV signatures at the outer device level (GitHub #4). Without the filter, guests that use LVM on their disks produce duplicate-VG warnings on every `pvesm` / `pvesh` / `qm` invocation, and storage-list calls can exceed the API timeout.
+
+The helper rejects both symlink families:
+
+- `/dev/disk/by-id/nvme-TrueNAS_*`: NVMe/TCP namespaces. udev builds these from the controller model string, so local NVMe drives never match.
+- `/dev/disk/by-path/ip-*-iscsi-*`: iSCSI LUNs that open-iscsi has logged into. Earlier releases of the helper filtered only the NVMe by-id path.
+
+```bash
+truenas-plugin-lvm-filter --status
+truenas-plugin-lvm-filter --install
+pvscan --cache
+vgscan --cache
+systemctl restart lvm2-monitor
+
+# Revert
+truenas-plugin-lvm-filter --uninstall
+```
+
+The helper edits the effective config: `/etc/lvm/lvmlocal.conf` when it carries a `global_filter` line, otherwise `/etc/lvm/lvm.conf`. It takes a timestamped backup, is idempotent per regex, and marks the entries it adds so `--uninstall` removes only those. It refuses to create a `global_filter` line that does not already exist. `install.sh` offers the same fix after storage configuration.
+
+See [LVM-Filter.md](LVM-Filter.md) for the full writeup.
 
 ## Advanced Troubleshooting
 

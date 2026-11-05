@@ -1,37 +1,56 @@
 # Testing Guide
 
-Comprehensive guide for testing the TrueNAS Proxmox VE Storage Plugin using the included test suite.
+Comprehensive guide for testing the TrueNAS Proxmox VE Storage Plugin with the included suites.
 
 ## Overview
 
-The TrueNAS Plugin Test Suite is an automated testing tool that validates all major plugin functionality through the Proxmox API. It simulates real-world usage patterns including VM creation, snapshot operations, cloning, resizing, and cleanup.
+Testing has two layers. The installer's Diagnostics function test validates the main plugin operations through the Proxmox API against a real storage and cleans up after itself. The repository's Perl and shell suites cover narrower areas: portal parsing, SCRAM authentication, snapshot-import planning, rate limits, lifecycle events and a 46-phase end-to-end run.
 
 ### Key Features
 
-- **API-Based Testing** - Uses Proxmox API (`pvesh`) to simulate GUI interactions
-- **Comprehensive Coverage** - Tests all major plugin features
-- **Performance Metrics** - Reports timing for all operations
-- **Compatible** - Works with Proxmox VE 8.x and 9.x
-- **Safe** - Uses isolated test VMs, automatic cleanup
-- **Detailed Logging** - Creates timestamped log files for troubleshooting
+- **API-Based Operations** - The installer test and development suite drive the plugin through `pvesh`/`pvesm`
+- **Isolated and Self-Cleaning** - Both end-to-end suites use dedicated test VM IDs and clean up afterwards
+- **Offline Unit Tests** - `t/nvme/`, `t/ipv6/`, `t/login/`, `t/scram/` and `t/import-snapshots/` need no TrueNAS
+- **Timed Runs** - The development suite reports per-operation timings and writes `test-results-*.log`
 
-## Test Suite Location
+## Test Suites and Locations
 
-The test suite is included in the plugin repository:
-```
-tools/dev-truenas-plugin-full-function-test.sh
-```
+The repository contains several independent suites. They are not interchangeable: only the first two execute real operations against a TrueNAS storage.
 
-Two smaller suites live alongside it:
+| Suite | Path | Requires | Run |
+|---|---|---|---|
+| Installer function test | `install.sh` → Diagnostics | Proxmox node, TrueNAS storage, ~10GB free | `bash install.sh`, then Diagnostics → Run plugin function test |
+| Development suite (46 phases) | `tools/dev-truenas-plugin-full-function-test.sh` | Proxmox node with the plugin installed; creates and destroys VMs | `./tools/dev-truenas-plugin-full-function-test.sh STORAGE_ID VMID_START` |
+| API-loss resilience unit tests | `t/nvme/` | Perl deps only; `-I t/nvme/lib` supplies PVE stubs | `prove -v -I t/nvme/lib t/nvme/*.t` |
+| IPv6 portal tests | `t/ipv6/` | Perl deps only; same stubs | `prove -v -I t/nvme/lib t/ipv6/01-portal-ipv6.t` |
+| iSCSI login portal tests | `t/login/` | Perl deps only; same stubs | `prove -v -I t/nvme/lib t/login/01-login-configured-portals-only.t` |
+| SCRAM unit tests | `t/scram/` | Perl deps (`Crypt::PBKDF2`, `MIME::Base64`) | `prove -v t/scram/` |
+| Snapshot import planner tests | `t/import-snapshots/` | `libpve-storage-perl` (skips without it) | `prove -v t/import-snapshots/` |
+| Rate-limit regression tests | `t/rate-limit/` | Real TrueNAS and a configured storage; see environment variables below | `sudo -E t/rate-limit/run.sh` |
+| Lifecycle integration tests | `tools/lifecycle-tests/` | SSH root to a disposable PVE node (and to TrueNAS for scenario 07) | `./tools/lifecycle-tests/run-all.sh --node HOST --storage ID` |
 
-```
-t/rate-limit/    # regression tests for the rate-limit defects; needs a real
-                 # TrueNAS and a configured storage (see t/rate-limit/README.md)
-t/nvme/          # offline unit tests; needs neither. Run with: prove -v t/nvme/
-```
+`t/nvme/` builds a fixture sysfs tree rather than talking to any hardware; `-I t/nvme/lib` provides minimal `PVE::Tools`, `PVE::JSONSchema` and `PVE::Storage::Plugin` stand-ins. On a real Proxmox host drop `-I t/nvme/lib` to compile against the real modules.
 
-`t/nvme/` builds a fixture sysfs tree rather than talking to any hardware, so it
-runs anywhere the plugin's Perl dependencies are present.
+### Rate-limit test environment variables
+
+`t/rate-limit/run.sh` reads:
+
+| Variable | Meaning |
+|---|---|
+| `TN_HOST` | TrueNAS management hostname or IP (required) |
+| `TN_API_KEY` | API key with read access and write access for `audit.query` (required) |
+| `STORAGE_ID` | PVE storage ID configured for that TrueNAS (required) |
+| `TEST_VMID_BASE` | Starting VMID (default `99000`) |
+| `TN_LOGIN_COUNT_METHOD` | `audit` (default) or `journal` |
+| `TN_SSH_HOST`, `TN_SSH_USER`, `TN_SSH_KEY` | TrueNAS SSH access, needed only for `TN_LOGIN_COUNT_METHOD=journal` |
+| `DRAIN_SECS` | Seconds to wait between tests for the limiter to reset (default `90`) |
+| `KEEP_RESOURCES` | `1` skips cleanup on failure (default `0`) |
+
+See `t/rate-limit/README.md` and `t/rate-limit/INSTALL.md` for setup.
+
+### Lifecycle test arguments
+
+`tools/lifecycle-tests/run-all.sh` and each scenario accept `--node`, `--storage`, `--vmid-start` (default `10100`), `--vm-count` (default `3`), `--settle-s` (default `30`) and `--keep-vms`. See `tools/lifecycle-tests/README.md` for the scenario list.
 
 ## Prerequisites
 
@@ -40,7 +59,7 @@ runs anywhere the plugin's Perl dependencies are present.
 - **Proxmox Node Execution** - Test suite must run on a Proxmox node
 - **Plugin Installed** - TrueNAS plugin must be installed and configured
 - **Storage Configured** - Storage must be active and accessible
-- **Available VM IDs** - Test suite uses sequential VM IDs starting from a specified VMID (default: 9001)
+- **Available VM IDs** - Provide `VMID_START`; the development suite uses `VMID_START`..`VMID_START+200` and has no default
 
 ### System Requirements
 - Proxmox VE 8.x or 9.x
@@ -55,13 +74,13 @@ runs anywhere the plugin's Perl dependencies are present.
 # Make executable
 chmod +x tools/dev-truenas-plugin-full-function-test.sh
 
-# Run with default storage 'tnscale' starting at VMID 9001
+# Run against storage 'tnscale' starting at VMID 9001
 ./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001
 
-# Run with custom storage name and VMID
+# Run with a different storage and VMID range
 ./tools/dev-truenas-plugin-full-function-test.sh your-storage-name 5000
 
-# Run with backup tests enabled
+# Run with backup phases enabled
 ./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
 ```
 
@@ -71,29 +90,36 @@ chmod +x tools/dev-truenas-plugin-full-function-test.sh
 ./tools/dev-truenas-plugin-full-function-test.sh STORAGE_ID VMID_START [OPTIONS]
 ```
 
-**Arguments**:
-- `STORAGE_ID` - TrueNAS storage ID from `/etc/pve/storage.cfg` (default: `tnscale`)
-- `VMID_START` - Starting VMID for test VMs (default: `9001`)
+**Arguments** (both required, no defaults):
+- `STORAGE_ID` - TrueNAS storage ID from `/etc/pve/storage.cfg`
+- `VMID_START` - Starting VMID for test VMs (numeric); the suite uses `VMID_START`..`VMID_START+200`
 
 **Options**:
-- `--backup-store STORAGE` - Backup storage ID for backup tests (if not specified, backup tests are skipped)
-- `--phase N` - Run only a specific test phase
+- `--backup-store STORAGE` - Backup storage ID for the backup phases (if not specified, those phases are skipped)
+- `--phase N` - Run only phase N (same as `--start N --stop N`)
+- `--start N` - Begin at phase N and run to the end
+- `--stop M` - Stop after phase M
 
 **Examples**:
 ```bash
 # Test storage named 'truenas-storage' starting at VMID 5000
 ./tools/dev-truenas-plugin-full-function-test.sh truenas-storage 5000
 
-# Run with backup tests using PBS storage
+# Run with backup phases using PBS storage
 ./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
 
 # Run only phase 2
 ./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --phase 2
+
+# Run phases 10-20
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --start 10 --stop 20
 ```
 
-## What Gets Tested
+## What the Installer Function Test Checks
 
-The test suite performs comprehensive validation of all major plugin features:
+This section covers the Diagnostics function test (`bash install.sh` → Diagnostics → Run plugin function test). The development suite's 46 phases are listed in [Tools.md](Tools.md#test-phases).
+
+The installer test performs 9 checks through the Proxmox API, plus VM migration and cross-node clone when run on a cluster node:
 
 ### 1. Storage Status Test
 **What it does**:
@@ -108,11 +134,9 @@ The test suite performs comprehensive validation of all major plugin features:
 - Creates test VM (ID auto-selected from available IDs)
 - Allocates 4GB disk on TrueNAS storage
 - Verifies volume creation on TrueNAS side
-- Tests iSCSI extent and targetextent creation
+- Tests backend exposure (iSCSI extent/targetextent or NVMe namespace)
 
 **Pass Criteria**: VM created with disk, volume appears in storage
-
-**Performance Metric**: Reports disk allocation time
 
 ### 3. Volume Listing Test
 **What it does**:
@@ -131,7 +155,13 @@ The test suite performs comprehensive validation of all major plugin features:
 
 **Pass Criteria**: Snapshots created successfully, appear in listings
 
-**Performance Metric**: Reports snapshot creation time
+### 4b. Multi-Disk Snapshot Check
+**What it does**:
+- Creates a VM with two disks on the same storage
+- Creates a snapshot that must cover both disks atomically
+- Deletes the snapshot and the VM
+
+**Pass Criteria**: Snapshot created and deleted across both disks
 
 ### 5. Clone Operations Test
 **What it does**:
@@ -142,9 +172,7 @@ The test suite performs comprehensive validation of all major plugin features:
 
 **Pass Criteria**: Clone VM created with independent disks
 
-**Performance Metric**: Reports clone operation time
-
-**Note**: Clone uses network transfer as documented in [Known Limitations](Known-Limitations.md#no-fast-clone-support)
+**Note**: Clone uses network transfer as documented in [Known Limitations](Known-Limitations.md#clone-performance)
 
 ### 6. Volume Resize Test
 **What it does**:
@@ -154,19 +182,15 @@ The test suite performs comprehensive validation of all major plugin features:
 
 **Pass Criteria**: Disk resized successfully, new size reflected
 
-**Performance Metric**: Reports resize operation time
-
 ### 7. VM Start/Stop Test
 **What it does**:
 - Starts test VM
 - Verifies VM running state
 - Stops VM
 - Verifies VM stopped state
-- Tests iSCSI disk accessibility during VM lifecycle
+- Tests disk accessibility during VM lifecycle
 
 **Pass Criteria**: VM starts and stops successfully
-
-**Performance Metrics**: Reports start time and stop time
 
 ### 8. Volume Deletion Test
 **What it does**:
@@ -174,224 +198,99 @@ The test suite performs comprehensive validation of all major plugin features:
 - Deletes base VM with `--purge` flag
 - Verifies automatic cleanup of TrueNAS resources
 - Checks for orphaned volumes
-- Tests proper cleanup of zvols, extents, targetextents
+- Tests proper cleanup of zvols and their iSCSI/NVMe exposure
 
 **Pass Criteria**: VMs deleted, no orphaned storage on TrueNAS
 
-**Performance Metric**: Reports deletion time
-
-**Important**: This test validates that GUI-style deletion (using `--purge`) properly cleans up all TrueNAS resources, unlike `qm destroy` (see [Known Limitations](Known-Limitations.md#vm-deletion-behavior))
+**Important**: This test validates that GUI-style deletion (using `--purge`) properly cleans up all TrueNAS resources, unlike `qm destroy` (see [Known Limitations](Known-Limitations.md#vm-deletion-qm-destroy))
 
 ## Test Execution Flow
 
-### Execution Stages
+### Installer Function Test Stages
 
-The test suite runs in the following stages:
-
-#### 1. Pre-Flight Checks
-```
-[CHECK] PRE-FLIGHT CHECKS
-  [*]  Checking plugin installation...
-  [*]  Checking storage configuration...
-  [*]  Checking required tools...
-  [*]  Checking permissions...
-```
-
-Validates:
-- Plugin file exists at `/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm`
-- Storage is accessible via API
-- `pvesh` command available
-- Running as root
-
-**If any check fails, test suite aborts immediately**
-
-#### 2. VM ID Selection
-```
-[TEST] Finding available VM IDs
-[PASS] Selected test VM IDs: 990 (base), 991 (clone)
-```
-
-Automatically finds two consecutive available VM IDs in range 990-1090
-
-#### 3. Cleanup Existing Test VMs
-Removes any existing test VMs from previous runs to ensure clean test environment
-
-#### 4. Main Test Execution
-Runs all 8 test cases sequentially (listed above)
-
-#### 5. Cleanup Stage
-Deletes test VMs and verifies storage cleanup
-
-#### 6. Results Summary
-Generates comprehensive test report with:
-- Pass/fail summary
-- Error and warning counts
-- Performance metrics for all operations
-- System information
+1. The test description is shown; type `ACCEPT` to continue.
+2. Select the storage to test from the configured `truenasplugin:` storages.
+3. **VM ID selection**: the test starts at 990 and walks upward until it finds two consecutive free IDs (base and clone). The multi-disk check uses base + 100.
+4. **Pre-flight**: `pvesh` must be available, then the storage-status check runs. A storage-status failure aborts the run.
+5. **Volume creation**: a failure here aborts the run after cleaning up the test VMs.
+6. **Remaining checks**: each failure is counted and the run continues.
+7. **Cleanup**: test VMs are deleted with `--purge` and temporary state is removed.
+8. **Summary**: totals, duration, storage, node, cluster mode and the installer log path are printed.
 
 ## Output and Logging
 
 ### Console Output
 
-The test suite provides colorized, real-time console output:
+The installer test prints 30-character labels followed by a spinner and a status glyph:
 
-**Status Indicators**:
-- `[PASS]` - Green - Test passed
-- `[FAIL]` - Red - Test failed
-- `[WARN]` - Yellow - Warning issued
-- `[TEST]` - Blue - Test starting
-- `[INFO]` - Blue - Informational message
-
-**Progress Steps**:
-- `• Step description...` - In progress (blue)
-- `✓ Step description...` - Completed (green checkmark)
+- `✓` - check passed
+- `✗` - check failed
+- `⚠` - check completed with a warning
 
 **Example Output**:
 ```
-[TEST] Testing volume creation (via API)
-    ✓ Creating test VM 990...
-    ✓ Adding 4GB disk to VM...
-    [INFO] [TIME]  Volume Creation (4GB disk) completed in 3.45s
-[PASS] Volume creation test passed (4.20s, disk: 3.45s)
+Storage accessibility         ✓ Storage active and accessible
+Volume creation                ✓ Created 4GB disk successfully
+Volume listing                 ✓ Retrieved volume configuration
+Snapshot operations            ✓ Snapshot created and verified
+Clone operations               ✓ Cloned VM from snapshot
+Volume resize                  ✓ Expanded disk by 1GB
+VM start/stop lifecycle        ✓ VM started and stopped
+Volume deletion                ✓ Cleaned up test resources
 ```
 
 ### Log Files
 
-Every test run creates a detailed log file:
+The function test writes nothing to a log file of its own; its output is console-only. The installer's global log is `/var/log/truenas-installer.log`, which receives installer-level events, not test results.
 
-**Location**: `/tmp/truenas-plugin-test-suite-YYYYMMDD-HHMMSS.log`
-
-**Contents**:
-- Timestamped entries for all operations
-- API call details (method, path, parameters)
-- API responses and errors
-- Performance timing data
-- Test results summary
-
-**Example Log Entry**:
-```
-[2025-10-01 23:45:12] [API] POST /nodes/pve/qemu --vmid 990 --name test-base-vm --memory 512 --cores 1 --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci
-[2025-10-01 23:45:13] [OUTPUT] UPID:pve:00001234:...
-[2025-10-01 23:45:13] [API] Request succeeded
-[2025-10-01 23:45:13] [TIMING] Creating test VM 990 completed in 1.23s
-[2025-10-01 23:45:13] [SUCCESS] Test VM 990 created successfully
-```
+The development suite is the one that writes a timestamped result log: `test-results-YYYYMMDD-HHMMSS.log` in the directory it is launched from. See [Tools.md](Tools.md#output-files).
 
 ### Performance Metrics
 
-Each operation reports timing:
-
-**Individual Operations**:
-```
-[INFO] [TIME]  Volume Creation (4GB disk) completed in 3.45s
-[INFO] [TIME]  First snapshot creation: 0.89s
-[INFO] [TIME]  Clone operation: 45.67s
-[INFO] [TIME]  Disk resize (+1GB): 2.34s
-[INFO] [TIME]  VM start: 5.12s
-[INFO] [TIME]  VM stop: 2.87s
-[INFO] [TIME]  VM deletion with --purge: 8.91s
-```
-
-**Test Totals**:
-```
-[PASS] Volume creation test passed (4.20s, disk: 3.45s)
-[PASS] Snapshot operations test passed (3.56s, snapshot: 0.89s)
-[PASS] Clone operations test passed (52.34s, clone: 45.67s)
-```
+The installer test reports only the total run duration in its summary; it does not time individual operations. For per-operation timings and a performance summary table, use the development suite (phases 8 and 28) and read `test-results-*.log`.
 
 ## Test Results Summary
 
-At the end of execution, a comprehensive summary is generated:
+At the end of the run, the installer prints:
 
 ```
-================================================================================
-TEST SUMMARY REPORT (API-based Testing)
-================================================================================
-Test Date: Mon Oct  1 23:45:00 UTC 2025
-Storage: truenas-storage
-Node: pve
-Log File: /tmp/truenas-plugin-test-suite-20251001-234500.log
-API Timeout: 60 seconds
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Test Results:
-8 tests passed
-0 errors encountered
-1 warnings issued
+Plugin Function Test Summary
 
-Performance Metrics:
-[TIME]  Storage Status Check completed in 0.45s
-[TIME]  Volume Creation (4GB disk) completed in 3.45s
-[TIME]  Volume Creation Test total time: 4.20s
-[TIME]  Volume Listing Test completed in 0.67s
-[TIME]  First snapshot creation: 0.89s
-[TIME]  Snapshot Operations Test total time: 3.56s
-[TIME]  Clone operation: 45.67s
-[TIME]  Clone Operations Test total time: 52.34s
-[TIME]  Disk resize (+1GB): 2.34s
-[TIME]  Volume Resize Test total time: 3.12s
-[TIME]  VM start: 5.12s
-[TIME]  VM stop: 2.87s
-[TIME]  VM Start/Stop Test total time: 10.45s
-[TIME]  VM deletion with --purge: 8.91s
-[TIME]  Volume Deletion Test total time: 15.23s
+  Total tests run:    9
+  Tests passed:       9
+  Tests failed:       0
+  Duration:           3m 12s
 
-System Information:
-Proxmox Version: pve-manager/8.2.2/9355359cd7afbae4 (running kernel: 6.8.4-2-pve)
-Kernel: 6.8.4-2-pve
-Node: pve
+  Storage tested:     truenas-storage
+  Node:               pve
+  Cluster mode:       No
 
-Plugin Feature Coverage (via API):
-[*]  Storage status and capacity reporting
-[*]  Volume creation and allocation
-[*]  Volume listing via API
-[*]  Snapshot creation via API
-[*]  Clone operations via API
-[*]  Volume resize via API
-[*]  VM start and stop operations
-[*]  Volume deletion with --purge flag
-[*]  PVE 8.x and 9.x compatibility
-
-Notes:
-- All operations performed via Proxmox API (pvesh)
-- Simulates GUI interaction patterns
-- Compatible with PVE 8.x and 9.x
-
-================================================================================
+  Log file:           /var/log/truenas-installer.log
 ```
+
+`Total tests run` includes the multi-disk snapshot check, so a standalone node reports 9 and a cluster node 11.
 
 ## Interpreting Results
 
-### Success Criteria
+The test function returns 0 when no test failed and 1 otherwise. Outside the installer, the status glyphs are the readable result: any `✗` line is a failed check.
 
-**All Tests Pass**:
+### All Checks Passed
+
 ```
-[SUCCESS] Test suite completed!
-[SUMMARY]  Summary: 8 passed, 0 errors, 0 warnings
+Plugin Function Test Summary: 9/9 tests passed
 ```
-Exit code: 0
 
-Plugin is functioning correctly, all features working as expected.
-
-### Partial Success
-
-**Some Warnings**:
-```
-[SUCCESS] Test suite completed!
-[SUMMARY]  Summary: 8 passed, 0 errors, 2 warnings
-```
-Exit code: 0
-
-Tests passed but warnings issued (e.g., slow operations, minor issues). Review log file for details.
+Exit status: 0. The plugin is functioning correctly.
 
 ### Failure
 
-**Test Failures**:
 ```
-[FAIL]  3 test(s) failed
+  Tests failed:       3
 ```
-Exit code: 1
 
-One or more tests failed. Review console output and log file to identify failures.
+Exit status: 1. Review the `✗` lines; the storage-status and volume-creation failures abort the run early by design.
 
 ## Common Test Failures
 
@@ -399,8 +298,8 @@ One or more tests failed. Review console output and log file to identify failure
 
 **Symptom**:
 ```
-[FAIL]  Storage 'truenas-storage' not accessible via API
-[FAIL]  Pre-flight checks failed
+Storage accessibility         ✗ Failed
+Storage status test failed - aborting test suite
 ```
 
 **Causes**:
@@ -424,7 +323,8 @@ ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
 
 **Symptom**:
 ```
-[FAIL] Failed to add disk to VM
+Add 4GB disk to VM:           ✗ Failed
+Volume creation test failed - attempting cleanup
 ```
 
 **Causes**:
@@ -445,16 +345,13 @@ ssh root@TRUENAS_IP "systemctl status iscsitarget"
 ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"iscsi.target.query\", [ [] ]); print \"ok\\n\";'"
 ```
 
-### Clone Operation Timeout
+### Clone Operation Is Slow
 
-**Symptom**:
-```
-[WARN]  Clone operation took 180s (slow network)
-```
+**Symptom**: the clone check takes minutes rather than seconds.
 
-**Cause**: Large disk being copied over network (expected behavior)
+**Cause**: a full copy is streamed over the network; this is expected.
 
-**Not a Failure**: Clone uses network transfer as documented in [Known Limitations](Known-Limitations.md#no-fast-clone-support)
+**Not a Failure**: Clone uses network transfer as documented in [Known Limitations](Known-Limitations.md#clone-performance)
 
 **Expected Times**:
 - 4GB disk over 1GbE: ~40-60s
@@ -462,12 +359,9 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 
 ### VM Deletion Leaves Orphans
 
-**Symptom**:
-```
-[WARN]  Some volumes remain after VM deletion
-```
+**Symptom**: `pvesm list <storage>` still shows `vm-990-*` or `vm-991-*` volumes after the run.
 
-**If using `--purge` flag**: This shouldn't happen, indicates cleanup issue
+**If using `--purge`**: this shouldn't happen and indicates a cleanup issue.
 
 **Solutions**:
 ```bash
@@ -477,61 +371,57 @@ pvesm list truenas-storage | grep -E "(990|991)"
 # Manual cleanup if needed
 pvesm free truenas-storage:vm-990-disk-0-lun1
 
+# Or run: bash install.sh -> Diagnostics -> Cleanup orphaned resources
+
 # Check TrueNAS side
 ssh root@TRUENAS_IP "zfs list -t volume | grep proxmox"
 ```
 
 ## Advanced Usage
 
-### Custom VM ID Range
+### Development Suite Phase Selection
 
-Set `TEST_VM_BASE_HINT` to change starting ID search range:
-
-```bash
-# Search for available IDs starting from 500
-TEST_VM_BASE_HINT=500 ./tools/dev-truenas-plugin-full-function-test.sh truenas-storage
-```
-
-### Extended Timeout
-
-Modify timeout for slow networks/systems:
+Select phases with `--phase`, `--start` and `--stop`:
 
 ```bash
-# Edit test suite
-nano tools/dev-truenas-plugin-full-function-test.sh
+# Only phase 5
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --phase 5
 
-# Change line:
-API_TIMEOUT=60  # Increase to 120 for slow systems
+# Phases 10 through 20
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001 --start 10 --stop 20
 ```
 
-### Selective Testing
+The test VM range is `VMID_START`..`VMID_START+200`. No environment variable changes it; choose the starting ID with the second positional argument.
 
-Comment out tests you don't want to run:
+### Installer Test VM IDs and Bridge
+
+The installer test starts at 990 and walks upward until it finds two consecutive free IDs. It attaches the test VM NIC to `vmbr0` when that bridge exists, otherwise to the first `vmbr*` bridge, or to `TRUENAS_PLUGIN_TEST_BRIDGE` when that variable is set:
 
 ```bash
-# Edit main() function around line 920
-# Comment out specific tests:
-# test_clone_operations || ((failed_tests++))
+TRUENAS_PLUGIN_TEST_BRIDGE=vmbr1 bash install.sh
 ```
+
+### API Timeout
+
+The installer test uses `TEST_API_TIMEOUT=60` (seconds) for each `pvesh` call; change that variable in `install.sh` for slow systems. The development suite sets per-command timeouts inline (for example `timeout 60 pvesh create ...`) and has no single override variable.
 
 ## Continuous Integration
 
 ### Automated Testing
 
-Run test suite in CI/CD pipelines:
+The development suite takes both positional arguments and has no auto-confirm flag:
 
 ```bash
 #!/bin/bash
 # CI test script
 
-# Run test suite with auto-confirm
-if ./tools/dev-truenas-plugin-full-function-test.sh production-storage -y; then
+if ./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001; then
     echo "Tests passed"
     exit 0
 else
     echo "Tests failed"
-    # Upload log file to artifact storage
-    cp /tmp/truenas-plugin-test-suite-*.log ./test-artifacts/
+    # Upload the log file to artifact storage
+    cp test-results-*.log ./test-artifacts/
     exit 1
 fi
 ```
@@ -542,7 +432,7 @@ Add to cron for periodic validation:
 
 ```bash
 # Daily test at 2 AM
-0 2 * * * /root/tools/dev-truenas-plugin-full-function-test.sh production-storage -y >> /var/log/truenas-plugin-test.log 2>&1
+0 2 * * * cd /root/truenas-proxmox-plugin/tools && ./dev-truenas-plugin-full-function-test.sh tnscale 9001 >> /var/log/truenas-plugin-test.log 2>&1
 ```
 
 ## Troubleshooting Test Suite
@@ -554,32 +444,29 @@ Add to cron for periodic validation:
 chmod +x tools/dev-truenas-plugin-full-function-test.sh
 ```
 
-**Not Running as Root**:
+**Not Running as Root**: the development suite must run on a PVE node as root, with both arguments:
 ```bash
-./tools/dev-truenas-plugin-full-function-test.sh
+./tools/dev-truenas-plugin-full-function-test.sh tnscale 9001
 ```
 
 ### API Timeout Errors
 
-Increase timeout in script:
-```bash
-API_TIMEOUT=120  # Increase from default 60
-```
+The installer test uses `TEST_API_TIMEOUT=60` in `install.sh`; raise it there for slow systems. The development suite uses inline `timeout` values per command.
 
 ### Missing Dependencies
 
 Install required tools:
 ```bash
-# bc for timing calculations
+# bc is used by the development suite's staggered concurrency phases
 apt-get install bc
 
-# Ensure pvesh available (should be with Proxmox)
+# Ensure pvesh is available (should come with Proxmox)
 which pvesh
 ```
 
 ## Performance Benchmarking
 
-Use test suite to benchmark different configurations:
+Use the development suite to benchmark different configurations.
 
 ### Compare Block Sizes
 
@@ -587,30 +474,28 @@ Use test suite to benchmark different configurations:
 # Test with 64K blocks
 # Edit /etc/pve/storage.cfg: tn_zvol_blocksize 64K
 # systemctl restart pvedaemon pveproxy
-./tools/dev-truenas-plugin-full-function-test.sh test-64k -y > bench-64k.log
+./tools/dev-truenas-plugin-full-function-test.sh test-64k 9001 > bench-64k.log
 
 # Test with 128K blocks
 # Edit /etc/pve/storage.cfg: tn_zvol_blocksize 128K
 # systemctl restart pvedaemon pveproxy
-./tools/dev-truenas-plugin-full-function-test.sh test-128k -y > bench-128k.log
+./tools/dev-truenas-plugin-full-function-test.sh test-128k 9001 > bench-128k.log
 
-# Compare timing results
-grep "TIMING" bench-64k.log > compare-64k.txt
-grep "TIMING" bench-128k.log > compare-128k.txt
+# Compare the reported durations
+grep -E "in [0-9]+s" bench-64k.log > compare-64k.txt
+grep -E "in [0-9]+s" bench-128k.log > compare-128k.txt
 ```
 
 ### Network Performance
 
-Test different network configurations:
+Test different network configurations (each storage ID configured with the portal layout under test):
 
 ```bash
 # Test single portal
-./tools/dev-truenas-plugin-full-function-test.sh single-portal -y
+./tools/dev-truenas-plugin-full-function-test.sh single-portal 9001
 
 # Test multipath with multiple portals
-./tools/dev-truenas-plugin-full-function-test.sh multipath -y
-
-# Compare clone operation times
+./tools/dev-truenas-plugin-full-function-test.sh multipath 9001
 ```
 
 ## Best Practices
@@ -620,7 +505,7 @@ Test different network configurations:
 1. **Backup Configuration**: Save `/etc/pve/storage.cfg`
 2. **Check Space**: Ensure adequate TrueNAS space (~10GB minimum)
 3. **Verify Storage Active**: `pvesm status` shows storage active
-4. **Review Test VMs**: Ensure VM IDs 990-999 are available (or will be auto-selected)
+4. **Review Test VMs**: the installer test needs two consecutive free VM IDs at or above 990 (it walks upward until it finds them)
 
 ### During Testing
 

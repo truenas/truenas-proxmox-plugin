@@ -1,10 +1,14 @@
 # Broker rate-limit regression tests
 
 Reference for everything under `t/rate-limit/`. Nine test files, 30
-individual assertions, all real-TN (no mocks). The harness counts
-upstream `auth.login_with_api_key` events through TN's own `audit.query`
-endpoint, so every assertion in the suite is grounded in what TN saw,
-not what the plugin claims to have done.
+individual assertions, all real-TN (no mocks). The default audit counter
+counts `AUTHENTICATION` events from TN's `audit.query` that carry an
+API-key marker (`event_data.credentials.credentials` matching `API_KEY`,
+or an `api_key_id`/`api_key` under `credentials_data`; see
+`t/rate-limit/lib/RateLimit/Harness.pm:218-230`), so every assertion is
+grounded in what TN saw, not what the plugin claims to have done. Because
+the counter keys on API-key credentials, the suite does not exercise
+SCRAM paths.
 
 Companion to `wiki/D2-per-process-reauth.md`, which explains the
 underlying problem the broker exists to solve.
@@ -29,10 +33,12 @@ response fire even more logins inside the same window, the limiter
 stays tripped longer.
 
 The session broker daemon (`tools/truenas-plugin-broker`) is the fix:
-one upstream authenticated WebSocket per (host, api_key) pair per node,
-listening on `/run/truenas-plugin/broker.sock`, proxying JSON-RPC for
-every plugin invocation. The plugin's `_broker_try_open` short-circuits
-into the broker on every call when the socket is present.
+each prefork worker holds its own upstream authenticated WebSocket per
+pool entry, keyed by host plus a hash of
+`(api_key, api_username, auth_mechanism)`, listening on
+`/run/truenas-plugin/broker.sock` and proxying JSON-RPC for every plugin
+invocation. The plugin's `_broker_try_open` short-circuits into the
+broker on every call when the socket is present.
 
 The tests below verify that the broker is doing what it should.
 

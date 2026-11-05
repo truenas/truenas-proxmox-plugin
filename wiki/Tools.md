@@ -10,9 +10,10 @@ The plugin includes several tools to simplify installation, testing, cluster man
 - **[Integrated Plugin Test](#integrated-plugin-test)** - Quick function validation via installer
 - **[Diagnostics Bundle](#diagnostics-bundle)** - 10-minute strace capture with system diagnostics for troubleshooting
 - **[Health Check Tool](#health-check-tool)** - Quick health validation for monitoring
-- **[Orphan Cleanup](#orphan-cleanup)** - Find and remove orphaned iSCSI resources
+- **[Orphan Cleanup](#orphan-cleanup)** - Find and remove orphaned iSCSI and NVMe/TCP resources
 
 **Standalone Tools**:
+- **[Session Broker](#session-broker)** - Persistent authenticated WebSocket upstream, shared by all plugin processes
 - **[Development Test Suite](#development-test-suite)** - **Development/testing only** - Comprehensive plugin testing
 - **[Debug Logging System](#debug-logging-system)** - Diagnostic logging for troubleshooting
 
@@ -22,12 +23,18 @@ The plugin includes several tools to simplify installation, testing, cluster man
 
 ```
 tools/
-└── dev-truenas-plugin-full-function-test.sh  # Development test suite (⚠️ DEV ONLY)
+├── truenas-plugin-broker                     # Session broker daemon (packaged with a systemd unit)
+├── truenas-plugin-lvm-filter                 # Adds/removes LVM global_filter entries for TrueNAS-served devices
+├── nvme-recovery.sh                          # Reassigns namespaces from a shared to per-storage NVMe subsystems
+├── diag-nvme-namespace-publish.sh            # Diagnoses namespaces that never appear on the Proxmox host
+├── boot-reboot-test.sh                       # Boot-time integration test (broker ordering, autostart VMs)
+├── build-deb.sh                              # Builds the .deb, runs lintian, verifies the stamped version
+├── dev-truenas-plugin-full-function-test.sh  # Development test suite (⚠️ DEV ONLY)
+├── lifecycle-tests/                          # Reboot, restart, upgrade, crash and network-flap scenarios
+└── apt-repo/                                 # reprepro configuration for the APT repository
 ```
 
-**Note**: Most tools are now integrated into the interactive installer (`install.sh`). The standalone development test suite remains for development purposes only.
-
-Note: Health check, orphan cleanup, and plugin function testing are now integrated directly into the `install.sh` installer script via the Diagnostics menu.
+Health check, orphan cleanup, plugin function testing and the diagnostics bundle are integrated directly into `install.sh` via the Diagnostics menu; they are not separate scripts in `tools/`.
 
 ---
 
@@ -103,6 +110,51 @@ container goes through `PVE::LXC::Config` with `rootfs`/`mpN` instead of
 
 ---
 
+## Session Broker
+
+`tools/truenas-plugin-broker` is a Perl daemon that holds persistent,
+authenticated WebSocket connections to TrueNAS and multiplexes all plugin
+processes through them, so `pvesm`, `pvedaemon` and `pvestatd` do not each
+re-authenticate on every call.
+
+**Paths**:
+
+| Path | Purpose |
+|---|---|
+| `/run/truenas-plugin/broker.sock` | Unix socket the plugin connects to |
+| `/run/truenas-plugin/broker.pid` | PID file |
+| `/var/log/truenas-plugin-broker.log` | Log file used when the broker daemonizes itself (not used by the packaged unit, which runs `--foreground` and logs to the journal) |
+
+**Options**:
+
+| Option | Effect |
+|---|---|
+| `--foreground`, `-f` | Stay in the foreground and log to stderr instead of the log file; also suppresses daemonising |
+| `--debug`, `-d` | Emit `DEBUG` lines in addition to `INFO`/`WARN`/`ERROR` |
+
+Without `--foreground` the broker daemonises itself. `PREFORK_N = 4` worker
+processes share the listening socket and each holds one upstream WebSocket.
+The socket path, PID file and log file are fixed constants in the script, not
+configurable flags.
+
+The packaged systemd unit (`debian/truenas-plugin-broker.service`) runs
+`/usr/sbin/truenas-plugin-broker --foreground` with `Type=notify`, so the
+service is marked ready only after the listening socket is bound. The unit is
+ordered `Before=pvestatd.service pvedaemon.service pveproxy.service` and is
+enabled and started by the package postinst.
+
+```bash
+# Service status and logs
+systemctl status truenas-plugin-broker
+journalctl -u truenas-plugin-broker -n 50
+
+# Manual foreground run with debug output (stop the service first)
+systemctl stop truenas-plugin-broker
+/usr/sbin/truenas-plugin-broker --foreground --debug
+```
+
+---
+
 ## Development Test Suite
 
 > ⚠️ **WARNING: DEVELOPMENT USE ONLY**
@@ -124,131 +176,113 @@ The Development Test Suite (`dev-truenas-plugin-full-function-test.sh`) is a com
 
 ### Features
 
-- **Machine-Readable Output** - JSON + CSV logs for analysis
-- **TrueNAS Size Verification** - Validates disk sizes on TrueNAS backend via API
-- **API-Only Testing** - Uses Proxmox API exclusively (pvesh)
-- **Detailed Timing** - Performance metrics for all operations
-- **Color-Coded Output** - Clear visual status indicators
+- **TrueNAS Size Verification** - Validates disk sizes against the TrueNAS backend through the plugin
+- **API-Only Testing** - Uses the Proxmox API (`pvesh`, `pvesm`) and `qm` on the node
+- **Detailed Timing** - Per-operation timings and a performance summary table
+- **Color-Coded Output** - Status indicators in the console and in the log
+- **Baseline Comparison** - Phase 28 compares current timings against `/var/lib/truenas-test-baseline.json`
 
 ### Usage
 
-> ⚠️ **IMPORTANT**: Only run in isolated test/development environments
+Both positional arguments are required:
 
 ```bash
-# Navigate to tools directory
 cd tools/
+./dev-truenas-plugin-full-function-test.sh STORAGE_ID VMID_START [OPTIONS]
 
-# Basic usage (development environment only!)
-./dev-truenas-plugin-full-function-test.sh
-
-# Specify storage and starting VMID
+# Example: storage 'tnscale', test VMs from 9001
 ./dev-truenas-plugin-full-function-test.sh tnscale 9001
 
-# Include backup tests (requires backup storage)
+# Include backup phases (requires a backup storage)
 ./dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
+
+# Run one phase only
+./dev-truenas-plugin-full-function-test.sh tnscale 9001 --phase 5
+
+# Run phases 10-20
+./dev-truenas-plugin-full-function-test.sh tnscale 9001 --start 10 --stop 20
 
 # View results
 tail -f test-results-*.log
 ```
 
 **Command-line Arguments**:
-- `STORAGE_ID` - TrueNAS storage ID (default: tnscale)
-- `VMID_START` - Starting VMID for test VMs (default: 9001)
-- `--backup-store STORAGE` - Backup storage for backup tests (optional)
+- `STORAGE_ID` - TrueNAS storage ID from `/etc/pve/storage.cfg` (required)
+- `VMID_START` - Starting VMID for test VMs (required, numeric); the suite uses `VMID_START`..`VMID_START+200`
+- `--backup-store STORAGE` - Backup storage for the backup phases (optional; those phases are skipped without it)
+- `--phase N` - Run phase N only (same as `--start N --stop N`)
+- `--start N` - Begin at phase N and continue to the end
+- `--stop M` - Stop after phase M
 
-**Examples**:
-```bash
-# Standalone node (skips cluster tests)
-./dev-truenas-plugin-full-function-test.sh tnscale 9001
-
-# Cluster environment with backup storage
-./dev-truenas-plugin-full-function-test.sh tnscale 9001 --backup-store pbs
-
-# Different VMID range
-./dev-truenas-plugin-full-function-test.sh tnscale 8000 --backup-store local
-```
+Missing arguments or an unknown option print the usage line and exit 1. There are no default values.
 
 **Cluster Detection**:
 - Script automatically detects if running in a cluster
-- If cluster detected with available nodes: runs migration and cross-node clone tests
-- If standalone node: automatically skips cluster-only tests
+- If cluster detected with online peer nodes: migration and cross-node clone phases run
+- If standalone node: cluster-only phases are skipped
+
+**LXC Detection**:
+- Phases 37-46 require a storage whose content includes `rootdir`
 
 **Backup Tests**:
-- Requires `--backup-store` flag
-- If not specified: automatically skips backup tests
-- Tests both online (running VM) and offline (stopped VM) backups
+- Require `--backup-store`
+- If not specified: backup phases are skipped
+- Cover both online (running VM) and offline (stopped VM) backups
 
 ### Test Phases
 
-The Development Test Suite performs comprehensive testing across 16 test phases:
+The suite runs phases 1-46. Cluster, backup and LXC phases are skipped automatically when their prerequisites are absent.
 
-#### Phase 1-9: Core Plugin Functionality
+| Phase | Name |
+|---|---|
+| 1 | Pre-flight Cleanup |
+| 2 | Disk Allocation |
+| 3 | TrueNAS Size Verification |
+| 4 | Disk Deletion |
+| 5 | Clone and Snapshot |
+| 6 | Disk Resize |
+| 7 | Concurrent Operations |
+| 8 | Performance Benchmarks |
+| 9 | Multiple Disks |
+| 10 | EFI VM Creation |
+| 11 | Multi-Disk Advanced Operations |
+| 12 | Live Migration (cluster) |
+| 13 | Offline Migration (cluster) |
+| 14 | Cross-Node Clone, Online (cluster) |
+| 15 | Cross-Node Clone, Offline (cluster) |
+| 16 | Online Backup (`--backup-store`) |
+| 17 | Offline Backup (`--backup-store`) |
+| 18 | Rapid Creation/Deletion Stress |
+| 19 | Storage Quota/Space Exhaustion |
+| 20 | Invalid/Malformed API Requests |
+| 21 | Interrupted Operations |
+| 22 | Large Disk Operations |
+| 23 | Transport Mode Verification |
+| 24 | Snapshot Reversion |
+| 25 | Disk Hotswap |
+| 26 | API Rate Limiting |
+| 27 | Multi-Pool Operations |
+| 28 | Performance Regression Tracking |
+| 29 | Dataset Property Inheritance |
+| 30 | NVMe Stale Connection Recovery |
+| 31 | Concurrent Alloc+Free Lock Contention |
+| 32 | Multi-Disk Sequential Timing |
+| 33 | Mixed Concurrent Operations |
+| 34 | Concurrent Clone Operations |
+| 35 | Cross-Node Concurrent Allocations (cluster) |
+| 36 | Concurrent Migration + Allocation (cluster) |
+| 37 | LXC Container Create/Start/Stop |
+| 38 | LXC Snapshot & Revert |
+| 39 | LXC Container Clone |
+| 40 | LXC Container Resize |
+| 41 | LXC Offline Migration (cluster) |
+| 42 | LXC Multi-Mountpoint |
+| 43 | LXC Rapid Create/Delete Stress |
+| 44 | LXC Concurrent Creation/Destruction |
+| 45 | LXC Online Backup (`--backup-store`) |
+| 46 | LXC Offline Backup (`--backup-store`) |
 
-1. **Pre-flight Cleanup** - Remove orphaned resources from previous test runs
-2. **Disk Allocation** - Test disk creation with multiple sizes (1GB, 10GB, 32GB, 100GB)
-3. **TrueNAS Size Verification** - Verify disk sizes match on TrueNAS backend via API
-4. **Disk Deletion** - Test VM and disk deletion with cleanup verification
-5. **Clone & Snapshot** - Test VM cloning, snapshots, and deletion
-6. **Disk Resize** - Test expanding disk from 10GB to 20GB
-7. **Concurrent Operations** - Test parallel disk allocations and deletions
-8. **Performance Benchmarks** - Benchmark disk allocation and deletion timing
-9. **Multiple Disks** - Test VMs with multiple disk attachments
-
-#### Phase 10: EFI Boot Support
-
-10. **EFI VM Creation** - Test VM creation with EFI BIOS and EFI disk configuration
-
-**Verifies**:
-- VM created with EFI BIOS (OVMF)
-- EFI disk allocated and configured
-- Data disk attached successfully
-- VM configuration contains correct EFI settings
-
-#### Phase 11-12: Live Migration (Cluster Only)
-
-11. **Live Migration** - Test online VM migration between cluster nodes
-12. **Offline Migration** - Test offline VM migration between cluster nodes
-
-**Verifies**:
-- VM successfully migrates to target node
-- VM data remains intact
-- Migration back to original node works
-- Storage remains accessible on both nodes
-
-**Requirements**:
-- Proxmox cluster with multiple nodes
-- All nodes must have access to TrueNAS storage
-- Auto-skipped on standalone nodes
-
-#### Phase 13-14: Backup Operations (Optional)
-
-13. **Online Backup** - Test backup of running VM
-14. **Offline Backup** - Test backup of stopped VM
-
-**Verifies**:
-- Backup completes successfully
-- Backup file is created in backup storage
-- Backup cleanup removes files properly
-
-**Requirements**:
-- Backup storage specified via `--backup-store` flag
-- Auto-skipped if backup storage not provided
-
-#### Phase 15-16: Cross-Node Cloning (Cluster Only)
-
-15. **Cross-Node Clone (Online)** - Test cloning running VM to different node
-16. **Cross-Node Clone (Offline)** - Test cloning stopped VM to different node
-
-**Verifies**:
-- VM successfully cloned to target node
-- Clone has independent disks
-- Both VMs can operate independently
-- Cleanup removes both VMs correctly
-
-**Requirements**:
-- Proxmox cluster with multiple nodes
-- All nodes must have access to TrueNAS storage
-- Auto-skipped on standalone nodes
+Phase 2 allocates 1GB, 10GB, 32GB and 100GB disks and verifies each size on TrueNAS; phase 6 grows a 10GB disk; phase 22 allocates a 200GB disk.
 
 ### Performance Summary Table
 
@@ -281,42 +315,11 @@ This table shows:
 
 ### Output Files
 
-**JSON Log** (`test-results-TIMESTAMP.json`):
-```json
-{
-  "test_run": {
-    "timestamp": "2025-10-08T07:15:00Z",
-    "storage_id": "tnscale",
-    "truenas_api": "10.15.14.172",
-    "node": "pve-test-node"
-  },
-  "tests": [
-    {
-      "test_id": "alloc_001",
-      "test_name": "Allocate 10GB disk via API",
-      "category": "disk_allocation",
-      "status": "PASS",
-      "duration_ms": 2341,
-      "results": {
-        "requested_bytes": 10737418240,
-        "truenas_bytes": 10737418240,
-        "size_match": true
-      }
-    }
-  ],
-  "summary": {
-    "total": 8,
-    "passed": 8,
-    "failed": 0
-  }
-}
-```
+The suite writes one result file in the current working directory:
 
-**CSV Log** (`test-results-TIMESTAMP.csv`):
-```csv
-test_id,test_name,category,status,duration_ms,requested_bytes,actual_bytes,size_match,error_message
-alloc_001,"Allocate 10GB disk via API",disk_allocation,PASS,2341,10737418240,10737418240,true,
-```
+**Log** (`test-results-YYYYMMDD-HHMMSS.log`) - every console line, including per-test results, timings and the final summary.
+
+There is no JSON or CSV result file. The only JSON written is the performance baseline at `/var/lib/truenas-test-baseline.json`, which phase 28 reads and then rewrites with the current run's average timings.
 
 ### When to Use
 
@@ -325,12 +328,11 @@ alloc_001,"Allocate 10GB disk via API",disk_allocation,PASS,2341,10737418240,107
 - Verifying bug fixes (e.g., size allocation bug)
 - Regression testing after code changes
 - Generating diagnostic data for bug reports
-- CI/CD pipeline for plugin repository
 
 **❌ Do NOT Use For**:
-- Production environment validation (use Production Test Suite instead)
+- Production environment validation (use the installer's Diagnostics > Run plugin function test instead)
 - Running on live systems with active VMs
-- Routine health checks (use Health Check tool instead)
+- Routine health checks (use the installer's Diagnostics > Run health check instead)
 
 ### Development Workflow
 
@@ -344,10 +346,10 @@ ssh root@pve-test "systemctl restart pvedaemon"
 
 # 3. Run development test suite
 cd tools/
-./dev-truenas-plugin-full-function-test.sh test-storage pve-test 9001
+./dev-truenas-plugin-full-function-test.sh tnscale 9001
 
 # 4. Review results
-cat test-results-*.json | jq '.summary'
+tail -f test-results-*.log
 
 # 5. Fix any failures and repeat
 ```
@@ -364,7 +366,7 @@ jobs:
   test:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Deploy to test node
         run: |
           scp TrueNASPlugin.pm root@pve-test:/usr/share/perl5/PVE/Storage/Custom/
@@ -372,27 +374,27 @@ jobs:
       - name: Run tests
         run: |
           cd tools/
-          ./dev-truenas-plugin-full-function-test.sh test-storage pve-test 9001
+          ./dev-truenas-plugin-full-function-test.sh tnscale 9001
       - name: Upload results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: tools/test-results-*.json
+          path: tools/test-results-*.log
 ```
 
 ### Limitations
 
-- Creates test VMs (VMIDs 9001-9031 by default, expanded for new tests)
+- Creates test VMs across `VMID_START`..`VMID_START+200` (clone tests at +20/+21, LXC phases from +150)
 - Consumes storage space during tests
-- May interfere with existing VMs in VMID range
+- May interfere with existing VMs in the VMID range
 - Requires API access to TrueNAS
 - Not suitable for concurrent execution
-- Cluster tests require at least 2 nodes with shared storage access
-- Backup tests require backup storage to be configured and accessible
+- Cluster phases require at least 2 nodes with shared storage access
+- Backup phases require backup storage to be configured and accessible
 
 ### See Also
 
-- [Production Test Suite](#production-test-suite) - For production validation
+- [Integrated Plugin Test](#integrated-plugin-test) - Installer function test for production validation
 - [Debug Logging System](#debug-logging-system) - For detailed diagnostics
 - [Health Check Tool](#health-check-tool) - For quick health validation
 
@@ -553,11 +555,11 @@ The integrated plugin test functionality is built into the interactive installer
 
 ### Features
 
-- **8 Core Tests** - Validates all essential plugin operations
+- **9 Checks** - Validates all essential plugin operations (8 numbered steps plus a multi-disk snapshot check)
 - **Interactive Confirmation** - Requires typed "ACCEPT" to proceed
 - **Storage Selection** - Choose from configured TrueNAS storages
 - **Transport Detection** - Displays transport mode (iSCSI or NVMe/TCP)
-- **Cluster Awareness** - Detects cluster for potential migration/clone tests (informational)
+- **Cluster Awareness** - Runs VM migration and cross-node clone tests when on a cluster node
 - **Health-Check Style Display** - Spinner animations with inline status updates
 - **Automatic Cleanup** - Test VMs are removed after completion or on failure
 - **Dynamic VM IDs** - Automatically selects available VM IDs (990+)
@@ -583,13 +585,13 @@ bash install.sh
 2. **Confirmation** - Requires typing "ACCEPT" (in caps) to continue
 3. **Storage Selection** - Choose from available TrueNAS plugin storages
 4. **Transport Display** - Shows detected transport mode (iSCSI/NVMe/TCP)
-5. **Test Execution** - Runs 8 core tests with spinner animations
+5. **Test Execution** - Runs the 9 checks with spinner animations
 6. **Summary Report** - Shows passed/failed count and overall result
 7. **Automatic Cleanup** - Removes test VMs and volumes
 
 ### Tests Performed
 
-The integrated test performs 8 comprehensive tests with 30-character label formatting for consistent output:
+The integrated test performs 9 checks with 30-character label formatting for consistent output:
 
 **Test 1: Storage Accessibility** - Validates storage is active and accessible via Proxmox API
 - Format: `Storage accessibility         ✓ Storage active and accessible`
@@ -608,6 +610,11 @@ The integrated test performs 8 comprehensive tests with 30-character label forma
 - Creates snapshot of test VM
 - Prepares for clone operation
 - Format: `Snapshot operations            ✓ Snapshot created and verified`
+
+**Test 4b: Multi-Disk Snapshot Operations** - Creates a VM with two disks on the same storage
+- Snapshot creation must cover both disks atomically
+- Verifies the snapshot can be deleted across both disks, then removes the VM
+- Format: `Snapshot multi-disk VM:        ✓ Created and verified`
 
 **Test 5: Clone Operations** - Clones VM from snapshot
 - Creates linked clone from snapshot
@@ -725,7 +732,7 @@ Cluster detected - additional tests available:
   • Cross-node VM cloning
 ```
 
-**Note**: Cluster-specific tests (VM migration and cross-node cloning) are currently informational only and not yet implemented in the integrated test. For cluster testing, use the standalone Development Test Suite.
+**Note**: On a cluster node the test also runs two cluster tests: VM migration to a remote node and cross-node clone. They count towards the total in the summary and are skipped on standalone nodes.
 
 ### Safety Features
 
@@ -734,7 +741,7 @@ Cluster detected - additional tests available:
 3. **Isolated Testing** - Uses dedicated test VM IDs, doesn't affect production
 4. **Automatic Cleanup** - Removes all test resources on completion or failure
 5. **Non-Destructive** - Only creates/modifies test VMs, never touches production
-6. **Failure Handling** - Stops on first failure and cleans up partial resources
+6. **Failure Handling** - Storage-status and volume-creation failures abort after cleanup; later failures are counted and the run continues
 7. **Interrupt Handling** - Ctrl+C gracefully stops tests, restores cursor, cleans up resources, and displays user-friendly message
 
 ### Troubleshooting
@@ -764,24 +771,23 @@ Cluster detected - additional tests available:
 
 ### Comparison with Other Test Tools
 
-| Feature | Integrated Test | Production Test Suite | Development Test Suite |
-|---------|----------------|----------------------|----------------------|
-| **Access** | Via installer menu | Standalone script | Standalone script |
-| **Purpose** | Quick validation | Comprehensive testing | Plugin development |
-| **Test Count** | 8 core tests | 8 tests + metrics | 16 tests + cluster/backup |
-| **Duration** | 2-5 minutes | 5-10 minutes | 10-20 minutes |
-| **Confirmation** | Interactive (typed) | Yes (or -y flag) | Yes |
-| **Output** | Health-check style (30-char labels) | Detailed console + log | Pastel colors + JSON/CSV |
-| **Cleanup** | Automatic | Automatic | Automatic |
-| **Cluster Tests** | Planned (not yet) | Planned (not yet) | Yes (migration/clone) |
-| **Production Safe** | Yes | Yes | No (dev only) |
-| **API Method** | pvesh | pvesh | pvesh |
-| **Logging** | Silent (no log file) | Detailed log file | JSON + CSV logs |
-| **Interrupt Handling** | Graceful with cleanup | Standard | Standard |
+| Feature | Integrated Test | Development Test Suite |
+|---------|----------------|----------------------|
+| **Access** | Via installer Diagnostics menu | Standalone script |
+| **Purpose** | Quick validation | Comprehensive plugin development testing |
+| **Test Count** | 8 numbered checks plus a multi-disk snapshot check; VM migration and cross-node clone are added on a cluster node | 46 phases (cluster, backup and LXC phases gated) |
+| **Duration** | 2-5 minutes | Much longer; depends on phases selected |
+| **Confirmation** | Typed `ACCEPT` | None; both positional arguments required |
+| **Output** | Health-check style spinner with 30-char labels | Colored console plus `test-results-TIMESTAMP.log` |
+| **Logging** | Console only (not written to the installer log) | `test-results-TIMESTAMP.log` in the working directory |
+| **Cleanup** | Automatic | Automatic (phase 1 also cleans leftovers) |
+| **Cluster Tests** | Migration and cross-node clone, run when on a cluster node | Migration and cross-node clone phases |
+| **Production Safe** | Yes | No (dev only) |
+| **API Method** | `pvesh` | `pvesh` / `pvesm` / `qm` |
+| **Interrupt Handling** | Graceful with cleanup | Standard |
 
 **Recommendation**:
 - Use **Integrated Test** for quick validation after installation/updates
-- Use **Production Test Suite** for scheduled testing or detailed diagnostics
 - Use **Development Test Suite** only in isolated development environments
 
 ### Best Practices
@@ -803,7 +809,6 @@ Cluster detected - additional tests available:
 
 ### See Also
 
-- [Production Test Suite](#production-test-suite) - For detailed standalone testing
 - [Health Check Tool](#health-check-tool) - For configuration validation
 - [Development Test Suite](#development-test-suite) - For plugin development testing
 
@@ -946,78 +951,7 @@ systemctl start pvestatd
 
 ## Production Test Suite
 
-> **DEPRECATED**: This standalone script has been removed. Use the integrated **Plugin Function Test** feature via `install.sh` > Diagnostics > Run plugin function test instead.
-
-### Overview
-
-The plugin function test feature (integrated in the installer) validates all major plugin functionality through the Proxmox API.
-
-**Full documentation**: [Testing Guide](Testing.md)
-
-### Quick Reference
-
-**Location**: `tools/truenas-plugin-test-suite.sh`
-
-**Basic Usage**:
-```bash
-# Navigate to tools directory
-cd tools/
-
-# Run test suite
-./truenas-plugin-test-suite.sh your-storage-name
-
-# Run with auto-confirmation
-./truenas-plugin-test-suite.sh your-storage-name -y
-```
-
-**What It Tests**:
-- Storage status and accessibility
-- Volume creation and allocation
-- Volume listing
-- Snapshot operations
-- Clone operations
-- Volume resize
-- VM start/stop operations
-- Volume deletion and cleanup
-
-**Requirements**:
-- Root access
-- Plugin installed and configured
-- Active storage configuration
-- ~10GB free space on TrueNAS
-
-**Output**:
-- Real-time console output with color-coded results
-- Detailed log file in `/tmp/truenas-plugin-test-suite-*.log`
-- Performance metrics for all operations
-- Comprehensive summary report
-
-### Common Commands
-
-```bash
-# Test default storage 'tnscale'
-cd tools/
-./truenas-plugin-test-suite.sh
-
-# Test specific storage
-./truenas-plugin-test-suite.sh production-storage
-
-# Automated testing (no prompts)
-./truenas-plugin-test-suite.sh production-storage -y
-
-# View most recent test log
-ls -lt /tmp/truenas-plugin-test-suite-*.log | head -1
-tail -f /tmp/truenas-plugin-test-suite-$(date +%Y%m%d)-*.log
-```
-
-### Exit Codes
-
-- `0` - All tests passed
-- `1` - One or more tests failed
-
-### See Also
-
-Complete test suite documentation: [Testing Guide](Testing.md)
+The standalone `tools/truenas-plugin-test-suite.sh` script no longer exists. Production validation is the installer's **Diagnostics > Run plugin function test**; see [Integrated Plugin Test](#integrated-plugin-test). Full walkthrough: [Testing Guide](Testing.md).
 
 ---
 
@@ -1230,104 +1164,32 @@ See [Installation Guide - Cluster Installation](Installation.md#cluster-installa
 | Plugin Function Test | Quick validation of core operations | Integrated in `install.sh` | This page |
 | Health Check | Quick health validation for monitoring | Integrated in `install.sh` | This page |
 | Cluster Update | Deploy plugin to cluster nodes | Integrated in `install.sh` | This page |
-| Orphan Cleanup | Find and remove orphaned iSCSI resources | Integrated in `install.sh` | This page |
+| Orphan Cleanup | Find and remove orphaned iSCSI and NVMe/TCP resources | Integrated in `install.sh` | This page |
+| Session Broker | Shared authenticated WebSocket upstream for all plugin processes | `tools/truenas-plugin-broker` (packaged) | This page |
+| Development Test Suite | 46-phase development testing | `tools/dev-truenas-plugin-full-function-test.sh` | This page |
 
 ---
 
 ## Orphan Cleanup
 
-### Overview
+Orphan cleanup is part of the installer Diagnostics menu: `bash install.sh` → "Diagnostics" → "Cleanup orphaned resources" → select storage → type `DRYRUN` to preview the deletion operations or `DELETE` to remove them now. `DRYRUN` asks for a second `DELETE` before deleting.
 
-The orphan cleanup functionality is now integrated into the interactive installer (`install.sh`). It detects and removes orphaned iSCSI resources on TrueNAS that result from failed operations or interrupted workflows.
+The standalone `cleanup-orphans.sh` script no longer exists; there is no CLI for this operation.
 
-**Access Method**: Run `bash install.sh`, select "Diagnostics" from the main menu, then choose "Cleanup orphaned resources"
+What counts as an orphan depends on the storage's transport:
 
-**Note**: The standalone script has been removed. All orphan cleanup functionality is now available through the installer's Diagnostics menu.
+| Transport | Resources scanned |
+|---|---|
+| iSCSI | Extents whose zvol no longer exists; target-extent mappings whose extent no longer exists; zvols under the configured dataset with no extent |
+| NVMe/TCP | Namespaces whose zvol no longer exists; zvols under the configured dataset with no namespace; empty subsystems not referenced by any storage configuration (listed separately as global, because they affect every storage on that TrueNAS) |
 
-### What Are Orphaned Resources?
-
-Orphaned resources occur when storage operations fail partway through:
-
-1. **Orphaned Extents** - iSCSI extents pointing to deleted/missing zvols
-2. **Orphaned Target-Extent Mappings** - Mappings referencing deleted extents
-3. **Orphaned Zvols** - Zvols without corresponding iSCSI extents
-
-> **Note**: Orphan detection currently supports **iSCSI transport only**. It does not yet detect orphaned NVMe/TCP namespaces or subsystems. Zvols created for NVMe/TCP will not be scanned or cleaned up by this tool.
+Deletion is dependency-first: NVMe namespaces and iSCSI target-extent mappings, then extents, then zvols. Failures are reported per resource and do not stop the rest of the cleanup.
 
 **Common Causes**:
 - VM deletion failures
 - Network interruptions during volume creation
 - Manual cleanup on TrueNAS without updating Proxmox
 - Power failures during operations
-
-### Usage
-
-#### Interactive Method (Recommended)
-
-```bash
-bash install.sh
-# Select: "Diagnostics" from the main menu
-# Select: "Cleanup orphaned resources" from the diagnostics menu
-# Choose storage from the list
-# Review detected orphans
-# Type "DELETE" (in caps) to confirm cleanup
-```
-
-The integrated cleanup will:
-1. Scan for orphaned iSCSI resources (extents, zvols, target-extent mappings)
-2. Display detailed list with reasons for each orphan
-3. Require typed "DELETE" confirmation for safety
-4. Delete orphans in safe order (mappings → extents → zvols)
-5. Report success/failure for each deletion
-
-**Example Output**:
-```
-Found 3 orphaned resource(s):
-
-  [EXTENT] vm-999-disk-0 (ID: 42)
-           Reason: zvol missing: tank/proxmox/vm-999-disk-0
-  [TARGET-EXTENT] mapping-15 (ID: 15)
-                  Reason: extent missing: 40 (target: 2)
-  [ZVOL] vm-998-disk-1
-         Reason: no extent pointing to this zvol
-
-WARNING: This will permanently delete these orphaned resources!
-
-Type "DELETE" to confirm cleanup:
-```
-
-#### Using the Integrated Feature
-
-Access orphan cleanup through the installer:
-
-1. Run `bash install.sh`
-2. Select **"Diagnostics"** from main menu
-3. Choose **"Cleanup orphaned resources"**
-4. Select storage to scan
-5. Review detected orphans
-6. Type **DELETE** to confirm removal
-
-The integrated feature provides the same functionality as the removed standalone script, with an improved interactive interface.
-
-### Output Interpretation
-
-**Resource Types**:
-- `[EXTENT]` - Orphaned iSCSI extent
-- `[TARGET-EXTENT]` - Orphaned target-extent mapping
-- `[ZVOL]` - Orphaned zvol dataset
-
-**Status Messages**:
-- `✓ Deleted` - Resource successfully removed
-- `✗ Failed to delete` - Error during deletion (check permissions/API)
-
-### Safety Features
-
-1. **Typed Confirmation** - Requires typing "DELETE" (in caps) to proceed
-2. **Dataset Isolation** - Only scans resources under configured dataset
-3. **Ordered Deletion** - Removes dependencies first (mappings → extents → zvols)
-4. **Transport Limitation** - iSCSI only (NVMe/TCP shows unsupported message)
-5. **Error Reporting** - Failed deletions are reported but don't stop cleanup
-6. **Dry Run Mode** - Available in standalone script for preview without deletion
 
 ### When to Run
 
@@ -1353,7 +1215,7 @@ Run orphan cleanup periodically through the installer's Diagnostics menu to main
 - Storage is not a TrueNAS plugin storage
 - Check: `grep truenasplugin /etc/pve/storage.cfg`
 
-**"Error: Failed to fetch extents from TrueNAS API"**:
+**Orphan detection fails**:
 - TrueNAS is offline or unreachable
 - API key is invalid or expired
 - Check with the plugin-based call from Proxmox:
@@ -1361,7 +1223,7 @@ Run orphan cleanup periodically through the installer's Diagnostics menu to main
   ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; use PVE::Storage::Custom::TrueNASPlugin; my $scfg=PVE::Storage::config()->{ids}{\"STORAGE_ID\"} or die \"storage STORAGE_ID not found\\n\"; my $res=PVE::Storage::Custom::TrueNASPlugin::_api_call($scfg, \"system.info\", []); print \"ok\\n\";'"
   ```
 
-**"Failed to cleanup orphaned extent"**:
+**A deletion fails**:
 - API key lacks permissions
 - Resource is in use (shouldn't happen for true orphans)
 - Check TrueNAS logs: System Settings → Shell → `tail -f /var/log/middlewared.log`
@@ -1374,29 +1236,10 @@ Run orphan cleanup periodically through the installer's Diagnostics menu to main
 ### Best Practices
 
 1. **Run health check first** - Health check will detect orphans and their count
-2. **Use interactive cleanup** - The integrated installer version provides clear prompts and safety
-3. **Review before confirming** - Carefully check the orphan list before typing "DELETE"
+2. **Use `DRYRUN` first** - Review the exact operations before typing `DELETE`
+3. **Review before confirming** - Carefully check the orphan list before typing `DELETE`
 4. **Run after incidents** - Clean up after failed operations or storage issues
 5. **Backup before cleanup** - Snapshot TrueNAS pool before major cleanup operations
-
-**Example Automated Maintenance Script** (using standalone script):
-```bash
-#!/bin/bash
-# Monthly orphan cleanup with notification
-cd /path/to/tools/
-STORAGE="truenas-storage"
-
-# Dry run to detect
-ORPHANS=$(./cleanup-orphans.sh "$STORAGE" --dry-run | grep -c "Found.*orphaned")
-
-if [ "$ORPHANS" -gt 0 ]; then
-    echo "Found $ORPHANS orphaned resources on $STORAGE" | \
-      mail -s "TrueNAS Orphan Alert" admin@example.com
-
-    # Cleanup (automated)
-    ./cleanup-orphans.sh "$STORAGE" --force
-fi
-```
 
 ---
 

@@ -1,11 +1,11 @@
-# LVM Filter for TrueNAS NVMe/TCP
+# LVM Filter for TrueNAS NVMe/TCP and iSCSI
 
 ## The problem
 
-If a VM's disk lives on a TrueNAS NVMe/TCP namespace and the guest
-inside that VM uses LVM (default on Ubuntu, RHEL, and their
+If a VM's disk lives on a TrueNAS NVMe/TCP namespace or iSCSI LUN and
+the guest inside that VM uses LVM (default on Ubuntu, RHEL, and their
 derivatives), the Proxmox host's LVM scanner sees the guest's PV
-signatures at the outer namespace level and treats them as
+signatures at the outer device level and treats them as
 host-level physical volumes.
 
 Symptoms an operator will actually see:
@@ -14,25 +14,27 @@ Symptoms an operator will actually see:
   /nodes/<node>/storage`, `qm ...`, `pvestatd` polls) emits pages
   of `WARNING: VG name <name> is used by VGs <uuid1> and <uuid2>.
   Fix duplicate VG names with vgrename uuid, ...` lines. With many
-  namespaces cloned from the same template the duplicates cascade
+  namespaces/LUNs cloned from the same template the duplicates cascade
   into thousands of lines.
 - `pvesh get /nodes/<node>/storage` slows enough to trip the 596s
   API timeout, which in turn breaks external tools that poll it
   (Veeam's backup/restore scans have been observed to fail here).
-- Boot is slower because `pvscan --cache` runs on every namespace
+- Boot is slower because `pvscan --cache` runs on every namespace/LUN
   udev-add event.
 
 Reference: GitHub issue [#4](https://github.com/truenas/truenas-proxmox-plugin/issues/4).
 
 ## The fix
 
-Add a reject regex to LVM's `global_filter` (see [Which file](#which-file-lvmlocalconf-vs-lvmconf))
-so LVM stops scanning TrueNAS-served NVMe namespaces:
+Add reject regexes to LVM's `global_filter` (see [Which file](#which-file-lvmlocalconf-vs-lvmconf))
+so LVM stops scanning TrueNAS-served block devices:
 
 ```
-"r|/dev/disk/by-id/nvme-TrueNAS_.*|"
+"r|/dev/disk/by-id/nvme-TrueNAS_.*|"    # NVMe/TCP namespaces
+"r|/dev/disk/by-path/ip-.*-iscsi-.*|"   # iSCSI LUNs
 ```
 
+Both regexes are defined in `tools/truenas-plugin-lvm-filter:73-81`.
 Why this works:
 
 - `udev` populates `/dev/disk/by-id/nvme-<model>_<serial>` symlinks
@@ -40,12 +42,17 @@ Why this works:
   advertise `TrueNAS <hardware-model>` (e.g. `TrueNAS PowerEdge
   R730xd`, `TrueNAS FREENAS-MINI-2.0`), so every TrueNAS namespace
   ends up with a `nvme-TrueNAS_...` by-id name.
+- iSCSI LUNs get `/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<n>`
+  symlinks from open-iscsi for every logged-in target, so the
+  `by-path/ip-.*-iscsi-.*` regex covers every TrueNAS LUN on a
+  plugin-managed PVE node.
 - `pve-manager` sets `obtain_device_list_from_udev = 1` (LVM's
-  default), so LVM's scan enumerates by-id symlinks and matches
+  default), so LVM's scan enumerates these symlinks and matches
   them against `global_filter`.
 - Local NVMe drives use their own vendor prefix (e.g.
-  `nvme-Samsung_...`, `nvme-Intel_...`) and never match, so host
-  LVM (root filesystem VGs, local-lvm, etc.) is untouched.
+  `nvme-Samsung_...`, `nvme-Intel_...`) and never match; local SCSI
+  devices do not carry an `iscsi-` by-path name. Host LVM (root
+  filesystem VGs, local-lvm, etc.) is untouched.
 
 ## Which file: `lvmlocal.conf` vs `lvm.conf`
 
@@ -72,8 +79,8 @@ sudo pvscan --cache
 sudo vgscan
 ```
 
-`--install` appends the regex to the effective `global_filter` line
-(`lvmlocal.conf` preferred, else `lvm.conf`), tagged with a comment marker
+`--install` appends each missing reject regex to the effective
+`global_filter` line (`lvmlocal.conf` preferred, else `lvm.conf`), tagged with a comment marker
 (`# truenas-proxmox-plugin issue #4`) for future removal. A
 timestamped backup is written first, and `lvm dumpconfig` is run
 after the edit to verify the file still parses.
@@ -84,7 +91,7 @@ Reversal:
 sudo truenas-plugin-lvm-filter --uninstall
 ```
 
-`--uninstall` removes only the regex the plugin added; anything
+`--uninstall` removes only the regexes the plugin added; anything
 else in `global_filter` (including `pve-manager`'s default
 `"r|/dev/zd.*|"` and `"r|/dev/rbd.*|"` for ZFS zvols and Ceph
 rbds) is left in place.
@@ -106,7 +113,8 @@ behaviour.
 
 Edit the effective file (see [Which file](#which-file-lvmlocalconf-vs-lvmconf)) —
 find the `global_filter =` line inside the `devices { ... }` block and append
-`"r|/dev/disk/by-id/nvme-TrueNAS_.*|"` to the list. Save. Refresh LVM:
+`"r|/dev/disk/by-id/nvme-TrueNAS_.*|"` and
+`"r|/dev/disk/by-path/ip-.*-iscsi-.*|"` to the list. Save. Refresh LVM:
 
 ```
 sudo pvscan --cache
@@ -122,7 +130,7 @@ global_filter = [ "r|/dev/zd.*|", "r|/dev/rbd.*|" ]
 After the fix:
 
 ```
-global_filter = [ "r|/dev/zd.*|", "r|/dev/rbd.*|", "r|/dev/disk/by-id/nvme-TrueNAS_.*|" ]
+global_filter = [ "r|/dev/zd.*|", "r|/dev/rbd.*|", "r|/dev/disk/by-id/nvme-TrueNAS_.*|", "r|/dev/disk/by-path/ip-.*-iscsi-.*|" ]
 ```
 
 ## Cleaning up `/etc/lvm/archive`
@@ -162,11 +170,10 @@ consent).
 
 ## Scope and caveats
 
-- **NVMe/TCP only.** iSCSI LUNs from TrueNAS appear as `/dev/sd*`
-  and can hit the same class of duplicate-VG warnings; a similar
-  filter for those would need a matcher against SCSI vendor/model
-  (`/dev/disk/by-id/scsi-*TrueNAS*` for example). Not shipped
-  because it has not been reported. Ask if you want it.
+- **Both transports are covered.** NVMe/TCP namespaces match on the
+  `nvme-TrueNAS_` by-id prefix; iSCSI LUNs match on the
+  `/dev/disk/by-path/ip-*-iscsi-*` symlink that open-iscsi creates.
+  No SCSI vendor/model matching is involved.
 - **Requires `obtain_device_list_from_udev = 1`** (LVM's default).
   If a local operator has set `obtain_device_list_from_udev = 0`,
   LVM will not enumerate the by-id symlinks and the filter has no

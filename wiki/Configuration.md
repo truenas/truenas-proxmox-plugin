@@ -24,6 +24,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_api_budget_s](#tn_api_budget_s)
   - [tn_status_probe_backoff_s](#tn_status_probe_backoff_s)
   - [tn_storage_lock_timeout](#tn_storage_lock_timeout)
+  - [tn_broker_timeout](#tn_broker_timeout)
   - [tn_api_username](#tn_api_username)
   - [tn_auth_mechanism](#tn_auth_mechanism)
 - [Network Configuration](#network-configuration)
@@ -44,6 +45,7 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_nvme_reconnect_delay](#tn_nvme_reconnect_delay)
   - [tn_nvme_keep_alive_tmo](#tn_nvme_keep_alive_tmo)
   - [tn_nvme_manage_ports](#tn_nvme_manage_ports)
+  - [tn_nvme_allow_any_host](#tn_nvme_allow_any_host)
 - [iSCSI Behavior](#iscsi-behavior)
   - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
   - [tn_logout_on_free](#tn_logout_on_free)
@@ -134,13 +136,14 @@ tn_dataset tank/proxmox
 
 ### `tn_discovery_portal`
 **Description**: Primary portal for target/subsystem discovery
-**Type**: String (IP:PORT format)
+**Type**: String, `IP[:port]` or `[IPv6]:port`
 **Default Port**:
-  - `3260` for iSCSI transport mode
+  - `3260` for iSCSI transport mode (applied by `iscsiadm`)
   - `4420` for NVMe/TCP transport mode
 **Example**:
   - iSCSI: `192.168.1.100:3260`
   - NVMe/TCP: `192.168.1.100:4420`
+  - IPv6 iSCSI: `[fd00::10]:3260`
 
 ```ini
 # iSCSI mode
@@ -148,7 +151,14 @@ tn_discovery_portal 192.168.1.100:3260
 
 # NVMe/TCP mode
 tn_discovery_portal 192.168.1.100:4420
+
+# IPv6 iSCSI mode (supported from 2.1.24~beta8, #140)
+tn_discovery_portal [fd00::10]:3260
 ```
+
+For iSCSI, the login uses only `tn_discovery_portal` and `tn_portals`: portals
+returned by SendTargets that are not listed are skipped and logged once, so
+list every path you want in `tn_portals`.
 
 ## Content Type
 
@@ -299,6 +309,21 @@ tn_storage_lock_timeout 300
 
 **Technical Details**: This property controls the timeout for `PVE::Storage::lock_storage()` calls, which serialize access to the storage configuration file during write operations. When concurrent operations exceed this timeout, they fail with a "lock timeout" error. Typical disk allocation operations take 10-15 seconds on standard hardware, so the default 120-second timeout provides ample time for 8+ concurrent operations.
 
+### `tn_broker_timeout`
+**Description**: Broker Unix-socket round-trip deadline in seconds
+**Type**: Integer
+**Valid Range**: 5-300
+**Default**: `60`
+
+Deadline for each request the plugin sends to `truenas-plugin-broker`. A long
+TrueNAS operation under concurrent cluster load (large `iscsi.extent.query`,
+contended `pool.dataset.get_instance`) that exceeds it trips the deadline and
+burns a retry. Tune down only if you want failures to surface faster.
+
+```ini
+tn_broker_timeout 60
+```
+
 ### `tn_api_username`
 **Description**: TrueNAS account that owns `tn_api_key`
 **Required**: Only when `tn_auth_mechanism` is `scram` or `scram-plus` (hard failure if unset). Otherwise optional: both `auto` and `plain` fall back to the legacy `auth.login_with_api_key` call when no username is configured. Set it to opt in to SCRAM under `auto`, or to use `auth.login_ex` + `API_KEY_PLAIN` under `plain`.
@@ -352,9 +377,14 @@ tn_prefer_ipv4 1
 ```
 
 ### `tn_portals`
-**Description**: Additional iSCSI portals for redundancy
-**Type**: Comma-separated list of IP:PORT
+**Description**: Additional portals for redundancy
+**Type**: Comma-separated list of `IP[:port]` or `[IPv6]:port`
 **Example**: `192.168.1.101:3260,192.168.1.102:3260`
+
+Applies to both transports. The default port is `3260` for iSCSI and `4420`
+for NVMe/TCP. The NVMe/TCP connect path removes duplicate and equivalent
+entries (`10.0.0.1` and `10.0.0.1:4420` are one portal). The iSCSI path
+discovers and probes each entry separately, so list each portal once.
 
 Configure multiple portals for failover and multipath.
 
@@ -394,7 +424,10 @@ tn_use_by_path 0
 **Type**: Boolean (0 or 1)
 **Default**: `0`
 
-Required for IPv6 iSCSI connections when using by-path.
+Declared in the schema and validated, but never read at runtime
+(`TrueNASPlugin.pm:754,980` are its only occurrences). By-path names are now
+rendered from the configured portal, IPv6 included (from 2.1.24~beta8, #140),
+so no setting is needed for IPv6 iSCSI with `tn_use_by_path 1`.
 
 ```ini
 tn_ipv6_by_path 0
@@ -662,6 +695,23 @@ is `0` and the subsystem named by `tn_subsystem_nqn` does not exist,
 the plugin refuses to create it and prints the three `midclt` calls
 above.
 
+### `tn_nvme_allow_any_host`
+**Description**: Value the plugin writes to the TrueNAS NVMe subsystem's `allow_any_host`
+**Type**: Boolean (0 or 1)
+**Default**: `1`
+
+Default `1` asks TrueNAS to accept any host NQN on the subsystem. The value is
+written on subsystem create and on Issue-#12 configfs-resync ping updates.
+
+Set to `0` **only** when `allowed_hosts` on the same subsystem is already
+populated (TrueNAS UI or API) and you want the allow-list enforced. On
+25.10.x, `allow_any_host=1` together with a populated `allowed_hosts`
+aborts the configfs render (#90).
+
+```ini
+tn_nvme_allow_any_host 1
+```
+
 ## iSCSI Behavior
 
 ### `tn_force_delete_on_inuse`
@@ -689,13 +739,16 @@ tn_logout_on_free 0
 ## ZFS Volume Options
 
 ### `tn_zvol_blocksize`
-**Description**: ZFS volume block size
-**Type**: String (power of 2 from 4K to 1M)
-**Valid Values**: `4K`, `8K`, `16K`, `32K`, `64K`, `128K`, `256K`, `512K`, `1M`
-**Default**: None (uses TrueNAS default, typically 16K)
+**Description**: ZFS volume block size, passed through as `volblocksize` (uppercased)
+**Type**: String (free-form, no enum)
+**Example**: `16K`, `64K`, `128K`
+**Default**: `16K` (the plugin sends `volblocksize 16K` when the key is unset)
 **Recommended**: `128K` for VM workloads
 
-Larger block sizes improve sequential I/O performance but increase space overhead.
+Only `<digits>` with an optional `K`, `M` or `G` suffix is understood by the
+plugin's alignment checks (`_parse_blocksize`). A value that does not match is
+passed through after uppercasing and skipped by the alignment check. Larger
+block sizes improve sequential I/O performance but increase space overhead.
 
 ```ini
 tn_zvol_blocksize 128K
@@ -979,7 +1032,6 @@ truenasplugin: truenas-ipv6
     content images
     shared 1
     tn_prefer_ipv4 0
-    tn_ipv6_by_path 1
     tn_use_by_path 1
     tn_zvol_blocksize 128K
     tn_use_multipath 1

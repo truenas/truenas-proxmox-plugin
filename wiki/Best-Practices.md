@@ -151,13 +151,17 @@ Both are supported. Pick one per storage entry via `tn_transport`.
 | Throughput on 25 Gb+ links | Good, may need multipath | Better with high queue count |
 | Multipath | Standard `multipath-tools` (dm-mp) | Native NVMe multipath (`nvme-cli`) |
 | Auth | CHAP (optional) | DH-HMAC-CHAP (optional) |
-| TrueNAS support | 25.10 or later | 25.10 or later; TN 25.10.4 is unsafe pending nvmet MDTS fix (GitHub #96) |
+| TrueNAS support | 25.10 or later | 25.10 or later; affected releases are unsafe without the `max_sectors_kb` cap pending the nvmet MDTS fix (GitHub #96) |
 | Namespace identity | LUN number per extent | NGUID per namespace |
 | Snapshot handling | Same via `pool.snapshot.*` | Same via `pool.snapshot.*` |
-| Field maturity | Very mature | Newer; shares 25.10 floor with iSCSI, but TN 25.10.4 ships without the `nvmet` MDTS kernel patch (GitHub #96) and can silently corrupt data under NVMe/TCP — until the patch is in a TN point release, use iSCSI for production |
+| Field maturity | Very mature | Newer; shares the 25.10 floor with iSCSI. Affected TN releases (reported on 25.10.4, 25.10.6, 25.10.7) ship without the `nvmet` MDTS kernel patch (GitHub #96) and can fail or corrupt large transfers: cap `max_sectors_kb` on every node, use iSCSI, or run a release that carries the kernel fix |
 
 Default to **iSCSI** for most deployments. Move to **NVMe/TCP** when you
-have measurably latency-sensitive workloads and a 25 Gb+ storage fabric.
+have measurably latency-sensitive workloads and a 25 Gb+ storage fabric,
+and only after choosing one of: cap `max_sectors_kb` at 1024 on every
+PVE node with the udev rule in
+[Known Limitations](Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors),
+stay on iSCSI, or run a TrueNAS release that carries the kernel fix.
 Do not run both transports against the same dataset from the same PVE
 cluster; use two datasets and two storage entries.
 
@@ -213,8 +217,7 @@ After the edit, restart `iscsid` and re-login: `systemctl restart iscsid
 resume when the surviving controller takes over the LUN.
 
 These values were tested against a live TrueNAS HA pair with running
-guests; they are not round-number guesses. See
-[Testing Guide](Testing.md#ha-failover-test) for the reproducer.
+guests; they are not round-number guesses.
 
 ### NVMe/TCP HA failover
 
@@ -384,21 +387,34 @@ and use linked clones (`qm clone <tpl> <new>`). The plugin implements
 this via ZFS-native `pool.snapshot.clone`: no data crosses the wire, and
 the new VM is ready in under two seconds regardless of source size.
 
-Full clone (`qm clone --full`) and disk move (`qm move_disk` between
-storages) run host-side through `qemu-img convert` and are subject to
-network bandwidth.
+`create_base` renames the volume's dataset from `vm-<vmid>-disk-N` to `base-<vmid>-disk-N` and creates the `@__base__` snapshot that linked clones derive from. `free_image` refuses to delete a base while any dataset's `origin.parsed` points at `<base>@__base__`; destroy the clones, or run `pool.dataset.promote` on one to break the dependency.
+
+Full clones (`qm clone --full`) stay host-side: PVE reads the source and
+writes the new volume from the Proxmox node.
+
+Cross-storage disk moves can use PVE's storage-migrate protocol instead
+of `qemu-img convert` when both storages support it. The plugin
+advertises `raw+size` export/import streams for raw `images` volumes
+only: `volume_export` streams the block device with `dd`, and
+`volume_import` writes the stream into a newly allocated volume. The
+data still crosses the Proxmox host; this is not a server-side copy on
+TrueNAS, and snapshot-chain (`with_snapshots`) and incremental
+(`base_snapshot`) transfers are refused. `rootdir` container volumes are
+not exported, so `pct move_volume` falls back to PVE's own LXC paths.
 
 ### What is offloaded, what is not
 
 Proxmox has no server-side copy hook in its storage plugin contract.
-Only linked clones from a template snapshot are offloaded.
+Only linked clones from a template snapshot are offloaded; the
+`raw+size` export/import stream is a host-mediated byte stream, not a
+server-side copy.
 
 | Operation | Where the data moves |
 |---|---|
 | `qm clone <tpl> <new>` (linked, from template) | Server-side ZFS clone — nothing over the wire |
 | `qm snapshot` / `qm delsnapshot` / `qm rollback` | Server-side ZFS op — nothing over the wire |
-| `qm clone --full` | Host-side `qemu-img convert` |
-| `qm move_disk` between storages | Host-side copy |
+| `qm clone --full` | Host-side copy; the plugin does not offload it |
+| `qm move_disk` between storages | `raw+size` export/import stream when both plugins support it (`dd` on export); host-mediated, not a TrueNAS-side copy |
 | `vzdump` backup | Host-side read of the LUN |
 | `qm importdisk` | Host-side write of the LUN |
 

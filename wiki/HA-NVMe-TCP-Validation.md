@@ -100,8 +100,13 @@ kernels; see memory `project_issue_96_nvmet_mdts`).
 
 ## What was tested
 
-The plugin's full data path on an HA pair, continuous fio I/O through
-forced master-controller power cycles:
+Scope: this run validates the plugin's data path on an HA pair across
+forced controller power-cycles, with the recorded fio workload below.
+It does not exercise the plugin's own reconnect gates
+(`_nvme_device_for_uuid` at `i==10/25/35/75/125/150`); a controller
+power-cycle is a kernel NVMe session event, not a plugin reconnect.
+
+Exercised in each iteration:
 
 - plugin `activate_storage` + `alloc_image` (namespace create via
   `nvmet.namespace.create` with `subsys_id` of the admin-provisioned
@@ -200,6 +205,11 @@ Distribution notes:
   reroutes to the surviving path). See
   [`HA-Transport-Comparison.md`](HA-Transport-Comparison.md) for why
   this does not surface as application-level errors.
+
+These are kernel-side messages. A `Successfully reconnected` line means
+the kernel NVMe controller re-established its session; it is not
+evidence that the plugin's `_nvme_device_for_uuid` reconnect gates
+fired. This run did not intentionally trigger those gates.
 
 **Spot-checked fio-result.json for several iterations:**
 

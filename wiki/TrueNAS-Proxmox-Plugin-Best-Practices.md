@@ -79,7 +79,7 @@ TrueNAS as backing store.
 | Protocol | Supported | Description | When to Use | Notes / Caveats |
 |---|---|---|---|---|
 | iSCSI | Yes | Block storage via LUNs mapped from zvol-backed extents | General VM workloads on 10 GbE or slower fabrics | Multipath recommended for reliability; timeouts must be tuned for HA (see §4). Auth via CHAP optional. |
-| NVMe/TCP | Yes | Block storage via NVMe-oF namespaces mapped to zvols | Latency-sensitive workloads on 25 GbE+ fabrics | Shares the 25.10 TrueNAS floor with iSCSI. TN 25.10.4 ships without the `nvmet` MDTS kernel patch (GitHub #96) and can silently corrupt data; use iSCSI until the patch is in a TN point release. Native NVMe multipath; DH-HMAC-CHAP optional. |
+| NVMe/TCP | Yes | Block storage via NVMe-oF namespaces mapped to zvols | Latency-sensitive workloads on 25 GbE+ fabrics | Shares the 25.10 TrueNAS floor with iSCSI. Affected TN releases ship without the `nvmet` MDTS kernel patch (GitHub #96) and can fail or corrupt large transfers; cap `max_sectors_kb` on every node, use iSCSI, or run a release that carries the kernel fix. Native NVMe multipath; DH-HMAC-CHAP optional. |
 | NFS | Yes (via native Proxmox) | Not implemented by this plugin | ISO libraries, backup targets, mixed file/block deployments | Use Proxmox's built-in NFS storage type; ensure UID/GID mapping is consistent. |
 | SMB | Yes (via native Proxmox) | Not implemented by this plugin | Windows-adjacent workloads, mixed OS environments | Not suitable for VM disk images. |
 
@@ -100,11 +100,12 @@ Software:
   snapshots).
 - **TrueNAS SCALE** 25.10 or later for both transports. NVMe/TCP has
   no earlier floor than iSCSI — they share the 25.10 baseline.
-  **Caveat**: TN 25.10.4 ships without the `nvmet` MDTS kernel patch
-  (GitHub #96) and can silently corrupt data under NVMe/TCP. Until
-  that patch lands in a TN point release, use iSCSI for production
-  deployments on 25.10.4, or stay on a pre-25.10.4 release for
-  NVMe/TCP.
+  **Caveat**: affected TN releases ship without the `nvmet` MDTS kernel
+  patch (GitHub #96) and can fail or corrupt large NVMe/TCP transfers.
+  On those releases, either cap `max_sectors_kb` on every Proxmox node
+  with the udev rule in
+  [Known Limitations](Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors),
+  use iSCSI, or run a TN release that carries the kernel fix.
 - **Perl** 5.36 or later (shipped with Proxmox VE).
 
 Network:
@@ -455,7 +456,27 @@ guest-visible I/O errors.
 ### 4.2 NVMe/TCP HA failover
 
 NVMe/TCP handles path loss via native multipath and does not require
-timeout tuning of the same kind. Verify path health before failover:
+timeout tuning of the same kind. On a TrueNAS HA pair, two prerequisites
+must be in place first:
+
+- Set `tn_nvme_manage_ports 0` on the storage entry. The plugin then
+  skips every `nvmet.port.*` mutation and leaves port management to
+  TrueNAS.
+- Pre-provision a VIP-based `nvmet.port` plus an `nvmet.port_subsys`
+  binding to the subsystem named by `tn_subsystem_nqn`. Only the VIP
+  (`addr_traddr`) is accepted by the HA middleware; it renders the one
+  logical port on both controllers, each binding it to its own physical
+  IP.
+
+Without both, the default port-management path writes a physical
+controller IP as `addr_traddr`, which TrueNAS 25.10.x's nvmet
+middleware rejects with a `map_attrs` KeyError that aborts the render
+and leaves every namespace unpublished. `tn_api_host` names the VIP
+(management plane); `tn_discovery_portal` names a physical controller IP
+(data plane). The full `midclt` recipe is in
+[Best Practices - NVMe/TCP HA failover](Best-Practices.md#nvmetcp-ha-failover).
+
+Verify path health before failover:
 
 ```bash
 nvme list-subsys
@@ -474,10 +495,25 @@ clone via ZFS-native `pool.snapshot.clone`. No data crosses the wire,
 and the new VM is ready in under two seconds regardless of source disk
 size.
 
-Only linked clones from a template snapshot are offloaded. Full clones,
-disk moves between storages, and backups still run host-side through
-`qemu-img convert` because Proxmox has no server-side copy hook in its
-storage plugin contract for those paths.
+`create_base` renames the volume's dataset from `vm-<vmid>-disk-N` to
+`base-<vmid>-disk-N` and creates the `@__base__` snapshot that linked
+clones derive from. `free_image` refuses to delete a base volume while
+any dataset's `origin.parsed` property points at `<base>@__base__`. The
+error lists the dependent clones; destroy them first, or run
+`pool.dataset.promote` on one clone to break the dependency.
+
+Only linked clones from a template snapshot are offloaded. Full clones
+stay host-side: PVE reads the source and writes the new volume from the
+Proxmox node.
+
+Cross-storage disk moves can use PVE's storage-migrate protocol instead
+of `qemu-img convert` when both storages support it. The plugin
+advertises `raw+size` export/import streams for raw `images` volumes
+only: `volume_export` streams the block device with `dd`, and
+`volume_import` writes the stream into a newly allocated volume. The
+data still crosses the Proxmox host; this is not a server-side copy on
+TrueNAS, and snapshot-chain (`with_snapshots`) and incremental
+(`base_snapshot`) transfers are refused.
 
 ### 4.4 Snapshot coexistence with TrueNAS auto-snapshots
 
@@ -494,22 +530,40 @@ Recommended convention:
 A TrueNAS retention rule deleting a snapshot that Proxmox thinks it
 owns will surface as an opaque rollback failure inside Proxmox.
 
-### 4.5 Recommended settings summary
+### 4.5 LXC snapshot-mode backups
+
+For containers, `vzdump` in snapshot mode calls `activate_volume` with
+the snapshot name set. The plugin creates a deterministic clone zvol
+named `vzdump-<zname>-<snapname>-<hash>`, attaches it as its own iSCSI
+LUN or NVMe/TCP namespace, and leaves it active for the backup; `path()`
+resolves the same clone.
+
+`deactivate_volume` tears the clone down after the backup, and
+`volume_snapshot_delete` tears it down as a fallback while refusing to
+delete the source snapshot if the clone cannot be removed. These
+`vzdump-*` clones are filtered from `list_images` and from orphan
+detection, so they do not appear as stray volumes.
+
+### 4.6 Recommended settings summary
 
 - Use iSCSI for general workloads, NVMe/TCP for latency-sensitive
-  workloads on 25 GbE+ fabrics.
+  workloads on 25 GbE+ fabrics. On affected TN releases, NVMe/TCP also
+  requires the `max_sectors_kb` cap from §3.1, or a TN release that
+  carries the kernel fix.
 - Apply the tested iSCSI HA timeouts to every Proxmox node.
 - Configure two portals on separate VLANs and enable `tn_use_multipath`.
 - Isolate storage traffic on a dedicated VLAN with jumbo frames.
 - Provision templates and prefer linked clones for repeated VM builds.
 - Store TrueNAS API keys in `tn_api_key_file`, not inline.
 
-### 4.6 Known Limitations
+### 4.7 Known Limitations
 
 - Proxmox has no server-side copy hook in its storage plugin contract.
-  Only linked clones from a template snapshot are offloaded; full
-  clones, disk moves, backups, and image imports run host-side through
-  `qemu-img convert` regardless of storage backend.
+  Only linked clones from a template snapshot are offloaded. Full
+  clones, backups, and image imports run host-side. Cross-storage disk
+  moves can use the plugin's `raw+size` export/import stream for raw
+  `images` volumes; snapshot-chain and incremental transfers are not
+  supported.
 - Snapshot rollback is restricted to the most recent snapshot for the
   volume, matching Proxmox's built-in ZFS storage semantics. Rolling
   back to an older snapshot requires deleting the intervening
@@ -559,8 +613,10 @@ detail.
 
 For paste-ready bug reports, include the plugin version
 (`dpkg -l truenas-proxmox-plugin`), the last 200 lines of
-`journalctl -t pvedaemon -t pvestatd`, and the broker log at
-`/var/log/truenas-plugin-broker.log`.
+`journalctl -t pvedaemon -t pvestatd`, and the broker log from
+`journalctl -u truenas-plugin-broker`. The packaged unit runs the broker with
+`--foreground` and `StandardOutput=journal`, so its output goes to the
+journal, not to `/var/log/truenas-plugin-broker.log`.
 
 ---
 
@@ -576,7 +632,8 @@ For paste-ready bug reports, include the plugin version
 - Enable ZFS compression (`zstd`); leave deduplication off unless
   measurement justifies it.
 - Choose iSCSI by default; move to NVMe/TCP for measurably
-  latency-sensitive workloads on 25 GbE+ fabrics.
+  latency-sensitive workloads on 25 GbE+ fabrics, after applying the
+  `max_sectors_kb` precondition on affected TN releases (§3.1).
 - Isolate storage on a dedicated VLAN with jumbo frames and dual
   portals.
 - Apply the tested iSCSI HA timeouts on every Proxmox node.

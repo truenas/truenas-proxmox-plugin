@@ -24,9 +24,17 @@ The biggest practical win is at the **session layer**:
 
 - NVMe/TCP keeps both controllers' sessions open at all times. When
   controller A dies, nvme-core already has a live session to B — it just
-  stops dispatching to A. No session re-establishment, no TCP handshake,
-  no NVMe login, no DH-CHAP negotiation, no udev probing a new block
-  device.
+  stops dispatching to A. There is no TCP handshake or NVMe login on the
+  surviving path, and no new block device for udev to probe.
+- The plugin has its own reconnect paths, and they are guarded.
+  `_nvme_device_for_uuid` retries device discovery at `i==10`, `25`,
+  `35`, `75`, `125`, and `150`. The `i==10/25/35/75` gates skip a
+  disruptive reconnect when any device on the shared subsystem is held
+  open by another process. `i==125` is the last resort and forces a
+  reconnect when the target UUID is confirmed on TrueNAS but still not
+  visible. `i==150` (emergency reconnect) runs only for a caller that
+  opted in with `allow_reconnect=1` and refuses to run while the
+  subsystem is in use (`TrueNASPlugin.pm:6455-6811`).
 - iSCSI typically has one session per path, each independent. When A's
   portal dies, dm-multipath has to notice (polling delay), kill the
   session, and ship I/O to B's session — which may itself need a relogin
@@ -76,10 +84,13 @@ little variance across runs.
 - Both transports still depend on the storage back-end being able to
   import the pool quickly on the surviving node. NVMe/TCP is not a magic
   cure for a slow pool import.
-- The plugin's `tn_nvme_manage_ports 0` knob is **required** for a
-  TrueNAS HA pair on 25.10.x. See the
-  [`tn_nvme_manage_ports`](Configuration.md#tn_nvme_manage_ports) field
-  for why.
+- On an HA pair affected by the physical-IP `addr_traddr` middleware
+  limitation, set `tn_nvme_manage_ports 0` and pre-provision a VIP-based
+  `nvmet.port` + `nvmet.port_subsys` binding to `tn_subsystem_nqn`. The
+  plugin then stops touching `nvmet.port.*` records but still manages
+  the subsystem lookup, namespace lifecycle, and initiator-side connect
+  (`TrueNASPlugin.pm:929-940`). See the
+  [`tn_nvme_manage_ports`](Configuration.md#tn_nvme_manage_ports) field.
 - Linux's dm-multipath / `multipathd` tuning for iSCSI can narrow the
   gap but will never eliminate the session-re-establishment overhead
   because iSCSI has no equivalent of "both sessions always open".

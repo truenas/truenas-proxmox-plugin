@@ -112,8 +112,8 @@ After installation, the installer provides a full-featured management interface:
 ║                  Installer v2.0.0                        ║
 ╚══════════════════════════════════════════════════════════╝
 
-Plugin Status: Installed (v2.0.12)
-Update Available: v2.0.13
+Plugin Status: Installed (v2.1.23)
+Update Available: v2.1.24
 
 Main Menu:
   1) Update plugin
@@ -135,6 +135,15 @@ Choose an option:
 - Install specific version (numbered version selection, no typing required)
 - Update plugin with sub-menu for local or cluster-wide update
 - Automatic update detection and notification
+
+The update path follows the install path, and only a package install is
+supported for 2.1.24. An APT- or dpkg-managed node is updated as a package.
+A node installed by an older installer from a raw `.pm` pull is a legacy
+state: the installer can replace that file, but a 2.1.24 `.pm` on its own
+has no broker, so every call fails. Convert such a node to the package
+(`apt-get install -y truenas-proxmox-plugin`, or `dpkg -i` the release
+`.deb`) instead of copying another file. Check whether the node is
+package-managed with `dpkg -s truenas-proxmox-plugin`.
 
 **Configuration Management**
 - Interactive configuration wizard
@@ -235,7 +244,7 @@ Non-interactive mode will:
 The APT repository only publishes stable releases. Pre-release builds
 (`v*-alpha*`, `v*-beta*`, `v*-rc*`) are not pushed there, so running
 `apt install truenas-proxmox-plugin` on a fresh system always lands on
-the current stable (e.g. `2.1.17+deb1`), even when a newer beta is the
+the current stable (e.g. `2.1.23+deb1`), even when a newer beta is the
 one tagged **Latest** on GitHub. This is intentional — it keeps
 unattended upgrades on production clusters from pulling in a beta — but
 it means you need to use `install.sh` or a direct download when a
@@ -254,7 +263,7 @@ the beta from the list (pre-releases are flagged in the version list).
 
 Each release attaches a signed `.deb` plus `SHA256SUMS`. Open the
 release page in a browser (e.g.
-<https://github.com/truenas/truenas-proxmox-plugin/releases/tag/v2.1.23-beta8>),
+<https://github.com/truenas/truenas-proxmox-plugin/releases/tag/v2.1.24-beta8>),
 right-click the `.deb` link to copy its URL, then from any cluster
 node:
 
@@ -266,7 +275,7 @@ dpkg -i truenas-proxmox-plugin_*.deb
 ```
 
 (Note: GitHub converts `~` to `.` in asset filenames at upload time, so
-the file you download is named `truenas-proxmox-plugin_2.1.23.beta8_all.deb`
+the file you download is named `truenas-proxmox-plugin_2.1.24.beta8_all.deb`
 while `SHA256SUMS` references the original `~beta8` form. `sha256sum -c
 --ignore-missing` tolerates the mismatch; if you want strict
 verification, verify the hash by hand with `sha256sum
@@ -298,8 +307,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 ./install.sh
 
 # Main menu will show:
-# "Plugin Status: Installed (v2.0.12)"
-# "Update Available: v2.0.13"
+# "Plugin Status: Installed (v2.1.23)"
+# "Update Available: v2.1.24"
 
 # Choose option 1: "Update plugin"
 # Sub-menu will present:
@@ -308,8 +317,8 @@ wget -qO- https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/
 #   0) Cancel
 
 # After selecting update target, installer will:
-# 1. Create backup of v2.0.12
-# 2. Download and install v2.0.13
+# 1. Create backup of v2.1.23
+# 2. Download and install v2.1.24
 # 3. Validate syntax
 # 4. Restart services
 # 5. Offer to run health check
@@ -413,7 +422,7 @@ Portal numbers (or press Enter to skip): 1 2
 # Screen clears and displays "Health Check" header
 # Shows "Running health check on storage: X" message
 # Health check validates (with spinners and 30-character label formatting):
-# Plugin file:                   ✓ Installed v1.1.3
+# Plugin file:                   ✓ Installed v2.1.24
 # Storage configuration:         ✓ Configured
 # Storage status:                ✓ Active (space usage shown)
 # Content type:                  ✓ images
@@ -483,9 +492,9 @@ Portal numbers (or press Enter to skip): 1 2
 
 # Displays available backups:
 Available Backups:
-  1) v2.0.13 - 2026-03-31 14:32:15 (2 hours ago) - 89.2 KB
-  2) v2.0.12 - 2026-03-28 09:15:42 (3 days ago) - 88.8 KB
-  3) v2.0.11 - 2026-03-25 11:22:03 (6 days ago) - 87.1 KB
+  1) v2.1.24 - 2026-03-31 14:32:15 (2 hours ago) - 89.2 KB
+  2) v2.1.23 - 2026-03-28 09:15:42 (3 days ago) - 88.8 KB
+  3) v2.1.22 - 2026-03-25 11:22:03 (6 days ago) - 87.1 KB
 
 Select backup to restore (1-3):
 ```
@@ -751,18 +760,48 @@ Before installing the plugin, ensure TrueNAS is properly configured:
 
 ### Single Node Installation
 
-#### 1. Install the Plugin File
+#### 1. Install the Package
+
+The plugin is only supported as a Debian package. The package installs all
+of its runtime pieces:
+
+- `TrueNASPlugin.pm` and `TrueNAS/SCRAM.pm`
+- `/usr/sbin/truenas-plugin-broker` and its systemd unit
+- `/usr/sbin/truenas-plugin-lvm-filter`
+- `/usr/share/truenas-proxmox-plugin/install.sh`
+
+`postinst` enables and starts `truenas-plugin-broker`, waits for
+`/run/truenas-plugin/broker.sock`, and restarts the PVE daemons that load
+the plugin.
+
+Install with the APT repository configured (see [Automated Installation](#automated-installation-recommended)):
 
 ```bash
-# Copy the plugin to Proxmox storage directory
-cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-
-# Set proper permissions
-chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
-
-# Verify installation
-ls -la /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+apt-get update
+apt-get install -y truenas-proxmox-plugin
 ```
+
+Or install the `.deb` from the GitHub release page:
+
+```bash
+# See "Installing a specific pre-release build" for the download steps
+dpkg -i truenas-proxmox-plugin_<version>_all.deb
+```
+
+Verify the install:
+
+```bash
+dpkg -l truenas-proxmox-plugin
+systemctl is-active truenas-plugin-broker
+ls -l /run/truenas-plugin/broker.sock
+```
+
+> **Do not install by copying `TrueNASPlugin.pm` alone.** A file-only copy
+> leaves the broker binary and its unit absent, so
+> `/run/truenas-plugin/broker.sock` never appears and every plugin call
+> dies with `[TrueNAS] broker socket missing at
+> /run/truenas-plugin/broker.sock`. Direct WebSocket mode exists only
+> behind the unsupported `TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1` escape hatch.
 
 #### 2. Configure Storage
 
@@ -824,11 +863,13 @@ Use the installer's cluster-wide deployment feature:
 Or manually on each node:
 
 ```bash
-# On each cluster node
-cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
-chmod 644 /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
-systemctl restart pvedaemon pveproxy
+# On each cluster node, with the plugin APT repository configured
+for node in node1 node2 node3; do
+  ssh root@$node "apt-get update && apt-get install -y truenas-proxmox-plugin"
+done
 ```
+
+Install the same package version on every node.
 
 #### 3. Configure Shared Storage
 
@@ -1180,17 +1221,30 @@ telnet YOUR_TRUENAS_IP 3260
 
 ## Updating the Plugin
 
+Update the package. Replacing the `.pm` by hand desyncs dpkg from the file
+on disk on a package-managed node, and on a raw-file node it leaves the
+broker missing; convert that node to the package instead of overwriting
+the file.
+
 ### Single Node Update
 ```bash
-# Backup current version
-cp /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm \
-  /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm.backup
+# APT-managed install
+apt-get update
+apt-get install --only-upgrade -y truenas-proxmox-plugin
 
-# Copy new version
-cp TrueNASPlugin.pm /usr/share/perl5/PVE/Storage/Custom/
+# dpkg-only install (no plugin APT source)
+dpkg -i truenas-proxmox-plugin_<version>_all.deb
+```
 
-# Restart services
-systemctl restart pvedaemon pveproxy
+`postinst` restarts `pvedaemon`, `pvestatd`, `pvescheduler` and the HA
+daemons immediately, and `pveproxy` after a short delay, so no manual
+restart is needed. Set `TRUENAS_PLUGIN_NO_RESTART=1` on the `dpkg -i` run to
+skip the PVE-side restarts.
+
+Check the installed version with:
+
+```bash
+dpkg-query -W -f='${Version}\n' truenas-proxmox-plugin
 ```
 
 ### Cluster Update
@@ -1200,8 +1254,7 @@ systemctl restart pvedaemon pveproxy
 
 # Or manually on each node
 for node in node1 node2 node3; do
-  scp TrueNASPlugin.pm root@$node:/usr/share/perl5/PVE/Storage/Custom/
-  ssh root@$node "systemctl restart pvedaemon pveproxy"
+  ssh root@$node "apt-get install --only-upgrade -y truenas-proxmox-plugin"
 done
 ```
 
@@ -1209,15 +1262,22 @@ done
 
 ### Remove Plugin
 ```bash
-# Remove plugin file
-rm /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm
+# Remove the package
+apt-get remove -y truenas-proxmox-plugin
+
+# Or, for a dpkg-only install
+dpkg -r truenas-proxmox-plugin
 
 # Remove storage configuration from /etc/pve/storage.cfg
-# (edit manually to remove truenasplugin entries)
+# (edit manually to remove the truenasplugin: entries)
 
 # Restart services
 systemctl restart pvedaemon pveproxy
 ```
+
+Package removal leaves `/etc/pve/storage.cfg` intact. Delete every
+`truenasplugin:` entry as well, otherwise PVE keeps trying to load a storage
+type that is no longer installed.
 
 ### Clean Up TrueNAS
 ```bash

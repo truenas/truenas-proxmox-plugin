@@ -183,6 +183,10 @@ IPv6 portals are written in brackets, `tn_discovery_portal [fd00::10]:3260`
 (and the same in `tn_portals`); the TrueNAS portal must listen on an IPv6
 address or `::`. Supported from 2.1.24~beta8 (#140).
 
+Since 2.1.24~beta8 the iSCSI login uses only `tn_discovery_portal` plus
+`tn_portals`. Portals returned by SendTargets that are not listed are skipped
+(and logged once), so list every path you want in `tn_portals`.
+
 `content images,rootdir` enables both VM disks and LXC container rootfs on this
 storage. Drop `rootdir` if you only need VM disks; see
 [wiki/LXC-Setup.md](wiki/LXC-Setup.md) for the container-side details.
@@ -190,6 +194,9 @@ storage. Drop `rootdir` if you only need VM disks; see
 If your TrueNAS API listens on a port other than 443 (or 80 for `tn_api_scheme=ws`),
 add `tn_api_port <port>` — e.g. `tn_api_port 8443`. Otherwise the plugin defaults
 to 443 and the broker will fail to connect with a TLS-connect error.
+
+`tn_auth_mechanism` accepts `auto` (default), `scram`, `scram-plus`, or `plain`.
+`tn_api_username` is required for `scram` and `scram-plus`.
 
 #### NVMe/TCP Configuration (Alternative)
 
@@ -451,6 +458,7 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 
 - **Proxmox VE** 8.x or later (9.x recommended)
 - **TrueNAS SCALE** 25.10 or later
+- **SCRAM dependencies**: `libcrypt-pbkdf2-perl` and `libcrypt-urandom-perl` (installed automatically by the Debian package)
 - Network connectivity between Proxmox nodes and TrueNAS (iSCSI on port 3260, WebSocket API on port 443)
 
 ## Support
@@ -466,6 +474,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.23
-**Last Updated**: August 5, 2026
+**Version**: 2.1.24~beta8
+**Last Updated**: November 4, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
