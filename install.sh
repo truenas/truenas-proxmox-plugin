@@ -1553,29 +1553,30 @@ download_plugin() {
 
 # Create backup of plugin file
 backup_plugin() {
-    if [[ ! -f "$PLUGIN_FILE" ]]; then
-        log "INFO" "No existing plugin to backup"
-        return 0
-    fi
-
     mkdir -p "$BACKUP_DIR"
 
-    local timestamp
-    timestamp=$(date '+%Y%m%d_%H%M%S')
-    local version
-    version=$(get_installed_version)
-    local backup_file="${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version:-unknown}.${timestamp}"
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        local timestamp
+        timestamp=$(date '+%Y%m%d_%H%M%S')
+        local version
+        version=$(get_installed_version)
+        local backup_file="${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version:-unknown}.${timestamp}"
 
-    cp "$PLUGIN_FILE" "$backup_file" || {
-        error "Failed to create backup"
-        return 1
-    }
+        cp "$PLUGIN_FILE" "$backup_file" || {
+            error "Failed to create backup"
+            return 1
+        }
 
-    success "Backup created: $backup_file"
-    log "INFO" "Backup created: $backup_file"
+        success "Backup created: $backup_file"
+        log "INFO" "Backup created: $backup_file"
+    else
+        # Degraded state (#105): the module is gone but the package may still
+        # be installed, so do not skip the package capture below.
+        log "INFO" "No existing plugin module to backup"
+    fi
 
     # Also capture the installed .deb (best-effort) so rollback can reinstall
-    # it with `dpkg -i` and keep dpkg state consistent. Never blocks the caller.
+    # it with dpkg and keep dpkg state consistent. Never blocks the caller.
     backup_installed_deb
     return 0
 }
@@ -1866,16 +1867,11 @@ install_package_file() {
         return 1
     fi
 
-    if [[ -f "$PLUGIN_FILE" ]]; then
-        backup_plugin || {
-            error "Backup failed. Installation aborted for safety."
-            return 1
-        }
-    else
-        # Module missing but the package may be installed (#105 drift), so
-        # capture the package before it is replaced.
-        backup_installed_deb || true
-    fi
+    # Captures the module when present and the package in every case (#105).
+    backup_plugin || {
+        error "Backup failed. Installation aborted for safety."
+        return 1
+    }
 
     info "Installing package $(basename "$package")..."
     # --reinstall: installing the package version that is already on disk is a
@@ -1952,9 +1948,10 @@ install_artifact_on_remote_node() {
     local node_ip="$2"
     local file="$3"
     local version="$4"
+    local release_data="${5:-}"
 
     if [[ "$kind" == "deb" ]]; then
-        install_package_on_remote_node "$node_ip" "$file" "$version"
+        install_package_on_remote_node "$node_ip" "$file" "$version" "$release_data"
     else
         install_plugin_on_remote_node "$node_ip" "$file" "$version"
     fi
@@ -2041,9 +2038,23 @@ pveproxy_exit_schedule() {
 # Restarting it synchronously drops that terminal mid-transaction; deferring it
 # past the (short) apt transaction keeps the operator's session alive while
 # pveproxy still picks up the new plugin without manual action.
+# Package installs are restarted by debian/postinst: pvedaemon, pvestatd,
+# pvescheduler, the HA daemons, and a deferred pveproxy. The installer only
+# verifies the result, so a package install is never restarted twice.
+verify_pve_services_running() {
+    local failed=false service
+
+    for service in pvedaemon pvestatd pvescheduler; do
+        if ! systemctl is-active --quiet "$service" 2>/dev/null; then
+            error "$service is not running"
+            failed=true
+        fi
+    done
+    [[ "$failed" == "false" ]]
+}
+
 restart_pve_services() {
     info "Restarting Proxmox services..."
-
     # Plugin-loading daemons, restarted immediately. These are core PVE units
     # that exist on every node, so a hard restart + is-active check is safe.
     local services=("pvedaemon" "pvestatd" "pvescheduler")
@@ -2062,6 +2073,10 @@ restart_pve_services() {
             failed=true
         fi
     done
+
+    # HA units are restarted by the package postinst; keep the raw path at
+    # parity. try-restart tolerates nodes where HA is not active.
+    systemctl try-restart pve-ha-crm pve-ha-lrm 2>/dev/null || true
 
     # Defer pveproxy until the installer exits so the ~10s restart does not
     # land while the operator is still at the installer's main menu (review
@@ -2111,6 +2126,18 @@ install_plugin_on_remote_node() {
         return 1
     fi
 
+    # A broker-era module copied onto a node without the broker leaves every
+    # storage call failing (#133). Refuse before touching the node.
+    if plugin_file_requires_broker "$plugin_file"; then
+        if ! ssh -n -o ConnectTimeout=10 -o BatchMode=yes "root@${node_ip}" \
+            "test -f /usr/lib/systemd/system/truenas-plugin-broker.service" 2>/dev/null; then
+            log "ERROR" "Remote installation to $node_ip: broker unit is missing"
+            refuse_plugin_without_broker
+            echo "This plugin version requires truenas-plugin-broker on $node_ip"
+            return 1
+        fi
+    fi
+
     local temp_remote="/tmp/TrueNASPlugin.pm.$$"
     log "INFO" "Starting remote installation to $node_ip (version $version)"
 
@@ -2119,6 +2146,15 @@ install_plugin_on_remote_node() {
         "cat > ${temp_remote}" < "$plugin_file" 2>/dev/null; then
         log "ERROR" "Remote installation to $node_ip: SSH transfer failed"
         echo "SSH transfer failed"
+        return 1
+    fi
+    local local_hash remote_hash
+    local_hash=$(sha256sum "$plugin_file" | awk '{print $1}')
+    remote_hash=$(ssh -n "root@${node_ip}" "sha256sum ${temp_remote} 2>/dev/null | awk '{print \$1}'")
+    if [[ "$local_hash" != "$remote_hash" ]]; then
+        ssh -n "root@${node_ip}" "rm -f ${temp_remote}" 2>/dev/null || true
+        log "ERROR" "Remote installation to $node_ip: transfer checksum mismatch"
+        echo "Transfer checksum mismatch"
         return 1
     fi
     log "INFO" "Remote installation to $node_ip: File transferred successfully"
@@ -2212,9 +2248,17 @@ install_package_on_remote_node() {
     local node_ip="$1"
     local package="$2"
     local version="$3"
+    local release_data="${4:-}"
 
     if [[ -z "$node_ip" || ! -f "$package" ]]; then
         log "ERROR" "Remote package installation: Invalid parameters (ip=$node_ip, file=$package)"
+        return 1
+    fi
+
+    # Verify the release checksum here as well, so the function is safe when
+    # called without the caller's precheck.
+    if [[ -n "$release_data" ]] && ! verify_package_checksum "$package" "$release_data"; then
+        log "ERROR" "Remote package installation to $node_ip: checksum verification failed"
         return 1
     fi
 
@@ -2268,8 +2312,8 @@ install_package_on_remote_node() {
         [[ \"\$status\" == 'install ok installed' ]] || { echo \"dpkg status: \$status\"; exit 1; }
         [[ -f ${PLUGIN_FILE} ]] || { echo 'plugin file missing'; exit 1; }
         if dpkg -L truenas-proxmox-plugin 2>/dev/null | grep -q 'truenas-plugin-broker.service'; then
-            systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
-            systemctl restart truenas-plugin-broker
+            # postinst enabled/started the broker; only start it if inactive.
+            systemctl is-active --quiet truenas-plugin-broker || systemctl start truenas-plugin-broker
             for _ in {1..30}; do
                 [[ -S /run/truenas-plugin/broker.sock ]] && break
                 sleep 1
@@ -2284,25 +2328,18 @@ install_package_on_remote_node() {
     fi
     log "INFO" "Remote package installation to $node_ip: package installed"
 
+    # debian/postinst restarted the PVE daemons for this package install, so
+    # verify the result instead of restarting them a second time.
     if ! ssh -n "root@${node_ip}" "
-        if ! systemctl restart pvedaemon pvestatd pvescheduler 2>/dev/null; then
-            echo 'daemon restart failed'
-            exit 1
-        fi
-        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
-            if command -v systemd-run >/dev/null 2>&1; then
-                systemd-run --on-active=10s --unit=truenas-pveproxy-restart systemctl try-restart pveproxy >/dev/null 2>&1 || \
-                    systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
-            else
-                systemctl restart pveproxy 2>/dev/null || { echo 'pveproxy restart failed'; exit 1; }
-            fi
-        fi
+        for svc in pvedaemon pvestatd pvescheduler; do
+            systemctl is-active --quiet \$svc || { echo \"\$svc is not running\"; exit 1; }
+        done
     " 2>/dev/null; then
-        log "WARNING" "Remote package installation to $node_ip: service restart failed"
-        echo "Service restart failed - manual restart required"
+        log "WARNING" "Remote package installation to $node_ip: services are not all running"
+        echo "Services not all running after package install - manual check required"
         return 2
     fi
-    log "INFO" "Remote package installation to $node_ip: services restarted successfully"
+    log "INFO" "Remote package installation to $node_ip: services verified"
 
     return 0
 }
@@ -2619,7 +2656,16 @@ perform_cluster_wide_installation() {
         info "Installing on local node ($current_node)..."
 
         if install_artifact "$artifact_kind" "$temp_file"; then
-            if restart_pve_services; then
+            # Package postinst owns the restart; raw installs keep it here.
+            if [[ "$artifact_kind" == "deb" ]]; then
+                if verify_pve_services_running; then
+                    success "Local node installation completed"
+                    successful_nodes+=("$current_node")
+                else
+                    warning "Local node installed but services may need manual restart"
+                    successful_nodes+=("$current_node (services need restart)")
+                fi
+            elif restart_pve_services; then
                 success "Local node installation completed"
                 successful_nodes+=("$current_node")
             else
@@ -2651,7 +2697,7 @@ perform_cluster_wide_installation() {
         start_spinner
 
         local error_msg
-        error_msg=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$temp_file" "$install_version" 2>&1)
+        error_msg=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$temp_file" "$install_version" "$release_data" 2>&1)
         local result=$?
 
         stop_spinner
@@ -2726,7 +2772,7 @@ perform_cluster_wide_installation() {
                     printf "  %s (%s): " "$node_name" "$node_ip"
 
                     local retry_error
-                    retry_error=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$retry_temp" "$install_version" 2>&1)
+                    retry_error=$(install_artifact_on_remote_node "$artifact_kind" "$node_ip" "$retry_temp" "$install_version" "$release_data" 2>&1)
                     local retry_result=$?
 
                     if [[ $retry_result -eq 0 ]]; then
@@ -2893,8 +2939,15 @@ perform_installation() {
 
     rm -f "$temp_file"
 
-    # Restart services
-    if ! restart_pve_services; then
+    # Restart scope: debian/postinst already restarted the PVE daemons for a
+    # package install, so verify instead of restarting them a second time.
+    # A raw .pm install has no postinst and keeps the installer restart.
+    if [[ "$artifact_kind" == "deb" ]]; then
+        if ! verify_pve_services_running; then
+            warning "Plugin installed but some PVE services are not running"
+            warning "Check: systemctl status pvedaemon pvestatd pvescheduler"
+        fi
+    elif ! restart_pve_services; then
         warning "Plugin installed but services may need manual restart"
     fi
 
@@ -2992,14 +3045,16 @@ menu_not_installed() {
             has_backups=true
         fi
 
-        # Build menu options dynamically
-        local menu_options=("Install latest version" "Install via APT (Recommended)" "Install specific version" "View available versions")
+        # The Debian package ships the plugin module, SCRAM library, broker,
+        # LVM filter helper and systemd unit, so it is the primary path. The
+        # GitHub entry installs the release .deb asset, not a bare .pm.
+        local menu_options=("Install Debian package via APT (recommended)" "Install latest release (Debian package)" "Install specific version" "View available versions")
         local max_choice=4
 
         # Add cluster-wide option if in a cluster
         local cluster_option_position=0
         if is_cluster_node; then
-            menu_options+=("Install latest version (all cluster nodes)")
+            menu_options+=("Install latest release on all cluster nodes (Debian package)")
             max_choice=5
             cluster_option_position=5
         fi
@@ -3028,6 +3083,27 @@ menu_not_installed() {
                 exit $EXIT_SUCCESS
                 ;;
             1)
+                if apt_bootstrap_install; then
+                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
+                        echo
+                        read -rp "Would you like to configure storage now? [y/N]: " response
+                        if [[ "$response" =~ ^[Yy] ]]; then
+                            menu_configure_storage
+                            echo
+                            read -rp "Would you like to run a health check now? [y/N]: " hc_response
+                            if [[ "$hc_response" =~ ^[Yy] ]]; then
+                                echo
+                                menu_health_check
+                            fi
+                        fi
+                    fi
+                    read -rp "Press Enter to return to main menu..."
+                    return 0
+                else
+                    read -rp "Press Enter to return to main menu..."
+                fi
+                ;;
+            2)
                 if perform_installation "latest"; then
                     # Prompt to configure storage after successful installation
                     if [[ "$NON_INTERACTIVE" != "true" ]]; then
@@ -3046,27 +3122,6 @@ menu_not_installed() {
                     fi
                     read -rp "Press Enter to return to main menu..."
                     # After successful installation, break out to re-detect state
-                    return 0
-                else
-                    read -rp "Press Enter to return to main menu..."
-                fi
-                ;;
-            2)
-                if apt_bootstrap_install; then
-                    if [[ "$NON_INTERACTIVE" != "true" ]]; then
-                        echo
-                        read -rp "Would you like to configure storage now? [y/N]: " response
-                        if [[ "$response" =~ ^[Yy] ]]; then
-                            menu_configure_storage
-                            echo
-                            read -rp "Would you like to run a health check now? [y/N]: " hc_response
-                            if [[ "$hc_response" =~ ^[Yy] ]]; then
-                                echo
-                                menu_health_check
-                            fi
-                        fi
-                    fi
-                    read -rp "Press Enter to return to main menu..."
                     return 0
                 else
                     read -rp "Press Enter to return to main menu..."
@@ -3226,7 +3281,7 @@ menu_installed() {
         fi
 
         # Build menu dynamically
-        local -a menu_items=("Update plugin" "Install specific version" "Configure storage" "Diagnostics" "Rollback to backup")
+        local -a menu_items=("Update plugin (Debian package)" "Install specific release" "Configure storage" "Diagnostics" "Rollback to backup")
         local max_choice=5
 
         if [[ "$should_manage_backups" = true ]]; then
@@ -5331,8 +5386,15 @@ menu_health_check() {
     echo
 
     # Run health check and capture exit code
-    # Don't let non-zero returns trigger error trap
-    run_health_check "$storage_name" || true
+    # Surface a failed check at the menu boundary but stay successful here:
+    # the installer runs under `set -e`, so a nonzero return would abort it.
+    local hc_status=0
+    run_health_check "$storage_name" || hc_status=$?
+    if [[ "$hc_status" -ne 0 ]]; then
+        echo
+        warning "Health check reported warnings or failures; review the output above"
+    fi
+    return 0
 }
 
 # Extract storage configuration block safely
@@ -5665,7 +5727,13 @@ run_health_check() {
     # Check 1: Plugin file installed
     if [[ -f "$PLUGIN_FILE" ]]; then
         local version
-        version=$(grep 'our $VERSION' "$PLUGIN_FILE" 2>/dev/null | grep -oP "[0-9.]+" || echo "unknown")
+        # dpkg keeps the full version including pre-release suffixes; the
+        # module string is the fallback for raw installs.
+        version=$(dpkg-query -W -f='${Version}' "$APT_PACKAGE_NAME" 2>/dev/null || true)
+        if [[ -z "$version" ]]; then
+            version=$(perl -ne 'print $1 if /VERSION\s*=\s*\x27([^\x27]+)\x27/' "$PLUGIN_FILE" 2>/dev/null | head -1)
+        fi
+        [[ -n "$version" ]] || version="unknown"
         check_result "Plugin file" "OK" "Installed v$version"
     else
         check_result "Plugin file" "CRITICAL" "Not installed"
@@ -13339,6 +13407,8 @@ main() {
                 echo "Please choose one of these methods instead:"
                 echo
                 echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+                echo "     The installer installs the truenas-proxmox-plugin Debian package,"
+                echo "     which supplies the plugin module, broker, SCRAM library and LVM filter helper."
                 echo "     ssh root@your-proxmox-host"
                 echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)"
                 echo
@@ -13367,6 +13437,8 @@ main() {
             echo "Please choose one of these methods instead:"
             echo
             echo "  ${COLOR_GREEN}1. SSH to Proxmox, then run installer (Recommended)${COLOR_RESET}"
+                echo "     The installer installs the truenas-proxmox-plugin Debian package,"
+                echo "     which supplies the plugin module, broker, SCRAM library and LVM filter helper."
             echo "     ssh root@your-proxmox-host"
             echo "     bash <(curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)"
             echo
