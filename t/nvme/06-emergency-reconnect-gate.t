@@ -171,8 +171,8 @@ sub log_matches {
         'idle case: _nvme_connect called by the emergency path (count='
         . scalar(@CONNECTS) . ')');
 
-    ok(log_matches(qr/EMERGENCY RECONNECT after 150-iteration budget/),
-        'idle case: EMERGENCY RECONNECT log line fired');
+    ok(log_matches(qr/i==150 emergency reconnect FIRING/),
+        'idle case: emergency reconnect FIRING log line fired');
     ok(!log_matches(qr/emergency reconnect SKIPPED.+subsystem is in use/),
         'idle case: SKIPPED(in-use) log line NOT fired');
 }
