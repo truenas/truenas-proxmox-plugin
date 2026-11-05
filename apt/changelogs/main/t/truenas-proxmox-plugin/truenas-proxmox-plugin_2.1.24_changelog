@@ -1,3 +1,269 @@
+truenas-proxmox-plugin (2.1.24) unstable; urgency=medium
+
+  * Release 2.1.24. Promotes 2.1.24~beta8 to the stable 2.1.24 series
+    with no code changes. The beta cycle covered: broker-based auth with
+    SCRAM-SHA-512 / SCRAM-PLUS (channel binding) / API_KEY_PLAIN /
+    legacy fallback (betas 1-7), snapshot and lifecycle fixes, HA iSCSI
+    tuning, IPv6 iSCSI portals (#140), and configured-portals-only login
+    (#91). See the 2.1.24~beta1 through 2.1.24~beta8 entries in
+    debian/changelog and wiki/Changelog.md for the full detail.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 05 Nov 2026 14:39:28 -0500
+
+truenas-proxmox-plugin (2.1.24~beta8) unstable; urgency=medium
+
+  * fix: log into configured iSCSI portals only. After SendTargets
+    discovery, open-iscsi holds a node record for every address the
+    target advertises, and a TrueNAS portal bound to 0.0.0.0 or ::
+    advertises every address on the box (docker and VM bridges,
+    link-local and public IPv6). _iscsi_login_all logged into all of
+    them; each unreachable address blocks for open-iscsi's whole login
+    retry budget (about two minutes), serially, on the first login and
+    on every reconnect after a session drop. The loop now logs into the
+    portals listed in tn_discovery_portal and tn_portals only, logs the
+    skipped discovered portals once, and keeps the direct fallback login
+    for configured portals missing from the node list (#91). Unit test
+    in t/login. Measured live (Proxmox VE 9 -> TrueNAS 28.0, portal on
+    0.0.0.0 advertising 8 addresses, 7 unreachable): first login took
+    858 s before and 4 s after, with the same single usable session.
+    Behaviour change: a host that configured only tn_discovery_portal
+    against a TrueNAS with several reachable storage interfaces used to
+    get a session on each of them implicitly; it now gets one, and a
+    warning names the portals that were skipped. List the extra portals
+    in tn_portals to keep the additional paths.
+
+  * fix(#140): IPv6 iSCSI portals. A portal written as "[fd00::1]:3260"
+    was normalised to "fd00::1:3260", probed with the IPv4-only
+    IO::Socket::INET (always "not reachable") and compared with iscsiadm
+    session lines by substring, so an IPv6 portal could not be used.
+    Portals are now parsed once into host and port, kept bracketed for
+    every iscsiadm -p argument, probed with IO::Socket::IP (both address
+    families), and matched against sessions and node records by parsed
+    value, with equivalent IPv6 spellings (2001:db8:0:0::1 vs 2001:db8::1)
+    treated as the same portal. IPv4 and hostname portals behave as
+    before, including the FQDN-to-IPv4 session match from #102 and the
+    longer-IQN guard from #124. path() used to synthesise a by-path name
+    from the configured portal string verbatim; udev spells an IPv6
+    portal without brackets (ip-fd42::70:3260-iscsi-...), so the
+    synthesised name is now rendered that way too. Unit tests in t/ipv6;
+    verified live from Proxmox VE 9 to TrueNAS 28.0 over a ULA portal
+    (discovery, login, alloc, activate, path, free).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Wed, 04 Nov 2026 12:00:00 -0500
+
+truenas-proxmox-plugin (2.1.24~beta7) unstable; urgency=medium
+
+  * feat(auth): migrate TrueNAS authentication from auth.login_with_api_key
+    to auth.login_ex with explicit tier selection via tn_auth_mechanism
+    (auto|scram|scram-plus|plain, default auto). Adds base SCRAM-SHA-512
+    plus API_KEY_PLAIN plus legacy fallback, with per-storage opt-in.
+    New tn_api_username scfg field. Broker pool key hashes host, api_key,
+    api_username, and mechanism so distinct auth configs get distinct
+    worker pools. Live-verified across TrueNAS 26.0 BETA.3 and 28.0 MASTER
+    on four PVE 9.2.21 nodes; dev full-function sweep (50/50 PASS, 1 SKIP)
+    and lifecycle tests (7 PASS + 1 SKIP) green with
+    tn_auth_mechanism=scram.
+  * feat(auth): SCRAM-PLUS strict channel binding to tls-server-end-point
+    (RFC 5929) via tn_auth_mechanism=scram-plus. Picks the SHA digest per
+    cert signature algorithm per RFC 5929 section 4.1; refuses to connect
+    when the server does not advertise SCRAM, when the TLS peer cert
+    cannot be read, or when the server rejects the c= attribute. No
+    fallback to plain SCRAM under any circumstance. tn_api_insecure=1
+    allowed with scram-plus. Pure-Perl crypto in lib/TrueNAS/SCRAM.pm
+    with Python-stdlib known-answer vectors.
+  * fix(#133): bound every local-node systemctl restart call in
+    install.sh through SYSTEMCTL_RESTART_TIMEOUT_SECS (60 s). A wedged
+    systemd job queue previously left the installer waiting out the
+    unit's TimeoutStopSec, which users observed as an indefinite hang
+    on "Restarting Proxmox services...". The timeout now surfaces the
+    stuck unit with a diagnosable error and the exact systemctl status
+    command. Covers restart_pve_services and the pveproxy immediate
+    fallback in schedule_pveproxy_deferred_restart.
+  * dep: adds libcrypt-pbkdf2-perl and libcrypt-urandom-perl to Depends
+    (both present in bookworm and trixie).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 02 Nov 2026 09:30:00 -0500
+
+truenas-proxmox-plugin (2.1.24~beta6) unstable; urgency=medium
+
+  * fix(#135): drop the full-NAS snapshot scan from
+    `volume_snapshot_info`. The earlier implementation called
+    `pool.snapshot.query` with no filter and no `extra.properties`,
+    so on a NAS with several thousand snapshots it fetched every
+    snapshot on the array (~20 MB JSON, ~33 s per call) and then
+    filtered client-side. `qm rollback` makes three of these calls
+    per invocation, which put rollbacks in the multi-minute range
+    for anyone with a busy TrueNAS. Delegate to the existing
+    `_tn_snapshot_query_datasets` helper, which asks the middleware
+    to filter by dataset and return only the `creation` property --
+    the same NAS answers the one-dataset query in ~1.7 s on the
+    reporter's measurements. Also drop the unused `_tn_snapshots`
+    helper (dead code, zero callers).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 23 Oct 2026 09:00:00 -0400
+
+truenas-proxmox-plugin (2.1.24~beta5) unstable; urgency=medium
+
+  * fix(nvme): close the i==25 reconnect blind spot in
+    _nvme_device_for_uuid and harden the fuser-based in-use probe
+    (GitHub #134). A VM being provisioned on an NVMe-oF subsystem
+    could tear down the shared controller mid-flight and knock out
+    every other running VM on the same subsystem. Two combined
+    defects produced this:
+
+      - The i==25 "stale connection" branch was the only mid-loop
+        reconnect site without an in-use guard. Its precondition
+        `!$ever_saw_devices` reads as "the subsystem is empty",
+        but `$ever_saw_devices` is set from the target UUID
+        lookup's linux_device_count, not the subsystem total; a
+        shared subsystem with 48 live namespaces could satisfy
+        this for the whole 15 s loop and still see the reconnect
+        fire. Apply the same in-use guard the i==10 / i==35 /
+        i==75 / i==150 branches use.
+
+      - `_nvme_check_devices_in_use` interpreted `run_command`'s
+        outcome as "$@ ? 0 : 1", collapsing every non-success
+        exit (spawn failures, timeouts, signal deaths) into
+        "not in use". Switch to `run_command(noerr => 1)` and
+        distinguish exit 0 (in use) from exit 1 (idle) from
+        anything else (unknown — fail-safe = assume in use).
+
+    Also uniform structured logging across every reconnect site in
+    `_nvme_device_for_uuid`: FIRING / SKIPPED lines now carry the
+    iteration label (i==10 / i==25 / i==35 / i==75 / i==125 /
+    i==150), the reason, dev_paths count, and in_use value. Future
+    field reports pin the responsible branch directly instead of
+    inferring from timing.
+
+    Validated with a mocked unit test (unpatched build fires the
+    reconnect; patched build logs the new SKIPPED line and does
+    not call _nvme_disconnect) and two iterations of
+    proxmox-test-runner storage-plugin-validation against
+    truenas-storage (0 failed per iteration).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Wed, 22 Oct 2026 12:30:00 -0400
+
+truenas-proxmox-plugin (2.1.24~beta4) unstable; urgency=medium
+
+  * fix(broker): correct systemd ordering so pvestatd/pvedaemon wait
+    for the broker's listen socket (GitHub #132). The broker's unit
+    was `Type=simple` + `After=network-online.target`, with nothing
+    ordering it ahead of the PVE storage services. At boot that
+    produced a race: pvestatd and pvedaemon start, call status() /
+    activate_storage() on each truenasplugin storage, find
+    /run/truenas-plugin/broker.sock not listening yet, and fall back
+    to the plugin's direct-WS path. Each PVE worker then
+    independently re-authenticates against TrueNAS, and the first
+    burst trips TN's `auth.login_with_api_key` rate limit (20 calls
+    / 60 s / IP) into a 10-minute cooldown. Every subsequent
+    status() tick stays rate-limited, pve-guests.service waits for
+    storages to become active, graphical.target is never reached,
+    autostart VMs never fire, and CPU churns on fork/respawn.
+
+    Fix:
+
+      - debian/truenas-plugin-broker.service: switch to `Type=notify`
+        with `NotifyAccess=main`, and add
+        `Before=pvestatd.service pvedaemon.service pveproxy.service`.
+        Downstream services now wait until the broker socket is
+        actually accepting connections before they start.
+
+      - tools/truenas-plugin-broker: add pure-Perl `sd_notify_ready()`
+        and call it immediately after `make_listener()` returns.
+        No extra fork, no sd-daemon dependency.
+
+    Reproduced on pvevm1 with a provisioned 5-VM load on
+    truenas-storage (onboot=1). Pre-fix: graphical.target never
+    reached in 14 min; pvestatd.log full of
+    "broker socket missing" followed by "TrueNAS API rate limited";
+    broker burned 20min of CPU time. Post-fix: boot clean.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 16 Oct 2026 12:00:00 -0400
+
+truenas-proxmox-plugin (2.1.24~beta3) unstable; urgency=medium
+
+  * feat(nvme-ha): add tn_nvme_manage_ports (boolean, default 1) so an
+    admin can disable the plugin's auto-creation of nvmet.port and
+    nvmet.port_subsys records on TrueNAS. Required for a TrueNAS HA
+    pair on 25.10.x, where the middleware's nvmet map_attrs() refuses
+    any addr_traddr that is not the VIP: a physical-IP port record
+    triggers KeyError in write_config() and aborts the whole render,
+    leaving namespaces unpublished in configfs. With
+    tn_nvme_manage_ports=0 the plugin leaves nvmet.port.* to the
+    admin, who pre-provisions exactly one VIP-based port record;
+    TrueNAS renders that port on both controllers automatically,
+    kernel multipath + ANA handles failover. The plugin still manages
+    subsystem lookup, namespace lifecycle, and initiator connect. If
+    the subsystem is missing while manage_ports=0, the plugin refuses
+    to auto-create and prints the three midclt calls needed to
+    bootstrap.
+
+  * docs(nvme-ha): discoverable HA deployment documentation beyond the
+    bare property reference. README gains an HA callout in the
+    NVMe/TCP section; wiki/NVMe-Setup.md adds an "HA Pair (Dual
+    Controller) Deployment" subsection with the midclt recipe;
+    wiki/Best-Practices.md expands the "NVMe/TCP HA failover" section
+    (previously two sentences about `nvme list-subsys`) to include the
+    storage-config, TrueNAS-side pre-provisioning, failover
+    verification, and the NGUID cross-check; wiki/Known-Limitations.md
+    documents the TrueNAS middleware constraint that drives the knob;
+    wiki/HA-NVMe-TCP-Validation.md and wiki/HA-Transport-Comparison.md
+    are added as supporting material (50-iteration failover record
+    with 50/50 PASS, 0 fio errors, 20.6 s average pause; and the
+    ANA-vs-ALUA transport-mechanism comparison that explains why the
+    NVMe/TCP recovery path behaves differently from iSCSI).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Fri, 16 Oct 2026 10:00:00 -0400
+
+truenas-proxmox-plugin (2.1.24~beta2) unstable; urgency=medium
+
+  * nvme_device_for_uuid: gate the post-150-iter emergency reconnect
+    on a devices-in-use check (GitHub #131). The alpha26 trade-off
+    accepted a ~500ms NVMe controller drop as "lesser evil" than a
+    guaranteed activate failure, but a multi-tenant deployment hit
+    the pathological case: QEMU io-error escalation on unrelated
+    running consumers of the shared subsystem, VMs end up with
+    "deleted" /dev/nvmeN handles and need a restart to recover.
+    With this change, if any device on the shared subsystem is
+    open by another process on this host, the emergency reconnect
+    is refused and THIS activate fails cleanly instead; the other
+    consumers are not disrupted. Admin: verify the namespace on
+    TrueNAS, then manually `nvme disconnect`+`nvme connect` when
+    no consumers are using the subsystem. An unused subsystem
+    still goes through the emergency reconnect. Also kept: the
+    fail-safe assume-in-use behavior when `fuser` is not available
+    on the host — if we cannot verify, we do not disrupt. New
+    unit tests in t/nvme/06-emergency-reconnect-gate.t cover both
+    paths and the fail-safe. Reported by dsmitty166.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 14 Oct 2026 14:00:00 -0400
+
+truenas-proxmox-plugin (2.1.24~beta1) unstable; urgency=medium
+
+  * check_config: skip required-field validation on edit path
+    (GitHub #130). PVE calls check_config with just the submitted
+    delta on `pvesm set <id> -<flag>`, not the merged stored config,
+    so demanding tn_api_host / tn_api_key / tn_dataset (and the
+    transport-specific requires) made every edit die with
+    "tn_api_host is required". Required-field dies now gate on
+    $create; format/warning checks still fire whenever the relevant
+    field is actually submitted. Reproducer from the issue
+    (pvesm set <id> -disable true) now works. Reported by
+    O'Neill, Will (4wrxb).
+
+  * api(): bump $TESTED_APIVER from 15 to 16 (GitHub #99). PVE
+    bumped pve-storage APIVER during the 2.1.23 release cycle;
+    users on PVE 9.2+ hit "implementing an older storage API"
+    on every pvesm call. Reported by blunweon, noberasco.
+
+  * Validation: 20/20 PASS on the proxmox-test-runner
+    storage-plugin-validation suite against truenas-storage on
+    the four-node cluster (pve/pve2/proxmox2/pvevm1) on
+    2026-10-11/12. Each round: 19 validated, 2 unsupported,
+    3 not tested for prerequisite reasons, 0 failed.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 12 Oct 2026 08:00:00 -0400
+
 truenas-proxmox-plugin (2.1.23+deb1) unstable; urgency=medium
 
   * Promote 2.1.23~beta11 to 2.1.23+deb1 (stable). First stable
