@@ -6,25 +6,27 @@ surface. Compare against TrueNAS release notes and
 `core.get_methods` output to catch API changes that will break the
 driver.
 
-Generated from alpha branch, plugin version 2.1.23~beta7+.
+Generated from plugin version 2.1.24~beta8.
 See "Regeneration" at the bottom for the exact scan procedure.
 
 ---
 
-## Plugin-core methods (production runtime, 39)
+## Plugin-core methods (production runtime, 41)
 
 These are called by `TrueNASPlugin.pm` and the
 `truenas-plugin-broker` daemon. Any breaking change here breaks
 production deployments.
 
-### Authentication (1)
+### Authentication (4)
 
-- `auth.login_with_api_key`
+- `auth.me`
+- `auth.mechanism_choices`
+- `auth.login_ex`
+- `auth.login_with_api_key` (legacy fallback)
 
-### Core / infrastructure (4)
+### Core / infrastructure (3)
 
 - `core.bulk`
-- `core.call`
 - `core.get_jobs`
 - `core.ping`
 

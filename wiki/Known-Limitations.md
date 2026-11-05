@@ -23,7 +23,6 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
   - [TrueNAS HA + NVMe/TCP needs tn_nvme_manage_ports 0](#truenas-ha--nvmetcp-needs-tn_nvme_manage_ports-0)
   - [API Rate Limits](#api-rate-limits)
   - [WebSocket Connection Stability](#websocket-connection-stability)
-  - [Version Compatibility](#version-compatibility)
 - [Proxmox Specific Limitations](#proxmox-specific-limitations)
   - [Proxmox Version Requirements](#proxmox-version-requirements)
   - [Custom Storage Plugin Directory](#custom-storage-plugin-directory)
@@ -31,7 +30,7 @@ Important limitations, restrictions, and workarounds for the TrueNAS Proxmox VE 
   - [No NFS/CIFS Support](#no-nfscifs-support)
   - [IPv6 Considerations](#ipv6-considerations)
 - [Security Limitations](#security-limitations)
-  - [No Mutual CHAP](#no-mutual-chap)
+  - [No Mutual CHAP (iSCSI)](#no-mutual-chap-iscsi)
   - [API Key Storage](#api-key-storage)
   - [No SCSI persistent reservations for HA fencing](#no-scsi-persistent-reservations-for-ha-fencing)
   - [`rename_volume` not implemented](#rename_volume-not-implemented)
@@ -273,10 +272,13 @@ shared 1
 **Tracking:** GitHub #45 (original report, 2026-06), GitHub #96
 (current tracking issue with upstream analysis).
 
-**Affected:** NVMe/TCP transport on TrueNAS 25.10.x and TN 26.0 BETA.x.
-Does not affect iSCSI.
+**Affected:** NVMe/TCP on TrueNAS 25.10.4, 25.10.7 and 27.0.0 RC1;
+iSCSI on 25.10.6. Not every release in a series is confirmed; those
+are the versions reported in #96. The iSCSI case comes from a
+different mechanism (see below), and the 25.10.5/25.10.6 release
+notes contain no NVMe target data-path fix.
 
-**Symptom:** vzdump streaming backups, `qemu-img convert -t none`
+**Symptom (NVMe/TCP):** vzdump streaming backups, `qemu-img convert -t none`
 disk moves, `pvesm export | pvesm import` transfers, and any other
 large direct-I/O workload against an NVMe/TCP namespace can fail
 with `err -5 - Input/output error` partway through. On the Proxmox
@@ -299,18 +301,44 @@ Oversized requests from the client have, in some reports, also led
 to silent corruption on offline (stopped-VM) disk moves — see #96
 and #32 for examples.
 
-**Root cause:** The `nvmet-tcp` kernel module does not implement
+**Root cause (NVMe/TCP):** The `nvmet-tcp` kernel module does not implement
 the `.get_mdts` (Maximum Data Transfer Size) callback, so the target
 advertises an unlimited transfer size. Linux's nvme block layer
 chooses a default `max_sectors_kb` of 32768 (16 MB per request).
 When a request arrives, `nvmet_tcp_map_data()` cannot allocate the
 scatter-gather map and returns Internal Error (sct 0x0 / sc 0x6).
 
+**Root cause (iSCSI):** the target advertises an 8 MiB maximum and
+optimal transfer length, so the SCSI block layer sets
+`max_sectors_kb=8192` and `read_ahead_kb=16384` and issues 8 MiB
+requests. SCST then fails to allocate the request buffer on TrueNAS:
+
+```
+scst: Allocation of sgv_pool_obj failed (size 8388608)
+scst: Unable to allocate or build requested buffer (size 8388608), sending BUSY or QUEUE FULL status
+```
+
+On the initiator the command is requeued until the SCSI layer gives
+up after 180 s, then reported as an I/O error:
+
+```
+sd 1:0:0:18: [sds] tag#80 timing out command, waited 180s
+I/O error, dev sds, sector 64421888 op 0x0:(READ) flags 0x0 phys_seg 2048 prio class 2
+```
+
+Failed reads are readahead requests. `scst_max_cmd_mem` and
+`scst_max_dev_cmd_mem` were not the limit in the reported case; the
+allocation is believed to fail on memory fragmentation (unconfirmed,
+see #96).
+
 **Status:** Kernel patch exists upstream and has received Reviewed-by
 from the NVMe maintainer. Not yet in a released TrueNAS point
-version at the time of writing.
+version at the time of writing. For the iSCSI case no target-side fix
+is reported in #96; until TrueNAS either stops advertising 8 MiB or
+stops failing the buffer allocation, the initiator-side cap is the
+mitigation.
 
-**Workaround — cap `max_sectors_kb` on every PVE node:**
+**Workaround for NVMe/TCP:** cap `max_sectors_kb` on every PVE node.
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
@@ -333,10 +361,10 @@ Four clauses, each necessary:
   keep their native (large) MDTS. Adjust the glob if your subsystem
   NQNs don't contain "truenas".
 - `ATTR{queue/max_sectors_kb}="1024"` — 1024 KiB (2048 sectors) is
-  the value this project validated against TN 25.10.4 and TN 26.0
-  BETA.x; it stays well under the mapping limit while leaving
-  streaming workloads at near-line-rate. If you still see sporadic
-  errors with 1024, drop to 128 (used by the original #45 reporter).
+  the value validated against TN 25.10.4 in #96; it stays well under
+  the mapping limit while leaving streaming workloads at
+  near-line-rate. If you still see sporadic errors with 1024, drop to
+  128 (used by the original #45 reporter).
 
 **Trap:** `ATTRS{transport}=="tcp"` as a scope filter **does not
 work** with native NVMe multipath. The `transport` attribute lives on
@@ -356,7 +384,37 @@ forwarding to the paths, so per-path `max_sectors_kb` doesn't need to
 be touched. The value survives a full disconnect/reconnect of the
 subsystem.
 
-**Remove the rule** once the kernel fix lands in your TrueNAS
+**Workaround for iSCSI:** cap the same value on SCSI block devices.
+
+```bash
+cat > /etc/udev/rules.d/60-scsi-max-sectors.rules <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="sd*[!0-9]", \
+  ATTRS{vendor}=="TrueNAS*", ATTR{queue/max_sectors_kb}="1024", \
+  ATTR{queue/read_ahead_kb}="1024"
+EOF
+udevadm control --reload
+udevadm trigger --subsystem-match=block --action=change
+```
+
+`KERNEL=="sd*[!0-9]"` matches whole SCSI disks only, so partitions
+(`sds1`, `sds2`) are skipped. `ATTRS{vendor}=="TrueNAS*"` scopes the
+rule to LUNs served by the TrueNAS target; check with
+`cat /sys/block/sdX/device/vendor`. Both attributes are required:
+`max_sectors_kb` caps the request size, and `read_ahead_kb` caps the
+readahead cluster; failed reads in #96 were readahead requests, and
+readahead alone can reach the 8 MiB limit while `max_sectors_kb`
+stays low.
+
+**Note:** a SCSI rescan resets `read_ahead_kb` to 16384 while
+`max_sectors_kb` stays at 1024. Re-trigger the rule after a rescan:
+
+```bash
+udevadm trigger --subsystem-match=block --action=change
+```
+
+**Remove the rules** once the target stops advertising a transfer
+size it cannot serve: `mdts 0` (i.e. 32 MiB requests) on NVMe/TCP,
+8 MiB on iSCSI, or once the kernel fix lands in your TrueNAS
 version.
 
 ### TrueNAS HA + NVMe/TCP needs `tn_nvme_manage_ports 0`
@@ -530,7 +588,7 @@ tn_portals [2001:db8::101]:3260,[2001:db8::102]:3260
 - iSCSI transport supports CHAP authentication (initiator → target)
 - Mutual CHAP (target → initiator) not implemented for iSCSI
 
-**Note**: NVMe/TCP transport supports full bidirectional DH-HMAC-CHAP authentication (host + controller secrets). See [NVMe Setup Guide](NVMe-Setup.md#authentication) for details.
+**Note**: NVMe/TCP transport supports full bidirectional DH-HMAC-CHAP authentication (host + controller secrets). See [NVMe Setup Guide](NVMe-Setup.md#dh-chap-authentication-setup) for details.
 
 **Impact**: Slightly reduced security in high-security iSCSI environments
 
@@ -607,7 +665,7 @@ plugin just doesn't expose it yet.
 
 ### Clone Performance
 
-**Limitation**: See "No Fast Clone Support" above
+**Limitation**: A full clone copies data over the network; the plugin does not implement storage-side fast cloning for plain `clone_image` calls. Linked clones from a base image use `create_base` and `clone_image` and avoid the copy.
 
 **Impact**: Large VM clones are slow
 
@@ -806,7 +864,7 @@ zfs set quota=500G tank/proxmox
 | WebSocket instability | Improve network stability, verify TLS/certs, tune retry settings |
 | Clone performance | Faster network, smaller images, accept limitation |
 | Multipath read performance | Upgrade to 10GbE, accept ~100 MB/s, or use parallel workloads |
-| nvmet-tcp large-transfer I/O errors | Cap `max_sectors_kb=1024` via udev rule on PVE nodes until kernel patch ships |
+| Large-transfer I/O errors | Cap `max_sectors_kb=1024` via udev rule (`read_ahead_kb=1024` too on iSCSI) until fixed upstream |
 
 ## See Also
 - [Troubleshooting Guide](Troubleshooting.md) - Solutions to common issues

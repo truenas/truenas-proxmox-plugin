@@ -39,6 +39,8 @@ Each Proxmox cluster (or standalone node) should use its own dedicated ZFS datas
 truenasplugin: cluster-a-storage
     tn_api_host 10.0.0.100
     tn_api_key 1-cluster-a-key
+    tn_api_username cluster-a
+    tn_auth_mechanism auto
     tn_dataset tank/proxmox-cluster-a
     tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-a
     tn_discovery_portal 10.0.0.100:3260
@@ -49,12 +51,18 @@ truenasplugin: cluster-a-storage
 truenasplugin: cluster-b-storage
     tn_api_host 10.0.0.100
     tn_api_key 1-cluster-b-key
+    tn_api_username cluster-b
+    tn_auth_mechanism auto
     tn_dataset tank/proxmox-cluster-b
     tn_target_iqn iqn.2005-10.org.freenas.ctl:cluster-b
     tn_discovery_portal 10.0.0.100:3260
     content images
     shared 1
 ```
+
+Each storage entry supplies its own `tn_api_key`, optional `tn_api_username`, and `tn_auth_mechanism` (`auto`, `scram`, `scram-plus`, or `plain`; see [Configuration.md](Configuration.md#tn_api_username)). The broker keys each worker's upstream pool by host plus a hash of `(api_key, api_username, auth_mechanism)`, so entries on the same host with different credentials get separate authenticated sessions.
+
+Separate datasets and targets isolate VM volumes and LUN visibility only. They do not restrict the TrueNAS user's permissions: API keys inherit the owning user's global roles, and TrueNAS authorizes roles per method, not per dataset (see [API-Permissions.md](API-Permissions.md#caveats)).
 
 **Why this matters:** Proxmox assigns VM IDs independently per cluster. Both clusters can have a VM 101, and both will try to create a zvol named `vm-101-disk-0`. With separate datasets, these resolve to different full paths (`tank/proxmox-cluster-a/vm-101-disk-0` vs `tank/proxmox-cluster-b/vm-101-disk-0`) and never collide.
 

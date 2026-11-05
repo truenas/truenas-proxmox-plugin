@@ -2,7 +2,7 @@
 
 This document contains suggested features, enhancements, and improvements for future development of the TrueNAS Proxmox VE Storage Plugin.
 
-**Last Updated**: October 2025
+**Last Updated**: November 2026
 **Status**: Planning and Ideas Collection
 
 ---
@@ -68,7 +68,7 @@ sub get_metrics {
 
 **Description**: Quick health validation without running the full test suite. Useful for automated monitoring and rapid diagnostics.
 
-**Implementation**: Health check functionality is now integrated into the interactive installer (`install.sh`). Access via menu option "Run health check" or programmatically using the `run_health_check()` function.
+**Implementation**: Health check functionality is integrated into the interactive installer (`install.sh`). Access via menu option "Run health check" or by calling the `menu_health_check()` function.
 
 **Features**:
 - 13 comprehensive checks covering plugin, storage, API, and connectivity
@@ -241,16 +241,18 @@ Overall Score      GOOD        BEST        FAIR
 
 ---
 
-### 6. Orphan Resource Cleanup Tool ⭐⭐⭐ ✅ COMPLETED
+### 6. Orphan Resource Cleanup Tool ⭐⭐⭐
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
 
-**Status**: ✅ **COMPLETED** - Implemented and tested
+**Status**: Implemented in the installer as `menu_cleanup_orphans`
+(`install.sh`). There is no standalone `tools/cleanup-orphans.sh`; the
+sketches below are illustrative, not the shipped code.
 
 **Description**: Find and clean up orphaned resources on TrueNAS (referenced in todo.md #4).
 
-**Tool to Add**: `tools/cleanup-orphans.sh`
+**Illustrative sketch**: `tools/cleanup-orphans.sh` (not shipped)
 ```bash
 #!/bin/bash
 # Find and clean up orphaned resources on TrueNAS
@@ -1034,10 +1036,14 @@ fi
 
 ## 📦 Packaging and Distribution
 
-### 18. Debian/RPM Package ⭐⭐⭐
+### 18. Debian/RPM Package ⭐⭐⭐ ✅ DEBIAN COMPLETED
 **Priority**: High
 **Effort**: Medium
 **Impact**: High
+
+**Status**: ✅ Implemented for Debian: `debian/` builds the
+`truenas-proxmox-plugin` package via `tools/build-deb.sh`. RPM
+packaging is still an idea.
 
 **Description**: Proper packaging for easy installation via package manager.
 
@@ -1170,10 +1176,13 @@ truenasplugin: auto-storage
 
 ---
 
-### 21. NVMe-oF (NVMe over Fabrics) Support ⭐⭐⭐
+### 21. NVMe-oF (NVMe over Fabrics) Support ⭐⭐⭐ ✅ COMPLETED
 **Priority**: High
 **Effort**: High
 **Impact**: Very High
+
+**Status**: ✅ Implemented for NVMe/TCP (`tn_transport_mode nvme-tcp`).
+NVMe/RDMA and NVMe/FC remain ideas.
 
 **Description**: Add support for NVMe over Fabrics as an alternative to iSCSI, providing significantly lower latency and higher performance for VM storage.
 
@@ -1192,8 +1201,8 @@ truenasplugin: auto-storage
 truenasplugin: truenas-nvmeof
     tn_api_host 192.168.1.100
     tn_api_key xxx
-    transport nvme-tcp
-    target_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
+    tn_transport_mode nvme-tcp
+    tn_subsystem_nqn nqn.2005-10.org.freenas.ctl:proxmox-nvme
     tn_dataset tank/proxmox-nvme
     tn_discovery_portal 192.168.1.100:4420  # NVMe/TCP default port
     content images
@@ -1301,7 +1310,7 @@ sub list_nvme_devices {
 
 **Backward Compatibility**:
 - Keep existing iSCSI code path
-- Add transport detection in plugin: `transport_type` parameter (iscsi/nvme-tcp)
+- Add transport detection in plugin: `tn_transport_mode` parameter (`iscsi`/`nvme-tcp`)
 - Auto-detect based on TrueNAS capabilities
 
 **Testing Requirements**:
@@ -1335,19 +1344,19 @@ NVMe/TCP Target:
 
 ### Quick Wins (High Impact, Low Effort)
 1. ✅ **Version Counter** - COMPLETED
-2. ✅ **Orphan Cleanup Tool** (#6) - COMPLETED
-3. ✅ **Health Check Tool** (#2) - COMPLETED
+2. ✅ **Orphan Cleanup Tool** (#6) - COMPLETED (installer)
+3. ✅ **Health Check Tool** (#2) - COMPLETED (installer)
 4. **Dry-Run Mode** (#5)
 
 ### High Value (High Impact, Medium Effort)
 5. **Metrics Collection** (#1)
 6. **Snapshot Lifecycle** (#3)
-7. **Debian/RPM Packages** (#18)
+7. ✅ **Debian Package** (#18) - COMPLETED (RPM pending)
 8. **API Key Rotation** (#9)
 9. **Performance Baseline** (#8)
 
 ### Strategic (High Impact, High Effort)
-10. **NVMe-oF Support** (#21)
+10. ✅ **NVMe-oF Support** (#21) - COMPLETED (NVMe/TCP)
 11. **Web UI** (#16)
 12. **Monitoring Templates** (#7)
 13. **Chaos Testing** (#12)

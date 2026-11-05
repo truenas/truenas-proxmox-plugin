@@ -120,16 +120,30 @@ Under the hood the plugin creates a ZFS snapshot per zvol on TrueNAS,
 recorded in the CT's config file. Rollback stops the CT, does
 `zfs rollback` on each backing zvol, and restarts (if it was running).
 
+PVE's snapshot listing and rollback call the plugin's
+`volume_snapshot_info`, which queries only the volume's backing dataset
+(`TrueNASPlugin.pm:2833-2853`, #135). That keeps `pct listsnapshot` and
+`pct rollback` to one small API query even on a NAS with thousands of
+snapshots.
+
 Both plugin transports (iSCSI, NVMe/TCP) handle CT snapshots
 identically because the ZFS layer on TrueNAS does the work.
 
 ## Backup and Restore
 
-`vzdump` in `snapshot` mode is fully supported: the plugin creates an
-ephemeral clone of the CT's rootfs zvol at snapshot time, exposes that
-clone as a temporary LUN, and lets vzdump read from it while the live
-container keeps running. When vzdump finishes, the plugin tears the
-clone back down.
+`vzdump` in `snapshot` mode is fully supported: the plugin clones the
+CT's `zvol@snapname` into a throwaway zvol named `vzdump-<...>`. The
+clone name is derived deterministically from the volume and snapshot
+name, so `path()` and teardown resolve the same zvol. The clone is
+exposed as its own LUN or NVMe namespace and vzdump reads from it while
+the live container keeps running.
+
+`deactivate_volume` tears the clone down. PVE's LXC path calls
+`volume_snapshot_delete` without a `deactivate_volume($snapname)`, so
+the same idempotent teardown also runs there (issue #42). If teardown
+fails, the failure is propagated and the origin snapshot is not deleted
+while the clone still depends on it (issue #123). The task log reports
+the failure instead of returning a false `TASK OK`.
 
 ```bash
 vzdump 100 --mode snapshot --storage local
@@ -144,8 +158,11 @@ pct restore 101 /var/lib/vz/dump/vzdump-lxc-100-*.tar.zst \
 ```
 
 Both `backup_ct.pl` and `backup_restore.pl` in Proxmox's
-`proxmox-test-runner storage-plugin-validation` suite pass against
-this plugin on both iSCSI and NVMe/TCP transports as of beta5.
+`proxmox-test-runner storage-plugin-validation` suite passed against
+this plugin on both iSCSI and NVMe/TCP transports in the beta5
+validation run. The #123 teardown-failure handling described above
+landed later; re-run the suite against the current beta before relying
+on that record.
 
 ## Foreign Snapshot Import for Containers
 

@@ -41,12 +41,25 @@ Generate API keys in TrueNAS:
 5. Click **Add** to generate new key
 6. Copy key immediately (format: `1-xxxxx...`)
 
-### Authorization Header
+### WebSocket Authentication
 
-All API requests include authorization header:
-```
-Authorization: Bearer 1-your-api-key-here
-```
+The plugin does not send an HTTP `Authorization` header. It authenticates inside the WebSocket JSON-RPC session with the API key from `tn_api_key`.
+
+**Configuration**:
+- `tn_api_key`: the API key (format `1-xxxxx...`).
+- `tn_api_username`: TrueNAS account that owns the key. Required by `scram` and `scram-plus` (hard failure if unset); under `auto` or `plain`, leaving it unset forces the legacy API-key login.
+- `tn_auth_mechanism`: `auto` (default), `scram`, `scram-plus`, or `plain`.
+
+**Mechanisms**:
+
+| Value | Behavior |
+|---|---|
+| `auto` | With `tn_api_username` set, probes `auth.mechanism_choices`: uses SCRAM when advertised, otherwise `API_KEY_PLAIN` when advertised, otherwise legacy `auth.login_with_api_key`. Without `tn_api_username`, always uses the legacy login. |
+| `scram` | SCRAM-SHA-512 only. Requires `tn_api_username`; refuses servers that do not advertise SCRAM. |
+| `scram-plus` | SCRAM-SHA-512 with TLS channel binding (`tls-server-end-point`, RFC 5929). Requires `tn_api_username`, a readable TLS peer certificate, and a server that advertises SCRAM. |
+| `plain` | Never attempts SCRAM. Uses `API_KEY_PLAIN` on TrueNAS 25.10+ when `tn_api_username` is set; legacy login otherwise. |
+
+The probe and login run in the `truenas-plugin-broker` daemon; direct WS mode (developer escape hatch) uses only the legacy `auth.login_with_api_key` call. `auth.me` is also used by the plugin's preflight check to confirm the session is authenticated.
 
 ### Required Permissions
 
@@ -588,11 +601,11 @@ WebSocket responses include rate limit information in error messages when limits
 
 The plugin has two connection modes. Both are used transparently by `_api_call()` — reads and writes alike; `_api_call_mutate()` is a thin wrapper around the same function. See [Advanced-Features.md](Advanced-Features.md#connection-routing-broker-vs-direct-mode) for the concurrency rationale.
 
-### Broker Mode (preferred)
+### Broker Mode (required)
 
-When `/run/truenas-plugin/broker.sock` is present, every call from every plugin process on the node is forwarded to the `truenas-plugin-broker` daemon over that Unix socket — one newline-delimited JSON-RPC request per connection, closed immediately after the response. The broker holds a single persistent, authenticated WebSocket per `(host, api_key)` pair upstream to TrueNAS, so plugin processes never re-authenticate individually. Round-trip timeout is tunable via `tn_broker_timeout` (default 30s). See [Broker-Tests.md](Broker-Tests.md).
+When `/run/truenas-plugin/broker.sock` is present, every call from every plugin process on the node is forwarded to the `truenas-plugin-broker` daemon over that Unix socket; one newline-delimited JSON-RPC request per connection, closed immediately after the response. The daemon runs a prefork worker pool; each worker holds its own persistent, authenticated WebSocket per pool entry, keyed by `api_host` plus `sha1(api_key|api_username|auth_mechanism)`. Two storage entries on the same host with different credentials therefore get separate pools, and plugin processes never re-authenticate individually. Round-trip timeout is tunable via `tn_broker_timeout` (default 60s). See [Broker-Tests.md](Broker-Tests.md).
 
-### Direct Mode (fallback)
+### Direct Mode (developer escape hatch)
 
 **Behavior**:
 - First API call for a given `(host, api_key)` pair opens a WebSocket connection and caches it in-process (keyed on `host:api_key`)

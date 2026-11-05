@@ -78,10 +78,27 @@ The plugin automatically creates subsystems when needed, but you can create them
    - Configure:
      - **Name**: Short identifier (e.g., `proxmox-nvme`)
      - **Subsystem NQN**: Full NQN (e.g., `nqn.2005-10.org.freenas.ctl:proxmox-nvme`)
-     - **Allow Any Host**: Enable for testing, disable for production
+     - **Allow Any Host**: Leave enabled unless an allow-list is configured (see below)
    - Click **Save**
 
-   **SECURITY WARNING**: `allow_any_host: true` permits ANY host to access your storage without authentication. This should ONLY be used in isolated test environments. Production deployments MUST disable `allow_any_host` and explicitly link authorized hosts.
+   **`allow_any_host`:** the plugin writes `tn_nvme_allow_any_host`
+   (default `1`, i.e. TRUE) to the subsystem on create and on every
+   configfs resync, so the default lets any host NQN connect. Two TrueNAS
+   caveats decide when to set it to `0`:
+
+   - **TrueNAS 26.0.0-BETA.2 (and possibly other 26.x betas)** does not
+     render a freshly created subsystem at all when `allow_any_host` is
+     false and `allowed_hosts` is empty: the port gets no listener and no
+     host can connect. Populate `allowed_hosts` first, then set
+     `tn_nvme_allow_any_host 0`.
+   - **TrueNAS 25.10.x** aborts the configfs render when `allow_any_host`
+     is true and `allowed_hosts` is populated (issue #90): namespaces stay
+     unpublished and `nvme list` shows nothing. Set
+     `tn_nvme_allow_any_host 0` in storage.cfg in that case.
+
+   How to choose: keep the default while there is no host allow-list; set
+   `0` once `allowed_hosts` is populated on 25.10.x. DH-CHAP (below)
+   authenticates hosts independently of this setting.
 
 2. **Via TrueNAS API (plugin call):**
    ```bash
@@ -174,7 +191,7 @@ nvme gen-hostnqn > /etc/nvme/hostnqn
 
 **Option 1: Using Interactive Installer (Recommended)**
 
-The installer (v1.1.0+) includes a built-in configuration wizard that simplifies NVMe/TCP setup. Download and run it in one line:
+The installer includes a built-in configuration wizard that simplifies NVMe/TCP setup. Download and run it in one line:
 
 ```bash
 bash <(curl -sSL https://raw.githubusercontent.com/truenas/truenas-proxmox-plugin/main/install.sh)
@@ -259,7 +276,9 @@ truenasplugin: truenas-nvme
 | `tn_transport_mode` | Yes | Must be `nvme-tcp` for NVMe/TCP | `iscsi` |
 | `tn_subsystem_nqn` | Yes | NVMe subsystem NQN (format: `nqn.YYYY-MM.domain:name`) | None |
 | `tn_hostnqn` | No | Override host NQN (if not using `/etc/nvme/hostnqn`) | Auto-detected |
+| `tn_nvme_allow_any_host` | No | Value the plugin writes to the subsystem's `allow_any_host` on create and configfs resync. Leave at the default; set `0` only after populating `allowed_hosts` (see [Create NVMe Subsystem](#create-nvme-subsystem)). | `1` |
 | `tn_discovery_portal` | Yes | Primary portal IP:port | None |
+| `tn_nvme_manage_ports` | No | Create the `nvmet.port` and `port_subsys` records that match `tn_discovery_portal`/`tn_portals`. Set `0` on a TrueNAS HA pair with pre-provisioned VIP ports; the plugin then makes no `nvmet.port.*` calls. | `1` |
 | `tn_nvme_dhchap_secret` | No | Host authentication secret | None |
 | `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret | None |
 | `tn_nr_io_queues` | No | Pin NVMe/TCP I/O queue count per controller (1–256). Auto-detected when unset: uses online CPU count normally, or `floor(possible/2)` when any CPU is offline. Set manually if TrueNAS reports queue limit errors. | Auto-detected |
@@ -272,6 +291,14 @@ truenasplugin: truenas-nvme
 - The default port for NVMe/TCP is `4420` (different from iSCSI's `3260`)
 - TrueNAS SCALE 25.10+ automatically uses port 4420; manual specification is optional
 - `tn_subsystem_nqn` cannot be changed after creation (prevents orphaned volumes)
+
+**Portal scope:** the plugin logs in only to the portals listed in
+`tn_discovery_portal` and `tn_portals`. A portal that TrueNAS advertises on
+the subsystem but that is absent from both keys is skipped: no `nvme
+connect` is issued for it. On a multipath storage, list every path you want
+the plugin to establish in `tn_portals`. iSCSI follows the same rule since
+2.1.24~beta8, where addresses seen only through SendTargets discovery
+stopped being logged into.
 
 ### Verify Connection
 
@@ -442,6 +469,11 @@ ssh root@PROXMOX_NODE "perl -e 'use lib \"/usr/share/perl5\"; use PVE::Storage; 
 ```
 
 **Important**: When `allow_any_host: false`, ONLY explicitly linked hosts can connect to the subsystem. DH-CHAP authentication is an optional additional security layer.
+
+Changing the attribute on TrueNAS alone is not durable: the plugin writes
+`tn_nvme_allow_any_host` back on subsystem create and on every
+namespace-create resync. Set `tn_nvme_allow_any_host 0` in storage.cfg as
+well (see the caveats under [Create NVMe Subsystem](#create-nvme-subsystem)).
 
 ### Configure on Proxmox
 

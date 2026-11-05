@@ -34,6 +34,73 @@
 - New runtime dependencies: `libcrypt-pbkdf2-perl` and `libcrypt-urandom-perl`. Both ship in bookworm and trixie; `apt install truenas-proxmox-plugin` pulls them automatically.
 - `wiki/Configuration.md` documents the two new properties, each mechanism value, the TN version matrix, the ~1-3 s first-auth PBKDF2 cost at TrueNAS's 500000-iteration server-side default, and the old-key-format caveat (pre-25.10 `id-token` keys have no SCRAM credentials bound server-side).
 
+## Version 2.1.24~beta6 (October 23, 2026)
+
+### Bug Fixes
+
+- **#135: `volume_snapshot_info` no longer scans the whole NAS.** The previous implementation called `pool.snapshot.query` with no filter and no `extra.properties`, so on an array with several thousand snapshots it fetched every snapshot (~20 MB JSON, ~33 s per call) and then filtered client-side; `qm rollback` makes three such calls per invocation, putting rollbacks in the multi-minute range on a busy TrueNAS.
+- **Delegated dataset-scoped query.** The call now goes through the existing `_tn_snapshot_query_datasets` helper, which asks the middleware to filter by dataset and return only the `creation` property; the same one-dataset query answers in ~1.7 s on the reporter's measurements.
+- Removed the unused `_tn_snapshots` helper (dead code, zero callers).
+
+## Version 2.1.24~beta5 (October 22, 2026)
+
+### Bug Fixes
+
+- **#134: mid-provision reconnect could tear down a shared NVMe-oF subsystem.** A VM being provisioned could disconnect the shared controller and knock out every other running VM on the same subsystem: the `i==25` "stale connection" branch was the only mid-loop reconnect site without an in-use guard, and its precondition `!$ever_saw_devices` reads as "the subsystem is empty" while `$ever_saw_devices` is actually derived from the target UUID lookup's `linux_device_count`, not the subsystem total. It now applies the same in-use guard used by the `i==10` / `i==35` / `i==75` / `i==150` branches.
+- **`_nvme_check_devices_in_use` fail-safe.** The old `"$@ ? 0 : 1"` interpretation collapsed every non-success `run_command` exit (spawn failure, timeout, signal death) into "not in use". It now uses `run_command(noerr => 1)` and distinguishes exit 0 (in use) from exit 1 (idle) from anything else (unknown; fail-safe: assume in use).
+- **Structured reconnect logging** across every site in `_nvme_device_for_uuid`: FIRING / SKIPPED lines now carry the iteration label (`i==10` / `i==25` / `i==35` / `i==75` / `i==125` / `i==150`), the reason, the dev_paths count and the in_use value, so future field reports pin the responsible branch instead of inferring from timing.
+
+### Notes
+
+- Validated with a mocked unit test (the unpatched build fires the reconnect; the patched build logs the new SKIPPED line and does not call `_nvme_disconnect`) and two iterations of proxmox-test-runner storage-plugin-validation against truenas-storage (0 failed per iteration).
+
+## Version 2.1.24~beta4 (October 16, 2026)
+
+### Bug Fixes
+
+- **#132: broker was not ordered ahead of the PVE storage services.** The broker unit was `Type=simple` + `After=network-online.target` with nothing ordering it before pvestatd/pvedaemon. At boot those services called `status()` / `activate_storage()`, found `/run/truenas-plugin/broker.sock` not yet listening, and fell back to the plugin's direct-WS path, so each worker independently re-authenticated against TrueNAS and the first burst tripped TN's `auth.login_with_api_key` rate limit (20 calls / 60 s / IP) into a 10-minute cooldown. Every later `status()` tick stayed rate-limited, `pve-guests.service` waited forever, `graphical.target` was never reached and autostart VMs never fired.
+- **`debian/truenas-plugin-broker.service`** now uses `Type=notify` with `NotifyAccess=main` and adds `Before=pvestatd.service pvedaemon.service pveproxy.service`, so downstream services start only once the broker socket is accepting connections.
+- **`tools/truenas-plugin-broker`** gains a pure-Perl `sd_notify_ready()`, called immediately after `make_listener()` returns: no extra fork, no sd-daemon dependency.
+
+### Notes
+
+- Reproduced on pvevm1 with a provisioned 5-VM load on truenas-storage (`onboot=1`). Pre-fix: `graphical.target` never reached in 14 min, `pvestatd.log` full of "broker socket missing" followed by "TrueNAS API rate limited", broker burned 20 min of CPU time. Post-fix: clean boot.
+
+## Version 2.1.24~beta3 (October 16, 2026)
+
+### New Features
+
+- **`tn_nvme_manage_ports`** (boolean, default 1) lets an admin disable the plugin's auto-creation of `nvmet.port` and `nvmet.port_subsys` records on TrueNAS. It is required for a TrueNAS HA pair on 25.10.x, where the middleware's `nvmet` `map_attrs()` refuses any `addr_traddr` that is not the VIP: a physical-IP port record triggers `KeyError` in `write_config()` and aborts the whole render, leaving namespaces unpublished in configfs.
+- **HA mode (`tn_nvme_manage_ports=0`)** leaves `nvmet.port.*` to the admin, who pre-provisions exactly one VIP-based port record; TrueNAS renders that port on both controllers automatically and kernel multipath + ANA handles failover. The plugin still manages subsystem lookup, namespace lifecycle and initiator connect, and refuses to auto-create a missing subsystem, printing the three `midclt` calls needed to bootstrap it instead.
+
+### Documentation
+
+- HA deployment is now documented beyond the bare property reference: README gains an HA callout in the NVMe/TCP section; `wiki/NVMe-Setup.md` adds an "HA Pair (Dual Controller) Deployment" subsection with the `midclt` recipe; `wiki/Best-Practices.md` expands the "NVMe/TCP HA failover" section (storage config, TrueNAS-side pre-provisioning, failover verification, NGUID cross-check); `wiki/Known-Limitations.md` records the middleware constraint that drives the knob.
+- Supporting material added: `wiki/HA-NVMe-TCP-Validation.md` (50-iteration failover record, 50/50 PASS, 0 fio errors, 20.6 s average pause) and `wiki/HA-Transport-Comparison.md` (ANA-vs-ALUA transport comparison explaining why the NVMe/TCP recovery path behaves differently from iSCSI).
+
+## Version 2.1.24~beta2 (October 14, 2026)
+
+### Bug Fixes
+
+- **#131: emergency reconnect after 150 iterations is now gated on a devices-in-use check.** The alpha26 trade-off accepted a ~500 ms NVMe controller drop as the lesser evil compared with a guaranteed activate failure, but on a multi-tenant deployment that produced QEMU io-error escalation on unrelated running consumers of the shared subsystem, leaving VMs with "deleted" `/dev/nvmeN` handles that needed a restart to recover.
+- If any device on the shared subsystem is open by another process on this host, the emergency reconnect is now refused and this activate fails cleanly instead, leaving the other consumers undisturbed; an unused subsystem still goes through the emergency reconnect. Admin remediation: verify the namespace on TrueNAS, then manually `nvme disconnect` + `nvme connect` when no consumer is using the subsystem. Reported by dsmitty166.
+- The fail-safe assume-in-use behaviour is kept when `fuser` is not available on the host; if the state cannot be verified, nothing is disrupted.
+
+### Notes
+
+- New unit tests in `t/nvme/06-emergency-reconnect-gate.t` cover both paths and the fail-safe.
+
+## Version 2.1.24~beta1 (October 12, 2026)
+
+### Bug Fixes
+
+- **#130: `check_config` no longer demands required fields on the edit path.** PVE calls `check_config` with only the submitted delta on `pvesm set <id> -<flag>`, not the merged stored config, so requiring `tn_api_host` / `tn_api_key` / `tn_dataset` (and the transport-specific requires) made every edit die with "tn_api_host is required". Required-field dies now gate on `$create`; format and warning checks still fire whenever the relevant field is actually submitted. The issue's reproducer (`pvesm set <id> -disable true`) now works. Reported by O'Neill, Will (4wrxb).
+- **#99: `$TESTED_APIVER` bumped from 15 to 16.** PVE bumped the pve-storage APIVER during the 2.1.23 release cycle, so users on PVE 9.2+ saw "implementing an older storage API" on every `pvesm` call. Reported by blunweon, noberasco.
+
+### Notes
+
+- Validation: 20/20 PASS on the proxmox-test-runner storage-plugin-validation suite against truenas-storage on the four-node cluster (pve/pve2/proxmox2/pvevm1) on 2026-10-11/12. Each round: 19 validated, 2 unsupported, 3 not tested for prerequisite reasons, 0 failed.
+
 ## Version 2.1.23~beta7 (September 29, 2026)
 
 ### New Features
