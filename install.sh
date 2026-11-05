@@ -1377,7 +1377,7 @@ get_deb_download_url() {
     local deb_url
 
     deb_url=$(echo "$release_data" | \
-        grep -Po '"browser_download_url":\s*"\K[^"]*truenas-proxmox-plugin_[^"]*_all\.deb(?=")' | head -1)
+        grep -Po '"browser_download_url":\s*"\K[^"]*truenas-proxmox-plugin_[^"/]*\.deb(?=")' | head -1)
 
     if [[ -z "$deb_url" ]]; then
         return 1
@@ -1729,10 +1729,39 @@ validate_plugin() {
     fi
 }
 
+# Broker enforcement started in 2.1.21~alpha1. Earlier modules also reference
+# BROKER_SOCKET_PATH, but they load the broker opportunistically and still run
+# standalone, so match the hard failure instead of the constant (issue #133).
+plugin_file_requires_broker() {
+    local file="$1"
+    grep -q 'broker socket missing at' "$file" 2>/dev/null
+}
+
+broker_unit_installed() {
+    [[ -f /usr/lib/systemd/system/truenas-plugin-broker.service ]]
+}
+
+# Shared refusal for any path that would install a broker-era .pm on a node
+# without the broker (manual install, rollback, artifact install).
+refuse_plugin_without_broker() {
+    error "This plugin version requires the truenas-plugin-broker service,"
+    error "but the service is not installed on this node."
+    error "Install the Debian package instead of copying TrueNASPlugin.pm:"
+    error "  apt install /path/to/truenas-proxmox-plugin_<version>_all.deb"
+    return 1
+}
+
 # Install plugin file
 install_plugin_file() {
     local source="$1"
     local backup="${2:-true}"
+
+    # Refuse before the backup: a rejected file must not leave a backup entry
+    # for a plugin that was never installed.
+    if plugin_file_requires_broker "$source" && ! broker_unit_installed; then
+        refuse_plugin_without_broker
+        return 1
+    fi
 
     # Create backup if requested and file exists
     if [[ "$backup" == "true" ]]; then
@@ -1740,19 +1769,6 @@ install_plugin_file() {
             error "Backup failed. Installation aborted for safety."
             return 1
         }
-    fi
-
-    # A release that carries the session broker cannot run from the .pm file
-    # alone: _ws_get_persistent() dies when /run/truenas-plugin/broker.sock is
-    # absent, so a file-only install breaks every storage operation (issue
-    # #133). Refuse instead of installing a plugin that cannot work.
-    if grep -q 'BROKER_SOCKET_PATH' "$source" 2>/dev/null && \
-       [[ ! -f /usr/lib/systemd/system/truenas-plugin-broker.service ]]; then
-        error "This plugin version requires the truenas-plugin-broker service,"
-        error "but the service is not installed on this node."
-        error "Install the Debian package instead of copying TrueNASPlugin.pm:"
-        error "  apt install /path/to/truenas-proxmox-plugin_<version>_all.deb"
-        return 1
     fi
 
     # Validate plugin before installation
@@ -1811,14 +1827,24 @@ install_package_file() {
         return 1
     fi
 
-    backup_plugin || {
-        error "Backup failed. Installation aborted for safety."
-        return 1
-    }
+    if [[ -f "$PLUGIN_FILE" ]]; then
+        backup_plugin || {
+            error "Backup failed. Installation aborted for safety."
+            return 1
+        }
+    else
+        # Module missing but the package may be installed (#105 drift), so
+        # capture the package before it is replaced.
+        backup_installed_deb || true
+    fi
 
     info "Installing package $(basename "$package")..."
+    # --reinstall: installing the package version that is already on disk is a
+    # no-op for apt, which would leave a hand-copied or deleted module in place
+    # while the installer reports success. This is the repair path for #133.
     if ! DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y --allow-downgrades -o Dpkg::Options::=--force-confdef \
+        apt-get install --reinstall -y --allow-downgrades \
+        -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold "$package" >"$install_log" 2>&1; then
         warning "apt install failed; retrying with dpkg and dependency repair"
         if ! dpkg -i "$package" >>"$install_log" 2>&1; then
@@ -1833,28 +1859,39 @@ install_package_file() {
         fi
     fi
 
-    local installed_version
+    # dpkg-query reports a version for removed and half-configured packages
+    # too, so check the state and the file the plugin actually needs.
+    local installed_version installed_status
     installed_version=$(dpkg-query -W -f='${Version}' truenas-proxmox-plugin 2>/dev/null || true)
-    if [[ -z "$installed_version" ]]; then
-        error "truenas-proxmox-plugin is not registered with dpkg after install"
+    installed_status=$(dpkg-query -W -f='${Status}' truenas-proxmox-plugin 2>/dev/null || true)
+    if [[ "$installed_status" != "install ok installed" ]]; then
+        error "truenas-proxmox-plugin is not fully installed (dpkg status: ${installed_status:-unknown})"
+        return 1
+    fi
+    if [[ ! -f "$PLUGIN_FILE" ]]; then
+        error "Package installed but $PLUGIN_FILE is missing"
         return 1
     fi
     success "Package installed: truenas-proxmox-plugin $installed_version"
 
-    # The broker is mandatory from 2.1.21 onward. Start it and prove the
-    # socket exists before reporting success, otherwise the next storage
-    # operation fails with a missing-broker error (issue #133).
-    systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
-    if ! timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart truenas-plugin-broker 2>/dev/null; then
-        error "Failed to start truenas-plugin-broker.service"
-        error "Run: systemctl status truenas-plugin-broker"
-        return 1
+    # The broker is required only by the releases that ship it: 2.1.21 and
+    # later. Pre-broker packages are valid installs and must not fail here.
+    if dpkg -L truenas-proxmox-plugin 2>/dev/null | grep -q 'truenas-plugin-broker.service'; then
+        systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
+        if ! timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart truenas-plugin-broker 2>/dev/null; then
+            error "Failed to start truenas-plugin-broker.service"
+            error "Run: systemctl status truenas-plugin-broker"
+            return 1
+        fi
+        if ! wait_for_broker_socket 30; then
+            error "truenas-plugin-broker did not create /run/truenas-plugin/broker.sock"
+            return 1
+        fi
+        success "Broker socket present: /run/truenas-plugin/broker.sock"
+    else
+        info "This package predates the session broker; no broker service expected"
     fi
-    if ! wait_for_broker_socket 30; then
-        error "truenas-plugin-broker did not create /run/truenas-plugin/broker.sock"
-        return 1
-    fi
-    success "Broker socket present: /run/truenas-plugin/broker.sock"
+    rm -f "$install_log"
     log "INFO" "Package installed: $installed_version"
     return 0
 }
@@ -2151,30 +2188,43 @@ install_package_on_remote_node() {
         return 1
     fi
 
-    # Back up the current module so a rollback keeps the previous file.
-    ssh "root@${node_ip}" "mkdir -p ${BACKUP_DIR} && \
+    # Back up the current module so a rollback keeps the previous file. -n so
+    # a remote call cannot consume the caller's stdin (issue #133 review).
+    ssh -n "root@${node_ip}" "mkdir -p ${BACKUP_DIR} && \
         if [[ -f ${PLUGIN_FILE} ]]; then \
             cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\$(date +%Y%m%d_%H%M%S); \
         fi" >/dev/null 2>&1 || true
 
     local install_output
-    if ! install_output=$(ssh "root@${node_ip}" "
+    if ! install_output=$(ssh -n "root@${node_ip}" "
         set -e
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y --allow-downgrades \
             -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-            ${remote_pkg} >/tmp/truenas-plugin-remote-install.log 2>&1 || {
-            tail -n 20 /tmp/truenas-plugin-remote-install.log
-            rm -f ${remote_pkg}
-            exit 1
-        }
+            ${remote_pkg} >/tmp/truenas-plugin-remote-install.log 2>&1; then
+            dpkg -i ${remote_pkg} >>/tmp/truenas-plugin-remote-install.log 2>&1 || {
+                tail -n 20 /tmp/truenas-plugin-remote-install.log
+                rm -f ${remote_pkg}
+                exit 1
+            }
+            DEBIAN_FRONTEND=noninteractive apt-get -f install -y >>/tmp/truenas-plugin-remote-install.log 2>&1 || {
+                tail -n 20 /tmp/truenas-plugin-remote-install.log
+                rm -f ${remote_pkg}
+                exit 1
+            }
+        fi
         rm -f ${remote_pkg}
-        systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
-        systemctl restart truenas-plugin-broker
-        for _ in {1..30}; do
-            [[ -S /run/truenas-plugin/broker.sock ]] && break
-            sleep 1
-        done
-        [[ -S /run/truenas-plugin/broker.sock ]] || { echo 'broker socket missing'; exit 1; }
+        status=\$(dpkg-query -W -f='\${Status}' truenas-proxmox-plugin 2>/dev/null || true)
+        [[ \"\$status\" == 'install ok installed' ]] || { echo \"dpkg status: \$status\"; exit 1; }
+        [[ -f ${PLUGIN_FILE} ]] || { echo 'plugin file missing'; exit 1; }
+        if dpkg -L truenas-proxmox-plugin 2>/dev/null | grep -q 'truenas-plugin-broker.service'; then
+            systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
+            systemctl restart truenas-plugin-broker
+            for _ in {1..30}; do
+                [[ -S /run/truenas-plugin/broker.sock ]] && break
+                sleep 1
+            done
+            [[ -S /run/truenas-plugin/broker.sock ]] || { echo 'broker socket missing'; exit 1; }
+        fi
         echo 'package installed'
     " 2>&1); then
         log "ERROR" "Remote package installation to $node_ip failed: $install_output"
@@ -2183,7 +2233,7 @@ install_package_on_remote_node() {
     fi
     log "INFO" "Remote package installation to $node_ip: package installed"
 
-    if ! ssh "root@${node_ip}" "
+    if ! ssh -n "root@${node_ip}" "
         if ! systemctl restart pvedaemon pvestatd pvescheduler 2>/dev/null; then
             echo 'daemon restart failed'
             exit 1
@@ -12491,6 +12541,13 @@ restore_plugin_from_backup() {
     # Validate backup before restoring
     if ! validate_plugin "$backup_file"; then
         error "Backup file validation failed"
+        return 1
+    fi
+
+    # A raw .pm restore bypasses install_plugin_file, so apply the same
+    # broker requirement here (issue #133).
+    if plugin_file_requires_broker "$backup_file" && ! broker_unit_installed; then
+        refuse_plugin_without_broker
         return 1
     fi
 
