@@ -1,5 +1,9 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.24 (November 5, 2026)
+
+GA release. Same code as 2.1.24~beta8; no fixes or feature changes beyond beta8. See the 2.1.24~beta1 through 2.1.24~beta8 entries below for what landed across the cycle (HA NVMe/TCP auto-detect, SCRAM-SHA-512 / SCRAM-PLUS / API_KEY_PLAIN authentication, snapshot and lifecycle fixes, PVE 9.2 boot-race fix, IPv6 iSCSI portals, and configured-portals-only iSCSI login).
+
 ## Version 2.1.24~beta8 (November 4, 2026)
 
 ### Bug Fixes

@@ -1,3 +1,15 @@
+truenas-proxmox-plugin (2.1.24) unstable; urgency=medium
+
+  * Release 2.1.24. Promotes 2.1.24~beta8 to the stable 2.1.24 series
+    with no code changes. The beta cycle covered: broker-based auth with
+    SCRAM-SHA-512 / SCRAM-PLUS (channel binding) / API_KEY_PLAIN /
+    legacy fallback (betas 1-7), snapshot and lifecycle fixes, HA iSCSI
+    tuning, IPv6 iSCSI portals (#140), and configured-portals-only login
+    (#91). See the 2.1.24~beta1 through 2.1.24~beta8 entries in
+    debian/changelog and wiki/Changelog.md for the full detail.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 05 Nov 2026 14:39:28 -0500
+
 truenas-proxmox-plugin (2.1.24~beta8) unstable; urgency=medium
 
   * fix: log into configured iSCSI portals only. After SendTargets

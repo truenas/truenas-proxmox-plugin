@@ -181,7 +181,7 @@ Replace:
 
 IPv6 portals are written in brackets, `tn_discovery_portal [fd00::10]:3260`
 (and the same in `tn_portals`); the TrueNAS portal must listen on an IPv6
-address or `::`. Supported from 2.1.24~beta8 (#140).
+address or `::`. Supported from 2.1.24 (#140).
 
 `content images,rootdir` enables both VM disks and LXC container rootfs on this
 storage. Drop `rootdir` if you only need VM disks; see
@@ -466,6 +466,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.23
-**Last Updated**: August 5, 2026
+**Version**: 2.1.24
+**Last Updated**: November 5, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
