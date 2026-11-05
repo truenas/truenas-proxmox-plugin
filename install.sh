@@ -19,6 +19,19 @@ set -euo pipefail
 # ============================================================================
 
 readonly INSTALLER_VERSION="2.0.0"
+
+# Private temp directory. Predictable /tmp names (spinner script, backup path,
+# install log, artifacts) were writable by any local user and could be used to
+# clobber root-owned files through symlinks.
+INSTALL_TMPDIR=""
+ensure_install_tmpdir() {
+    if [[ -n "${INSTALL_TMPDIR:-}" && -d "$INSTALL_TMPDIR" ]]; then
+        return 0
+    fi
+    INSTALL_TMPDIR=$(mktemp -d /tmp/truenas-installer.XXXXXX) || return 1
+    chmod 700 "$INSTALL_TMPDIR"
+    return 0
+}
 readonly GITHUB_REPO="truenas/truenas-proxmox-plugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
@@ -192,7 +205,11 @@ start_spinner() {
 
     # Create a wrapper script that runs spinner in its own process group
     # This ensures all children (including sleep) can be killed together
-    local spinner_script="/tmp/.installer-spinner-$$.sh"
+    if ! ensure_install_tmpdir; then
+        warning "Cannot create a private temp directory; spinner disabled"
+        return 0
+    fi
+    local spinner_script="$INSTALL_TMPDIR/spinner.sh"
     cat > "$spinner_script" << 'SPINNER_EOF'
 #!/bin/bash
 # Create new process group
@@ -263,7 +280,6 @@ stop_spinner() {
         fi
 
         # Clean up temporary spinner script
-        rm -f "/tmp/.installer-spinner-$$.sh" 2>/dev/null || true
 
         SPINNER_PID=""
     fi
@@ -317,6 +333,25 @@ print_banner() {
         printf '%b%s%b\n' "$color" "$line" "$c0"
         i=$((i + 1))
     done
+}
+
+# One installer per node. Two concurrent runs share /etc/pve/storage.cfg,
+# the package state and the backup directory; an append from one run is lost
+# when the other rewrites the file. An advisory lock on tmpfs cannot go stale:
+# the kernel drops it when the process dies, including SIGKILL.
+acquire_installer_lock() {
+    local lock_file="/run/truenas-plugin-installer.lock"
+
+    exec 9>"$lock_file" || {
+        error "Cannot open installer lock $lock_file"
+        return 1
+    }
+    if ! flock -n 9; then
+        error "Another installer instance is already running on this node."
+        error "Wait for it to finish, then run the installer again."
+        return 1
+    fi
+    return 0
 }
 
 # Initialize logging
@@ -872,7 +907,13 @@ cleanup_all() {
 
     # Extra safety: kill any orphaned sleep 0.1 processes that belong to this script
     # This is a safety net for any edge cases
-    pkill -f "sleep 0\.1" 2>/dev/null || true
+    :
+
+    # Remove the private temp directory (predictable /tmp paths were a
+    # symlink target for any local user).
+    if [[ -n "${INSTALL_TMPDIR:-}" && -d "$INSTALL_TMPDIR" ]]; then
+        rm -rf "$INSTALL_TMPDIR"
+    fi
 
     # Restore cursor visibility
     printf "\033[?25h" >&2
@@ -1405,7 +1446,13 @@ verify_package_checksum() {
         return 0
     fi
 
-    sums_file="/tmp/truenas-plugin-SHA256SUMS.$$"
+    # mktemp: $$ is shared by subshells, so concurrent verifications used to
+    # overwrite and delete each other's checksum file.
+    ensure_install_tmpdir || true
+    sums_file=$(mktemp "${INSTALL_TMPDIR:-/tmp}/SHA256SUMS.XXXXXX") || {
+        error "Could not create a temporary file for SHA256SUMS"
+        return 1
+    }
     if ! download_file "$sums_url" "$sums_file" >/dev/null 2>&1 || [[ ! -s "$sums_file" ]]; then
         rm -f "$sums_file"
         error "Could not download SHA256SUMS from $sums_url"
@@ -1560,12 +1607,22 @@ backup_plugin() {
         timestamp=$(date '+%Y%m%d_%H%M%S')
         local version
         version=$(get_installed_version)
-        local backup_file="${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version:-unknown}.${timestamp}"
-
-        cp "$PLUGIN_FILE" "$backup_file" || {
-            error "Failed to create backup"
+        # Unique per process: two runs in the same second used to collide and
+        # one aborted on cp EEXIST. Write to a mktemp file then rename so a
+        # reader never sees a partial module and parallel writers never share
+        # a temporary path.
+        local backup_file="${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version:-unknown}.${timestamp}.$$"
+        local backup_tmp
+        backup_tmp=$(mktemp "${BACKUP_DIR}/.module-backup.XXXXXX") || {
+            error "Failed to create backup temp file"
             return 1
         }
+
+        if ! cp "$PLUGIN_FILE" "$backup_tmp" || ! mv -f "$backup_tmp" "$backup_file"; then
+            rm -f "$backup_tmp"
+            error "Failed to create backup"
+            return 1
+        fi
 
         success "Backup created: $backup_file"
         log "INFO" "Backup created: $backup_file"
@@ -1605,7 +1662,11 @@ backup_installed_deb() {
         return 0
     fi
     mkdir -p "$BACKUP_DIR"
-    if ! cp "$src" "$dest" 2>/dev/null; then
+    # Atomic publish: a rollback reader must never see a partial package.
+    local deb_tmp
+    deb_tmp=$(mktemp "${BACKUP_DIR}/.deb-backup.XXXXXX") || return 0
+    if ! cp "$src" "$deb_tmp" 2>/dev/null || ! mv -f "$deb_tmp" "$dest" 2>/dev/null; then
+        rm -f "$deb_tmp" 2>/dev/null
         log "WARNING" "backup_installed_deb: failed to copy $(basename "$src") to $BACKUP_DIR"
         return 0
     fi
@@ -1860,7 +1921,8 @@ wait_for_broker_socket() {
 # dependency tree that dpkg alone cannot (issue #133).
 install_package_file() {
     local package="$1"
-    local install_log="/tmp/truenas-plugin-install.$$.log"
+    ensure_install_tmpdir || true
+    local install_log="${INSTALL_TMPDIR:-/tmp}/install.log"
 
     if [[ ! -f "$package" ]]; then
         error "Package file not found: $package"
@@ -1907,16 +1969,29 @@ install_package_file() {
         error "Package installed but $PLUGIN_FILE is missing"
         return 1
     fi
+    # A concurrent or previously failed run can leave a different version
+    # installed; never report success for the wrong build.
+    local expected_version
+    expected_version=$(dpkg-deb -f "$package" Version 2>/dev/null || true)
+    if [[ -n "$expected_version" && "$installed_version" != "$expected_version" ]]; then
+        error "Version mismatch: installed $installed_version, expected $expected_version"
+        return 1
+    fi
     success "Package installed: truenas-proxmox-plugin $installed_version"
 
     # The broker is required only by the releases that ship it: 2.1.21 and
     # later. Pre-broker packages are valid installs and must not fail here.
     if dpkg -L truenas-proxmox-plugin 2>/dev/null | grep -q 'truenas-plugin-broker.service'; then
         systemctl enable truenas-plugin-broker >/dev/null 2>&1 || true
-        if ! timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl restart truenas-plugin-broker 2>/dev/null; then
-            error "Failed to start truenas-plugin-broker.service"
-            error "Run: systemctl status truenas-plugin-broker"
-            return 1
+        # postinst enabled and started (or try-restarted) the broker. Restart it
+        # here only when it is not running, otherwise the socket is torn down
+        # while the freshly restarted daemons do their first poll.
+        if ! systemctl is-active --quiet truenas-plugin-broker 2>/dev/null; then
+            if ! timeout "$SYSTEMCTL_RESTART_TIMEOUT_SECS" systemctl start truenas-plugin-broker 2>/dev/null; then
+                error "Failed to start truenas-plugin-broker.service"
+                error "Run: systemctl status truenas-plugin-broker"
+                return 1
+            fi
         fi
         if ! wait_for_broker_socket 30; then
             error "truenas-plugin-broker did not create /run/truenas-plugin/broker.sock"
@@ -2138,7 +2213,8 @@ install_plugin_on_remote_node() {
         fi
     fi
 
-    local temp_remote="/tmp/TrueNASPlugin.pm.$$"
+    local token="$$-$RANDOM$RANDOM"
+    local temp_remote="/tmp/TrueNASPlugin.pm.${token}"
     log "INFO" "Starting remote installation to $node_ip (version $version)"
 
     # Transfer plugin file to remote node
@@ -2176,7 +2252,7 @@ install_plugin_on_remote_node() {
     backup_result=$(ssh "root@${node_ip}" "
         if [[ -f ${PLUGIN_FILE} ]]; then
             remote_ts=\$(date +%Y%m%d_%H%M%S)
-            if cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\${remote_ts} 2>&1; then
+            if cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\${remote_ts}.${token} 2>&1; then
                 echo 'success'
             else
                 echo 'failed'
@@ -2194,8 +2270,11 @@ install_plugin_on_remote_node() {
     fi
 
     # Install plugin on remote node atomically with error handling
-    if ! ssh "root@${node_ip}" "
+    if ! ssh -n "root@${node_ip}" "
         set -e
+        # Serialize with package installs on this node.
+        exec 8>/var/lock/truenas-plugin-install.lock
+        flock -w 120 8 || { echo 'another install is in progress on this node'; exit 1; }
         mkdir -p \$(dirname ${PLUGIN_FILE})
         cp ${temp_remote} ${PLUGIN_FILE}
         chown root:root ${PLUGIN_FILE}
@@ -2262,7 +2341,10 @@ install_package_on_remote_node() {
         return 1
     fi
 
-    local remote_pkg="/tmp/truenas-proxmox-plugin.$$.deb"
+    # Per-call token: $$ is shared by subshells, so two installs launched from
+    # one shell used to overwrite each other's remote file.
+    local token="$$-$RANDOM$RANDOM"
+    local remote_pkg="/tmp/truenas-proxmox-plugin.${token}.deb"
     log "INFO" "Starting remote package installation to $node_ip (version $version)"
 
     if ! scp -o ConnectTimeout=10 -o BatchMode=yes -q "$package" "root@${node_ip}:${remote_pkg}" 2>/dev/null; then
@@ -2287,12 +2369,17 @@ install_package_on_remote_node() {
     # a remote call cannot consume the caller's stdin (issue #133 review).
     ssh -n "root@${node_ip}" "mkdir -p ${BACKUP_DIR} && \
         if [[ -f ${PLUGIN_FILE} ]]; then \
-            cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\$(date +%Y%m%d_%H%M%S); \
+            cp ${PLUGIN_FILE} ${BACKUP_DIR}/TrueNASPlugin.pm.backup.${version}.\$(date +%Y%m%d_%H%M%S).${token}; \
         fi" >/dev/null 2>&1 || true
 
     local install_output
     if ! install_output=$(ssh -n "root@${node_ip}" "
         set -e
+        # Serialize installs per node so two admins starting from different
+        # nodes cannot interleave apt/dpkg on this one.
+        exec 8>/var/lock/truenas-plugin-install.lock
+        flock -w 120 8 || { echo 'another install is in progress on this node'; exit 1; }
+        expected=\$(dpkg-deb -f ${remote_pkg} Version 2>/dev/null || true)
         if ! DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y --allow-downgrades \
             -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
             ${remote_pkg} >/tmp/truenas-plugin-remote-install.log 2>&1; then
@@ -2309,7 +2396,9 @@ install_package_on_remote_node() {
         fi
         rm -f ${remote_pkg}
         status=\$(dpkg-query -W -f='\${Status}' truenas-proxmox-plugin 2>/dev/null || true)
+        installed=\$(dpkg-query -W -f='\${Version}' truenas-proxmox-plugin 2>/dev/null || true)
         [[ \"\$status\" == 'install ok installed' ]] || { echo \"dpkg status: \$status\"; exit 1; }
+        [[ -z \"\$expected\" || \"\$installed\" == \"\$expected\" ]] || { echo \"version mismatch: \$installed != \$expected\"; exit 1; }
         [[ -f ${PLUGIN_FILE} ]] || { echo 'plugin file missing'; exit 1; }
         if dpkg -L truenas-proxmox-plugin 2>/dev/null | grep -q 'truenas-plugin-broker.service'; then
             # postinst enabled/started the broker; only start it if inactive.
@@ -2529,7 +2618,7 @@ perform_cluster_wide_installation() {
             echo
             info "Updating local node ($current_node) via APT..."
             if apt_bootstrap_install; then
-                if restart_pve_services; then
+                if verify_pve_services_running; then
                     successful_nodes+=("$current_node")
                 else
                     warning "Local node updated but services may need manual restart"
@@ -2628,11 +2717,12 @@ perform_cluster_wide_installation() {
         download_url=$(get_plugin_download_url "$release_data")
     fi
 
+    ensure_install_tmpdir || true
     local temp_file
     if [[ "$artifact_kind" == "deb" ]]; then
-        temp_file="/tmp/truenas-proxmox-plugin.$$.deb"
+        temp_file="${INSTALL_TMPDIR:-/tmp}/artifact.deb"
     else
-        temp_file="/tmp/TrueNASPlugin.pm.$$"
+        temp_file="${INSTALL_TMPDIR:-/tmp}/artifact.pm"
     fi
     if ! download_plugin "$download_url" "$temp_file"; then
         error "Failed to download ${artifact_kind} artifact"
@@ -2728,11 +2818,12 @@ perform_cluster_wide_installation() {
             sleep 5
 
             # Download plugin again for retry
+            ensure_install_tmpdir || true
             local retry_temp
             if [[ "$artifact_kind" == "deb" ]]; then
-                retry_temp="/tmp/truenas-proxmox-plugin.retry.$$.deb"
+                retry_temp="${INSTALL_TMPDIR:-/tmp}/retry.deb"
             else
-                retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
+                retry_temp="${INSTALL_TMPDIR:-/tmp}/retry.pm"
             fi
             local retry_ready="false"
             if download_plugin "$download_url" "$retry_temp"; then
@@ -2852,8 +2943,11 @@ perform_installation() {
             error "APT update failed"
             return 1
         fi
-        if ! restart_pve_services; then
-            warning "Plugin updated but services may need manual restart"
+        # debian/postinst restarted the PVE daemons; verify instead of a
+        # second restart (the old call double-restarted every APT update).
+        if ! verify_pve_services_running; then
+            warning "Plugin updated but some PVE services are not running"
+            warning "Check: systemctl status pvedaemon pvestatd pvescheduler"
         fi
         local updated_version
         updated_version=$(get_installed_version) || updated_version="unknown"
@@ -2913,11 +3007,12 @@ perform_installation() {
     info "Download URL: $download_url"
 
     # Download to temporary location
+    ensure_install_tmpdir || true
     local temp_file
     if [[ "$artifact_kind" == "deb" ]]; then
-        temp_file="/tmp/truenas-proxmox-plugin.$$.deb"
+        temp_file="${INSTALL_TMPDIR:-/tmp}/artifact.deb"
     else
-        temp_file="/tmp/TrueNASPlugin.pm.$$"
+        temp_file="${INSTALL_TMPDIR:-/tmp}/artifact.pm"
     fi
     if ! download_plugin "$download_url" "$temp_file"; then
         error "Failed to download ${artifact_kind} artifact"
@@ -3633,9 +3728,18 @@ run_diagnostics_bundle() {
             warning "Diagnostics bundle creation interrupted by user (CTRL+C)"
         fi
 
-        # Restore traps
-        trap - EXIT INT TERM
+        # Restore the installer's traps instead of clearing them.
+        if [[ -n "${DIAG_SAVED_EXIT:-}" ]]; then eval "$DIAG_SAVED_EXIT"; fi
+        if [[ -n "${DIAG_SAVED_INT:-}" ]]; then eval "$DIAG_SAVED_INT"; fi
+        if [[ -n "${DIAG_SAVED_TERM:-}" ]]; then eval "$DIAG_SAVED_TERM"; fi
     }
+
+    # Preserve the installer's global traps. Diagnostics used to clear them,
+    # which disabled the pveproxy deferral and the global cleanup for the rest
+    # of the session after a bundle was created.
+    DIAG_SAVED_EXIT=$(trap -p EXIT || true)
+    DIAG_SAVED_INT=$(trap -p INT || true)
+    DIAG_SAVED_TERM=$(trap -p TERM || true)
 
     # Set traps for cleanup
     trap 'cleanup_diagnostics INT' INT
@@ -3858,8 +3962,10 @@ run_diagnostics_bundle() {
     stop_spinner
     echo -e "\r$(printf "%-30s " "Compressing bundle:")${c2}✓${c0} Complete"
 
-    # Clear the cleanup trap since we completed successfully
-    trap - EXIT INT TERM
+    # Restore the installer traps since we completed successfully
+    if [[ -n "${DIAG_SAVED_EXIT:-}" ]]; then eval "$DIAG_SAVED_EXIT"; fi
+    if [[ -n "${DIAG_SAVED_INT:-}" ]]; then eval "$DIAG_SAVED_INT"; fi
+    if [[ -n "${DIAG_SAVED_TERM:-}" ]]; then eval "$DIAG_SAVED_TERM"; fi
 
     echo
     success "Diagnostics bundle created successfully"
@@ -12048,10 +12154,12 @@ menu_configure_storage() {
             start_spinner
             local backup_path
             local backup_error
-            backup_error=$(backup_storage_cfg 2>&1 1>/tmp/backup_path_$$)
+            ensure_install_tmpdir || true
+            backup_path_file="${INSTALL_TMPDIR:-/tmp}/backup_path"
+            backup_error=$(backup_storage_cfg 2>&1 1>"$backup_path_file")
             local backup_exit=$?
-            backup_path=$(cat /tmp/backup_path_$$ 2>/dev/null)
-            rm -f /tmp/backup_path_$$ 2>/dev/null
+            backup_path=$(cat "$backup_path_file" 2>/dev/null)
+            rm -f "$backup_path_file" 2>/dev/null
             stop_spinner
             if [[ $backup_exit -eq 0 ]] && [[ -n "$backup_path" ]]; then
                 echo -e "\r$(printf "%-30s " "Configuration backup:")${c2}✓${c0} $backup_path"
@@ -13457,12 +13565,16 @@ main() {
     fi
 
     # Initialize logging
+    if ! acquire_installer_lock; then
+        exit $EXIT_ERROR
+    fi
+
     init_logging
 
     # Clean up any orphaned processes from previous runs
     # This prevents accumulation of zombie spinners
     pkill -f "bash.*install\.sh.*while" 2>/dev/null || true
-    pkill -f "sleep 0\.1" 2>/dev/null || true
+    :
 
     # Perform checks (with banner for non-interactive mode only)
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
