@@ -216,6 +216,16 @@ ok(!$@, "seed: zvol deleted (orphan extent/namespace now dangles)")
 # and what its `disk` / `device_path` field looks like now. If TN
 # cascade-deletes or clears the field, Fix 1's grep-by-disk-path
 # cannot possibly reuse -- we need a different anchor.
+#
+# Modern TrueNAS (observed on 28.0 MASTER, 2026-11-05) cascade-deletes
+# iSCSI extents and nvmet namespaces when the backing zvol is deleted,
+# so the reuse-by-id assertion in step 6 is unsatisfiable there: the
+# plugin's reuse path has no orphan to find. That is what Fix 1 was
+# meant to defend against, so in that case the fix is still correct --
+# the defence is just moot on a TN that does the cascade itself.
+# Capture the cascade state so step 6 can skip accordingly instead of
+# failing on healthy modern TN.
+my $orphan_cascade_deleted = 0;
 if ($mode eq 'iscsi') {
     my $e = eval {
         PVE::Storage::Custom::TrueNASPlugin::_api_call(
@@ -226,6 +236,7 @@ if ($mode eq 'iscsi') {
             ($e->[0]{disk} // '<undef>') . "]");
     } else {
         say_diag("post-delete orphan extent id=$orphan_id CASCADE-DELETED by TN");
+        $orphan_cascade_deleted = 1;
     }
 } else {
     my $n = eval {
@@ -237,6 +248,7 @@ if ($mode eq 'iscsi') {
             ($n->[0]{device_path} // '<undef>') . "]");
     } else {
         say_diag("post-delete orphan namespace id=$orphan_id CASCADE-DELETED by TN");
+        $orphan_cascade_deleted = 1;
     }
 }
 
@@ -274,8 +286,14 @@ is(scalar(@matching), 1,
     "exactly one " . ($mode eq 'iscsi' ? "extent" : "namespace") .
     " references $zvol_path (no duplicate)");
 
-is($matching[0]{id}, $orphan_id,
-    "the surviving id ($matching[0]{id}) is the seeded orphan id ($orphan_id) -- reuse confirmed");
+SKIP: {
+    skip "orphan was cascade-deleted by TN, plugin reuse path cannot fire " .
+         "(and need not -- the orphan-collision failure mode this test " .
+         "defends against is already prevented by TN itself on this version)",
+         1 if $orphan_cascade_deleted;
+    is($matching[0]{id}, $orphan_id,
+        "the surviving id ($matching[0]{id}) is the seeded orphan id ($orphan_id) -- reuse confirmed");
+}
 
 # ---------------------------------------------------------------------
 # 6. Cleanup.

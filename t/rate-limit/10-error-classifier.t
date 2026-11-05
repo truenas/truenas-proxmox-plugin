@@ -55,8 +55,12 @@ my @connection_errors = (
     'WS write failed: at /usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm line 865.',
     'WS payload truncated',
     'WS len exceeded',
-    'WebSocket closed unexpectedly',
-    'WebSocket.*closed mid-frame',
+    # 'WebSocket closed unexpectedly' / 'WebSocket.*closed mid-frame'
+    # are deliberately NOT classified as connection errors; see
+    # TrueNASPlugin.pm _is_connection_error (lines 283-295) for why
+    # (middlewared JSON-RPC trace payloads can include Python
+    # 'RpcWebSocketApp object at 0x... closed=False' repr strings on
+    # benign errors, and WebSocket.*closed matched them).
     # POSIX socket errors:
     'Broken pipe',
     'broken pipe',
