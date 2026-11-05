@@ -1385,6 +1385,45 @@ get_deb_download_url() {
     echo "$deb_url"
 }
 
+# Get the SHA256SUMS asset URL for a release, if published.
+get_sums_download_url() {
+    local release_data="$1"
+    echo "$release_data" | \
+        grep -Po '"browser_download_url":\s*"\K[^"]*/SHA256SUMS(?=")' | head -1
+}
+
+# Verify a downloaded package against the release's SHA256SUMS. Asset names
+# use dots ("2.1.24.beta8") while the checksum file uses tildes
+# ("2.1.24~beta8"), so match the computed digest instead of the filename.
+verify_package_checksum() {
+    local package="$1"
+    local release_data="$2"
+    local sums_url sums_file actual
+
+    if ! sums_url=$(get_sums_download_url "$release_data"); then
+        warning "Release publishes no SHA256SUMS; skipping checksum verification"
+        return 0
+    fi
+
+    sums_file="/tmp/truenas-plugin-SHA256SUMS.$$"
+    if ! download_file "$sums_url" "$sums_file" >/dev/null 2>&1 || [[ ! -s "$sums_file" ]]; then
+        rm -f "$sums_file"
+        error "Could not download SHA256SUMS from $sums_url"
+        return 1
+    fi
+
+    actual=$(sha256sum "$package" | awk '{print $1}')
+    if ! grep -q "^${actual} " "$sums_file"; then
+        error "Checksum mismatch for $(basename "$package")"
+        error "Digest $actual is not listed in $sums_url"
+        rm -f "$sums_file"
+        return 1
+    fi
+    rm -f "$sums_file"
+    success "Checksum verified against SHA256SUMS"
+    return 0
+}
+
 # Compare two semantic versions
 # Returns: 0 if equal, 1 if v1 > v2, 2 if v1 < v2
 compare_versions() {
@@ -2188,6 +2227,18 @@ install_package_on_remote_node() {
         return 1
     fi
 
+    # scp is reliable, but verify the bytes landed intact before running a
+    # root-level package install from them.
+    local local_hash remote_hash
+    local_hash=$(sha256sum "$package" | awk '{print $1}')
+    remote_hash=$(ssh -n "root@${node_ip}" "sha256sum ${remote_pkg} 2>/dev/null | awk '{print \$1}'")
+    if [[ "$local_hash" != "$remote_hash" ]]; then
+        log "ERROR" "Remote package installation to $node_ip: transfer checksum mismatch"
+        echo "Transfer checksum mismatch"
+        ssh -n "root@${node_ip}" "rm -f ${remote_pkg}" 2>/dev/null || true
+        return 1
+    fi
+
     # Back up the current module so a rollback keeps the previous file. -n so
     # a remote call cannot consume the caller's stdin (issue #133 review).
     ssh -n "root@${node_ip}" "mkdir -p ${BACKUP_DIR} && \
@@ -2552,6 +2603,11 @@ perform_cluster_wide_installation() {
         return 1
     fi
 
+    if [[ "$artifact_kind" == "deb" ]] && ! verify_package_checksum "$temp_file" "$release_data"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
     # Initialize arrays for tracking installation results
     declare -a successful_nodes=()
     declare -a failed_nodes=()
@@ -2632,7 +2688,17 @@ perform_cluster_wide_installation() {
             else
                 retry_temp="/tmp/TrueNASPlugin.pm.retry.$$"
             fi
+            local retry_ready="false"
             if download_plugin "$download_url" "$retry_temp"; then
+                if [[ "$artifact_kind" == "deb" ]] && \
+                   ! verify_package_checksum "$retry_temp" "$release_data"; then
+                    error "Retry download failed checksum verification"
+                    rm -f "$retry_temp"
+                else
+                    retry_ready="true"
+                fi
+            fi
+            if [[ "$retry_ready" == "true" ]]; then
                 echo
                 info "Retrying failed nodes..."
                 echo
@@ -2809,6 +2875,11 @@ perform_installation() {
     fi
     if ! download_plugin "$download_url" "$temp_file"; then
         error "Failed to download ${artifact_kind} artifact"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    if [[ "$artifact_kind" == "deb" ]] && ! verify_package_checksum "$temp_file" "$release_data"; then
         rm -f "$temp_file"
         return 1
     fi
