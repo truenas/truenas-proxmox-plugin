@@ -6401,20 +6401,185 @@ sub _nvme_get_subsystem_device_paths {
     return @paths;
 }
 
-# Check if any of the given device paths are in use by a running process.
-# Returns: 1 if any device is in use OR the probe outcome is uncertain
-# (unsafe to disconnect), 0 only when fuser conclusively reports no process
-# holds any of them.
+# Enumerate the sysfs "major:minor" ids for each NVMe device path plus any
+# of its partitions. Returns (\%id_to_path, undef) on success, or
+# (undef, "reason") when a required sysfs read fails -- the caller treats
+# the latter as fail-safe "in use".
+sub _nvme_dev_major_minors {
+    my (@device_paths) = @_;
+    my %id;
+    for my $dev (@device_paths) {
+        my $base = $dev;
+        $base =~ s{^/dev/}{};
+        my $sys = "/sys/block/$base";
+        my $num;
+        if (!open(my $fh, '<', "$sys/dev")) {
+            return (undef, "cannot read $sys/dev: $!");
+        } else {
+            $num = <$fh>;
+            close $fh;
+            chomp $num if defined $num;
+        }
+        return (undef, "empty $sys/dev") unless defined $num && length $num;
+        $id{$num} = $dev;
+        # NVMe partitions are named like nvme1n1p1, nvme1n1p2, ...
+        if (opendir(my $dh, $sys)) {
+            while (my $e = readdir($dh)) {
+                next unless $e =~ /^\Q$base\Ep\d+$/;
+                if (open(my $pfh, '<', "$sys/$e/dev")) {
+                    my $pnum = <$pfh>;
+                    close $pfh;
+                    chomp $pnum if defined $pnum;
+                    $id{$pnum} = "/dev/$e" if defined $pnum && length $pnum;
+                }
+            }
+            closedir($dh);
+        }
+    }
+    return (\%id, undef);
+}
+
+# Scan /sys/dev/block/<maj>:<min>/holders. Catches dm-* stackers (LVM,
+# dm-multipath, dm-crypt, md) that keep a kernel reference to the device
+# without any userspace file descriptor -- fuser does not see those.
+# Returns (1, [matches]) if any holder exists, (0, undef) if none, or
+# (undef, "reason") on probe error.
+sub _nvme_scan_holders {
+    my ($id_hr) = @_;
+    my @hits;
+    for my $majmin (keys %$id_hr) {
+        my $holders_dir = "/sys/dev/block/$majmin/holders";
+        if (!opendir(my $hd, $holders_dir)) {
+            # No holders directory for this device is normal on exotic
+            # setups; absence of the directory is not the same as a
+            # probe failure, so only treat EACCES / EIO as "unknown".
+            next if $!{ENOENT} || $!{ENOTDIR};
+            return (undef, "cannot read $holders_dir: $!");
+        } else {
+            my @h = grep { $_ !~ /^\.\.?$/ } readdir($hd);
+            closedir($hd);
+            push @hits, { path => $id_hr->{$majmin}, holders => [@h] } if @h;
+        }
+    }
+    return @hits ? (1, \@hits) : (0, undef);
+}
+
+# Walk every mount namespace reachable via /proc/*/ns/mnt and check
+# whether any of our device IDs appears as the major:minor field (field 3)
+# in that namespace's mountinfo. Catches a filesystem mounted inside a
+# container or any other namespace, where no process on the host holds a
+# file descriptor on the device node but the kernel still refcounts it.
+# Returns (1, {hit info}) on a match, (0, undef) when nothing matches, or
+# (undef, "reason") on probe error.
+sub _nvme_scan_mount_namespaces {
+    my ($id_hr) = @_;
+    my $pdh;
+    if (!opendir($pdh, '/proc')) {
+        return (undef, "cannot open /proc: $!");
+    }
+    my %seen_ns;
+    while (my $pid = readdir($pdh)) {
+        next unless $pid =~ /^\d+$/;
+        my $ns = readlink("/proc/$pid/ns/mnt");
+        next unless defined $ns;
+        next if $seen_ns{$ns}++;
+        open(my $mi, '<', "/proc/$pid/mountinfo") or next;  # process gone
+        while (my $line = <$mi>) {
+            # mountinfo field layout:
+            #   1 mount_id  2 parent_id  3 major:minor  4 root  5 mount_point ...
+            my @f = split /\s+/, $line, 11;
+            next unless defined $f[2];
+            if (exists $id_hr->{$f[2]}) {
+                close $mi;
+                closedir($pdh);
+                chomp $line;
+                return (1, {
+                    path => $id_hr->{$f[2]},
+                    pid  => $pid,
+                    ns   => $ns,
+                    line => $line,
+                });
+            }
+        }
+        close $mi;
+    }
+    closedir($pdh);
+    return (0, undef);
+}
+
+# Check if any of the given device paths are in use by a running process,
+# by another mount namespace, or by a kernel stack (dm/md/mapper). Returns
+# 1 whenever we see use OR the probe outcome is uncertain (unsafe to
+# disconnect); returns 0 only when ALL three probes conclusively report
+# the device is free.
 #
-# #134: the earlier version returned $@ ? 0 : 1, which collapsed every
-# non-zero exit — including spawn failures, timeouts, and signal deaths —
-# into "not in use". The real "not in use" signal from fuser -s is
-# specifically exit 1; anything else is "unknown, assume in use" so a
-# shared-subsystem reconnect can't silently blast through on a flaky probe.
+# Three probes, in order (any "yes" short-circuits, any "unknown" is
+# treated as "yes" for safety):
+#   1. /sys/dev/block/<maj>:<min>/holders    — dm/md/mapper stackers
+#   2. /proc/*/mountinfo across mount ns'es  — container / namespaced FS
+#   3. fuser -s                               — userspace open fd's
+#
+# #134: the i==25 branch (and siblings) in _nvme_device_for_uuid rely on
+# this signal to decide whether to tear a controller down. The earlier
+# version only looked at fuser, which misses two kernel-held cases both
+# reproducible on a stock PVE 9 node with a loop device:
+#   a) a filesystem mounted only in another mount namespace (container
+#      rootfs, `unshare -m` mount) -- no process holds the fd;
+#   b) a device-mapper holder (LVM, dm-multipath, dm-crypt) stacked on
+#      the device -- the kernel is the holder.
+# fuser returns rc=1 for both, which the earlier code read as "idle"; a
+# reconnect then tears the subsystem down while the device is actually
+# in use.
+#
+# The earlier version also collapsed every non-zero fuser exit — spawn
+# failures, timeouts, signal deaths — into "not in use". The real "not
+# in use" signal is specifically exit 1; anything else is "unknown,
+# assume in use" so a shared-subsystem reconnect can't silently blast
+# through on a flaky probe.
 sub _nvme_check_devices_in_use {
     my ($scfg, @device_paths) = @_;
     return 0 unless @device_paths;
 
+    my ($id_hr, $id_err) = _nvme_dev_major_minors(@device_paths);
+    if (!$id_hr) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] in_use probe: $id_err — assuming "
+            . scalar(@device_paths) . " device(s) in use");
+        return 1;
+    }
+
+    # Probe 1: kernel holders (dm/md/mapper).
+    my ($h_hit, $h_info) = _nvme_scan_holders($id_hr);
+    if (!defined $h_hit) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] in_use probe: holders scan failed ($h_info) — assuming in use");
+        return 1;
+    }
+    if ($h_hit) {
+        for my $m (@$h_info) {
+            _log($scfg, 1, 'warning',
+                "[TrueNAS] in_use probe: $m->{path} has kernel holder(s): "
+                . join(',', @{$m->{holders}}) . " — in use (dm/md/mapper stack)");
+        }
+        return 1;
+    }
+
+    # Probe 2: mountinfo across every reachable mount namespace.
+    my ($m_hit, $m_info) = _nvme_scan_mount_namespaces($id_hr);
+    if (!defined $m_hit) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] in_use probe: mountinfo scan failed ($m_info) — assuming in use");
+        return 1;
+    }
+    if ($m_hit) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] in_use probe: $m_info->{path} mounted in mnt-ns "
+            . "$m_info->{ns} via pid $m_info->{pid}: " . substr($m_info->{line}, 0, 160)
+            . " — in use");
+        return 1;
+    }
+
+    # Probe 3: fuser (open file descriptors on the device node).
     if (! -x '/usr/bin/fuser' && ! -x '/bin/fuser') {
         _log($scfg, 1, 'warning', "[TrueNAS] fuser not found, cannot verify device safety — assuming in use");
         return 1;
