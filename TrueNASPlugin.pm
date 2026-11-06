@@ -6405,6 +6405,15 @@ sub _nvme_get_subsystem_device_paths {
 # of its partitions. Returns (\%id_to_path, undef) on success, or
 # (undef, "reason") when a required sysfs read fails -- the caller treats
 # the latter as fail-safe "in use".
+#
+# Per-path NVMe devices (nvme<X>c<Y>n<Z>) that show up with
+# nvme_core.multipath=Y have a sysfs node but no /sys/block/<name>/dev
+# file, because they are not independent block devices; they are
+# per-controller views of the head namespace. The holders and mountinfo
+# live on the head device (nvme<X>n<Z>), which the caller also passes in.
+# A per-path entry with no dev file is silently skipped here, since
+# fuser still runs against the whole @device_paths list later and will
+# see any userspace file descriptor on the per-path device.
 sub _nvme_dev_major_minors {
     my (@device_paths) = @_;
     my %id;
@@ -6412,6 +6421,12 @@ sub _nvme_dev_major_minors {
         my $base = $dev;
         $base =~ s{^/dev/}{};
         my $sys = "/sys/block/$base";
+        if (!-e "$sys/dev") {
+            # No dev file (per-path NVMe device in multipath=Y mode, or a
+            # path that simply is not a block device). Skip rather than
+            # treat as a probe failure.
+            next;
+        }
         my $num;
         if (!open(my $fh, '<', "$sys/dev")) {
             return (undef, "cannot read $sys/dev: $!");
