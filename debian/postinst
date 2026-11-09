@@ -41,19 +41,23 @@ enable_broker() {
 }
 
 restart_proxmox_services() {
-    # The plugin-loading daemons (pvedaemon / pvestatd / pvescheduler / the HA
-    # daemons) do not touch the operator's web-UI session. pveproxy IS the web
-    # UI gateway and serves the xterm.js terminal that streams `apt upgrade`
-    # output when an operator updates from the UI (issue #60): restarting it
-    # synchronously drops that terminal mid-transaction. So we restart the
-    # plugin-loading daemons now and DEFER pveproxy ~10s via a systemd one-shot
-    # timer -- by the time it fires the apt transaction (and its terminal) has
-    # closed, so pveproxy still picks up the new plugin without dropping the
-    # session.
+    # pvestatd, pvescheduler, and the HA daemons don't touch the operator's
+    # web-UI session, so we restart them immediately.
+    #
+    # pvedaemon and pveproxy both DO. pveproxy is the web-UI gateway, and the
+    # REST connection that streams `apt upgrade` progress dies if pveproxy is
+    # restarted mid-transaction (issue #60). pvedaemon owns every terminal in
+    # the Proxmox web UI (Updates -> Upgrade, and any node Shell) through
+    # termproxy as its child; restarting pvedaemon immediately SIGTERMs its
+    # children, killing the apt/dpkg driving THIS postinst and leaving the
+    # package half-installed with triggers pending (issue #144). So we DEFER
+    # both pvedaemon and pveproxy ~10s via a systemd one-shot timer -- by the
+    # time the timers fire the apt transaction (and its terminal) has closed,
+    # so both daemons pick up the new plugin without dropping the session.
     #
     # TRUENAS_PLUGIN_NO_RESTART=1 is an escape hatch for operators who reach
     # the UI through a jump host or a PAM-mediated password vault and can't
-    # afford even the deferred pveproxy restart: it skips the PVE-side restarts
+    # afford even the deferred restart: it skips the PVE-side restarts
     # entirely and prints the command to run later. The truenas-plugin-broker
     # restart in enable_broker() still runs unconditionally -- our own service,
     # does not touch the web UI session.
@@ -64,31 +68,44 @@ restart_proxmox_services() {
         return 0
     fi
     if have_systemd; then
-        # Plugin-loading daemons, restarted immediately (try-restart: HA units
-        # may not be active on a standalone node, and that is not fatal here).
-        systemctl try-restart pvedaemon pvestatd pvescheduler pve-ha-crm pve-ha-lrm || true
-        # Defer pveproxy ~10s so an active web-UI upgrade terminal survives the
-        # transaction; fall back to an immediate restart if systemd-run is
-        # unavailable. A pending timer from a concurrent installer run is
-        # detected and NOT re-scheduled: a second `systemd-run` with the same
-        # unit name fails while the first timer is pending, and the fallback
-        # would restart pveproxy immediately -- dropping the terminal this
-        # deferral exists to protect (issue #60).
-        if ! systemctl is-active --quiet truenas-pveproxy-restart.timer 2>/dev/null; then
-            # A previously failed transient unit keeps its name in the failed
-            # state and makes systemd-run refuse to re-create it; reset stale
-            # failed state so the deferral does not fall back to an immediate
-            # pveproxy restart mid-transaction. No-op when the units are clean.
-            systemctl reset-failed truenas-pveproxy-restart.timer \
-                truenas-pveproxy-restart.service 2>/dev/null || true
-            if command -v systemd-run >/dev/null 2>&1; then
-                systemd-run --on-active=10s --unit=truenas-pveproxy-restart \
-                    systemctl try-restart pveproxy >/dev/null 2>&1 || \
-                    systemctl try-restart pveproxy || true
-            else
-                systemctl try-restart pveproxy || true
+        # Non-terminal-owning daemons: restarted immediately. try-restart
+        # is used because HA units may not be active on a standalone node,
+        # and that is not fatal here.
+        systemctl try-restart pvestatd pvescheduler pve-ha-crm pve-ha-lrm || true
+        # pvedaemon and pveproxy are BOTH deferred ~10s so an active
+        # web-UI upgrade session survives this transaction; fall back to
+        # an immediate restart if systemd-run is unavailable. A pending
+        # timer from a concurrent installer run is detected and NOT
+        # re-scheduled: a second `systemd-run` with the same unit name
+        # fails while the first timer is pending, and the fallback would
+        # restart the daemon immediately -- dropping the terminal or REST
+        # session this deferral exists to protect.
+        #
+        # pvedaemon: every terminal in the Proxmox web UI (Updates ->
+        # Upgrade, or node Shell) runs as a termproxy child of pvedaemon.
+        # Restarting pvedaemon immediately SIGTERMs its children, killing
+        # the apt/dpkg driving THIS postinst and leaving the package half-
+        # installed with triggers pending (issue #144).
+        # pveproxy: the REST connection that the upgrade progress bar
+        # rides on dies if pveproxy is restarted mid-transaction (#60).
+        for svc in pvedaemon pveproxy; do
+            unit="truenas-${svc}-restart"
+            if systemctl is-active --quiet "${unit}.timer" 2>/dev/null; then
+                continue
             fi
-        fi
+            # A previously failed transient unit keeps its name in the
+            # failed state and makes systemd-run refuse to re-create it;
+            # reset stale failed state so the deferral does not fall back
+            # to an immediate restart mid-transaction. No-op when clean.
+            systemctl reset-failed "${unit}.timer" "${unit}.service" 2>/dev/null || true
+            if command -v systemd-run >/dev/null 2>&1; then
+                systemd-run --on-active=10s --unit="${unit}" \
+                    systemctl try-restart "$svc" >/dev/null 2>&1 || \
+                    systemctl try-restart "$svc" || true
+            else
+                systemctl try-restart "$svc" || true
+            fi
+        done
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
         invoke-rc.d pvestatd restart || true
