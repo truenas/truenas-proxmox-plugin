@@ -2,6 +2,14 @@
 
 set -e
 
+# Source debconf at the top (standard Debian pattern) so db_get works
+# from any helper function below without each one re-sourcing it.
+# Guard it so sh -n-ing the script on a system without debconf stays
+# clean.
+if [ -r /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
 PLUGIN_PATH="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 STORAGE_CFG="/etc/pve/storage.cfg"
 BROKER_BIN="/usr/sbin/truenas-plugin-broker"
@@ -38,6 +46,68 @@ enable_broker() {
             echo "  Check: systemctl status $BROKER_UNIT && journalctl -u $BROKER_UNIT -n 50" >&2
         fi
     fi
+}
+
+MULTIPATH_CONF=/etc/multipath/conf.d/truenas-proxmox-plugin.conf
+MULTIPATH_TEMPLATE=/usr/share/truenas-proxmox-plugin/truenas-proxmox-plugin.conf
+
+configure_multipath() {
+    # Install, refresh, or remove the TrueNAS multipath profile based on
+    # the debconf answer truenas-proxmox-plugin/setup-multipath. Default
+    # debconf answer is "false", so this is a strict opt-in; unattended
+    # installs leave multipath state alone.
+    #
+    # The on-disk file at $MULTIPATH_CONF is NOT a dpkg conffile: it is
+    # managed here so we can keep it in sync with the shipped template on
+    # upgrade without a dpkg prompt (when unmodified), and never clobber
+    # local edits (when modified).
+    #
+    # TRUENAS_PLUGIN_NO_MULTIPATH_RELOAD=1 skips the multipathd reload
+    # part only; the file is still written/removed per debconf.
+    local wanted="false"
+    if command -v db_get >/dev/null 2>&1; then
+        db_get truenas-proxmox-plugin/setup-multipath 2>/dev/null || true
+        wanted="${RET:-false}"
+    fi
+
+    if [ "$wanted" = "true" ]; then
+        if [ ! -f "$MULTIPATH_TEMPLATE" ]; then
+            echo "WARNING: $MULTIPATH_TEMPLATE missing; multipath profile not installed." >&2
+            return 0
+        fi
+        mkdir -p /etc/multipath/conf.d
+        if [ ! -f "$MULTIPATH_CONF" ]; then
+            cp "$MULTIPATH_TEMPLATE" "$MULTIPATH_CONF"
+            echo "Installed TrueNAS multipath profile at $MULTIPATH_CONF"
+        elif cmp -s "$MULTIPATH_TEMPLATE" "$MULTIPATH_CONF"; then
+            : # already up to date, no-op
+        else
+            # On-disk differs. It is either a previous version of our
+            # template OR a locally-edited copy. We can't distinguish, so
+            # leave it alone and point the operator at the newer template.
+            echo "NOTE: $MULTIPATH_CONF differs from the shipped template; leaving it alone." >&2
+            echo "      New template at $MULTIPATH_TEMPLATE; diff and update manually to refresh." >&2
+        fi
+    else
+        # Opted out (or unanswered -- default false). Remove our file iff
+        # it is still our unmodified shipped copy; leave local edits alone.
+        if [ -f "$MULTIPATH_CONF" ] && [ -f "$MULTIPATH_TEMPLATE" ] \
+           && cmp -s "$MULTIPATH_TEMPLATE" "$MULTIPATH_CONF"; then
+            rm -f "$MULTIPATH_CONF"
+            echo "Removed TrueNAS multipath profile at $MULTIPATH_CONF (opted out)"
+        fi
+    fi
+
+    if [ "${TRUENAS_PLUGIN_NO_MULTIPATH_RELOAD:-0}" = "1" ]; then
+        return 0
+    fi
+    if ! command -v multipathd >/dev/null 2>&1; then
+        return 0
+    fi
+    if have_systemd && ! systemctl is-active --quiet multipathd.service 2>/dev/null; then
+        return 0
+    fi
+    multipathd reconfigure >/dev/null 2>&1 || true
 }
 
 restart_proxmox_services() {
@@ -219,6 +289,7 @@ case "$1" in
         fi
 
         enable_broker
+        configure_multipath
         restart_proxmox_services
         ;;
     abort-upgrade|abort-remove|abort-deconfigure|triggered)

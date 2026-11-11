@@ -4,3 +4,4 @@ install.sh usr/share/truenas-proxmox-plugin/
 tools/truenas-plugin-broker usr/sbin/
 tools/truenas-plugin-lvm-filter usr/sbin/
 debian/truenas-plugin-broker.service usr/lib/systemd/system/
+debian/multipath/truenas-proxmox-plugin.conf usr/share/truenas-proxmox-plugin/

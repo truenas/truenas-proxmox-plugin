@@ -1,0 +1,21 @@
+Template: truenas-proxmox-plugin/setup-multipath
+Type: boolean
+Default: false
+Description: Install the TrueNAS multipath profile?
+ The plugin ships a device{} profile for TrueNAS iSCSI targets with the
+ vendor's recommended settings: ALUA hardware handler, immediate failback,
+ no_path_retry queue, fast_io_fail_tmo 10, dev_loss_tmo 30. These values
+ hold a path down across a TrueNAS HA failover (~20-60 s) without failing
+ I/O out.
+ .
+ Answering yes installs this profile at
+ /etc/multipath/conf.d/truenas-proxmox-plugin.conf and asks multipathd to
+ reload its configuration. Future plugin upgrades keep the profile in
+ sync. You can change your mind later with
+ 'dpkg-reconfigure truenas-proxmox-plugin'.
+ .
+ Answer no if you manage /etc/multipath.conf yourself, if this node does
+ not use iSCSI (NVMe/TCP only), or if you want to try the plugin without
+ touching system-wide multipath configuration. The plugin itself does
+ not require the profile to function; the profile only changes how
+ dm-multipath merges TrueNAS iSCSI paths.

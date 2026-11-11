@@ -12002,6 +12002,24 @@ menu_configure_storage() {
             else
                 use_multipath="1"
             fi
+            # Offer to install the plugin's TrueNAS multipath profile
+            # (debian/postinst reads this debconf answer and writes the
+            # drop-in to /etc/multipath/conf.d/, then reloads multipathd).
+            if [[ "$use_multipath" == "1" ]] && command -v debconf-set-selections >/dev/null 2>&1; then
+                echo
+                read -rp "Install the plugin's TrueNAS multipath profile (/etc/multipath/conf.d/truenas-proxmox-plugin.conf)? [Y/n]: " install_mp_profile
+                if [[ ! "$install_mp_profile" =~ ^[Nn] ]]; then
+                    echo "truenas-proxmox-plugin truenas-proxmox-plugin/setup-multipath boolean true" \
+                        | debconf-set-selections
+                    DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -fnoninteractive truenas-proxmox-plugin \
+                        >/dev/null 2>&1 || true
+                    if [[ -f /etc/multipath/conf.d/truenas-proxmox-plugin.conf ]]; then
+                        success "Installed /etc/multipath/conf.d/truenas-proxmox-plugin.conf (multipathd reloaded)"
+                    else
+                        warning "Multipath profile install skipped (dpkg-reconfigure did not complete)"
+                    fi
+                fi
+            fi
         else
             # NVMe/TCP uses native multipath
             info "NVMe/TCP uses native kernel multipath (no dm-multipath required)"

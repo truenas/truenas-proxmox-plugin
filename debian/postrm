@@ -2,6 +2,10 @@
 
 set -e
 
+if [ -r /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
 BACKUP_DIR="/var/lib/truenas-plugin-backups"
 LOG_FILE="/var/log/truenas-installer.log"
 BROKER_RUNDIR="/run/truenas-plugin"
@@ -13,6 +17,23 @@ case "$1" in
         rm -rf "$BROKER_RUNDIR"
         rm -f "$LOG_FILE"
         rm -f "$BROKER_LOG"
+
+        # Remove the multipath drop-in if it's still our file; leave a
+        # locally-edited copy alone so operators don't lose custom tuning.
+        MP_CONF=/etc/multipath/conf.d/truenas-proxmox-plugin.conf
+        MP_TMPL=/usr/share/truenas-proxmox-plugin/truenas-proxmox-plugin.conf
+        if [ -f "$MP_CONF" ] && [ -f "$MP_TMPL" ] && cmp -s "$MP_TMPL" "$MP_CONF"; then
+            rm -f "$MP_CONF"
+            if command -v multipathd >/dev/null 2>&1 \
+               && [ -d /run/systemd/system ] && systemctl is-active --quiet multipathd.service 2>/dev/null; then
+                multipathd reconfigure >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # Drop debconf state so a reinstall re-prompts cleanly.
+        if command -v db_purge >/dev/null 2>&1; then
+            db_purge || true
+        fi
 
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true

@@ -1,0 +1,9 @@
+#!/bin/sh
+# debconf config script: ask the operator whether to install the
+# TrueNAS multipath profile. The question is only shown on first
+# install (or when the admin runs dpkg-reconfigure). The default is
+# "no", so unattended installs leave multipath state alone.
+set -e
+. /usr/share/debconf/confmodule
+db_input medium truenas-proxmox-plugin/setup-multipath || true
+db_go || true
