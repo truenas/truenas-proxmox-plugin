@@ -939,6 +939,44 @@ sub properties {
                           "no longer touch nvmet.port.* records.",
             type => 'boolean', optional => 1, default => 1,
         },
+
+        # Cross-node stale WWID reconcile (#147).
+        # When a volume is deleted on one cluster node, the other nodes keep
+        # the local SCSI device and multipath map for that LUN. ALUA then
+        # reports the paths as failed and multipathd spams the log every 5 s.
+        # On top of the obvious noise, TrueNAS reuses LUN IDs, so a new
+        # extent getting the same LUN later surfaces behind the stale
+        # devices on peer nodes. This set of knobs enables a hybrid cleanup:
+        # on delete the plugin drops a per-WWID hint into /etc/pve (which
+        # pmxcfs replicates to every node), and on each activate/status
+        # every node checks local sysfs against the hints (fast) and
+        # against TrueNAS's current extent list (floor reconcile).
+        tn_reconcile => {
+            description => "Reconcile stale per-LUN SCSI devices and multipath maps across " .
+                          "cluster nodes after a volume is deleted on any one node (#147). " .
+                          "Hint-driven: the deleting node writes a WWID marker under /etc/pve, " .
+                          "pmxcfs replicates it, and every peer's next activate_storage/status " .
+                          "sweeps its own sysfs. A floor reconcile also cross-checks local " .
+                          "WWIDs against TrueNAS's current extent list to catch leftovers from " .
+                          "before this knob existed, or from a delete that happened while this " .
+                          "node was down. iSCSI + multipath only. Default: 1.",
+            type => 'boolean', optional => 1, default => 1,
+        },
+        tn_reconcile_grace_s => {
+            description => "Seconds a WWID must be absent from TrueNAS before the floor " .
+                          "reconcile (#147) considers it an orphan and tears it down. " .
+                          "Protects against brief create-then-vanish windows while another " .
+                          "node is provisioning a new extent. Default: 120.",
+            type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 3600,
+        },
+        tn_reconcile_hint_ttl_s => {
+            description => "Seconds a #147 stale-WWID hint lives in /etc/pve before the node " .
+                          "that wrote it unlinks the marker. Longer values give peers that were " .
+                          "offline at delete time more chances to pick it up on their next " .
+                          "activate; shorter values keep the hint directory tidier. The floor " .
+                          "reconcile is the safety net regardless of this value. Default: 600.",
+            type => 'integer', optional => 1, default => 600, minimum => 60, maximum => 86400,
+        },
     };
 }
 sub options {
@@ -1027,6 +1065,11 @@ sub options {
         tn_nvme_reconnect_delay => { optional => 1 },
         tn_nvme_keep_alive_tmo  => { optional => 1 },
         tn_nvme_manage_ports    => { optional => 1 },
+
+        # Cross-node stale WWID reconcile (#147)
+        tn_reconcile            => { optional => 1 },
+        tn_reconcile_grace_s    => { optional => 1 },
+        tn_reconcile_hint_ttl_s => { optional => 1 },
     };
 }
 
@@ -4263,6 +4306,400 @@ sub _unlink_status_stamp {
     my ($status_method) = @_;
     my $path = _status_stamp_path($status_method);
     unlink($path);
+}
+
+# ======== Cross-node stale WWID reconcile (#147) ========
+#
+# When one cluster node deletes a volume, the LUN disappears from TrueNAS
+# but every other node that was logged in still holds the backing SCSI
+# device and the multipath map. ALUA then reports every path failed and
+# multipathd logs "tur checker reports path is down" every 5 s forever;
+# worse, TrueNAS reuses LUN numbers, so a later extent getting the same
+# LUN lands behind the stale sd on peer nodes.
+#
+# The fix is two mechanisms running side by side:
+#
+#   1) Push. The deleting node drops a WWID marker into
+#      /etc/pve/priv/truenas-plugin/stale-wwid/<storeid>/<wwid>. Because
+#      /etc/pve is pmxcfs, the marker is replicated cluster-wide for
+#      free. The pusher removes its own marker after
+#      tn_reconcile_hint_ttl_s so the directory doesn't accumulate.
+#
+#   2) Pull. Each node's activate_storage and status call
+#      _reconcile_stale_wwids, which walks the hint directory and tears
+#      down any WWID that is locally present. status also runs
+#      _floor_reconcile_wwids, a rate-limited sweep that compares local
+#      iSCSI sd* devices against TrueNAS's current targetextent list
+#      and drops any that have been absent from the array for longer
+#      than tn_reconcile_grace_s. Floor fails CLOSED on any TN query
+#      error - "we are uncertain" never deletes.
+#
+# iSCSI + multipath only. Scope is limited to sd devices behind
+# /sys/class/iscsi_session entries whose targetname matches the
+# configured tn_target_iqn, so other TrueNAS storages or non-TN iSCSI
+# are never touched.
+
+# Package variables (not use-constant) so tests can locally override them
+# to a tempdir without the module's compile-time baking the paths in.
+our $STALE_WWID_HINT_ROOT  = '/etc/pve/priv/truenas-plugin/stale-wwid';
+our $RECONCILE_STAMP_DIR   = '/run/truenas-plugin';
+our $ISCSI_SESSION_ROOT    = '/sys/class/iscsi_session';
+our $SYS_BLOCK_ROOT        = '/sys/block';
+# Floor reconcile is rate-limited to this interval regardless of how
+# often status() is called. pvestatd fires every 10 s; a floor sweep
+# does one TN query + a sysfs walk, so tying it to each tick is wasteful.
+our $FLOOR_RECONCILE_MIN_S = 60;
+
+# Normalize a WWID string. Expected shape: lower-case hex starting with
+# '3' (naa.3-type) followed by 32 more hex characters (33 total, which
+# is what scsi_id reports for TrueNAS iSCSI LUNs). Anything else is
+# rejected to keep untrusted input from being spliced into sysfs or
+# shell arguments.
+sub _sane_wwid {
+    my ($w) = @_;
+    return undef unless defined $w;
+    return undef unless $w =~ /^(3[0-9a-f]{32})$/;
+    return $1;
+}
+
+# TrueNAS extent NAA is '0x6589cfc...' (16 hex after the 0x); multipath
+# prepends '3' for NAA-6, so the WWID is '3' + '6589cfc...'.
+sub _naa_to_wwid {
+    my ($naa) = @_;
+    return undef unless defined $naa;
+    return undef unless $naa =~ /^0[xX]([0-9a-fA-F]{16,})$/;
+    return _sane_wwid('3' . lc($1));
+}
+
+# Local node name. POSIX::uname always exists in core.
+sub _local_node_name {
+    my @u = POSIX::uname();
+    my $n = $u[1] // 'unknown';
+    $n =~ s/[^A-Za-z0-9._-]/_/g;
+    return $n;
+}
+
+# Hint directory for a given storage.
+sub _stale_wwid_hint_dir {
+    my ($storeid) = @_;
+    my $safe = $storeid // 'unknown';
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    return "$STALE_WWID_HINT_ROOT/$safe";
+}
+
+# Path for one WWID's hint.
+sub _stale_wwid_hint_path {
+    my ($storeid, $wwid) = @_;
+    my $w = _sane_wwid($wwid) // return undef;
+    return _stale_wwid_hint_dir($storeid) . "/$w";
+}
+
+# Write a stale-WWID hint. Best-effort: filesystem errors never propagate
+# (the local teardown already happened in _free_image_iscsi; the hint is
+# a nicety for peers).
+sub _write_stale_wwid_hint {
+    my ($scfg, $storeid, $wwid) = @_;
+    my $w = _sane_wwid($wwid) // return;
+    my $path = _stale_wwid_hint_path($storeid, $w) // return;
+    my $dir = _stale_wwid_hint_dir($storeid);
+    my $node = _local_node_name();
+    my $rc = eval {
+        if (!-d $dir) {
+            require File::Path;
+            File::Path::make_path($dir, { mode => 0700 });
+        }
+        my $tmp = "$path.$$";
+        open(my $fh, '>', $tmp) or die "open $tmp: $!";
+        chmod 0600, $tmp;
+        print $fh encode_json({ wwid => $w, by => $node, removed_at => time() });
+        close($fh) or die "close $tmp: $!";
+        rename($tmp, $path) or die "rename $tmp -> $path: $!";
+        1;
+    };
+    if ($@ || !$rc) {
+        _log($scfg, 1, 'warning', "[TrueNAS] stale-wwid hint write failed at $path: " . ($@ // 'unknown'));
+        return;
+    }
+    _log($scfg, 2, 'debug', "[TrueNAS] stale-wwid hint written: $path");
+}
+
+# Read a stale-WWID hint. Returns the decoded hashref or undef.
+sub _read_stale_wwid_hint {
+    my ($path) = @_;
+    my $decoded = eval {
+        open(my $fh, '<', $path) or die "open: $!";
+        local $/;
+        my $blob = <$fh>;
+        close($fh);
+        decode_json($blob);
+    };
+    return undef if $@ || ref($decoded) ne 'HASH';
+    return $decoded;
+}
+
+# Enumerate local sd devices served by an iSCSI session whose targetname
+# matches this storage's configured target IQN, keyed by WWID. Returns
+# a hashref { $wwid => [ 'sdX', 'sdY', ... ] }. Scoped so a reconcile
+# never considers an sd that belongs to another TN storage or to a
+# non-TN iSCSI target.
+#
+# Walks /sys/class/iscsi_session/session*/targetname (matching session) ->
+# /sys/class/iscsi_session/sessionN/device/target*/*/block/sd*.
+sub _enum_local_iscsi_wwids_for_target {
+    my ($scfg) = @_;
+    my $want_iqn = $scfg->{tn_target_iqn};
+    return {} unless defined($want_iqn) && length($want_iqn);
+
+    my %out;
+    my $sess_root = $ISCSI_SESSION_ROOT;
+    opendir(my $dh, $sess_root) or return {};
+    my @sessions = grep { /^session\d+$/ } readdir($dh);
+    closedir($dh);
+
+    for my $s (@sessions) {
+        my $tn_path = "$sess_root/$s/targetname";
+        next unless -r $tn_path;
+        open(my $tfh, '<', $tn_path) or next;
+        chomp(my $iqn = <$tfh> // '');
+        close($tfh);
+        next unless $iqn eq $want_iqn;
+
+        # Session's scsi_host lives at /sys/class/iscsi_session/sessionN/device/target*/...
+        # Simpler: walk /sys/class/iscsi_session/sessionN/device to find sd* under it.
+        my $dev_root = "$sess_root/$s/device";
+        next unless -d $dev_root;
+        # recursive-ish scan for block/sd*
+        my @stack = ($dev_root);
+        while (@stack) {
+            my $cur = pop @stack;
+            opendir(my $cdh, $cur) or next;
+            my @kids = grep { $_ !~ /^\.\.?$/ } readdir($cdh);
+            closedir($cdh);
+            for my $k (@kids) {
+                my $p = "$cur/$k";
+                if ($k =~ /^sd[a-z]+$/ && -d $p) {
+                    my $wwid_file = "$SYS_BLOCK_ROOT/$k/device/wwid";
+                    next unless -r $wwid_file;
+                    open(my $wfh, '<', $wwid_file) or next;
+                    chomp(my $raw = <$wfh> // '');
+                    close($wfh);
+                    # kernel format: 'naa.6589cfc...' or 't10....'
+                    my $w;
+                    if ($raw =~ /^naa\.([0-9a-fA-F]{16,})/i) {
+                        $w = _sane_wwid('3' . lc($1));
+                    }
+                    next unless defined $w;
+                    push @{ $out{$w} }, $k;
+                } elsif (-d $p && $k =~ /^(target\d|\d+:\d+:\d+:\d+|block|host\d+)/) {
+                    push @stack, $p;
+                }
+            }
+        }
+    }
+    return \%out;
+}
+
+# Tear down one WWID on the local node. Best-effort and idempotent.
+#   - kpartx -d /dev/mapper/<wwid> (releases mpathX-partN holders)
+#   - multipath -f <wwid> (removes the dm map)
+#   - echo 1 > /sys/block/<sd>/device/delete for each path
+# Returns 1 if the map is gone after the call, 0 if a step failed.
+sub _teardown_stale_wwid {
+    my ($scfg, $wwid, $sd_list) = @_;
+    my $w = _sane_wwid($wwid) // return 0;
+    $sd_list //= [];
+
+    _log($scfg, 1, 'info', "[TrueNAS] reconcile: tearing down stale WWID $w (sd="
+        . join(',', @$sd_list) . ')');
+
+    # Clear partition holders. Both the aliased and the WWID-named node
+    # might be in play depending on multipath.conf user_friendly_names.
+    for my $cand ("/dev/mapper/$w") {
+        eval { PVE::Tools::run_command(['kpartx','-d',$cand], outfunc=>sub{}, errfunc=>sub{}) };
+    }
+
+    # Remove the dm map. If it's still in use (a running VM holds it),
+    # multipath -f exits non-zero and leaves the map; we log + return 0
+    # without touching the sd devices below.
+    my $flush_rc = 1;
+    eval {
+        PVE::Tools::run_command(['multipath','-f',$w],
+            outfunc => sub {},
+            errfunc => sub { _log($scfg, 2, 'debug', "[TrueNAS] multipath -f $w: $_[0]"); });
+    };
+    if ($@) {
+        _log($scfg, 1, 'warning', "[TrueNAS] reconcile: multipath -f $w failed (busy?); leaving sd paths alone");
+        return 0;
+    }
+
+    # Drop the backing sd* paths. Each path's TUR will otherwise keep
+    # spamming until the device is actually gone from the kernel.
+    for my $sd (@$sd_list) {
+        next unless $sd =~ /^(sd[a-z]+)$/;
+        my $safe_sd = $1;
+        my $del = "$SYS_BLOCK_ROOT/$safe_sd/device/delete";
+        next unless -e $del && -w $del;
+        if (open my $fh, '>', $del) {
+            print $fh "1";
+            close $fh;
+            _log($scfg, 2, 'debug', "[TrueNAS] reconcile: deleted $SYS_BLOCK_ROOT/$safe_sd (wwid $w)");
+        }
+    }
+
+    eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
+    return 1;
+}
+
+# Hint-driven reconcile. Reads /etc/pve/priv/truenas-plugin/stale-wwid/
+# <storeid>/*, tears down any WWID that is locally present, and clears
+# hints the local node itself wrote once they age past
+# tn_reconcile_hint_ttl_s. Never dies - this is a background sweep.
+sub _reconcile_stale_wwids {
+    my ($storeid, $scfg) = @_;
+    return if !($scfg->{tn_reconcile} // 1);
+    return if ($scfg->{tn_transport_mode} // 'iscsi') ne 'iscsi';
+    return if !($scfg->{tn_use_multipath} // 1);
+
+    my $dir = _stale_wwid_hint_dir($storeid);
+    return unless -d $dir;
+    opendir(my $dh, $dir) or return;
+    my @hints = grep { /^3[0-9a-f]{32}$/ } readdir($dh);
+    closedir($dh);
+    return unless @hints;
+
+    my $local = _enum_local_iscsi_wwids_for_target($scfg);
+    my $me    = _local_node_name();
+    my $ttl   = $scfg->{tn_reconcile_hint_ttl_s} // 600;
+
+    for my $w (@hints) {
+        my $path = "$dir/$w";
+        my $hint = _read_stale_wwid_hint($path);
+        if (!$hint) {
+            _log($scfg, 2, 'debug', "[TrueNAS] reconcile: unreadable hint $path, skipping");
+            next;
+        }
+
+        # Does this hint apply to our local state?
+        if (exists $local->{$w}) {
+            _teardown_stale_wwid($scfg, $w, $local->{$w});
+        }
+
+        # Pusher-only cleanup: a node clears only hints it wrote, after
+        # TTL. This is intentionally conservative; a pusher-death hint
+        # lingers until something manual or the floor reconcile covers it.
+        if (($hint->{by} // '') eq $me) {
+            my $age = time() - ($hint->{removed_at} // 0);
+            if ($age > $ttl) {
+                unlink($path);
+                _log($scfg, 2, 'debug', "[TrueNAS] reconcile: cleared own expired hint $path (age ${age}s)");
+            }
+        }
+    }
+}
+
+# Floor reconcile. Rate-limited sweep that compares local iSCSI sd*
+# backed by $scfg->{tn_target_iqn} against TrueNAS's current extent list
+# for THIS storage's dataset. Any WWID present locally but absent on the
+# array for at least tn_reconcile_grace_s is torn down.
+#
+# Fail-closed: a failed TN query aborts the sweep (so a transient outage
+# does not delete anything). State is kept in a /run stamp so repeated
+# status() calls inside FLOOR_RECONCILE_MIN_S are cheap.
+sub _floor_reconcile_wwids {
+    my ($storeid, $scfg) = @_;
+    return if !($scfg->{tn_reconcile} // 1);
+    return if ($scfg->{tn_transport_mode} // 'iscsi') ne 'iscsi';
+    return if !($scfg->{tn_use_multipath} // 1);
+
+    # Rate limit.
+    my $safe = $storeid;
+    $safe =~ s/[^A-Za-z0-9._-]/_/g;
+    my $stamp = "$RECONCILE_STAMP_DIR/reconcile-$safe";
+    my $now   = time();
+    if (my $mt = (stat($stamp))[9]) {
+        return if ($now - $mt) < $FLOOR_RECONCILE_MIN_S;
+    }
+
+    # Snapshot of local state FIRST: if the array query fails below, we
+    # do nothing and leave the stamp un-updated so the next tick retries.
+    my $local = _enum_local_iscsi_wwids_for_target($scfg);
+    return unless %$local;
+
+    # Live set from TN for this storage's dataset. Fail-closed: any
+    # exception aborts the sweep.
+    my $live_wwids = {};
+    my $ok = eval {
+        my $zvol_prefix = "zvol/$scfg->{tn_dataset}/";
+        my $extents = _api_call($scfg, 'iscsi.extent.query',
+            [ [ [ 'disk', '^', $zvol_prefix ] ], { select => [ 'id', 'naa', 'disk' ] } ]);
+        for my $e (@{ $extents // [] }) {
+            my $w = _naa_to_wwid($e->{naa});
+            $live_wwids->{$w} = 1 if $w;
+        }
+        1;
+    };
+    if (!$ok) {
+        _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: TN extent query failed, skipping sweep: " . ($@ // ''));
+        return;
+    }
+
+    # Update stamp - we have a definitive answer from TN, next call can
+    # rate-limit even if nothing to do.
+    eval {
+        if (!-d $RECONCILE_STAMP_DIR) {
+            require File::Path;
+            File::Path::make_path($RECONCILE_STAMP_DIR, { mode => 0755 });
+        }
+        open(my $fh, '>', $stamp) or die "open: $!";
+        print $fh $now;
+        close($fh);
+    };
+
+    my $grace = $scfg->{tn_reconcile_grace_s} // 120;
+    my $orphan_stamp_dir = "$RECONCILE_STAMP_DIR/orphan-$safe";
+    eval {
+        if (!-d $orphan_stamp_dir) {
+            require File::Path;
+            File::Path::make_path($orphan_stamp_dir, { mode => 0755 });
+        }
+    };
+
+    # Clear any orphan stamp whose WWID either (a) no longer exists on
+    # this node or (b) is live again on TN. Done up front so the loop
+    # below only stamps/teardowns real orphans.
+    if (opendir(my $odh, $orphan_stamp_dir)) {
+        for my $ent (readdir($odh)) {
+            next unless $ent =~ /^(3[0-9a-f]{32})$/;
+            my $w = $1;
+            if (!exists $local->{$w} || $live_wwids->{$w}) {
+                unlink("$orphan_stamp_dir/$w");
+            }
+        }
+        closedir($odh);
+    }
+
+    for my $w (keys %$local) {
+        next if $live_wwids->{$w};
+
+        # First time we noticed this orphan; stamp it and wait out the
+        # grace window. If it comes back (admin re-created the extent),
+        # the pre-loop cleanup above clears the stamp on the next sweep.
+        my $ostamp = "$orphan_stamp_dir/$w";
+        my $omt    = (stat($ostamp))[9];
+        if (!defined $omt) {
+            if (open my $fh, '>', $ostamp) { print $fh $now; close $fh; }
+            _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: stamped new orphan $w (grace ${grace}s)");
+            next;
+        }
+        my $age = $now - $omt;
+        if ($age < $grace) {
+            _log($scfg, 2, 'debug', "[TrueNAS] floor reconcile: orphan $w still within grace (${age}s < ${grace}s)");
+            next;
+        }
+
+        _teardown_stale_wwid($scfg, $w, $local->{$w});
+        unlink($ostamp);
+    }
 }
 
 # Robustly resolve the TrueNAS target id for a configured fully-qualified IQN.
@@ -8761,6 +9198,37 @@ sub _free_image_iscsi {
     # Invalidate cache eagerly (list_images should not see the stale mapping).
     _clear_cache(_cache_host_key($scfg));
 
+    # Cross-node stale-WWID hint (#147). Only drop the hint when the
+    # extent is confirmed gone on TN side, so peers that act on it find
+    # a real orphan rather than wasting a teardown on a LUN that still
+    # exists. We already have the WWID from the original $extent NAA
+    # captured at top of this function.
+    if ($scfg->{tn_use_multipath} && ($scfg->{tn_reconcile} // 1)
+        && $extent && $extent->{naa})
+    {
+        eval {
+            # Narrow re-query: if the extent is still there, don't drop
+            # a hint that would mislead peers into tearing down a live
+            # LUN. The targetextent might still exist on another node's
+            # "in use" error path, but the plan's scope is only on
+            # EXTENT absence - that's what multipath keys on.
+            my $still = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
+            if (!@$still) {
+                my $wwid = _naa_to_wwid($extent->{naa});
+                if ($wwid) {
+                    _write_stale_wwid_hint($scfg, $storeid, $wwid);
+                } else {
+                    _log($scfg, 2, 'debug',
+                        "[TrueNAS] free_image: extent NAA $extent->{naa} did not parse, skipping stale-wwid hint");
+                }
+            } else {
+                _log($scfg, 2, 'debug',
+                    "[TrueNAS] free_image: extent still present on TN, no stale-wwid hint written");
+            }
+        };
+        # ignore any hint-write errors
+    }
+
     # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
     my $deferred_scfg = $scfg;
     my $deferred_need_force_logout = $need_force_logout;
@@ -9459,6 +9927,17 @@ sub status {
         _log($scfg, 2, 'debug', "[TrueNAS] status: path reconcile failed: $@") if $@;
     }
 
+    # Cross-node stale-WWID reconcile (#147), iSCSI + multipath only.
+    # Hint-driven first (cheap, no API) and then the rate-limited floor
+    # (one TN query). Both are wrapped so a bad sweep can never break
+    # capacity reporting below.
+    if (($scfg->{tn_transport_mode} // 'iscsi') eq 'iscsi' && ($scfg->{tn_use_multipath} // 1)) {
+        eval { _reconcile_stale_wwids($storeid, $scfg) };
+        _log($scfg, 2, 'debug', "[TrueNAS] status: reconcile_stale_wwids failed: $@") if $@;
+        eval { _floor_reconcile_wwids($storeid, $scfg) };
+        _log($scfg, 2, 'debug', "[TrueNAS] status: floor_reconcile_wwids failed: $@") if $@;
+    }
+
     eval {
         my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
         if ($ds) {
@@ -9892,6 +10371,11 @@ sub activate_storage {
         if ($@) {
             _log($scfg, 1, 'warning', "[TrueNAS] activate_storage: target visibility pre-flight check failed for $storeid: $@");
         }
+        # Cross-node stale-WWID hint-driven reconcile (#147). Cheap:
+        # readdir of a small /etc/pve directory plus local sysfs walk.
+        # Never raises.
+        eval { _reconcile_stale_wwids($storeid, $scfg) };
+        _log($scfg, 2, 'debug', "[TrueNAS] activate_storage: reconcile_stale_wwids failed: $@") if $@;
     } elsif ($mode eq 'nvme-tcp') {
         # Check nvme-cli is available
         eval {
