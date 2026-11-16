@@ -1,3 +1,37 @@
+truenas-proxmox-plugin (2.1.25~beta1) unstable; urgency=medium
+
+  * fix(#147): cross-node stale multipath/sd cleanup after volume
+    delete. When one cluster node deletes an iSCSI+multipath volume,
+    every other node that was logged in used to keep the local SCSI
+    device and the multipath map for that LUN; ALUA then reported
+    every path as failed and multipathd logged
+    `tur checker reports path is down` every 5 s until an operator
+    cleaned up by hand, and TrueNAS LUN-number reuse risked a new
+    extent landing behind the stale sd on peer nodes. The deleting
+    node now drops a per-WWID marker under
+    /etc/pve/priv/truenas-plugin/stale-wwid/<storeid>/<wwid>, pmxcfs
+    replicates it cluster-wide, and every peer's next
+    activate_storage / status call tears down any matching local
+    sd + multipath map (scoped by target IQN so other TN storages
+    and non-TN iSCSI are never touched). A rate-limited floor sweep
+    in status() also cross-checks local WWIDs against TrueNAS's
+    current extent list for the storage's dataset and removes any
+    that stay absent longer than tn_reconcile_grace_s, fail-closed
+    on any TN query error. Three new per-storage knobs with safe
+    defaults: tn_reconcile (1), tn_reconcile_grace_s (120),
+    tn_reconcile_hint_ttl_s (600).
+  * feat(#147): tn_status_capacity_ttl_s per-storage knob. The
+    status() capacity-cache TTLs were previously hardcoded (10 s
+    in-process cache, 15 s on-disk stamp), which at N nodes * S
+    storages scale (reporter: 11 * 3) saturated the TrueNAS
+    middleware with roughly N*S pool.dataset.get_instance calls per
+    10 s. The new knob caps both TTLs together; raise it (60-120 s
+    is a good range) to reduce API churn at the cost of staler
+    `pvesm status` output. Default 10 preserves pre-existing
+    behaviour.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 16 Nov 2026 14:49:32 -0500
+
 truenas-proxmox-plugin (2.1.24) unstable; urgency=medium
 
   * Release 2.1.24. Promotes 2.1.24~beta8 to the stable 2.1.24 series

@@ -1,5 +1,23 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.25~beta1 (November 16, 2026)
+
+### Bug Fixes
+
+- **#147 — cross-node stale multipath and SCSI device cleanup after a volume delete**. When one cluster node deleted an iSCSI+multipath volume, every other node that was logged into the same target kept the local SCSI device and multipath map for that LUN. ALUA then reported every path as failed and multipathd logged `tur checker reports path is down` every 5 s until an operator ran `multipath -f` and wrote the sd-delete file by hand on each peer. Because TrueNAS reuses LUN numbers, a later extent that got the same LUN could surface behind the stale `sd` on peer nodes. Fix: at the end of `free_image` on iSCSI+multipath storages, when the extent is confirmed gone from TrueNAS, the deleting node drops a per-WWID marker under `/etc/pve/priv/truenas-plugin/stale-wwid/<storeid>/<wwid>`. Because `/etc/pve` is `pmxcfs`, the marker is replicated cluster-wide for free. Every node's next `activate_storage` and `status` call reads the hint directory and tears down any WWID that is locally present (`kpartx -d` on partition holders, `multipath -f` on the dm map, then `1 > /sys/block/<sd>/device/delete` per path). Teardown is scoped by target IQN — only `sd` devices behind a session to `tn_target_iqn` are candidates, so other TrueNAS storages and non-TN iSCSI are never touched. A rate-limited floor sweep (one run per 60 s) in `status` cross-checks local WWIDs against TrueNAS's current `iscsi.extent.query` for the storage's dataset and removes any that stay absent longer than `tn_reconcile_grace_s` (default 120 s); the sweep fails closed on any TrueNAS query error, so an unreachable array never deletes anything. If a map is still in use by a live VM, `multipath -f` refuses and the teardown is skipped for that tick without touching the sd paths underneath. Three new per-storage knobs, all opt-out:
+  - `tn_reconcile` (default 1)
+  - `tn_reconcile_grace_s` (default 120)
+  - `tn_reconcile_hint_ttl_s` (default 600) — how long the writing node keeps its own marker before unlinking it.
+
+### New Features
+
+- **#147 — `tn_status_capacity_ttl_s` per-storage knob**. The `status()` capacity cache (both the in-process cache that `pvestatd` consults each tick, and the cross-process on-disk stamp under `/run/truenas-plugin/status-*` that a fresh `pvesm status` picks up) used to run on hardcoded 10 s / 15 s TTLs. With many nodes polling many storages the resulting burst of `pool.dataset.get_instance` calls could saturate the TrueNAS middleware (reporter observed `iscsi.extent.query` latency at ~12.5 s and `pool.dataset.query` at ~10.4 s on 11 nodes × 3 storages). The new knob caps both TTLs together; raise it on large clusters (60-120 s is a good starting range) to reduce API churn, at the cost of staler `pvesm status` output. Range 1-3600, default 10 matches the previous hardcoded behaviour so unchanged configurations are unaffected.
+
+### Notes
+
+- No API-version bump; `$TESTED_APIVER` stays at 16.
+- The stale-WWID reconcile is iSCSI + multipath only and is a no-op on NVMe/TCP and on iSCSI deployments with `tn_use_multipath=0`.
+
 ## Version 2.1.24 (November 5, 2026)
 
 GA release. Same code as 2.1.24~beta8; no fixes or feature changes beyond beta8. See the 2.1.24~beta1 through 2.1.24~beta8 entries below for what landed across the cycle (HA NVMe/TCP auto-detect, SCRAM-SHA-512 / SCRAM-PLUS / API_KEY_PLAIN authentication, snapshot and lifecycle fixes, PVE 9.2 boot-race fix, IPv6 iSCSI portals, and configured-portals-only iSCSI login).
