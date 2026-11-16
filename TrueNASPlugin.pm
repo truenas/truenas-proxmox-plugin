@@ -42,6 +42,10 @@ package PVE::Storage::Custom::TrueNASPlugin;
 # Simple cache for API results
 my %API_CACHE = ();
 my $CACHE_TTL = 60; # seconds
+# Default TTL (seconds) for the status() capacity cache. The actual TTL
+# used at runtime is $scfg->{tn_status_capacity_ttl_s} // this value --
+# see _status_capacity_ttl_s() below. Keep this default aligned with
+# pre-#147-TTL-knob behaviour.
 my $STATUS_CAPACITY_TTL_S = 10;
 # On-disk (/run/truenas-plugin/status-<key>) capacity-cache TTL. Shared
 # across processes so every `pvesm status` doesn't pay the full
@@ -162,6 +166,18 @@ sub _set_cache {
         timestamp => time()
     };
     return $data;
+}
+
+# Resolve the effective status()-capacity-cache TTL. One knob
+# (tn_status_capacity_ttl_s) controls both the in-process cache that
+# pvestatd consults each tick AND the cross-process on-disk stamp a
+# fresh `pvesm status` picks up. Default matches the historical
+# $STATUS_CAPACITY_TTL_S (10 s).
+sub _status_capacity_ttl_s {
+    my ($scfg) = @_;
+    my $v = $scfg->{tn_status_capacity_ttl_s};
+    return $STATUS_CAPACITY_TTL_S if !defined($v) || $v !~ /^\d+$/ || $v < 1;
+    return $v + 0;
 }
 
 sub _clear_cache {
@@ -867,6 +883,20 @@ sub properties {
                           "Default 30.",
             type => 'integer', optional => 1, default => 30, minimum => 0,
         },
+        tn_status_capacity_ttl_s => {
+            description => "TTL in seconds for the status() capacity cache -- both the " .
+                          "in-process cache that pvestatd consults on each tick and the " .
+                          "cross-process on-disk stamp that a fresh `pvesm status` picks " .
+                          "up. Default 10, matching previous hardcoded behaviour. Raise " .
+                          "on clusters where many nodes poll the same TrueNAS: with N " .
+                          "nodes and S storages per node, the API sees roughly N*S capacity " .
+                          "queries per TTL interval. 11 nodes * 3 storages at the 10 s " .
+                          "default has been reported to saturate the TN middleware " .
+                          "(issue #147); raising to 60-120 brings the per-call latency " .
+                          "back to normal at the cost of staler `pvesm status` output. " .
+                          "Range: 1-3600.",
+            type => 'integer', optional => 1, default => 10, minimum => 1, maximum => 3600,
+        },
         tn_storage_lock_timeout => {
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120. " .
@@ -1048,6 +1078,7 @@ sub options {
         tn_api_retry_delay => { optional => 1 },
         tn_api_budget_s => { optional => 1 },
         tn_status_probe_backoff_s => { optional => 1 },
+        tn_status_capacity_ttl_s  => { optional => 1 },
 
         # Concurrency
         tn_storage_lock_timeout => { optional => 1 },
@@ -4253,7 +4284,13 @@ sub _read_status_stamp {
     my $mtime = (stat($path))[9];
     return undef if !defined $mtime;
     my $age = time() - $mtime;
-    return undef if $age < 0 || $age >= $STATUS_CAPACITY_STAMP_TTL_S;
+    # The on-disk stamp TTL used to be hardcoded $STATUS_CAPACITY_STAMP_TTL_S.
+    # Honour the per-storage knob (issue #147), falling back to the stamp
+    # default so unchanged configs behave as before.
+    my $stamp_ttl = _status_capacity_ttl_s($scfg);
+    $stamp_ttl = $STATUS_CAPACITY_STAMP_TTL_S
+        if $stamp_ttl == $STATUS_CAPACITY_TTL_S;
+    return undef if $age < 0 || $age >= $stamp_ttl;
     my $decoded = eval {
         open(my $fh, '<', $path) or die "open: $!";
         local $/;
@@ -9939,7 +9976,7 @@ sub status {
     }
 
     eval {
-        my $ds = _get_cached($host_key, $status_method, $STATUS_CAPACITY_TTL_S);
+        my $ds = _get_cached($host_key, $status_method, _status_capacity_ttl_s($scfg));
         if ($ds) {
             $_status_capacity_cache_stats{hit}++;
             _log($scfg, 2, 'debug', "[TrueNAS] status-cache: hit key=$status_method");
