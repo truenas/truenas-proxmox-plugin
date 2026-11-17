@@ -53,6 +53,32 @@
 
 ### Installation
 
+> **⚠️ Upgrading from 2.1.24 or older: do it over SSH, not the Web Shell.**
+>
+> On `2.1.24` and earlier the postinst script restarts `pvedaemon`
+> immediately, which kills the `termproxy` session backing the Proxmox
+> Web Shell and the **Updates > Upgrade** button. The upgrade dies
+> mid-install and leaves the package half-configured ([#144]).
+>
+> If you are still on `2.1.24`, upgrade this package from an **SSH
+> session** (sshd is independent of `pvedaemon`). If a Web-Shell
+> upgrade has already been interrupted, recover by SSH-ing in and
+> running:
+>
+> ```bash
+> dpkg --configure -a
+> apt -f install
+> apt update && apt dist-upgrade
+> ```
+>
+> This limitation is fixed in `2.1.25~beta1` and later (both
+> `pvedaemon` and `pveproxy` restarts are deferred past the end of the
+> package transaction). Once you are on `2.1.25` or newer, future
+> upgrades from the Web Shell / **Updates > Upgrade** button are
+> safe.
+>
+> [#144]: https://github.com/truenas/truenas-proxmox-plugin/issues/144
+
 **Option 1 (Recommended): APT Repository**
 
 Install from the official APT repository with the installer:
