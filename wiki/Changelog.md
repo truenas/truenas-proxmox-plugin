@@ -1,5 +1,20 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.25~beta2 (November 19, 2026)
+
+### New Features
+
+- **GUI integration for the pve-manager 9.2.29+ custom-storage dialog.** On a pve-manager that exposes the new `/plugins/storage/plugin/<type>` API route (shipped in `pve-manager` 9.2.29 and later), the **Add Storage → TrueNAS** and **Edit** dialogs are now rendered from the plugin's schema. The form has two columns, nine essentials at the top (Content, Transport, TrueNAS host, API key, TrueNAS account, Auth mechanism, Parent dataset, iSCSI target IQN, iSCSI discovery portal, NVMe subsystem NQN), and a collapsible **Advanced** section with the 23 tuning knobs admins commonly touch. A further 19 knobs whose defaults fit every deployment we have seen are hidden from the dialog to keep it legible; they stay settable via `pvesm set` or by editing `/etc/pve/storage.cfg` directly. Four properties (the API key and the three NVMe/iSCSI secrets) are marked sensitive — the UI never renders their stored value on edit, and leaving the field empty keeps the stored value.
+
+### Behaviour Changes
+
+- **`$TESTED_APIVER` bumped from 16 to 17.** `pve-manager` 9.2.30 advertises `APIVER` 17, so older plugins log an "older storage API" warning on every load; this bump silences the warning. No functional change for the plugin surface we exercise.
+
+### Notes
+
+- This release is targeted at `pve-manager` 9.2.29 and later. On older `pve-manager` the new GUI metadata keys in `plugindata()` are silently ignored; the plugin falls back to the generic storage editor, so nothing regresses.
+- Knobs moved to `hidden-properties` in 2.1.25~beta2 (connection shape, retry/backoff tunings, `tn_use_cluster_lock`/`tn_storage_lock_timeout`, the three `#147` cross-node reconcile knobs, NVMe kernel tunings) all keep their existing defaults and can still be set via `pvesm set <storage> --<option> <value>`.
+
 ## Version 2.1.25~beta1 (November 16, 2026)
 
 ### Bug Fixes

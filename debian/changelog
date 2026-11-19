@@ -1,3 +1,31 @@
+truenas-proxmox-plugin (2.1.25~beta2) unstable; urgency=medium
+
+  * GUI integration for the pve-manager 9.2.29+ custom-storage dialog.
+    When the plugin is loaded into a pve-manager that exposes
+    /plugins/storage/plugin/<type>, the new Add Storage dialog is now
+    driven by this schema and renders a readable two-column form instead
+    of the earlier flat list. Delivered via four hashes in plugindata():
+      - 'advanced-properties' (23 entries): tuning knobs admins commonly
+        touch, collapsed under an Advanced disclosure.
+      - 'hidden-properties' (19 entries): rarely-touched knobs whose
+        defaults fit every deployment seen in the field; still settable
+        via `pvesm set` or /etc/pve/storage.cfg.
+      - 'sensitive-properties' (4 entries, hash shape): API key and
+        three NVMe/iSCSI secrets. The dialog never renders their
+        stored value on edit; an empty field keeps the stored value.
+      - meta.display-name 'TrueNAS' for the Add dropdown label.
+    Nine essentials remain top-level: Content, Transport, TrueNAS host,
+    API key, TrueNAS account, Auth mechanism, Parent dataset, iSCSI
+    target IQN, iSCSI discovery portal, NVMe subsystem NQN. Each
+    property also carries a 'title' for its field label, so no field
+    falls back to the "Tn Api Username"-style auto-title.
+  * Bump $TESTED_APIVER from 16 to 17. pve-manager 9.2.30 advertises
+    APIVER 17, so older plugins log an "older storage API" warning on
+    every load; this bump silences it. No signature changes in the
+    plugin surface we exercise between 16 and 17.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Thu, 19 Nov 2026 12:47:23 -0500
+
 truenas-proxmox-plugin (2.1.25~beta1) unstable; urgency=medium
 
   * fix(#147): cross-node stale multipath/sd cleanup after volume

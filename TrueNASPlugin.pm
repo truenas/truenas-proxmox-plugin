@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.25~beta1';
+our $VERSION = '2.1.25~beta2';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 16;
+our $TESTED_APIVER = 17;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -673,65 +673,140 @@ sub plugindata {
     return {
         content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
         format  => [ { raw => 1 }, 'raw' ],
+        meta => { 'display-name' => 'TrueNAS' },
+        # GUI integration keys read by pve-manager 9.2.29+ via the
+        # /plugins/storage/plugin/<type> API route. The API layer uses
+        # these hashes to annotate each property's x-advanced / x-hidden /
+        # sensitive flag, overriding anything set per-property; older
+        # pve-manager versions silently ignore the keys.
+        'advanced-properties' => {
+            tn_chap_password => 1,
+            tn_chap_user => 1,
+            tn_compression => 1,
+            tn_debug => 1,
+            tn_enable_bulk_operations => 1,
+            tn_enable_live_snapshots => 1,
+            tn_force_delete_on_inuse => 1,
+            tn_hostnqn => 1,
+            tn_ipv6_by_path => 1,
+            tn_logout_on_free => 1,
+            tn_nvme_allow_any_host => 1,
+            tn_nvme_dhchap_ctrl_secret => 1,
+            tn_nvme_dhchap_secret => 1,
+            tn_nvme_manage_ports => 1,
+            tn_portals => 1,
+            tn_prefer_ipv4 => 1,
+            tn_snapshot_volume_chains => 1,
+            tn_sparse => 1,
+            tn_status_capacity_ttl_s => 1,
+            tn_use_by_path => 1,
+            tn_use_multipath => 1,
+            tn_vmstate_storage => 1,
+            tn_zvol_blocksize => 1,
+        },
+        # Hidden from the UI but still settable via `pvesm set` /
+        # storage.cfg. Candidates: deprecated shims, tunings whose
+        # defaults fit everyone we have seen in the field, and
+        # safety-net gates that only matter in last-resort troubleshooting.
+        'hidden-properties' => {
+            tn_api_transport           => 1,  # deprecated, always wss
+            tn_api_scheme              => 1,  # 99% wss
+            tn_api_port                => 1,  # 99% 443
+            tn_api_insecure            => 1,  # 99% off
+            tn_api_budget_s            => 1,  # unset default is correct
+            tn_api_retry_delay         => 1,  # default 1s
+            tn_api_retry_max           => 1,  # default 3
+            tn_broker_timeout          => 1,  # default 60s
+            tn_device_ready_retries    => 1,  # default 60s of retries
+            tn_use_cluster_lock        => 1,  # last-resort correctness toggle
+            tn_storage_lock_timeout    => 1,  # only matters with the above
+            tn_status_probe_backoff_s  => 1,  # default 30s
+            tn_reconcile               => 1,  # #147 default is correct
+            tn_reconcile_grace_s       => 1,  # #147 default is correct
+            tn_reconcile_hint_ttl_s    => 1,  # #147 default is correct
+            tn_nr_io_queues            => 1,  # auto-detected
+            tn_nvme_ctrl_loss_tmo      => 1,  # NVMe kernel tuning
+            tn_nvme_keep_alive_tmo     => 1,  # NVMe kernel tuning
+            tn_nvme_reconnect_delay    => 1,  # NVMe kernel tuning
+        },
+        'sensitive-properties' => {
+            tn_api_key => 1,
+            tn_chap_password => 1,
+            tn_nvme_dhchap_ctrl_secret => 1,
+            tn_nvme_dhchap_secret => 1,
+        },
     };
 }
+
 
 # ======== Config schema (only plugin-specific keys) ========
 sub properties {
     return {
         # Transport & connection
         tn_api_host => {
+            title => 'TrueNAS host',
             description => "TrueNAS hostname or IP (IPv6 literals must be bracketed, e.g. [fd00:1::1]).",
             type => 'string', format => 'pve-storage-portal-dns',
         },
         tn_api_key => {
+            title => 'API key',
             description => "TrueNAS user-linked API key.",
             type => 'string',
         },
         tn_api_username => {
+            title => 'TrueNAS account',
             description => "TrueNAS account that owns the API key. Required by the SCRAM and SCRAM-PLUS authentication mechanisms (tn_auth_mechanism=scram or scram-plus); leaving it empty forces the legacy auth.login_with_api_key path (deprecated upstream; scheduled for removal in a future TrueNAS release).",
             type => 'string', optional => 1,
             format_description => 'account',
         },
         tn_auth_mechanism => {
+            title => 'Auth mechanism',
             description => "API-key authentication mechanism. 'auto' (default) prefers SCRAM when the server offers it, falling back to plain. 'scram' refuses to connect to servers that cannot do SCRAM-SHA-512. 'scram-plus' is the strict option: it requires SCRAM-SHA-512 with channel binding (tls-server-end-point) and refuses to connect otherwise. 'plain' never attempts SCRAM.",
             type => 'string', optional => 1,
             enum => ['auto','scram','scram-plus','plain'],
             default => 'auto',
         },
         tn_api_scheme => {
+            title => 'API scheme',
             description => "WebSocket scheme: 'wss' (secure) or 'ws' (insecure). Default: wss.",
             type => 'string', optional => 1,
         },
         tn_api_transport => {
+            title => 'Legacy transport (deprecated)',
             description => "Deprecated legacy transport selector. Ignored; WebSocket is always used.",
             type => 'string', optional => 1,
         },
         tn_api_port => {
+            title => 'API port',
             description => "TCP port (defaults: 443 for wss, 80 for ws).",
             type => 'integer', optional => 1,
         },
         tn_api_insecure => {
+            title => 'Skip TLS verification',
             description => "Skip TLS certificate verification.",
             type => 'boolean', optional => 1, default => 0,
         },
         tn_prefer_ipv4 => {
+            title => 'Prefer IPv4',
             description => "Prefer IPv4 (A records) when resolving tn_api_host.",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Placement
         tn_dataset => {
+            title => 'Parent dataset',
             description => "Parent dataset for zvols (e.g. tank/proxmox).",
             type => 'string',
         },
         tn_zvol_blocksize => {
+            title => 'ZVOL blocksize',
             description => "ZVOL volblocksize (e.g. 16K, 64K).",
             type => 'string', optional => 1,
         },
 
         # Transport mode selection
         tn_transport_mode => {
+            title => 'Transport',
             description => "Storage transport protocol: 'iscsi' or 'nvme-tcp'.",
             type => 'string',
             enum => ['iscsi', 'nvme-tcp'],
@@ -741,69 +816,93 @@ sub properties {
 
         # iSCSI target & portals
         tn_target_iqn => {
+            title => 'iSCSI target IQN',
             description => "Shared iSCSI Target IQN on TrueNAS (or target's short name) - required for iSCSI transport.",
             type => 'string',
             optional => 1,
         },
         tn_discovery_portal => {
+            title => 'iSCSI discovery portal',
             description => "Primary SendTargets portal (IP[:port] or [IPv6]:port).",
             type => 'string',
         },
         tn_portals => {
+            title => 'Additional iSCSI portals',
             description => "Comma-separated additional portals.",
             type => 'string', optional => 1,
         },
 
         # Initiator pathing
-        tn_use_multipath => { type => 'boolean', optional => 1, default => 1 },
+        tn_use_multipath => {
+            title => 'Enable iSCSI multipath',
+            type => 'boolean', optional => 1, default => 1,
+        },
         tn_force_delete_on_inuse => {
+            title => 'Force delete on in-use LUN',
             description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
             type => 'boolean',
             default => 'false',
         },
         tn_logout_on_free => {
+            title => 'Logout target after last free',
             description => 'After delete, logout the target if no LUNs remain for this node.',
             type => 'boolean',
             default => 'false',
         },
-        tn_use_by_path  => { type => 'boolean', optional => 1, default => 0 },
+        tn_use_by_path  => {
+            title => 'Use /dev/disk/by-path names',
+            type => 'boolean', optional => 1, default => 0,
+        },
         tn_ipv6_by_path => {
+            title => 'Normalize IPv6 by-path names',
             description => "Normalize IPv6 by-path names (enable only if using IPv6 portals).",
             type => 'boolean', optional => 1, default => 0,
         },
 
         # Debug level
         tn_debug => {
+            title => 'Debug logging level',
             description => "Debug level: 0=none (errors only), 1=light (function calls), 2=verbose (full trace)",
             type => 'integer', optional => 1, default => 0, minimum => 0, maximum => 2,
         },
 
         # CHAP (optional - iSCSI only)
-        tn_chap_user     => { type => 'string', optional => 1 },
-        tn_chap_password => { type => 'string', optional => 1 },
+        tn_chap_user     => {
+            title => 'iSCSI CHAP user',
+            type => 'string', optional => 1,
+        },
+        tn_chap_password => {
+            title => 'iSCSI CHAP password',
+            type => 'string', optional => 1,
+        },
 
         # NVMe/TCP parameters
         tn_subsystem_nqn => {
+            title => 'NVMe subsystem NQN',
             description => "NVMe subsystem NQN - required for nvme-tcp transport.",
             type => 'string',
             optional => 1,
         },
         tn_hostnqn => {
+            title => 'Initiator host NQN',
             description => "NVMe host NQN (optional, auto-generated from /etc/nvme/hostnqn if not specified).",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_secret => {
+            title => 'NVMe DH-HMAC-CHAP secret',
             description => "DH-HMAC-CHAP host authentication key (format: DHHC-1:01:...) - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_dhchap_ctrl_secret => {
+            title => 'NVMe DH-HMAC-CHAP controller secret',
             description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
             type => 'string',
             optional => 1,
         },
         tn_nvme_allow_any_host => {
+            title => 'NVMe allow-any-host',
             description => "Value the plugin writes to the TrueNAS NVMe subsystem's " .
                           "`allow_any_host` attribute on create and on Issue-#12 " .
                           "configfs-resync ping updates. Default: TRUE (the plugin " .
@@ -825,6 +924,7 @@ sub properties {
 
         # ZFS compression algorithm for new volumes
         tn_compression => {
+            title => 'Compression (zvol)',
             description => "ZFS compression algorithm for new volumes. When unset, inherits from parent dataset.",
             type => 'string',
             enum => [qw(OFF LZ4 GZIP GZIP-1 GZIP-9 ZSTD ZSTD-1 ZSTD-3 ZSTD-5 ZSTD-7 ZSTD-9 ZLE LZJB)],
@@ -833,42 +933,50 @@ sub properties {
 
         # Thin provisioning toggle (maps to TrueNAS sparse)
         tn_sparse => {
+            title => 'Sparse zvols',
             description => "Create thin-provisioned zvols on TrueNAS (maps to 'sparse').",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Live snapshot support
         tn_enable_live_snapshots => {
+            title => 'Live snapshots',
             description => "Enable live snapshots with VM state storage on TrueNAS.",
             type => 'boolean', optional => 1, default => 1,
         },
         # Volume chains for snapshots (enables vmstate support)
         tn_snapshot_volume_chains => {
+            title => 'Snapshot-as-volume-chains',
             description => "Use volume chains for snapshots (enables vmstate on iSCSI).",
             type => 'boolean', optional => 1, default => 1,
         },
         # vmstate storage location
         tn_vmstate_storage => {
+            title => 'VM state storage',
             description => "Storage location for vmstate: 'shared' (TrueNAS iSCSI) or 'local' (node filesystem).",
             type => 'string', optional => 1, default => 'local',
         },
 
         # Bulk operations for improved performance
         tn_enable_bulk_operations => {
+            title => 'Bulk API calls',
             description => "Enable bulk API operations for better performance (requires WebSocket transport).",
             type => 'boolean', optional => 1, default => 1,
         },
 
         # Retry configuration
         tn_api_retry_max => {
+            title => 'API retry attempts',
             description => "Maximum number of API call retries on transient failures.",
             type => 'integer', optional => 1, default => 3,
         },
         tn_api_retry_delay => {
+            title => 'API retry backoff (s)',
             description => "Initial retry delay in seconds (doubles with each retry).",
             type => 'number', optional => 1, default => 1,
         },
         tn_api_budget_s => {
+            title => 'API retry budget (s)',
             description => "Wall-clock budget in seconds for a whole retry sequence " .
                           "(across all attempts and backoff delays). Unset by default: " .
                           "a call is then bounded only by tn_api_retry_max, as before. " .
@@ -877,6 +985,7 @@ sub properties {
             type => 'integer', optional => 1, minimum => 1,
         },
         tn_status_probe_backoff_s => {
+            title => 'Status probe backoff (s)',
             description => "After status() sees a connectivity failure, suppress further " .
                           "API probes for this many seconds and report the storage inactive " .
                           "from memory instead. Set to 0 to probe on every poll (no marker). " .
@@ -884,6 +993,7 @@ sub properties {
             type => 'integer', optional => 1, default => 30, minimum => 0,
         },
         tn_status_capacity_ttl_s => {
+            title => 'Status cache TTL (s)',
             description => "TTL in seconds for the status() capacity cache -- both the " .
                           "in-process cache that pvestatd consults on each tick and the " .
                           "cross-process on-disk stamp that a fresh `pvesm status` picks " .
@@ -898,6 +1008,7 @@ sub properties {
             type => 'integer', optional => 1, default => 10, minimum => 1, maximum => 3600,
         },
         tn_storage_lock_timeout => {
+            title => 'Storage lock timeout (s)',
             description => "Cluster lock timeout in seconds for storage operations. " .
                           "Increase for parallel bulk provisioning. Default: 120. " .
                           "Only relevant when tn_use_cluster_lock=1; the default (bypass) " .
@@ -905,6 +1016,7 @@ sub properties {
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 600,
         },
         tn_use_cluster_lock => {
+            title => 'Use pmxcfs cluster lock',
             description => "Serialize all storage operations across nodes via the PVE " .
                           "CFS cluster lock (classic PVE behavior). Default: 0 (bypass). " .
                           "TrueNAS's middleware already serializes conflicting mutations " .
@@ -917,10 +1029,12 @@ sub properties {
             type => 'boolean', optional => 1, default => 0,
         },
         tn_device_ready_retries => {
+            title => 'Device-ready retry count',
             description => "Number of 100ms retries waiting for a block device to appear after connect.",
             type => 'integer', optional => 1, default => 600, minimum => 0, maximum => 1200,
         },
         tn_broker_timeout => {
+            title => 'Broker RPC timeout (s)',
             description => "Broker Unix-socket round-trip deadline in seconds. Bumped from " .
                           "the previous 30 s default so a single TN op that runs long under " .
                           "concurrent cluster load (large iscsi.extent.query, contended " .
@@ -929,6 +1043,7 @@ sub properties {
             type => 'integer', optional => 1, default => 60, minimum => 5, maximum => 300,
         },
         tn_nr_io_queues => {
+            title => 'NVMe I/O queues per controller',
             description => "Number of NVMe/TCP I/O queues per controller. When unset, " .
                           "auto-detected: uses online CPU count when all CPUs are online, " .
                           "or half of possible CPUs when any CPU is offline (avoids kernel " .
@@ -937,6 +1052,7 @@ sub properties {
             type => 'integer', optional => 1, minimum => 1, maximum => 256,
         },
         tn_nvme_ctrl_loss_tmo => {
+            title => 'NVMe ctrl-loss timeout (s)',
             description => "Seconds the kernel keeps retrying a failed NVMe/TCP controller " .
                           "before giving up and removing it (nvme connect --ctrl-loss-tmo). " .
                           "Use -1 to retry forever. When unset the kernel default of 600 applies, " .
@@ -946,17 +1062,20 @@ sub properties {
             type => 'integer', optional => 1, minimum => -1, maximum => 3600,
         },
         tn_nvme_reconnect_delay => {
+            title => 'NVMe reconnect delay (s)',
             description => "Seconds between reconnect attempts for a failed NVMe/TCP controller " .
                           "(nvme connect --reconnect-delay). Kernel default is 10.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
         tn_nvme_keep_alive_tmo => {
+            title => 'NVMe keep-alive timeout (s)',
             description => "NVMe/TCP keep-alive timeout in seconds " .
                           "(nvme connect --keep-alive-tmo). Lower values detect a dead path " .
                           "sooner, at the cost of more keep-alive traffic.",
             type => 'integer', optional => 1, minimum => 1, maximum => 3600,
         },
         tn_nvme_manage_ports => {
+            title => 'Manage NVMe ports',
             description => "Whether the plugin creates nvmet port + port_subsys records " .
                           "to match tn_discovery_portal/tn_portals (default: 1). " .
                           "Set to 0 for a TrueNAS HA pair: on 25.10.x TN's nvmet middleware " .
@@ -982,6 +1101,7 @@ sub properties {
         # every node checks local sysfs against the hints (fast) and
         # against TrueNAS's current extent list (floor reconcile).
         tn_reconcile => {
+            title => 'Cross-node reconcile',
             description => "Reconcile stale per-LUN SCSI devices and multipath maps across " .
                           "cluster nodes after a volume is deleted on any one node (#147). " .
                           "Hint-driven: the deleting node writes a WWID marker under /etc/pve, " .
@@ -993,6 +1113,7 @@ sub properties {
             type => 'boolean', optional => 1, default => 1,
         },
         tn_reconcile_grace_s => {
+            title => 'Reconcile orphan grace (s)',
             description => "Seconds a WWID must be absent from TrueNAS before the floor " .
                           "reconcile (#147) considers it an orphan and tears it down. " .
                           "Protects against brief create-then-vanish windows while another " .
@@ -1000,6 +1121,7 @@ sub properties {
             type => 'integer', optional => 1, default => 120, minimum => 10, maximum => 3600,
         },
         tn_reconcile_hint_ttl_s => {
+            title => 'Reconcile hint TTL (s)',
             description => "Seconds a #147 stale-WWID hint lives in /etc/pve before the node " .
                           "that wrote it unlinks the marker. Longer values give peers that were " .
                           "offline at delete time more chances to pick it up on their next " .
