@@ -7977,6 +7977,14 @@ sub _nvme_pick_nsid_cursor {
     my $max_used = 0;
     for my $n (keys %used) { $max_used = $n if $n <= TN_NSID_MAX && $n > $max_used; }
 
+    # Never pick a reserved nsid: one per line (or space-separated) in
+    # $TN_NSID_CURSOR_DIR/nsid-reserved, e.g. a ghost nsid the TN kernel still
+    # holds after its DB namespace was deleted (enable at it -> EBUSY).
+    if (open(my $rf, '<', "$TN_NSID_CURSOR_DIR/nsid-reserved")) {
+        while (my $l = <$rf>) { $used{$1} = 1 while $l =~ /(\d+)/g; }
+        close($rf);
+    }
+
     # PVE daemons run under perl -T: API data is tainted and s/// does not
     # untaint it, so take the id through a capture before it reaches open().
     my ($sid) = ("$subsys_id" =~ /^(\d+)$/)
