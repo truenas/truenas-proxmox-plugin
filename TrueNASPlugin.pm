@@ -7953,6 +7953,105 @@ sub _nvme_namespaces_for_device_path {
     ]) // [];
 }
 
+# pick the nsid for a new namespace on $subsys_id.
+#
+# Returns the first nsid after the persisted cursor that is not in use in
+# TN's DB (and not in %$exclude), wrapping within 1..TN_NSID_MAX, and
+# advances the cursor to it. The cursor lives on local disk under a flock,
+# one file per subsystem; across nodes the collision retry in the caller
+# covers a race. Dies (never auto-assigns) if TN cannot be queried, the
+# cursor cannot be locked, or no nsid is free.
+use constant TN_NSID_MAX => 1023;
+our $TN_NSID_CURSOR_DIR = '/var/lib/truenas-plugin';
+
+sub _nvme_pick_nsid_cursor {
+    my ($scfg, $subsys_id, $exclude) = @_;
+    $exclude //= {};
+
+    my $ns_list = _api_call($scfg, 'nvmet.namespace.query',
+        [[["subsys.id", "=", $subsys_id]]]);
+    die "_nvme_pick_nsid_cursor: nvmet.namespace.query for subsys $subsys_id returned no list\n"
+        if ref($ns_list) ne 'ARRAY';
+    my %used = map { (defined $_->{nsid} ? ($_->{nsid} => 1) : ()) } @$ns_list;
+
+    my $max_used = 0;
+    for my $n (keys %used) { $max_used = $n if $n <= TN_NSID_MAX && $n > $max_used; }
+
+    # Never pick a reserved nsid: one per line (or space-separated) in
+    # $TN_NSID_CURSOR_DIR/nsid-reserved, e.g. a ghost nsid the TN kernel still
+    # holds after its DB namespace was deleted (enable at it -> EBUSY).
+    if (open(my $rf, '<', "$TN_NSID_CURSOR_DIR/nsid-reserved")) {
+        while (my $l = <$rf>) { $used{$1} = 1 while $l =~ /(\d+)/g; }
+        close($rf);
+    }
+
+    # PVE daemons run under perl -T: API data is tainted and s/// does not
+    # untaint it, so take the id through a capture before it reaches open().
+    my ($sid) = ("$subsys_id" =~ /^(\d+)$/)
+        or die "_nvme_pick_nsid_cursor: unexpected subsys id '$subsys_id'\n";
+    my $file = "$TN_NSID_CURSOR_DIR/nsid-cursor-$sid";
+    # The cursor is required: picking without it lands on the lowest free
+    # nsid at the ceiling, which is the bug this replaces. Fail the create.
+    my $lk;
+    eval {
+        if (!-d $TN_NSID_CURSOR_DIR) {
+            require File::Path;
+            File::Path::make_path($TN_NSID_CURSOR_DIR, { mode => 0755 });
+        }
+        require Fcntl;
+        open($lk, '>>', "$file.lock") or die "open $file.lock: $!\n";
+        flock($lk, Fcntl::LOCK_EX()) or die "flock $file.lock: $!\n";
+        1;
+    } or do {
+        my $e = $@; chomp $e;
+        _log($scfg, 0, 'err', "[TrueNAS] _nvme_pick_nsid_cursor: cursor unavailable ($e)");
+        die "_nvme_pick_nsid_cursor: cursor unavailable ($e); refusing to pick an nsid without it\n";
+    };
+
+    # No (readable) cursor: below the ceiling, start after the highest nsid
+    # in use (upstream's monotonic behaviour: those nsids were never used).
+    # At the ceiling, max_used says nothing about which free slots were
+    # freed recently, and wrapping from it would always land on the LOWEST
+    # free nsid, i.e. the recycle bug again. Start at a random point instead.
+    my $cursor = $max_used < TN_NSID_MAX ? $max_used : int(rand(TN_NSID_MAX));
+    if (open(my $fh, '<', $file)) {
+        my $line = <$fh> // '';
+        close($fh);
+        $cursor = $1 if $line =~ /^\s*(\d+)\s*$/ && $1 <= TN_NSID_MAX;
+    }
+
+    my $picked;
+    for my $step (1 .. TN_NSID_MAX) {
+        my $n = (($cursor + $step - 1) % TN_NSID_MAX) + 1;
+        next if $used{$n} || $exclude->{$n};
+        $picked = $n;
+        last;
+    }
+    if (!defined $picked) {
+        close($lk);
+        die "_nvme_pick_nsid_cursor: no free nsid in 1.." . TN_NSID_MAX
+            . " on subsys $subsys_id (" . scalar(keys %used) . " in use)\n";
+    }
+
+    my $tmp = "$file.tmp.$$";
+    if (open(my $out, '>', $tmp)) {
+        print $out "$picked\n";
+        close($out);
+        if (!rename($tmp, $file)) {
+            _log($scfg, 1, 'warning', "[TrueNAS] _nvme_pick_nsid_cursor: rename $tmp: $!");
+            unlink($tmp);
+        }
+    } else {
+        _log($scfg, 1, 'warning', "[TrueNAS] _nvme_pick_nsid_cursor: cannot write $tmp: $!");
+    }
+    close($lk);
+
+    _log($scfg, 2, 'debug',
+        "[TrueNAS] _nvme_pick_nsid_cursor: subsys=$subsys_id cursor=$cursor picked=$picked "
+        . "in_use=" . scalar(keys %used));
+    return $picked;
+}
+
 # alpha21: idempotent namespace create.
 #
 # The plain nvmet.namespace.create call goes through _api_call_mutate which
@@ -8016,34 +8115,24 @@ sub _nvme_create_namespace_idempotent {
     # Jitter (random 1..8) reduces the collision window between concurrent
     # nodes both computing max+1.
     #
-    # Ceiling: TN subsystem NN=1024. If max ever exceeds ceiling, we fall
-    # back to letting TN auto-assign (accept the recycle-bug risk again).
-    # Under Max's test-suite churn this ceiling is well above what we see.
+    # max+jitter alone stops working once any namespace
+    # holds a nsid near the ceiling (TN subsystem NN=1024, valid 1..1023
+    # here): every create then fell back to TN auto-assignment (lowest free
+    # nsid), which re-introduced exactly the recycle bug above and, on TN
+    # 25.10, also wedges the nvmet configfs render (EBUSY on an in-place
+    # update of a still-live namespace). Instead hand out nsids from a
+    # persisted wrap-around cursor: next = first nsid after the last one
+    # assigned that is free in TN's DB, wrapping 1..1023. A freed slot is
+    # then not reused until the cursor has gone all the way round. Never
+    # fall back to TN auto-assignment.
     if (!defined $ns_payload->{nsid}) {
         my $subsys_id = $ns_payload->{subsys_id};
         if ($subsys_id) {
-            my $ns_list = eval {
-                _api_call($scfg, 'nvmet.namespace.query',
-                    [[["subsys.id", "=", $subsys_id]]]);
-            };
-            if (!$@ && ref($ns_list) eq 'ARRAY') {
-                my $max = 0;
-                for my $n (@$ns_list) {
-                    $max = $n->{nsid} if defined($n->{nsid}) && $n->{nsid} > $max;
-                }
-                my $jitter = int(rand(8)) + 1;   # 1..8
-                my $picked = $max + $jitter;
-                if ($picked < 1024) {
-                    $ns_payload = { %$ns_payload, nsid => $picked };
-                    _log($scfg, 1, 'info',
-                        "[TrueNAS] _nvme_create_namespace_idempotent: picked explicit nsid=$picked "
-                        . "(max_used=$max, jitter=$jitter) for $zvol_path");
-                } else {
-                    _log($scfg, 1, 'warning',
-                        "[TrueNAS] _nvme_create_namespace_idempotent: max_used_nsid=$max near "
-                        . "subsystem NN ceiling — falling back to TN auto-assignment for $zvol_path");
-                }
-            }
+            my $picked = _nvme_pick_nsid_cursor($scfg, $subsys_id, {});
+            $ns_payload = { %$ns_payload, nsid => $picked };
+            _log($scfg, 1, 'info',
+                "[TrueNAS] _nvme_create_namespace_idempotent: picked explicit nsid=$picked "
+                . "(wrap-around cursor) for $zvol_path");
         }
     }
 
@@ -8065,28 +8154,18 @@ sub _nvme_create_namespace_idempotent {
             return $recheck->[0];
         }
         # alpha30: nsid collision from concurrent nodes both picking the
-        # same max+jitter value. Recompute and retry once with a fresh
-        # max + fresh jitter.
+        # same nsid. Advance the cursor past the collided
+        # nsid and retry once.
         if (defined $ns_payload->{nsid}
             && $err =~ /nsid.*already|nsid.*in use|duplicate.*nsid/i) {
             _log($scfg, 1, 'warning',
                 "[TrueNAS] _nvme_create_namespace_idempotent: nsid=$ns_payload->{nsid} "
-                . "collision, recomputing and retrying once");
-            delete $ns_payload->{nsid};
+                . "collision, picking the next cursor nsid and retrying once");
+            my $collided = delete $ns_payload->{nsid};
             my $subsys_id = $ns_payload->{subsys_id};
             if ($subsys_id) {
-                my $ns_list = eval {
-                    _api_call($scfg, 'nvmet.namespace.query',
-                        [[["subsys.id", "=", $subsys_id]]]);
-                };
-                if (!$@ && ref($ns_list) eq 'ARRAY') {
-                    my $max = 0;
-                    for my $n (@$ns_list) {
-                        $max = $n->{nsid} if defined($n->{nsid}) && $n->{nsid} > $max;
-                    }
-                    my $picked = $max + int(rand(16)) + 1;
-                    $ns_payload = { %$ns_payload, nsid => $picked } if $picked < 1024;
-                }
+                my $picked = _nvme_pick_nsid_cursor($scfg, $subsys_id, { $collided => 1 });
+                $ns_payload = { %$ns_payload, nsid => $picked };
             }
             $ns = eval {
                 _api_call($scfg, 'nvmet.namespace.create', [ $ns_payload ],
