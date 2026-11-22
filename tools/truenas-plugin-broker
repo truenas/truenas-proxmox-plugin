@@ -401,10 +401,18 @@ sub _select_mechanism {
     $username = undef if defined $username && !length $username;
 
     my $limited = 0;
+    my $probe_crashed = 0;
     if (defined $probe_err) {
         my $unsupported = _is_scram_unsupported_error($probe_err)
                           || _is_method_not_found($probe_err);
         $limited = 1 if !$unsupported && _is_rate_limited($probe_err);
+        # TN 25.10.4 answers an unauthenticated auth.mechanism_choices with an
+        # EINVAL envelope (AttributeError on may_create_auth_token) instead of
+        # the list. The server HAS the method, so it has login_ex too: try
+        # API_KEY_PLAIN; T2's own method-not-found fallback still reaches T3.
+        # Only server envelopes count (_authenticate serializes those with
+        # encode_json); a transport failure keeps the T3 floor.
+        $probe_crashed = 1 if !$unsupported && !$limited && $probe_err =~ /\A\{.*"code"\s*:/s;
     }
     my %have = map { $_ => 1 } (ref($probe_result) eq 'ARRAY' ? @$probe_result : ());
 
@@ -415,7 +423,7 @@ sub _select_mechanism {
     }
     if ($mech eq 'plain') {
         return 'T3' unless defined $username;
-        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited;
+        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited || $probe_crashed;
         return 'T3';
     }
     if ($mech eq 'scram-plus') {
@@ -426,7 +434,7 @@ sub _select_mechanism {
     die "tn_auth_mechanism=$mech: unknown mechanism\n" unless $mech eq 'auto';
     return 'T3' unless defined $username;
     return 'T1' if $have{SCRAM};
-    return 'T2' if $have{API_KEY_PLAIN};
+    return 'T2' if $have{API_KEY_PLAIN} || $probe_crashed;
     return 'T1' if $limited;
     return 'T3';
 }
