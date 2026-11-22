@@ -9462,6 +9462,32 @@ sub _free_image_nvme {
 
     _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: deleting NVMe namespace for $zname");
 
+    # Deleting the namespace can cut off a running guest before zvol cleanup,
+    # so check local use before the first mutation. Check every namespace
+    # that _nvme_delete_namespace will remove (the volname UUID can be stale),
+    # plus the volname UUID itself. A failed API query dies here.
+    my $uuid_re = qr/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i;
+    my %on_zvol = map { $_->{device_uuid} => 1 } grep { ($_->{device_uuid} // '') =~ $uuid_re }
+        @{ _nvme_namespaces_for_device_path($scfg, "zvol/$full_ds") };
+    my %uuids = (%on_zvol, (defined($device_uuid) && $device_uuid =~ $uuid_re ? ($device_uuid => 1) : ()));
+    for my $uuid (sort keys %uuids) {
+        my $found = _nvme_find_device_by_subsystem($scfg, $uuid);
+        my $dev = _nvme_selector_selected_device_path($found);
+        if ($dev) {
+            die "Cannot free '$volname': NVMe device $dev is still in use on this node\n"
+                if _nvme_check_devices_in_use($scfg, $dev);
+            next;
+        }
+        my $reason = $found->{mismatch_reason} // $found->{selector_outcome} // 'unknown';
+        # The subsystem is not connected here, so nothing local can use it.
+        next if $reason eq 'subsystem_not_visible';
+        # Only the volname knew this UUID and TrueNAS no longer has it: the
+        # namespace is already gone, so the zvol can still be cleaned up.
+        next if $reason eq 'namespace_uuid_not_returned' && !$on_zvol{$uuid};
+        die "Cannot free '$volname': could not tell whether NVMe namespace $uuid is in use "
+            . "on this node ($reason). Nothing was deleted; retry after the subsystem is rescanned.\n";
+    }
+
     # Helper to detect "in use" errors
     my $in_use = sub {
         my ($err) = @_;
