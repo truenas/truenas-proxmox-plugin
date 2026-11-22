@@ -747,15 +747,20 @@ TrueNAS subsystems only:**
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+# Namespace heads (nvme0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ENV{DEVTYPE}=="disk", \
   ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+# Per-path devices of native multipath (nvme0c0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*c*n*", ENV{DEVTYPE}=="disk", \
+  ATTR{device/subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
 EOF
 udevadm control --reload
 udevadm trigger --subsystem-match=block --action=change
 ```
 
-Verify: `cat /sys/block/<nvmeNnM>/queue/max_sectors_kb` should
-print `1024`. See
+Verify: `grep . /sys/block/nvme*/queue/max_sectors_kb` should print
+`1024` for every namespace head **and** path device (a head-only cap is not enough
+with native multipath). See
 [Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
 for the full writeup. Remove the rule when the kernel fix lands in
 your TrueNAS version.

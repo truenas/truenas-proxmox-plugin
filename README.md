@@ -255,34 +255,48 @@ leaves every namespace unpublished in configfs. See
 [wiki/Best-Practices.md#nvmetcp-ha-failover](wiki/Best-Practices.md#nvmetcp-ha-failover)
 and the [HA stanza in storage.cfg.example](storage.cfg.example).
 
-**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** TrueNAS's
-`nvmet-tcp` kernel module is missing the `.get_mdts` callback, so
-clients may send transfers larger than the target can map. Any
-command that issues large direct I/O (vzdump streaming backups,
-`qemu-img convert -t none` disk moves, `pvesm` imports) can fail with
-`err -5 - Input/output error` partway through, and in some cases
-produce silent corruption. Cap the per-request transfer size on
-every Proxmox node that mounts this storage:
+**⚠️ Known issue — large-transfer I/O errors (GitHub #45, #96):** on TrueNAS
+25.10.x before 25.10.8, the `nvmet-tcp` target does not announce a maximum
+transfer size (`mdts: 0`), so the host can send commands the target cannot map.
+Large direct I/O (vzdump streaming backups, `qemu-img convert -t none` disk moves,
+`pvesm` imports) can then fail with `I/O Error (sct 0x0 / sc 0x6)` and, in some
+reports, leave silently corrupted copies. Cap the request size on every Proxmox
+node that mounts an affected NVMe/TCP namespace, on the namespace heads **and**
+on the per-path devices:
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+# Namespace heads (nvme0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ENV{DEVTYPE}=="disk", \
   ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+# Per-path devices of native multipath (nvme0c0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*c*n*", ENV{DEVTYPE}=="disk", \
+  ATTR{device/subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
 EOF
 udevadm control --reload
 udevadm trigger --subsystem-match=block --action=change
 ```
 
-Scoped to TrueNAS subsystems (`subsysnqn` match), whole-disk only
-(`DEVTYPE==disk`, avoids partition-write errors); capping the
-namespace head is enough because the bio layer splits before
-forwarding. Verify with
-`cat /sys/block/<nvmeNnM>/queue/max_sectors_kb` — rules that don't
-match any device fail silently. If your TrueNAS subsystem NQNs don't
-contain "truenas", adjust the glob.
+Scoped to TrueNAS subsystems (`subsysnqn` match) and whole disks (`DEVTYPE==disk`).
+Capping only the namespace head is not enough with native multipath: the head
+splits requests, but the path devices can merge them back above the head's limit
+(reported in #96 as 32 MiB requests on the path devices after a head-only cap).
 
-Validated against TN 25.10.4 and TN 26.0 BETA.x. Remove when the
-kernel patch (reviewed upstream) ships in a TrueNAS point release.
+Verify both layers. A rule that matches no device fails silently:
+
+```bash
+grep . /sys/block/nvme*/queue/max_sectors_kb   # heads and paths: all must print 1024
+cat /sys/block/nvme0c0n1/device/subsysnqn      # a path NQN; must match the rule glob
+nvme id-ctrl /dev/nvme0 | grep mdts            # 0 = target does not announce a limit
+```
+
+On TrueNAS 25.10.8 and later the target announces `mdts: 8` (1 MiB) and the host
+limits requests to 1024 KiB without the rule. That behaviour is confirmed on a
+single path only, so keep the rule until you have checked the path devices on your
+array. The rule is harmless on 25.10.8+. Remove it once every TrueNAS you mount
+reports a non-zero `mdts` and the heads and paths show the expected limit.
+
+Validated against TN 25.10.4 and TN 26.0 BETA.x.
 See [wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors](wiki/Known-Limitations.md#nvmet-tcp-missing-get_mdts--large-transfer-io-errors)
 for the full writeup.
 

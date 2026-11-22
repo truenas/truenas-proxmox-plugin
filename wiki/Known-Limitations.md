@@ -310,54 +310,60 @@ scatter-gather map and returns Internal Error (sct 0x0 / sc 0x6).
 from the NVMe maintainer. Not yet in a released TrueNAS point
 version at the time of writing.
 
-**Workaround — cap `max_sectors_kb` on every PVE node:**
+**Workaround — cap `max_sectors_kb` on every PVE node, heads and paths:**
 
 ```bash
 cat > /etc/udev/rules.d/60-nvme-tcp-max-sectors.rules <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n*", ENV{DEVTYPE}=="disk", \
+# Namespace heads (nvme0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ENV{DEVTYPE}=="disk", \
   ATTRS{subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
+# Per-path devices of native multipath (nvme0c0n1)
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*c*n*", ENV{DEVTYPE}=="disk", \
+  ATTR{device/subsysnqn}=="nqn.*truenas*", ATTR{queue/max_sectors_kb}="1024"
 EOF
 udevadm control --reload
 udevadm trigger --subsystem-match=block --action=change
 ```
 
-Four clauses, each necessary:
+- `KERNEL=="nvme[0-9]*n[0-9]*"` matches namespace heads (`nvme0n1`); the
+  `nvme*c*n*` rule matches per-path devices (`nvme0c0n1`). On some kernels the head
+  rule's `ATTRS{}` walk already reaches the path devices through their controller; the
+  explicit path rule makes the cap on the paths independent of that.
+- `ENV{DEVTYPE}=="disk"` — whole disks only; without it, udev tries to write
+  `max_sectors_kb` on every partition and logs an error per partition.
+- `ATTRS{subsysnqn}` (heads) and `ATTR{device/subsysnqn}` (paths) — scope the cap
+  to TrueNAS subsystems. The path NQN is read from `/sys/block/nvmeXcYnZ/device/subsysnqn`;
+  `device/../subsysnqn` does not exist for path devices. Adjust the glob if your
+  subsystem NQNs don't contain "truenas".
+- `ATTR{queue/max_sectors_kb}="1024"` — 1024 KiB is the value validated against
+  TN 25.10.4 and TN 26.0 BETA.x. If you still see sporadic errors with 1024, drop to
+  128 (used by the original #45 reporter).
 
-- `KERNEL=="nvme*n*"` — any NVMe block device.
-- `ENV{DEVTYPE}=="disk"` — namespace head only; without this, udev
-  tries to write `max_sectors_kb` on every partition (`nvme6n2p1`
-  etc.) during guest-disk partition-table scans and logs an error
-  per partition in `journalctl -p err`.
-- `ATTRS{subsysnqn}=="nqn.*truenas*"` — scopes the cap to TrueNAS
-  subsystems only; local NVMe SSDs behind `local-lvm` or `local-zfs`
-  keep their native (large) MDTS. Adjust the glob if your subsystem
-  NQNs don't contain "truenas".
-- `ATTR{queue/max_sectors_kb}="1024"` — 1024 KiB (2048 sectors) is
-  the value this project validated against TN 25.10.4 and TN 26.0
-  BETA.x; it stays well under the mapping limit while leaving
-  streaming workloads at near-line-rate. If you still see sporadic
-  errors with 1024, drop to 128 (used by the original #45 reporter).
+**Trap:** `ATTRS{transport}=="tcp"` as a scope filter **does not work** with
+native NVMe multipath. The `transport` attribute lives on the per-path controllers,
+not on the namespace head that carries the queue limits.
 
-**Trap:** `ATTRS{transport}=="tcp"` as a scope filter **does not
-work** with native NVMe multipath. The `transport` attribute lives on
-the per-path controllers (`nvme0c0n1`), not the namespace head
-(`nvme0n1`) that carries the queue limits — the rule installs cleanly
-and does nothing. Use `ATTRS{subsysnqn}` instead.
+**Capping the head alone is not enough.** The head splits requests, but the path
+devices can re-merge them above the head's limit. Reported in #96 on TrueNAS 25.10.6:
+a head-only rule left the path devices uncapped and the target logged `failed to map
+data` during an 8 GiB restore.
 
-**Verify** the value actually changed:
+**Verify** every head and every path, not just one, and again after a path
+reconnect (a recreated path device starts with the default limit until udev re-applies
+the rule):
 
 ```bash
-cat /sys/block/<nvmeNnM>/queue/max_sectors_kb
+grep . /sys/block/nvme*/queue/max_sectors_kb   # all must print 1024
+cat /sys/block/nvme0c0n1/device/subsysnqn      # confirms the path rule's NQN glob
+nvme id-ctrl /dev/nvme0 | grep mdts            # 0 = no limit announced by the target
 ```
 
-A rule that doesn't match any device fails silently. Capping the
-namespace head alone is enough; the bio layer splits before
-forwarding to the paths, so per-path `max_sectors_kb` doesn't need to
-be touched. The value survives a full disconnect/reconnect of the
-subsystem.
+**TrueNAS 25.10.8 and later** announce `mdts: 8` (1 MiB), so the host limits requests
+without the rule. That is confirmed on a single path only; keep the rule until the
+path devices are checked on your array. It is harmless on 25.10.8+.
 
-**Remove the rule** once the kernel fix lands in your TrueNAS
-version.
+**Remove the rule** once every TrueNAS you mount reports a non-zero `mdts` and the
+heads and paths show the expected limit.
 
 ### TrueNAS HA + NVMe/TCP needs `tn_nvme_manage_ports 0`
 
