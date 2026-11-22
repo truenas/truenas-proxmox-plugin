@@ -8171,6 +8171,19 @@ sub _nvme_reap_orphan_namespaces {
         next unless index($dp, $reap_prefix) == 0;  # only our storage's slice
         (my $ds_id = $dp) =~ s{^zvol/}{};
         next if $ds_exists{$ds_id};                 # backing dataset still there -- keep
+        # A template conversion in flight (create_base): its vm- zvol was just
+        # renamed to base-, so the path looks orphaned until create_base
+        # rewires it. Deleting it then makes the rewire fail ENOENT and leaves
+        # a half-converted template. Not gated on `enabled`: this reaper reads
+        # namespaces before datasets, so create_base can disable and rename in
+        # between. Cost: a stray vm- namespace beside a base- disk is kept.
+        (my $base_id = $ds_id) =~ s{/vm-([^/]+)$}{/base-$1};
+        if ($base_id ne $ds_id && $ds_exists{$base_id}) {
+            _log($scfg, 1, 'info',
+                "[TrueNAS] reap_orphan_namespaces: keeping id=" . ($ns->{id} // '?')
+                . " ($dp): base- sibling exists (template conversion in flight)");
+            next;
+        }
         my ($zname) = $dp =~ m{/([^/]+)$};
         next if $zname && _is_snapshot_clone_zname($zname);  # issue #42 clones own their cleanup
         push @orphans, $ns;
