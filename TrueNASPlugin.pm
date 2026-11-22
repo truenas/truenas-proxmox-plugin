@@ -8469,6 +8469,35 @@ sub path {
     }
 }
 
+# A pool.dataset.create that _api_call retried after a transport error can land twice:
+# the first send creates the zvol on the array but its reply is lost, and the retry is
+# answered "dataset already exists" for the very zvol this call created (#151). Moving on
+# to the next disk number then leaks that zvol: no guest config names it and it has no
+# share, so nothing ever deletes it. A zvol counts as this call's own only when the array
+# reports a VOLUME of exactly the requested size, created no earlier than this create
+# attempt began (less $ALLOC_ADOPT_CLOCK_SKEW_S for clock skew between node and array).
+# Anything older is the leftover of an async delete, which the rename path below is for:
+# adopting that would hand the guest someone else's data. Returns 1 or 0; never dies.
+my $ALLOC_ADOPT_CLOCK_SKEW_S = 10;
+sub _alloc_zvol_is_own_retry {
+    my ($scfg, $full_ds, $bytes, $attempt_started) = @_;
+    my $rows = eval {
+        _api_call($scfg, 'pool.dataset.query',
+            [ [ [ 'id', '=', $full_ds ] ],
+              { extra => { properties => [ 'creation', 'volsize' ] } } ]);
+    };
+    return 0 if !$rows || ref($rows) ne 'ARRAY' || @$rows != 1 || ref($rows->[0]) ne 'HASH';
+    my $ds = $rows->[0];
+    return 0 if ($ds->{type} // '') ne 'VOLUME';
+    my ($created, $volsize) = map { ref($_) eq 'HASH' ? $_->{rawvalue} : undef }
+        ($ds->{creation}, $ds->{volsize});
+    return 0 if !defined($created) || $created !~ /^\d+$/;
+    return 0 if !defined($volsize) || $volsize !~ /^\d+$/;
+    return 0 if $volsize != $bytes;
+    return 0 if $created < $attempt_started - $ALLOC_ADOPT_CLOCK_SKEW_S;
+    return 1;
+}
+
 # Create a new VM disk (zvol + transport-specific exposure) and hand it to Proxmox.
 # Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib)
 # NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
@@ -8587,6 +8616,7 @@ sub alloc_image {
         # Pass compression algorithm if configured (otherwise inherits from parent dataset)
         $create_payload->{compression} = uc($scfg->{tn_compression}) if $scfg->{tn_compression};
 
+        my $attempt_started = time();
         eval {
             $create_result = _api_call(
                 $scfg,
@@ -8599,6 +8629,12 @@ sub alloc_image {
             $create_error = $@;
             # Check if error is "dataset already exists" - indicates race condition with async delete
             if ($create_error =~ /dataset already exists/i) {
+                if (_alloc_zvol_is_own_retry($scfg, $full_ds, $bytes, $attempt_started)) {
+                    _log($scfg, 0, 'warning', "[TrueNAS] alloc_image: zvol $full_ds already exists, but it was created by this create's own retried request; using it (#151)");
+                    $create_error = undef;
+                    $create_result = undef;
+                    last;
+                }
                 _log($scfg, 1, 'warn', "[TrueNAS] alloc_image: zvol $full_ds already exists (attempt $create_attempt/$max_create_retries), trying alternate name");
 
                 # Parse current name and increment disk number
