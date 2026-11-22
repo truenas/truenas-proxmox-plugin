@@ -7375,16 +7375,9 @@ sub _nvme_device_for_uuid {
             # In steady-state cluster testing this gate almost always blocks
             # (there is always some VM using something), so it rarely fires.
             #
-            # Second tier (i==125, ~12.5s): LAST RESORT — force reconnect
-            # regardless of the fuser check. Rationale: at this point the
-            # activate_volume for the target VM is going to fail if we do
-            # nothing (~2.5s left of the budget, all previous interventions
-            # exhausted). A brief NVMe controller drop causes queued I/O on
-            # other VMs — kernel NVMe controller-loss handling normally
-            # resumes cleanly on reconnect within a couple of seconds. The
-            # trade is "one confirmed activate_volume failure now" vs "a few
-            # hundred ms of I/O pause on other VMs, then everything works".
-            # The failure is worse than the pause.
+            # Second tier (i==125, ~12.5s): LAST RESORT — also skip if the
+            # subsystem is in use. Disconnecting a shared subsystem can
+            # interrupt I/O for other guests.
             my $tn_has_uuid = 0;
             eval {
                 my $q = _api_call($scfg, 'nvmet.namespace.query',
@@ -7396,12 +7389,12 @@ sub _nvme_device_for_uuid {
                 my $tag = $is_last_resort ? 'i==125' : 'i==75';
                 my @dev_paths = _nvme_get_subsystem_device_paths($scfg);
                 my $in_use = _nvme_check_devices_in_use($scfg, @dev_paths);
-                if ($in_use && !$is_last_resort) {
+                if ($in_use) {
                     _log($scfg, 1, 'warning',
                         "[TrueNAS] nvme_device_for_uuid: $tag reconnect SKIPPED "
-                        . "(target $device_uuid confirmed on TN but not visible): "
+                        . "(target volume $device_uuid confirmed on TN but not visible): "
                         . "dev_paths=" . scalar(@dev_paths)
-                        . ", in_use=1 — deferring to i==125 last-resort");
+                        . ", in_use=1 — shared subsystem is in use by other consumers");
                 } else {
                     $reconnect_attempted = 1;
                     my $kind = $is_last_resort ? 'last-resort' : 'halfway';
@@ -7409,8 +7402,7 @@ sub _nvme_device_for_uuid {
                         "[TrueNAS] nvme_device_for_uuid: $tag reconnect FIRING "
                         . "($kind, target $device_uuid confirmed on TN): "
                         . "dev_paths=" . scalar(@dev_paths)
-                        . ", in_use=$in_use"
-                        . ($in_use ? " (last-resort forces despite in-use)" : ""));
+                        . ", in_use=$in_use");
                     eval { _nvme_disconnect($scfg) };
                     usleep(500_000);
                     eval { _nvme_connect($scfg) };
