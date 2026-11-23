@@ -1,3 +1,14 @@
+truenas-proxmox-plugin (2.1.25~beta9) unstable; urgency=medium
+
+  * GUI: tn_api_insecure is now in the Add Storage dialog's Advanced
+    section (was hidden in 2.1.25~beta2 on the "99% off" reasoning).
+    Self-signed TLS certs are common enough on TrueNAS installs that
+    admins adding a storage against a self-signed TN hit a TLS verify
+    failure on first pvesm status and had to drop to the CLI or edit
+    /etc/pve/storage.cfg to turn on insecure mode.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 13:26:54 -0500
+
 truenas-proxmox-plugin (2.1.25~beta8) unstable; urgency=medium
 
   * Fix a follow-on regression from 2.1.25~beta6's sensitive-properties
