@@ -674,6 +674,18 @@ sub scfg_key {
     return $host . ':' . sha1_hex($key . '|' . $user . '|' . $mech);
 }
 
+# A probe passed only if ws_rpc returned a matched reply WITHOUT a JSON-RPC
+# error envelope. undef (transport fail), a non-hash, or any reply with an
+# `error` key (e.g. ENOTAUTHENTICATED on a 30-day-expired session) fails.
+# Factored out so t/scram/05-liveness-probe.t can exercise the classifier
+# directly without reaching into the pool's lexical state (issue #161).
+sub _liveness_probe_passed {
+    my ($probe) = @_;
+    return 0 unless ref($probe) eq 'HASH';
+    return 0 if exists $probe->{error};
+    return 1;
+}
+
 sub get_or_open_ws {
     my ($scfg) = @_;
     my $sk = scfg_key($scfg);
@@ -695,17 +707,43 @@ sub get_or_open_ws {
             $entry->{last_used} = $now;
             return $entry->{conn};
         }
-        my $ok = eval {
+        # ws_rpc returns the full decoded JSON-RPC envelope (hashref) on a
+        # matched reply, or undef on transport failure / timeout / no
+        # matching id. An error envelope (`{"error":{...}}`) is still a
+        # matched reply and still a truthy hashref, so the earlier
+        # `if ($ok)` check passed through ENOTAUTHENTICATED replies and
+        # pinned the pool entry to a dead session until process exit
+        # (see #161 -- ~16,000 ENOTAUTHENTICATED errors over 6h on a
+        # 30-day-expired session with no reopen). Treat only a reply
+        # without an `error` field as success.
+        my $probe = eval {
             ws_rpc($entry->{conn}, {
                 jsonrpc => "2.0", id => 999999, method => "auth.me", params => [],
             });
         };
-        if ($ok) {
+        my $probe_err = $@;
+        if (_liveness_probe_passed($probe)) {
             $entry->{last_used} = $now;
             $entry->{last_liveness_ok} = $now;
             return $entry->{conn};
         }
-        # Dead or unauthenticated; drop and reopen (which re-auths).
+        # Dead, unauthenticated, or transport failure. Log so the journal
+        # distinguishes "quiet because healthy" from "quiet because the
+        # probe keeps evicting", then drop and reopen (which re-auths).
+        my $why;
+        if ($probe_err) {
+            $why = "transport error: $probe_err";
+        } elsif (!defined $probe) {
+            $why = "no reply from upstream";
+        } elsif (ref($probe) eq 'HASH' && exists $probe->{error}) {
+            my $e = $probe->{error};
+            my $errname = (ref($e) eq 'HASH' && ref($e->{data}) eq 'HASH')
+                ? ($e->{data}{errname} // '') : '';
+            $why = "upstream error" . ($errname ? " ($errname)" : '');
+        } else {
+            $why = "unexpected reply shape";
+        }
+        linfo("liveness probe failed for $sk -- reopening ($why)");
         eval { $entry->{conn}->{sock}->close(); };
         delete $POOL{$sk};
     }
@@ -891,6 +929,18 @@ sub handle_request {
             linfo("upstream ENOENT on $method (already gone; sk=$sk)");
         } else {
             lwarn("upstream error (sk=$sk method=$method): $err_repr");
+        }
+        # ENOTAUTHENTICATED on a real request means the session expired
+        # (TN's 30-day silent expiry, #137/#161). The liveness probe above
+        # catches it before most requests, but a request can land in the
+        # tiny window between probe and expiry. Evict the pool entry so
+        # the NEXT request gets a fresh auth.login_ex / login_with_api_key.
+        # We don't retry here -- the caller sees one error and retries.
+        if ($err_repr =~ /ENOTAUTHENTICATED/) {
+            linfo("evicting pool entry on ENOTAUTHENTICATED (sk=$sk method=$method)");
+            if (my $e = delete $POOL{$sk}) {
+                eval { $e->{conn}->{sock}->close(); };
+            }
         }
         my $msg = encode_json({ error => encode_json($result_obj->{error}) });
         $client->syswrite("$msg\n");
