@@ -1,3 +1,22 @@
+truenas-proxmox-plugin (2.1.25~beta4) unstable; urgency=medium
+
+  * NVMe/TCP: the i==125 "last-resort" reconnect tier in
+    _nvme_device_for_uuid now honours the in-use probe, matching
+    i==75 and the i==150 emergency path. 2.1.24 fixed the probe
+    itself so it catches kernel-held and other-mount-namespace
+    holders (LXC rootfs mounts); this release closes the one
+    remaining reconnect tier that bypassed the probe.
+
+    Trade-off (same reasoning as #131's emergency-reconnect fix): a
+    volume that would only have appeared after a forced reconnect
+    now needs an idle subsystem or a manual reconnect, so
+    activate_volume will fail more often on a busy subsystem. One
+    failed activation is preferable to an I/O stall or a lost
+    controller under other running guests. Recovery still runs
+    when the subsystem is idle. Fixes #146.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 10:14:02 -0500
+
 truenas-proxmox-plugin (2.1.25~beta3) unstable; urgency=medium
 
   * alloc_image: adopt a zvol our own retried pool.dataset.create made,
