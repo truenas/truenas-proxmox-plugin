@@ -1,3 +1,23 @@
+truenas-proxmox-plugin (2.1.25~beta8) unstable; urgency=medium
+
+  * Fix a follow-on regression from 2.1.25~beta6's sensitive-properties
+    fix: the create succeeded at the schema layer, the on_add_hook
+    accepted the API key, but the key was never written back into the
+    stored storage.cfg entry. write_config then persisted the entry
+    without it, and every later broker call died with "broker: scfg
+    missing api_host/api_key" even though the GUI dialog had reported
+    "storage saved". on_add_hook now merges all four sensitive
+    properties (tn_api_key, tn_chap_password, tn_nvme_dhchap_secret,
+    tn_nvme_dhchap_ctrl_secret) into the stored config, and the newly
+    added on_update_hook does the same for post-create secret
+    changes (with "undef means clear" so wiping a secret removes it
+    from storage.cfg). tn_api_key stays fixed, so PVE rejects any
+    update of it. Existing storage.cfg entries written with
+    2.1.25~beta6 or 2.1.25~beta7 need the tn_api_key line pasted
+    back in manually (edit /etc/pve/storage.cfg).
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 12:22:57 -0500
+
 truenas-proxmox-plugin (2.1.25~beta7) unstable; urgency=medium
 
   * NVMe/TCP: the namespace-create path now skips "ghost" nsids --
