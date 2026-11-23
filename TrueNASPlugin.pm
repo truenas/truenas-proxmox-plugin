@@ -8007,6 +8007,7 @@ sub _nvme_namespaces_for_device_path {
 # cursor cannot be locked, or no nsid is free.
 use constant TN_NSID_MAX => 1023;
 our $TN_NSID_CURSOR_DIR = '/var/lib/truenas-plugin';
+our $TN_SYSFS_BLOCK = '/sys/block';
 
 sub _nvme_pick_nsid_cursor {
     my ($scfg, $subsys_id, $exclude) = @_;
@@ -8020,6 +8021,45 @@ sub _nvme_pick_nsid_cursor {
 
     my $max_used = 0;
     for my $n (keys %used) { $max_used = $n if $n <= TN_NSID_MAX && $n > $max_used; }
+
+    # Never pick a reserved nsid: one per line (or space-separated) in
+    # $TN_NSID_CURSOR_DIR/nsid-reserved, e.g. a ghost nsid the TN kernel still
+    # holds after its DB namespace was deleted (enable at it -> EBUSY).
+    if (open(my $rf, '<', "$TN_NSID_CURSOR_DIR/nsid-reserved")) {
+        while (my $l = <$rf>) { $used{$1} = 1 while $l =~ /(\d+)/g; }
+        close($rf);
+    }
+
+    # Never pick a ghost nsid: one this host sees on the subsystem (so the
+    # target still serves it) that has no row in TN's DB. That is a namespace
+    # the TN kernel still holds after its configfs entry is gone; enabling a
+    # new namespace at that nsid fails EBUSY and aborts every later nvmet
+    # render. Recomputed on every pick, never persisted: a stale host view
+    # only costs one skipped slot. Reading the host view never fails a create.
+    my %in_db = map { (defined $_->{nsid} ? ($_->{nsid} => 1) : ()) } @$ns_list;
+    my %ghost;
+    eval {
+        for my $dev (_nvme_get_subsystem_device_paths($scfg)) {
+            my ($name) = ($dev =~ m{^/dev/(nvme\d+(?:c\d+)?n\d+)$}) or next;
+            open(my $nf, '<', "$TN_SYSFS_BLOCK/$name/nsid") or next;
+            my $l = <$nf> // '';
+            close($nf);
+            my ($n) = ($l =~ /^\s*(\d+)\s*$/) or next;
+            next if $in_db{$n};
+            $ghost{$n} //= $name;
+        }
+        1;
+    } or do {
+        my $e = $@; chomp $e;
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] _nvme_pick_nsid_cursor: host namespace view unavailable ($e); not skipping ghost nsids");
+    };
+    if (%ghost) {
+        $used{$_} = 1 for keys %ghost;
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] _nvme_pick_nsid_cursor: skipping ghost nsid(s) seen on this host but not in TN's DB: "
+            . join(' ', map { "$_($ghost{$_})" } sort { $a <=> $b } keys %ghost));
+    }
 
     # PVE daemons run under perl -T: API data is tainted and s/// does not
     # untaint it, so take the id through a capture before it reaches open().
