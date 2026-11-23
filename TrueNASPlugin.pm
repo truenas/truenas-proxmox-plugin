@@ -683,6 +683,7 @@ sub plugindata {
         # sensitive flag, overriding anything set per-property; older
         # pve-manager versions silently ignore the keys.
         'advanced-properties' => {
+            tn_api_insecure => 1,
             tn_chap_password => 1,
             tn_chap_user => 1,
             tn_compression => 1,
@@ -715,7 +716,6 @@ sub plugindata {
             tn_api_transport           => 1,  # deprecated, always wss
             tn_api_scheme              => 1,  # 99% wss
             tn_api_port                => 1,  # 99% 443
-            tn_api_insecure            => 1,  # 99% off
             tn_api_budget_s            => 1,  # unset default is correct
             tn_api_retry_delay         => 1,  # default 1s
             tn_api_retry_max           => 1,  # default 3
