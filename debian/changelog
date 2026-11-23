@@ -1,3 +1,57 @@
+truenas-proxmox-plugin (2.1.25~beta3) unstable; urgency=medium
+
+  * alloc_image: adopt a zvol our own retried pool.dataset.create made,
+    instead of incrementing the disk number and leaking it. Each create
+    attempt stamps a 32-hex-char random marker into the zvol's comments;
+    on "already exists" from the retry, the plugin adopts the zvol only
+    when it is a VOLUME of the requested size whose comments equal this
+    attempt's marker. Anything else keeps the existing next-name path.
+    Fixes #151.
+
+  * orphan-namespace reaper (NVMe transport): leaves alone a disk that
+    create_base is converting. When a namespace points at a missing
+    vm-X dataset but the base-X sibling exists under the same parent,
+    keep the namespace and log it. Not gated on the namespace being
+    disabled -- the reaper queries namespaces before datasets, so
+    create_base can disable+rename between those two reads and the
+    snapshot can still say enabled. Fixes #154 for the default mode.
+
+  * orphan-namespace reaper (tn_use_cluster_lock=1): also takes the
+    storage lock that create_base holds, or reuses it when the caller
+    already holds it. Before each delete, re-checks under the lock that
+    the backing dataset is still missing and that the namespace still
+    points at the same device_path. Emergency reap and reconnect in
+    _nvme_device_for_uuid ask for the lock with a 1 s timeout and skip
+    the block when it is busy. Default mode (tn_use_cluster_lock=0) is
+    unchanged apart from gaining the per-candidate re-check. Completes
+    the #154 coverage.
+
+  * broker liveness probe: an auth.me ping that gets a JSON-RPC error
+    envelope back (e.g. ENOTAUTHENTICATED after TrueNAS's silent 30-day
+    session expiry) was being treated as success -- the pool entry
+    never reopened and every subsequent request returned the same
+    error. A reporter observed ~16,000 ENOTAUTHENTICATED errors over
+    six hours with zero pool reopens. The probe now rejects any
+    non-hash, error-carrying, or empty reply as failure, classifies the
+    cause in the log, and the request handler evicts the pool entry on
+    ENOTAUTHENTICATED. Fixes #161.
+
+  * auth tier selection: on TrueNAS 25.10.4, the unauthenticated
+    auth.mechanism_choices probe crashes with EINVAL ('NoneType' object
+    has no attribute 'may_create_auth_token'). The selector only
+    recognised method-not-found and rate-limit error shapes, so EINVAL
+    fell through both, left the mechanism set empty, and auto / plain
+    mode both returned T3 (legacy auth.login_with_api_key). Server
+    silently reduced to the legacy T3 floor even though auth.login_ex
+    works. A well-formed server-error envelope from the probe that is
+    neither method-not-found nor rate-limited is now evidence that
+    login_ex is present, and auto / plain pick T2 (API_KEY_PLAIN via
+    login_ex). scram / scram-plus still die on absence of SCRAM,
+    no-username still floors to T3, rate-limited probe keeps the
+    optimistic T1 path, transport failures stay T3. Fixes #159.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 09:19:12 -0500
+
 truenas-proxmox-plugin (2.1.25~beta2) unstable; urgency=medium
 
   * GUI integration for the pve-manager 9.2.29+ custom-storage dialog.
