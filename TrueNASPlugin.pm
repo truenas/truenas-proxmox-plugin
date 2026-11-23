@@ -1239,12 +1239,45 @@ sub options {
 # pve-manager 9.2.29+ extracts sensitive-properties (tn_api_key and the
 # tn_chap_password / tn_nvme_dhchap_* set) out of the create/update
 # $param and passes them to on_add_hook / on_update_hook as a separate
-# hash, so check_config cannot see them. Validate here that a create
-# supplied tn_api_key.
+# hash, so check_config cannot see them.
+#
+# PVE core plugins that declare sensitive-properties (Ceph, PBS, CIFS,
+# RBD) all persist their secrets in sidecar files. We keep ours inline
+# in storage.cfg, so the hooks also have to merge the sensitive hash
+# back into $scfg; otherwise write_config writes the entry without the
+# key and every later broker call dies "scfg missing api_host/api_key".
+our @_SENSITIVE_KEYS = qw(
+    tn_api_key
+    tn_chap_password
+    tn_nvme_dhchap_secret
+    tn_nvme_dhchap_ctrl_secret
+);
+
 sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
     if (!defined($sensitive{tn_api_key}) || $sensitive{tn_api_key} eq '') {
         die "tn_api_key is required\n";
+    }
+    for my $k (@_SENSITIVE_KEYS) {
+        next unless exists($sensitive{$k})
+                 && defined($sensitive{$k})
+                 && $sensitive{$k} ne '';
+        $scfg->{$k} = $sensitive{$k};
+    }
+    return undef;
+}
+
+sub on_update_hook {
+    my ($class, $storeid, $scfg, %sensitive) = @_;
+    for my $k (@_SENSITIVE_KEYS) {
+        next unless exists $sensitive{$k};
+        if (defined($sensitive{$k}) && $sensitive{$k} ne '') {
+            $scfg->{$k} = $sensitive{$k};
+        } else {
+            # extract_sensitive_params returns undef when the admin
+            # explicitly cleared the field; drop it from stored config.
+            delete $scfg->{$k};
+        }
     }
     return undef;
 }
