@@ -15,8 +15,23 @@ my (@ns, %ds, @deleted, @logs);
     *{"${PKG}::_api_call"} = sub {
         my ($scfg, $m, $args) = @_;
         return [ { id => 1 } ] if $m eq 'nvmet.subsys.query';
-        return [ @ns ] if $m eq 'nvmet.namespace.query';
+        if ($m eq 'nvmet.namespace.query') {
+            # #162's re-check filters by id: [ [ 'subsys.id', '=', X ], [ 'id', '=', NSID ] ].
+            # When a second clause is present, return just that namespace.
+            my $filters = $args->[0];
+            if (ref($filters) eq 'ARRAY' && @$filters >= 2) {
+                my $want = $filters->[1][2];
+                return [ grep { ($_->{id} // '') eq $want } @ns ];
+            }
+            return [ @ns ];
+        }
         return [ map { { id => $_ } } keys %ds ] if $m eq 'pool.dataset.query';
+        # #162's re-check calls pool.dataset.get_instance before each delete.
+        if ($m eq 'pool.dataset.get_instance') {
+            my $full = $args->[0];
+            return { id => $full } if $ds{$full};
+            die "[ENOENT] Dataset does not exist\n";
+        }
         if ($m eq 'nvmet.namespace.delete') { push @deleted, $args->[0]; return 1; }
         die "unexpected $m";
     };
