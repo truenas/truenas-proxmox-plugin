@@ -8537,6 +8537,52 @@ sub path {
     }
 }
 
+# A pool.dataset.create that _api_call retried after a transport error can land twice:
+# the first send creates the zvol on the array but its reply is lost, and the retry is
+# answered "dataset already exists" for the very zvol this call created (#151). Moving on
+# to the next disk number then leaks that zvol: no guest config names it and it has no
+# share, so nothing ever deletes it. Each create attempt therefore stamps a random marker
+# into the zvol's comments (_alloc_create_marker). _api_call replays the same request, so
+# a zvol this attempt created carries this attempt's marker, and any other zvol of the
+# same name (an async-delete leftover, or another node allocating the same name) does
+# not. A zvol counts as this call's own only when the array reports a VOLUME of exactly
+# the requested size whose comments equal the marker. Adopting anything else would hand
+# the guest someone else's data. Returns 1 or 0; never dies.
+my $ALLOC_MARKER_PREFIX = 'Autocreated by Proxmox Plugin';
+sub _alloc_create_marker {
+    my $raw = '';
+    if (open(my $fh, '<:raw', '/dev/urandom')) {
+        read($fh, $raw, 16);
+        close($fh);
+    }
+    $raw = join('', map { chr(int(rand(256))) } 1..16) . "$$" . time() if length($raw) != 16;
+    my $hex = length($raw) == 16 ? unpack('H*', $raw) : substr(sha1_hex($raw), 0, 32);
+    return "$ALLOC_MARKER_PREFIX ($hex)";
+}
+
+sub _alloc_zvol_is_own_retry {
+    my ($scfg, $full_ds, $bytes, $marker) = @_;
+    return 0 if !defined($marker) || $marker eq '';
+    my $rows = eval {
+        _api_call($scfg, 'pool.dataset.query', [ [ [ 'id', '=', $full_ds ] ] ]);
+    };
+    return 0 if !$rows || ref($rows) ne 'ARRAY' || @$rows != 1 || ref($rows->[0]) ne 'HASH';
+    my $ds = $rows->[0];
+    return 0 if ($ds->{type} // '') ne 'VOLUME';
+    my $volsize = ref($ds->{volsize}) eq 'HASH' ? $ds->{volsize}{rawvalue} : undef;
+    return 0 if !defined($volsize) || $volsize !~ /^\d+$/ || $volsize != $bytes;
+    # For a VOLUME, TrueNAS 25.10 returns the comment only as user_properties.comments
+    # (top-level comments is filesystem-only); accept either place.
+    my $up = ref($ds->{user_properties}) eq 'HASH' ? $ds->{user_properties} : {};
+    my $comments;
+    for my $c ($ds->{comments}, $up->{comments}, $up->{'org.freenas:description'}) {
+        $comments = ref($c) eq 'HASH' ? ($c->{value} // $c->{rawvalue}) : $c;
+        last if defined $comments;
+    }
+    return 0 if !defined($comments) || ref($comments) || $comments ne $marker;
+    return 1;
+}
+
 # Create a new VM disk (zvol + transport-specific exposure) and hand it to Proxmox.
 # Arguments (per PVE): ($class, $storeid, $scfg, $vmid, $fmt, $name, $size_kib)
 # NOTE: Proxmox passes size in KiB (kibibytes), not bytes!
@@ -8634,6 +8680,8 @@ sub alloc_image {
         $create_attempt++;
         $create_error = undef;
 
+        my $alloc_marker = _alloc_create_marker();   # per attempt; see _alloc_zvol_is_own_retry
+
         # All six of these must be sent explicitly, not omitted: TrueNAS 25.10.4's
         # legacy API shim leaves omitted optional fields as unresolved _NotRequired
         # sentinels instead of real defaults, crashing pool.dataset.create both in
@@ -8644,7 +8692,7 @@ sub alloc_image {
             type                     => 'VOLUME',
             volsize                  => $bytes,
             sparse                   => ($scfg->{tn_sparse} // 1) ? JSON::PP::true : JSON::PP::false,
-            comments                 => 'Autocreated by Proxmox Plugin',
+            comments                 => $alloc_marker,
             volblocksize             => _normalize_blocksize($blocksize) // '16K',
             snapdev                  => 'INHERIT',
             reservation              => 0,
@@ -8667,6 +8715,12 @@ sub alloc_image {
             $create_error = $@;
             # Check if error is "dataset already exists" - indicates race condition with async delete
             if ($create_error =~ /dataset already exists/i) {
+                if (_alloc_zvol_is_own_retry($scfg, $full_ds, $bytes, $alloc_marker)) {
+                    _log($scfg, 0, 'warning', "[TrueNAS] alloc_image: zvol $full_ds already exists, but it was created by this create's own retried request; using it (#151)");
+                    $create_error = undef;
+                    $create_result = undef;
+                    last;
+                }
                 _log($scfg, 1, 'warn', "[TrueNAS] alloc_image: zvol $full_ds already exists (attempt $create_attempt/$max_create_retries), trying alternate name");
 
                 # Parse current name and increment disk number
