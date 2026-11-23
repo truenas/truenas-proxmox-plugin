@@ -1,3 +1,24 @@
+truenas-proxmox-plugin (2.1.25~beta6) unstable; urgency=medium
+
+  * Fix a create regression introduced in 2.1.25~beta2: the GUI
+    metadata work added sensitive-properties to plugindata() so
+    pve-manager 9.2.29+ would mask the API key in the Add Storage
+    dialog. The new pve-manager's /storage POST extracts those
+    sensitive values out of the request params before check_config
+    runs, so a tn_api_key declared non-optional at the schema layer
+    died with "missing value for required option 'tn_api_key'" on
+    every new-storage create -- even when the request supplied the
+    key. tn_api_key is now optional at the schema layer and its
+    presence is validated by a new on_add_hook, matching the
+    pattern RBD / CIFS / CephFS use for their sensitive required
+    fields. The three other sensitive properties
+    (tn_chap_password, tn_nvme_dhchap_secret,
+    tn_nvme_dhchap_ctrl_secret) were already optional and
+    unaffected. Existing storage.cfg entries are unaffected --
+    only new-create paths were broken.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 11:09:40 -0500
+
 truenas-proxmox-plugin (2.1.25~beta5) unstable; urgency=medium
 
   * NVMe/TCP: allocate namespace nsids from a persisted per-subsystem
