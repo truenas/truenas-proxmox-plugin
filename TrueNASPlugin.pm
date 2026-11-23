@@ -9427,9 +9427,53 @@ sub free_image {
     }
 }
 
+# Pre-fork a detached safety-net worker that will do the eventual
+# pool.dataset.delete on $full_ds. PVE's clone-cancel path escalates
+# to SIGKILL fast enough that our synchronous free_image can be cut
+# off mid-extent-delete, before we return the cleanup_worker closure
+# that vdisk_free would otherwise fork as an imgdel UPID task. The
+# detached child survives a SIGKILL to the parent. On the happy path
+# the fast imgdel UPID deletes the zvol first; our child's follow-up
+# attempt sees "does not exist" and exits.
+sub _spawn_detached_dataset_delete {
+    my ($scfg, $full_ds) = @_;
+    my $safety_scfg = { %$scfg };
+    my $safety_full_ds = $full_ds;
+    my $pid = fork();
+    if (!defined $pid) {
+        _log($scfg, 1, 'warning',
+            "[TrueNAS] free_image: detached safety-net fork failed: $! " .
+            "(relying on imgdel UPID alone)");
+        return;
+    } elsif ($pid != 0) {
+        # Parent -- reap the immediate fork; the actual worker is its child.
+        waitpid($pid, 0);
+        return;
+    }
+    # Intermediate child: detach into a new session, then fork the real
+    # worker and exit so the init process reaps it (no zombies on the
+    # parent side).
+    POSIX::setsid();
+    my $worker = fork();
+    POSIX::_exit(0) unless defined $worker && $worker == 0;
+    # Final grandchild: detached, close inherited fds, do the work.
+    open STDIN,  '<',  '/dev/null';
+    open STDOUT, '>>', '/dev/null';
+    open STDERR, '>>', '/dev/null';
+    # Give the fast imgdel UPID 30 s to win the race; whichever runs
+    # first succeeds, the other sees "does not exist" and exits.
+    sleep 30;
+    eval { _delete_dataset_with_retry($safety_scfg, $safety_full_ds) };
+    POSIX::_exit(0);
+}
+
 # iSCSI-specific deletion
 sub _free_image_iscsi {
     my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun) = @_;
+
+    # Spawn the safety-net delete BEFORE any TN API calls, so it survives
+    # a SIGKILL that lands partway through the synchronous cleanup.
+    _spawn_detached_dataset_delete($scfg, $full_ds);
 
     # Capture SCSI device names BEFORE any deletion/logout (symlinks disappear after logout)
     # This allows us to clean up orphaned SCSI devices after TrueNAS deletion succeeds
@@ -9740,6 +9784,9 @@ sub _free_image_iscsi {
 # NVMe-specific deletion
 sub _free_image_nvme {
     my ($class, $storeid, $scfg, $volname, $zname, $full_ds, $device_uuid) = @_;
+
+    # Safety-net detached worker; same reasoning as _free_image_iscsi.
+    _spawn_detached_dataset_delete($scfg, $full_ds);
 
     _log($scfg, 1, 'info', "[TrueNAS] _free_image_nvme: deleting NVMe namespace for $zname");
 
