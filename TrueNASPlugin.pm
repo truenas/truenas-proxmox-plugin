@@ -548,6 +548,9 @@ sub _is_retryable_error {
 # _retry_with_backoff a nearer deadline without touching tn_api_budget_s.
 our $_api_deadline;
 
+# Set only during the lock callback so deferred work takes a new lock.
+our %_storage_lock_held;
+
 sub _retry_with_backoff {
     my ($scfg, $operation_name, $code_ref, $retry_opts) = @_;
 
@@ -7560,26 +7563,52 @@ sub _nvme_device_for_uuid {
         # next device lookup can still mis-match. Reap first, then
         # reconnect -- the reconnect's re-enumeration will then reflect
         # the trimmed namespace set.
-        eval {
-            my $reaped = _nvme_reap_orphan_namespaces($scfg);
+        my $reconnect = sub {
+            eval {
+                my $reaped = _nvme_reap_orphan_namespaces($scfg);
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: pre-reconnect reap removed $reaped orphan namespace(s)")
+                    if $reaped;
+            };
+            my $note = $reconnect_attempted
+                ? " (SECOND reconnect — prior mid-loop reconnect fired too early)"
+                : "";
             _log($scfg, 0, 'warning',
-                "[TrueNAS] nvme_device_for_uuid: pre-reconnect reap removed $reaped orphan namespace(s)")
-                if $reaped;
+                "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect FIRING "
+                . "for UUID $device_uuid: dev_paths=" . scalar(@_emg_dev_paths)
+                . ", in_use=0$note — flushing stale kernel namespace cache");
+            eval { _nvme_disconnect($scfg) };
+            usleep(500_000);
+            eval { _nvme_connect($scfg) };
+            if ($@) {
+                _log($scfg, 0, 'err',
+                    "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect failed: $@");
+                return 0;
+            }
+            return 1;
         };
-        my $note = $reconnect_attempted
-            ? " (SECOND reconnect — prior mid-loop reconnect fired too early)"
-            : "";
-        _log($scfg, 0, 'warning',
-            "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect FIRING "
-            . "for UUID $device_uuid: dev_paths=" . scalar(@_emg_dev_paths)
-            . ", in_use=0$note — flushing stale kernel namespace cache");
-        eval { _nvme_disconnect($scfg) };
-        usleep(500_000);
-        eval { _nvme_connect($scfg) };
-        if ($@) {
-            _log($scfg, 0, 'err',
-                "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect failed: $@");
+
+        my $storeid = $scfg->{storeid};
+        my $reconnected;
+        if (!$scfg->{tn_use_cluster_lock} || (defined($storeid) && $_storage_lock_held{$storeid})) {
+            $reconnected = $reconnect->();
         } else {
+            # Call SUPER directly: our cluster_lock_storage override would raise
+            # this 1 s timeout to tn_storage_lock_timeout.
+            $reconnected = eval {
+                die "missing storage ID\n" unless defined($storeid) && length($storeid);
+                __PACKAGE__->SUPER::cluster_lock_storage($storeid, $scfg->{shared}, 1, sub {
+                    local $_storage_lock_held{$storeid} = 1;
+                    return $reconnect->();
+                });
+            };
+            if ($@) {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect SKIPPED "
+                    . "for UUID $device_uuid: storage lock unavailable: $@");
+            }
+        }
+        if ($reconnected) {
             _log($scfg, 0, 'warning',
                 "[TrueNAS] nvme_device_for_uuid: i==150 emergency reconnect completed, "
                 . "re-scanning for target UUID");
@@ -8119,8 +8148,21 @@ sub _nvme_create_namespace_idempotent {
 # #42), are left alone.
 #
 # Returns the number of namespaces reaped, or undef on setup failure.
-# Never dies -- best-effort cleanup, called from deferred paths.
 sub _nvme_reap_orphan_namespaces {
+    my ($scfg) = @_;
+    return _nvme_sweep_orphan_namespaces($scfg) unless $scfg->{tn_use_cluster_lock};
+    my $storeid = $scfg->{storeid};
+    return undef unless defined($storeid) && length($storeid);
+
+    # create_base holds this lock from the dataset rename through the namespace
+    # update.
+    return _nvme_sweep_orphan_namespaces($scfg) if $_storage_lock_held{$storeid};
+    return __PACKAGE__->cluster_lock_storage($storeid, $scfg->{shared}, undef, sub {
+        return _nvme_sweep_orphan_namespaces($scfg);
+    });
+}
+
+sub _nvme_sweep_orphan_namespaces {
     my ($scfg) = @_;
 
     my $nqn = $scfg->{tn_subsystem_nqn};
@@ -8185,10 +8227,22 @@ sub _nvme_reap_orphan_namespaces {
 
     my $reaped = 0;
     for my $ns (@orphans) {
-        my $ns_id = $ns->{id};
+        my $ns_id = $ns->{id} // next;
         my $dp    = $ns->{device_path} // '<undef>';
         my $uuid  = $ns->{device_uuid} // '<undef>';
         my $nsid  = $ns->{nsid}        // '<undef>';
+
+        my $dataset = eval { _tn_dataset_get($scfg, substr($dp, length('zvol/'))) };
+        next if $dataset || $@ !~ /does not exist|ENOENT|InstanceNotFound/i;
+
+        # A stale listing can still show the old path after a rename. Confirm
+        # the namespace still points to the missing dataset before deleting.
+        my $fresh = eval {
+            _api_call($scfg, 'nvmet.namespace.query',
+                [ [ [ 'subsys.id', '=', $subsys_id ], [ 'id', '=', $ns_id ] ] ]);
+        };
+        next if $@ || ref($fresh) ne 'ARRAY' || @$fresh != 1 || ref($fresh->[0]) ne 'HASH';
+        next if ($fresh->[0]{id} // '') ne $ns_id || ($fresh->[0]{device_path} // '') ne $dp;
         eval {
             _api_call($scfg, 'nvmet.namespace.delete', [ $ns_id ]);
         };
@@ -8333,6 +8387,7 @@ sub parse_volname {
 
 sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
+    local $scfg->{storeid} = $scfg->{storeid} // $storeid;
     # Note: snapname is used during clone operations - we support snapshots via ZFS
     my (undef, $zname, $vmid, undef, undef, undef, undef, $metadata) = $class->parse_volname($volname);
 
@@ -9587,13 +9642,14 @@ sub _free_image_nvme {
     # accumulate and the publication-mismatch detector in
     # _nvme_device_for_uuid starts failing every activate_volume that
     # runs against the ballooned namespace list. Reap here so orphans
-    # get cleaned up at the natural rate of one-per-free without
-    # slowing the caller (deferred block runs after the lock releases).
+    # get cleaned up at the natural rate of one-per-free (deferred block
+    # runs after the caller's lock releases).
     # See _nvme_reap_orphan_namespaces for the full rationale.
     my $deferred_scfg = $scfg;
     _defer_after_lock(sub {
         _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_nvme deferred: udev settle");
         eval { run_command(['udevadm','settle'], outfunc=>sub{}) };
+        local $deferred_scfg->{storeid} = $deferred_scfg->{storeid} // $storeid;
         eval { _nvme_reap_orphan_namespaces($deferred_scfg) };
     });
 
@@ -10925,6 +10981,7 @@ sub _teardown_snapshot_device {
 
 sub activate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    local $scfg->{storeid} = $scfg->{storeid} // $storeid;
     # Note: snapname is used for snapshot operations, we support snapshots via ZFS
 
     _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: volname=$volname");
@@ -11977,7 +12034,10 @@ sub cluster_lock_storage {
     # setups running an unusual TN configuration where its own internal
     # serialization is not trusted). Default remains bypass.
     if ($scfg->{tn_use_cluster_lock}) {
-        $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, $func, @param);
+        $result = $class->SUPER::cluster_lock_storage($storeid, $shared, $timeout, sub {
+            local $_storage_lock_held{$storeid} = 1;
+            return $func->(@_);
+        }, @param);
     } else {
         # No lock -- just run the callback directly. Errors propagate as
         # usual (die from $func bubbles up to the PVE caller).
