@@ -1,3 +1,33 @@
+truenas-proxmox-plugin (2.1.25~beta5) unstable; urgency=medium
+
+  * NVMe/TCP: allocate namespace nsids from a persisted per-subsystem
+    wrap-around cursor instead of max_used + jitter. The old scheme
+    stopped working once max_used reached the subsystem NN ceiling
+    (1024): every create fell back to TrueNAS auto-assignment, which
+    picks the lowest free nsid, which brought back the recycle bug
+    alpha30 was written to fix. On TrueNAS 25.10 a recycled nsid
+    whose old namespace was still live in the kernel wedged the
+    nvmet configfs render with EBUSY ("Failed to render
+    py:nvmet_kernel"), and from that point container starts failed.
+
+    The cursor file lives in /var/lib/truenas-plugin/ under a flock,
+    one file per subsystem. Each create picks the first nsid after
+    the cursor that TrueNAS shows as free, wrapping 1..1023, and
+    advances the cursor to it. A freed nsid is not reused until the
+    cursor has gone all the way round. No cursor file: start from
+    max_used below the ceiling, from a random nsid at the ceiling.
+    Collision retry excludes the collided nsid and takes the next
+    cursor nsid.
+
+    The plugin never auto-assigns. It dies with a clear message if
+    TrueNAS cannot be queried, the cursor cannot be locked, or no
+    nsid is free: a failed create is better than one that wedges
+    the target.
+
+    Taint-safe for PVE daemons (perl -T). Fixes #149.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 10:24:13 -0500
+
 truenas-proxmox-plugin (2.1.25~beta4) unstable; urgency=medium
 
   * NVMe/TCP: the i==125 "last-resort" reconnect tier in
