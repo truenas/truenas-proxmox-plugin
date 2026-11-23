@@ -211,7 +211,7 @@ sub _authenticate {
     my $mech = $scfg->{auth_mechanism} || 'auto';
     my $api_key = $scfg->{api_key};
 
-    my ($probe_result, $probe_err);
+    my ($probe_result, $probe_err, $probe_had_envelope);
     if (defined $username) {
         my $resp = eval {
             ws_rpc($conn, {
@@ -222,6 +222,16 @@ sub _authenticate {
         if ($@) { $probe_err = "$@"; }
         elsif (ref($resp) eq 'HASH' && exists $resp->{error}) {
             $probe_err = encode_json($resp->{error});
+            # The server returned a well-formed JSON-RPC error envelope.
+            # That means middleware is alive and routing requests -- just
+            # choking on this particular pre-auth call. See #159: TN
+            # 25.10.4's auth.mechanism_choices crashes pre-auth with
+            # EINVAL ('NoneType' has no attribute 'may_create_auth_token').
+            # Distinguish this from transport failures below so the tier
+            # selector can treat "server answered, just not usefully" as
+            # evidence that auth.login_ex is present and try T2 instead of
+            # silently falling to the legacy T3 floor.
+            $probe_had_envelope = 1;
         } elsif (ref($resp) eq 'HASH' && ref($resp->{result}) eq 'ARRAY') {
             $probe_result = $resp->{result};
         } elsif (ref($resp) eq 'ARRAY') {
@@ -239,7 +249,10 @@ sub _authenticate {
         $cb_raw = $cb;
     }
 
-    my $tier = _select_mechanism($username, $mech, $probe_result, $probe_err, defined $cb_raw ? 1 : 0);
+    my $tier = _select_mechanism(
+        $username, $mech, $probe_result, $probe_err,
+        defined $cb_raw ? 1 : 0, $probe_had_envelope ? 1 : 0,
+    );
     linfo("auth: using tier $tier (mechanism=$mech)");
     if ($tier eq 'T1') {
         return 1 if eval { _do_t1_login($conn, $username, $api_key); 1 };
@@ -395,18 +408,33 @@ sub _is_method_not_found {
 # consumed by any branch (scram-plus's CB readiness is checked in the
 # caller before dispatch, which Task 4 adds). The arg exists so a later
 # extension can read it without changing the signature again.
+# The sixth arg, $probe_had_envelope, is true iff the mechanism_choices
+# probe returned a well-formed JSON-RPC error envelope (not a transport
+# failure and not an unusable shape). TN 25.10.4's probe crashes
+# pre-auth with EINVAL (#159); the envelope proves the middleware is
+# routing requests, which strongly implies auth.login_ex is present. We
+# pick T2 on that signal so a login_ex server isn't silently reduced to
+# the legacy T3 floor. Transport failures stay T3 as before -- those
+# don't tell us anything about which auth methods the server has.
 sub _select_mechanism {
-    my ($username, $mech, $probe_result, $probe_err, $cb_available) = @_;
+    my ($username, $mech, $probe_result, $probe_err, $cb_available, $probe_had_envelope) = @_;
     $mech = 'auto' unless defined $mech && length $mech;
     $username = undef if defined $username && !length $username;
 
-    my $limited = 0;
+    my ($limited, $unsupported) = (0, 0);
     if (defined $probe_err) {
-        my $unsupported = _is_scram_unsupported_error($probe_err)
-                          || _is_method_not_found($probe_err);
+        $unsupported = _is_scram_unsupported_error($probe_err)
+                       || _is_method_not_found($probe_err);
         $limited = 1 if !$unsupported && _is_rate_limited($probe_err);
     }
     my %have = map { $_ => 1 } (ref($probe_result) eq 'ARRAY' ? @$probe_result : ());
+    # A server-error envelope that is not "method not found" and not
+    # "rate limited" means the TN side has the routing layer but choked
+    # on this call. Treat it as "login_ex is probably there" for tier
+    # selection. If T2 then 400s with method-not-found at login time
+    # (truly pre-25.10 TN that happens to answer envelopes here), the
+    # T2 handler in _authenticate already falls back to T3. See #159.
+    my $login_ex_probable = ($probe_had_envelope && !$unsupported && !$limited) ? 1 : 0;
 
     if ($mech eq 'scram') {
         die "tn_auth_mechanism=scram requires tn_api_username\n" unless defined $username;
@@ -415,7 +443,7 @@ sub _select_mechanism {
     }
     if ($mech eq 'plain') {
         return 'T3' unless defined $username;
-        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited;
+        return 'T2' if ref($probe_result) eq 'ARRAY' || $limited || $login_ex_probable;
         return 'T3';
     }
     if ($mech eq 'scram-plus') {
@@ -428,6 +456,7 @@ sub _select_mechanism {
     return 'T1' if $have{SCRAM};
     return 'T2' if $have{API_KEY_PLAIN};
     return 'T1' if $limited;
+    return 'T2' if $login_ex_probable;
     return 'T3';
 }
 
