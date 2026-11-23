@@ -1,3 +1,30 @@
+truenas-proxmox-plugin (2.1.25~beta11) unstable; urgency=medium
+
+  * Snapshot teardown: the hardcoded 7.5 s EBUSY retry ladder in
+    _teardown_snapshot_device was exhausting on setups with a longer
+    kernel-side SCSI release window (iSCSI without multipath,
+    mounted LXC rootfs; reporter saw 4 of 6 nightly LXC vzdumps
+    blow past it on the same evening). Default budget raised to
+    60 s and the ladder now derives from a new storage option
+    `tn_snapshot_teardown_timeout_s` (integer, 5-600) so admins
+    can tune it to their release-window observations. The option
+    surfaces in the Add Storage dialog's Advanced section. Fixes
+    part 1 of #163.
+
+  * Snapshot teardown: self-heal in volume_snapshot. When a vzdump
+    leaves an ephemeral vzdump-* clone behind (bounded teardown
+    timed out inside the EBUSY window), the next backup's
+    pool.snapshot.create was dying with "already exists" and
+    stayed stuck forever. volume_snapshot now probes for an
+    existing snapshot plus matching ephemeral clone before the
+    create, and if it finds both runs _teardown_snapshot_device
+    (now with the extended 60 s default budget) plus
+    pool.snapshot.delete to clean up. Only then does it create
+    the fresh snapshot. Breaks the "one slow release -> permanent
+    CT lock" cycle. Fixes part 2 of #163.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 15:11:49 -0500
+
 truenas-proxmox-plugin (2.1.25~beta10) unstable; urgency=medium
 
   * Fix a cancelled-full-clone orphan-zvol leak reported by a sales
