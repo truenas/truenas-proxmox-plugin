@@ -1,3 +1,26 @@
+truenas-proxmox-plugin (2.1.25~beta10) unstable; urgency=medium
+
+  * Fix a cancelled-full-clone orphan-zvol leak reported by a sales
+    engineer. When a user stops a `qm clone --full` partway, PVE's
+    clone error branch calls vdisk_free on the partial target, which
+    calls our _free_image_iscsi / _free_image_nvme. PVE escalates the
+    cancel to SIGKILL fast enough that the sync phase gets cut off
+    mid-extent-delete -- the TrueNAS side processes the request and
+    the extent disappears, but our process never reaches the
+    cleanup_worker return, so vdisk_free never forks the imgdel UPID
+    for the slow pool.dataset.delete. The zvol survived with no
+    extent and no VM config pointing at it, invisible to pvesm list.
+
+    Both free_image paths now spawn a double-fork detached process
+    (setsid + reparent to init) at entry that sleeps 30 s and then
+    calls _delete_dataset_with_retry on the same dataset. setsid puts
+    the grandchild in its own session, so a SIGKILL to the task's
+    process tree does not reach it. The 30 s delay gives the normal
+    imgdel UPID the first shot; whichever path succeeds, the loser
+    sees "does not exist" and exits silently.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 14:08:41 -0500
+
 truenas-proxmox-plugin (2.1.25~beta9) unstable; urgency=medium
 
   * GUI: tn_api_insecure is now in the Add Storage dialog's Advanced
