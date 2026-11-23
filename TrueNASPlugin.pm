@@ -700,6 +700,7 @@ sub plugindata {
             tn_nvme_manage_ports => 1,
             tn_portals => 1,
             tn_prefer_ipv4 => 1,
+            tn_snapshot_teardown_timeout_s => 1,
             tn_snapshot_volume_chains => 1,
             tn_sparse => 1,
             tn_status_capacity_ttl_s => 1,
@@ -1010,6 +1011,21 @@ sub properties {
                           "Range: 1-3600.",
             type => 'integer', optional => 1, default => 10, minimum => 1, maximum => 3600,
         },
+        tn_snapshot_teardown_timeout_s => {
+            title => 'Snapshot teardown timeout (s)',
+            description => "Total wall-clock budget, in seconds, for the bounded " .
+                          "EBUSY retry ladder in _teardown_snapshot_device when " .
+                          "removing an ephemeral vzdump clone during snapshot " .
+                          "cleanup. Default 60. The historical 7.5 s ladder fit " .
+                          "the usual ~1 s SCSI release settle, but setups with a " .
+                          "longer kernel-side release window (e.g. iSCSI without " .
+                          "multipath, mounted LXC rootfs, see issue #163) exhaust " .
+                          "it and end up with CTs stuck at lock=snapshot-delete. " .
+                          "Raise this when nightly vzdump cleanup leaves ephemeral " .
+                          "`vzdump-*` clones behind; lower it on fast-release " .
+                          "setups where failing early is preferable. Range 5-600.",
+            type => 'integer', optional => 1, default => 60, minimum => 5, maximum => 600,
+        },
         tn_storage_lock_timeout => {
             title => 'Storage lock timeout (s)',
             description => "Cluster lock timeout in seconds for storage operations. " .
@@ -1212,6 +1228,7 @@ sub options {
         tn_status_capacity_ttl_s  => { optional => 1 },
 
         # Concurrency
+        tn_snapshot_teardown_timeout_s => { optional => 1 },
         tn_storage_lock_timeout => { optional => 1 },
         tn_use_cluster_lock => { optional => 1 },
 
@@ -2887,6 +2904,46 @@ sub volume_snapshot {
         my $snap_full = $full . '@' . $snapname;    # full snapshot name for logging
 
         _log($scfg, 1, 'info', "[TrueNAS] volume_snapshot: creating $snap_full");
+
+        # #163 self-heal: if the snapshot already exists AND an ephemeral
+        # vzdump clone for it exists, the previous run's teardown timed
+        # out inside the EBUSY window. The EBUSY has usually cleared by
+        # now (hours-later, per the #163 report). Try the teardown and
+        # snapshot-delete here so the new snapshot create below can
+        # proceed, instead of dying "snapshot already exists" and leaving
+        # the CT stuck for the next run too.
+        my $existing_snap = eval {
+            _api_call($scfg, 'pool.snapshot.query',
+                [ [ [ 'id', '=', $snap_full ] ] ]);
+        };
+        if (ref($existing_snap) eq 'ARRAY' && @$existing_snap) {
+            my ($clone_zname, $clone_full) = _snapshot_clone_paths($scfg, $zname, $snapname);
+            my $existing_clone = eval {
+                _api_call($scfg, 'pool.dataset.query',
+                    [ [ [ 'id', '=', $clone_full ] ] ]);
+            };
+            if (ref($existing_clone) eq 'ARRAY' && @$existing_clone) {
+                _log($scfg, 0, 'warning',
+                    "[TrueNAS] volume_snapshot: $snap_full already exists with a "
+                    . "stale ephemeral clone $clone_zname from a previous run "
+                    . "(previous teardown exhausted its EBUSY budget -- see #163); "
+                    . "attempting self-heal before creating the new snapshot");
+                eval { $class->_teardown_snapshot_device($scfg, $volname, $snapname) };
+                if (my $err = $@) {
+                    die "volume_snapshot: $snap_full exists but its stale ephemeral "
+                        . "clone could not be torn down: $err"
+                        . "Consider raising tn_snapshot_teardown_timeout_s.\n";
+                }
+                eval { _api_call_mutate($scfg, 'pool.snapshot.delete', [ $snap_full ]) };
+                if (my $err = $@) {
+                    die "volume_snapshot: self-heal tore down stale clone of "
+                        . "$snap_full but could not delete the stale snapshot: $err\n";
+                }
+                _log($scfg, 0, 'info',
+                    "[TrueNAS] volume_snapshot: self-heal removed stale clone and "
+                    . "$snap_full; continuing with the new snapshot create");
+            }
+        }
 
         # Create ZFS snapshot for the disk
         my $payload = { dataset => $full, name => $snapname, recursive => JSON::PP::false };
@@ -11098,6 +11155,28 @@ sub _expose_snapshot_device {
 
 # Tear down everything _expose_snapshot_device created. Best-effort: every step
 # is wrapped so a single failure cannot prevent the rest of the cleanup.
+# Build the retry-ladder (array of ms-sleep values) for
+# _teardown_snapshot_device from a seconds budget. Shape: one immediate
+# attempt (0 ms), then 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, ... doubling
+# until the cumulative wait reaches the budget. The final step is
+# clipped so the total stays <= budget.
+sub _teardown_retry_ladder {
+    my ($budget_s) = @_;
+    $budget_s = 60 if !defined($budget_s) || $budget_s !~ /^\d+$/ || $budget_s < 1;
+    my $budget_ms = $budget_s * 1000;
+    my @ladder = (0);
+    my $cum = 0;
+    my $next = 500;
+    while ($cum + $next <= $budget_ms) {
+        push @ladder, $next;
+        $cum += $next;
+        $next *= 2;
+    }
+    my $remain = $budget_ms - $cum;
+    push @ladder, $remain if $remain > 0;
+    return @ladder;
+}
+
 sub _teardown_snapshot_device {
     my ($class, $scfg, $volname, $snapname) = @_;
 
@@ -11200,7 +11279,14 @@ sub _teardown_snapshot_device {
     # Either way, after the bounded ladder the only paths out are
     # "dataset truly gone" or "die with authoritative error".
     my $last_err;
-    my @delay_ms = (0, 500, 1000, 2000, 4000);
+    # Build the retry ladder from the configured budget (default 60 s,
+    # bumped from 7.5 s after Barbapapade-git's #163 report showing 4 of 6
+    # LXC vzdumps exhausting the shorter budget on a single night).
+    # Shape: one immediate attempt, then exponential backoff 500 ms, 1 s,
+    # 2 s, 4 s, 8 s, 16 s, ... capped so the cumulative wall-clock stays
+    # at or below the budget. The last step is clipped so we don't
+    # overshoot.
+    my @delay_ms = _teardown_retry_ladder($scfg->{tn_snapshot_teardown_timeout_s});
     for my $delay (@delay_ms) {
         usleep($delay * 1000) if $delay;
         $last_err = undef;
