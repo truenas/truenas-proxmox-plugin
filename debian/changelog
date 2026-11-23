@@ -1,3 +1,29 @@
+truenas-proxmox-plugin (2.1.25~beta7) unstable; urgency=medium
+
+  * NVMe/TCP: the namespace-create path now skips "ghost" nsids --
+    namespaces still enabled in the TrueNAS kernel after their
+    configfs entry and DB row are gone. Before picking an nsid, the
+    plugin reads /sys/block/<dev>/nsid for every device the host sees
+    on the subsystem and skips any nsid that has no row in
+    nvmet.namespace.query. The check is recomputed on each create
+    (never persisted) and a failure to read the host view is logged
+    and never fails a create. Builds on #149's wrap-around cursor;
+    without this skip the cursor eventually lands on a ghost nsid
+    and the create fails with EBUSY, which on TrueNAS releases
+    without per-item render isolation wedges every later
+    nvmet_kernel render.
+
+  * NVMe/TCP: an optional admin override at
+    /var/lib/truenas-plugin/nsid-reserved (whitespace- or
+    newline-separated nsids) fences nsids off from the picker --
+    useful for ghosts that the host cannot currently see. Reserved
+    nsids do not count toward max_used. With no file, nothing
+    changes.
+
+    Both of these address #150.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Mon, 23 Nov 2026 11:33:26 -0500
+
 truenas-proxmox-plugin (2.1.25~beta6) unstable; urgency=medium
 
   * Fix a create regression introduced in 2.1.25~beta2: the GUI
