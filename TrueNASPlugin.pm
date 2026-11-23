@@ -1144,7 +1144,13 @@ sub options {
 
         # Connection (fixed to avoid orphaning volumes)
         tn_api_host      => { fixed => 1 },
-        tn_api_key       => { fixed => 1 },
+        # pve-manager 9.2.29+ extracts sensitive-properties out of the
+        # request $param before check_config() sees it, so a schema-level
+        # "required" check would die with "missing value for required
+        # option 'tn_api_key'" even on a create that supplied the key.
+        # Mark it optional at the schema layer; on_add_hook validates
+        # presence from the sensitive hash the API layer passes through.
+        tn_api_key       => { optional => 1, fixed => 1 },
         tn_api_username  => { optional => 1 },
         tn_auth_mechanism => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
@@ -1230,6 +1236,19 @@ sub options {
 }
 
 # Force shared storage behavior for cluster migration support
+# pve-manager 9.2.29+ extracts sensitive-properties (tn_api_key and the
+# tn_chap_password / tn_nvme_dhchap_* set) out of the create/update
+# $param and passes them to on_add_hook / on_update_hook as a separate
+# hash, so check_config cannot see them. Validate here that a create
+# supplied tn_api_key.
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %sensitive) = @_;
+    if (!defined($sensitive{tn_api_key}) || $sensitive{tn_api_key} eq '') {
+        die "tn_api_key is required\n";
+    }
+    return undef;
+}
+
 sub check_config {
     my ($class, $sectionId, $config, $create, $skipSchemaCheck) = @_;
     my $opts = $class->SUPER::check_config($sectionId, $config, $create, $skipSchemaCheck);
@@ -1363,9 +1382,10 @@ sub check_config {
         if (!$opts->{tn_api_host}) {
             die "tn_api_host is required\n";
         }
-        if (!$opts->{tn_api_key}) {
-            die "tn_api_key is required\n";
-        }
+        # tn_api_key is sensitive; pve-manager 9.2.29+ extracts it out of
+        # $param before check_config runs, so $opts won't see it on
+        # create. Presence is validated in on_add_hook from the sensitive
+        # hash the API layer passes separately.
         my $mech = $opts->{tn_auth_mechanism} // '';
         if ($mech =~ /\Ascram(-plus)?\z/ && !$opts->{tn_api_username}) {
             die "tn_auth_mechanism=$mech requires tn_api_username\n";
