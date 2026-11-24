@@ -1,3 +1,32 @@
+truenas-proxmox-plugin (2.1.25~beta12) unstable; urgency=medium
+
+  * free_image: detached workers (the _spawn_detached_dataset_delete
+    safety-net grandchild and the imgdel UPID cleanup_worker that
+    PVE::Storage::vdisk_free forks after free_image returns) inherited
+    the destroying task's open FD on /var/lock/qemu-server/lock-<vmid>.conf.
+    Under Linux POSIX semantics an flock lives with the open file
+    description, so parent and child both have to close before the
+    lock releases -- and those workers routinely hold their inherited
+    copy for 20-50 s doing pool.dataset.delete. That kept PVE's
+    per-VM config lock held past destroy_vm's return, and the next
+    `qm create` (1 s lock_config_full timeout) failed with
+    "can't lock file - got timeout", cascading every subsequent
+    subtest under proxmox-test-runner's storage-plugin-validation.
+    Both workers now scan /proc/self/fd at entry and POSIX::close
+    any inherited lock-<vmid>.conf.
+
+  * free_image: keep iscsi.targetextent.delete on the synchronous
+    path. list_images iterates iscsi.targetextent.query to build the
+    volume listing, so a mapping that outlives free_image makes a
+    purged volid reappear in `pvesm list` / storage-content
+    listings until the imgdel worker catches up -- which failed
+    disk_purge's immediate-after-purge assertion. The slow calls
+    (iscsi.extent.delete, pool.dataset.delete, SCSI
+    verify-disconnected poll, multipath WWID flush) stay in the
+    imgdel worker, where list_images doesn't need them.
+
+ -- Bill O'Hanlon <bill.ohanlon@truenas.com>  Tue, 24 Nov 2026 09:10:50 -0500
+
 truenas-proxmox-plugin (2.1.25~beta11) unstable; urgency=medium
 
   * Snapshot teardown: the hardcoded 7.5 s EBUSY retry ladder in
