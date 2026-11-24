@@ -8217,6 +8217,11 @@ sub _nvme_pick_nsid_cursor {
         close($fh);
         $cursor = $1 if $line =~ /^\s*(\d+)\s*$/ && $1 <= TN_NSID_MAX;
     }
+    # The cursor is per node, so on a multi-node cluster it lags behind the
+    # nsids other nodes allocated. Below the ceiling, never scan from under
+    # max_used: a lagging cursor would take a slot freed below it. At the
+    # ceiling the clamp does nothing and the scan keeps wrapping.
+    $cursor = $max_used if $cursor < $max_used && $max_used < TN_NSID_MAX;
 
     my $picked;
     for my $step (1 .. TN_NSID_MAX) {
@@ -8353,9 +8358,13 @@ sub _nvme_create_namespace_idempotent {
         }
         # alpha30: nsid collision from concurrent nodes both picking the
         # same nsid. Advance the cursor past the collided
-        # nsid and retry once.
+        # nsid and retry once. TN 25.10 reports it two ways: validation
+        # ("This record already exists (Subsystem ID: X/NSID: N)") when the
+        # other row is committed, or the unique index on (subsys_id, nsid)
+        # ("UNIQUE constraint failed: ...nvmet_namespace_nsid") when both
+        # creates passed validation before NSID_LOCK.
         if (defined $ns_payload->{nsid}
-            && $err =~ /nsid.*already|nsid.*in use|duplicate.*nsid/i) {
+            && $err =~ /nsid.*already|nsid.*in use|duplicate.*nsid|already exists[^\n]*NSID|UNIQUE constraint failed[^\n]*nsid/i) {
             _log($scfg, 1, 'warning',
                 "[TrueNAS] _nvme_create_namespace_idempotent: nsid=$ns_payload->{nsid} "
                 . "collision, picking the next cursor nsid and retrying once");
