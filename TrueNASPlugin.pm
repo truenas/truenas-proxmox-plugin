@@ -5618,6 +5618,16 @@ sub _iscsi_ensure_lun_ready {
 
     # Phase 2: sd is genuinely dead. Delete it, force session rescan,
     # re-resolve the by-path (kernel may attach a new sdY).
+    #
+    # Deleting the sd tears down the by-path symlink; udev re-creates
+    # it when the session rescan re-attaches a new sd to the LUN. That
+    # cycle is asynchronous and under load on a busy target with many
+    # LUNs can take several seconds. The previous ~800 ms post-rescan
+    # wait was enough for a quiet test host but tripped on the
+    # proxmox-test-runner's ct_create.pl under a cold truenas-storage
+    # (~60+ extents), where the by-path symlink regularly reappeared
+    # 3-5 s after the rescan. Poll for recovery over a longer bounded
+    # window with periodic udev-settle + a one-shot rescan retry.
     _log($scfg, 1, 'warning', "[TrueNAS] _iscsi_ensure_lun_ready: LUN $lun sd=$sd stuck at size=0 after 10 rescans, purging stale device");
     if (open my $dfh, '>', "/sys/block/$sd/device/delete") {
         print $dfh "1\n";
@@ -5625,22 +5635,44 @@ sub _iscsi_ensure_lun_ready {
     }
     usleep(500_000);
     _try_run(['iscsiadm','-m','session','--rescan'], "iscsi session rescan after stale-sd purge (LUN $lun)");
-    eval { run_command(['udevadm','settle'], outfunc => sub {}) };
-    usleep(300_000);
+
+    my $recovery_budget_s = 10;
+    my $deadline = time() + $recovery_budget_s;
+    my $rescan_retry_done = 0;
+    my ($new_sd, $new_size);
+    while (time() < $deadline) {
+        eval { run_command(['udevadm','settle','-t','1'], outfunc => sub {}) };
+        if (-e $device_path) {
+            $new_sd = $resolve_sd->();
+            if ($new_sd) {
+                $new_size = $read_size->($new_sd);
+                last if $new_size && $new_size > 0;
+                # sd attached but still size=0: rescan it once per loop.
+                $rescan_sd->($new_sd);
+            }
+        } elsif (!$rescan_retry_done && (time() + 1 < $deadline)) {
+            # by-path still missing halfway through the budget: kick the
+            # session rescan one more time.
+            _try_run(['iscsiadm','-m','session','--rescan'],
+                "iscsi session rescan retry for LUN $lun recovery");
+            $rescan_retry_done = 1;
+        }
+        usleep(500_000);
+    }
 
     if (!-e $device_path) {
-        die "[TrueNAS] LUN $lun: by-path $device_path vanished after stale-sd purge\n";
+        die "[TrueNAS] LUN $lun: by-path $device_path still missing ${recovery_budget_s}s after stale-sd purge\n";
     }
-    my $new_sd = $resolve_sd->();
+    $new_sd //= $resolve_sd->();
     if (!$new_sd) {
-        die "[TrueNAS] LUN $lun: by-path $device_path not backed by sd after stale-sd purge\n";
+        die "[TrueNAS] LUN $lun: by-path $device_path has no sd backing ${recovery_budget_s}s after stale-sd purge\n";
     }
-    my $new_size = $read_size->($new_sd);
-    if ($new_size > 0) {
+    $new_size //= $read_size->($new_sd);
+    if ($new_size && $new_size > 0) {
         _log($scfg, 1, 'info', "[TrueNAS] _iscsi_ensure_lun_ready: LUN $lun recovered on new sd=$new_sd size=$new_size (was sd=$sd size=0)");
         return 1;
     }
-    die "[TrueNAS] LUN $lun: sd=$new_sd still size=0 after stale-sd purge — device unusable\n";
+    die "[TrueNAS] LUN $lun: sd=$new_sd still size=0 ${recovery_budget_s}s after stale-sd purge — device unusable\n";
 }
 
 sub _device_for_lun($scfg, $lun, $max_retries_override = undef) {
@@ -9496,6 +9528,26 @@ sub _spawn_detached_dataset_delete {
     my ($scfg, $full_ds) = @_;
     my $safety_scfg = { %$scfg };
     my $safety_full_ds = $full_ds;
+    # Dataset names like vm-<vmid>-disk-<N> get recycled by the very next
+    # alloc_image on the same VMID. The grandchild below checks that the
+    # dataset's `comments` marker (written by alloc_image, see #151) is
+    # unchanged before deleting; a mismatch (or absence) means the slot
+    # was reused and we must not touch it. Capture the current marker
+    # here, while free_image's caller still holds the storage lock, so
+    # the grandchild has a stable reference.
+    my $safety_marker;
+    eval {
+        my $rows = _api_call($safety_scfg, 'pool.dataset.query',
+            [ [ [ 'id', '=', $safety_full_ds ] ] ]);
+        if (ref($rows) eq 'ARRAY' && @$rows && ref($rows->[0]) eq 'HASH') {
+            my $ds = $rows->[0];
+            my $up = ref($ds->{user_properties}) eq 'HASH' ? $ds->{user_properties} : {};
+            for my $c ($ds->{comments}, $up->{comments}, $up->{'org.freenas:description'}) {
+                my $v = ref($c) eq 'HASH' ? ($c->{value} // $c->{rawvalue}) : $c;
+                if (defined($v) && !ref($v)) { $safety_marker = $v; last; }
+            }
+        }
+    };
     my $pid = fork();
     if (!defined $pid) {
         _log($scfg, 1, 'warning',
@@ -9517,9 +9569,78 @@ sub _spawn_detached_dataset_delete {
     open STDIN,  '<',  '/dev/null';
     open STDOUT, '>>', '/dev/null';
     open STDERR, '>>', '/dev/null';
+    # Close inherited /var/lock/qemu-server/lock-<vmid>.conf flocks.
+    # fork(2) duplicates every open FD, and under Linux POSIX
+    # semantics an flock on that FD travels with the open-file
+    # description -- both the forking caller and this grandchild
+    # keep it held until BOTH close. free_image is called inside
+    # destroy_vm's lock_config block, so a 30 s grandchild sleep
+    # here extended PVE's per-VM config lock past 10 s and made
+    # the next qm create's 1 s lock_config_full timeout fail
+    # ("can't lock file - got timeout"), cascading through
+    # proxmox-test-runner's subtests (reproduced in isolation,
+    # VMID 888, every trial).
+    eval {
+        if (opendir(my $dh, '/proc/self/fd')) {
+            my @fds = grep { /^\d+$/ && $_ > 2 } readdir($dh);
+            closedir($dh);
+            for my $fd (@fds) {
+                my $target = readlink("/proc/self/fd/$fd") // next;
+                next unless $target =~ m{^/(?:var|run)/lock/qemu-server/lock-[-\d]+\.conf$};
+                POSIX::close($fd + 0);
+            }
+        }
+    };
     # Give the fast imgdel UPID 30 s to win the race; whichever runs
     # first succeeds, the other sees "does not exist" and exits.
     sleep 30;
+
+    # Before deleting, verify the dataset is still the same one we were
+    # asked to clean up. Dataset names (vm-<vmid>-disk-<N>) get recycled
+    # by the very next alloc_image on the same slot -- or by a different
+    # VMID landing on the same disk-N. The captured $safety_marker holds
+    # what the dataset's comments looked like at free_image entry
+    # (written by alloc_image per #151 as "Autocreated by Proxmox Plugin
+    # (<hex>)"). If the current comments differ, the slot was reused and
+    # we must not touch it. Also skip if the dataset is already gone
+    # (the imgdel UPID won the race); mismatched / unreadable markers
+    # both route to skip, which is strictly safer than our old blind
+    # delete.
+    if (!defined $safety_marker) {
+        # We never captured a marker (dataset didn't exist at fork
+        # time, or the query failed). Nothing to anchor to -- skip.
+        POSIX::_exit(0);
+    }
+    my $current_marker;
+    my $dataset_gone;
+    eval {
+        my $rows = _api_call($safety_scfg, 'pool.dataset.query',
+            [ [ [ 'id', '=', $safety_full_ds ] ] ]);
+        if (ref($rows) ne 'ARRAY' || !@$rows) {
+            $dataset_gone = 1;
+            return;
+        }
+        my $ds = $rows->[0];
+        my $up = ref($ds->{user_properties}) eq 'HASH' ? $ds->{user_properties} : {};
+        for my $c ($ds->{comments}, $up->{comments}, $up->{'org.freenas:description'}) {
+            my $v = ref($c) eq 'HASH' ? ($c->{value} // $c->{rawvalue}) : $c;
+            if (defined($v) && !ref($v)) { $current_marker = $v; last; }
+        }
+    };
+    if ($dataset_gone) {
+        POSIX::_exit(0);  # already cleaned up by the fast imgdel path
+    }
+    if (!defined($current_marker) || $current_marker ne $safety_marker) {
+        _log($safety_scfg, 1, 'warning',
+            "[TrueNAS] free_image safety-net: $safety_full_ds marker changed "
+            . "since free_image entry (was="
+            . (defined $safety_marker ? "'$safety_marker'" : 'undef')
+            . ", now="
+            . (defined $current_marker ? "'$current_marker'" : 'undef')
+            . "); dataset name was recycled. Skipping the safety-net delete "
+            . "to avoid pulling it out from under its new owner.");
+        POSIX::_exit(0);
+    }
     eval { _delete_dataset_with_retry($safety_scfg, $safety_full_ds) };
     POSIX::_exit(0);
 }
@@ -9558,47 +9679,31 @@ sub _free_image_iscsi {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: captured " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) for cleanup") if @scsi_devices_to_cleanup;
     }
 
-    # Resolve target/extent/mapping on TrueNAS (moved up: needed for WWID validation below).
-    # Use narrow queries: we only ever want the row that matches THIS zvol.
-    my $target_id = _resolve_target_id($scfg);
+    # Extent + targetextent lookups and the multipath-by-WWID flush used to
+    # happen here synchronously (~2 s of TN WS calls plus the multipath
+    # command). Both moved into the imgdel cleanup_worker — the worker
+    # re-queries by disk path and runs multipath -f lazily. Leaving them
+    # sync kept destroy_vm's per-VM config lock past 10 s on multi-disk
+    # teardowns and cascaded the proxmox-test-runner suite.
     my $zvol_path_match = "zvol/$scfg->{tn_dataset}/$zname";
-    my $ext_matches = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
-    my $extent = $ext_matches->[0];
-    my $tx;
-    if ($extent && $target_id) {
-        my $tx_matches = _tn_targetextent_query_by_target_extent($scfg, $target_id, $extent->{id}) // [];
-        $tx = $tx_matches->[0];
-    }
 
-    # Best-effort: flush the local multipath map for this LUN's WWID.
-    # Derive WWID directly from the TrueNAS extent NAA (already fetched above) rather than
-    # calling path() + scsi_id — scsi_id does not work reliably on DM devices (/dev/mapper/mpathX),
-    # and calling path() here would re-enter the login path on a volume being deleted.
-    # TrueNAS NAA format: "0x6589cfc..." → multipath WWID: "36589cfc..." (0x prefix → NAA-6 type byte 3)
-    if ($scfg->{tn_use_multipath}) {
-        eval {
-            if ($extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
-                (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
-                _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: flushing multipath map $flush_wwid");
-                eval { PVE::Tools::run_command(['multipath','-f',$flush_wwid], outfunc=>sub{}, errfunc=>sub{}) };
-            }
-            # If no extent or NAA missing/malformed: skip flush (cannot determine WWID safely)
-        };
-        # ignore any multipath flush errors here
-    }
-
-    my $in_use = sub { my ($e)=@_; return ($e && $e =~ /in use/i) ? 1 : 0; };
-    my $need_force_logout = 0;
-    my $did_session_logout = 0;
-
-    # Pre-teardown: remove this LUN's SCSI block device from the kernel before TrueNAS API calls.
-    # The iSCSI TCP session stays open (needed for other LUNs), but the kernel device is released.
+    # Pre-teardown: write to /sys/block/<sd>/device/delete to release the
+    # kernel's SCSI device BEFORE the TN API calls (prevents "in use" errors
+    # on extent.delete). The write itself is non-blocking — the kernel does
+    # the actual release asynchronously. Historically we waited for the
+    # device to disappear here (poll + udevadm settle + 1s sleep) before
+    # continuing; that's ~4 s per disk, synchronous, under PVE's config
+    # lock (destroy_vm → vdisk_free → us), and a 3-disk destroy stacked
+    # past PVE's 10 s per-VM lock timeout and cascaded the test-runner
+    # suite. Issue the writes now, defer the verify+settle to the
+    # deferred block (runs after free_image returns but before the next
+    # operation touches the device set).
+    my @scsi_device_paths;
     if (@scsi_devices_to_cleanup) {
         _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: pre-teardown of " . scalar(@scsi_devices_to_cleanup) . " SCSI device(s) before API calls");
-        my @device_paths;
         for my $dev (@scsi_devices_to_cleanup) {
             my $delete_path = "/sys/block/$dev/device/delete";
-            push @device_paths, $delete_path if -e $delete_path;
+            push @scsi_device_paths, $delete_path if -e $delete_path;
             if (-e $delete_path && -w $delete_path) {
                 eval {
                     _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: deleting SCSI device $dev");
@@ -9606,119 +9711,45 @@ sub _free_image_iscsi {
                 };
             }
         }
-        _verify_devices_disconnected($scfg, \@device_paths);
-        eval { run_command(['udevadm','settle'], outfunc => sub {}) };
-        sleep(DEVICE_SETTLE_DELAY_S);
         @scsi_devices_to_cleanup = ();
     }
 
-    # 1) Delete targetextent mapping
-    # Always pass force=true to bypass "target in use" checks from other cluster nodes' sessions.
-    if ($tx && defined $tx->{id}) {
-        my $id = $tx->{id};
-        my $ok = eval {
-            _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ]);
-            1;
-        };
-        if (!$ok) {
-            my $err = $@ // '';
-            if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
-                $need_force_logout = 1;
-            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
-                # Only warn if resource actually exists - ENOENT means already cleaned up
-                warn "warning: delete targetextent id=$id failed: $err";
-            }
-            # Silently ignore "does not exist" errors - resource already gone
-        }
-    }
-
-    # 2) Delete extent (may still be mapped if step 1 failed)
-    # Always pass force=true to bypass "target in use" checks from other cluster nodes' sessions.
+    # Resolve + delete the iscsi.targetextent mapping synchronously here,
+    # even though it costs ~1 s on the destroy_vm config-lock critical
+    # path. list_images iterates iscsi.targetextent.query to build the
+    # volume listing (see _list_images_iscsi), so a mapping that outlives
+    # free_image's return makes the purged volid reappear in
+    # pvesm list / storage-content listings until the imgdel worker
+    # catches up. disk_purge in proxmox-test-runner asserts the volid
+    # is gone immediately after purge, and defers would fail it.
+    # The extent + dataset deletes stay in the imgdel worker: list_images
+    # keys on the mapping, not the extent, and the dataset.delete is
+    # the 20-50 s call that the detached worker was created for.
+    my $ext_matches = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
+    my $extent      = $ext_matches->[0];
     if ($extent && defined $extent->{id}) {
-        my $eid = $extent->{id};
-        my $ok = eval {
-            _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ]);
-            1;
-        };
-        if (!$ok) {
-            my $err = $@ // '';
-            if ($scfg->{tn_force_delete_on_inuse} && $in_use->($err)) {
-                $need_force_logout = 1;
-            } elsif ($err !~ /does not exist|ENOENT|InstanceNotFound/i) {
-                # Only warn if resource actually exists - ENOENT means already cleaned up
-                warn "warning: delete extent id=$eid failed: $err";
-            }
-            # Silently ignore "does not exist" errors - resource already gone
-        }
-    }
-
-    # 3) If TrueNAS reported "in use" and force_delete_on_inuse=1, check if safe to logout
-    # Don't logout if there are other active LUNs - this breaks multi-disk operations
-    if ($need_force_logout) {
-        # Invalidate cache to get fresh targetextent data — a destination LUN may have been
-        # created since the cache was last populated (e.g., during a disk move operation)
-        _clear_cache(_cache_host_key($scfg));
-        # Check how many LUNs are currently mapped to this target. Narrow-
-        # query by target only (server-side filter), then count.
-        my $active_luns = 0;
-        eval {
-            my $target_maps = _api_call($scfg, 'iscsi.targetextent.query',
-                [ [ [ 'target', '=', $target_id ] ] ]) // [];
-            $active_luns = scalar(@$target_maps);
-        };
-
-        # Only logout if this is the last LUN (or unknown count) — full logout during a
-        # disk move would tear down the destination LUN's session mid-copy.
-        if ($active_luns <= 1 || $@) {
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: logging out to retry extent deletion (active LUNs: $active_luns)");
-            _logout_target_all_portals($scfg);
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: waiting for iSCSI session to disconnect");
-            sleep(DEVICE_SETTLE_DELAY_S);
-            eval { run_command(['udevadm','settle'], outfunc => sub {}) };
-            $did_session_logout = 1;
-        } else {
-            # Other LUNs active — do NOT logout entire target.
-            # Early per-LUN SCSI teardown should have released this LUN's reference.
-            # $need_force_logout stays 1 to trigger the retry block below without a session logout.
-            _log($scfg, 2, 'debug', "[TrueNAS] _free_image_iscsi: $active_luns LUNs active — retrying deletes without logout");
-        }
-        # Retry mapping delete
+        my $tx_matches = _tn_targetextent_query_by_extent($scfg, $extent->{id}) // [];
+        my $tx         = $tx_matches->[0];
         if ($tx && defined $tx->{id}) {
-            my $id = $tx->{id};
+            my $tx_id = $tx->{id};
             eval {
-                _api_call($scfg,'iscsi.targetextent.delete',[ $id, JSON::PP::true ]);
+                _api_call($scfg, 'iscsi.targetextent.delete',
+                    [ $tx_id, JSON::PP::true ]);
             };
-            if ($@) {
-                # In cluster environments, other nodes may have active sessions causing "in use" errors
-                # This is expected - TrueNAS will clean up orphaned extents when all sessions close
-                _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete targetextent id=$id (may be in use by other cluster nodes)");
+            if ($@ && $@ !~ /does not exist|ENOENT|InstanceNotFound/i) {
+                _log($scfg, 1, 'info',
+                    "[TrueNAS] _free_image_iscsi: targetextent $tx_id delete: $@");
             }
-        }
-        # Retry extent delete (re-query extent by disk path, narrow)
-        my $retry_matches = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
-        $extent = $retry_matches->[0];
-        if ($extent && defined $extent->{id}) {
-            my $eid = $extent->{id};
-            eval {
-                _api_call($scfg,'iscsi.extent.delete',[ $eid, JSON::PP::false, JSON::PP::true ]);
-            };
-            if ($@) {
-                _log($scfg, 1, 'info', "[TrueNAS] _free_image_iscsi: could not delete extent id=$eid (may be in use by other cluster nodes)");
-            }
+            _clear_cache(_cache_host_key($scfg));
         }
     }
 
-    # 4) Allow devices to settle before dataset deletion
-    if ($need_force_logout) {
-        if ($did_session_logout) {
-            # Session was disconnected in step 3 — give it a moment before dataset deletion
-            sleep(DEVICE_SETTLE_DELAY_S);
-        }
-        eval { run_command(['udevadm','settle'], outfunc => sub {}) };
-        $need_force_logout = 1;  # signal deferred cleanup: skip session rescan
-    }
+    # The extent.delete and dataset.delete run in the imgdel
+    # cleanup_worker. Pass the extent id we already resolved so the
+    # worker doesn't re-query.
+    my $extent_id_for_worker = ($extent && defined $extent->{id}) ? $extent->{id} : undef;
 
-    # 5) Safety check before deferring the dataset delete: verify dataset has
+    # Safety check before deferring the dataset delete: verify dataset has
     # no child datasets (only snapshots allowed). Must run SYNCHRONOUSLY so we
     # can fail the free_image call cleanly if a manually-created child dataset
     # is present. Recursive deletion in the cleanup_worker would otherwise
@@ -9739,92 +9770,170 @@ sub _free_image_iscsi {
     # Invalidate cache eagerly (list_images should not see the stale mapping).
     _clear_cache(_cache_host_key($scfg));
 
-    # Cross-node stale-WWID hint (#147). Only drop the hint when the
-    # extent is confirmed gone on TN side, so peers that act on it find
-    # a real orphan rather than wasting a teardown on a LUN that still
-    # exists. We already have the WWID from the original $extent NAA
-    # captured at top of this function.
-    if ($scfg->{tn_use_multipath} && ($scfg->{tn_reconcile} // 1)
-        && $extent && $extent->{naa})
-    {
-        eval {
-            # Narrow re-query: if the extent is still there, don't drop
-            # a hint that would mislead peers into tearing down a live
-            # LUN. The targetextent might still exist on another node's
-            # "in use" error path, but the plan's scope is only on
-            # EXTENT absence - that's what multipath keys on.
-            my $still = _tn_extent_query_by_disk($scfg, $zvol_path_match) // [];
-            if (!@$still) {
-                my $wwid = _naa_to_wwid($extent->{naa});
-                if ($wwid) {
-                    _write_stale_wwid_hint($scfg, $storeid, $wwid);
-                } else {
-                    _log($scfg, 2, 'debug',
-                        "[TrueNAS] free_image: extent NAA $extent->{naa} did not parse, skipping stale-wwid hint");
-                }
-            } else {
-                _log($scfg, 2, 'debug',
-                    "[TrueNAS] free_image: extent still present on TN, no stale-wwid hint written");
-            }
-        };
-        # ignore any hint-write errors
-    }
+    # Cross-node stale-WWID hint (#147) moved into the imgdel worker:
+    # it is defensive signaling for other nodes, not something the
+    # caller waits on, and keeping it in sync re-queried the extent
+    # by disk path (~1 s WS call). Worker writes the hint after the
+    # extent delete succeeds and the re-query confirms it's gone.
 
-    # 6) Defer post-deletion cleanup after lock release (session rescan, self-healing, logout check)
-    my $deferred_scfg = $scfg;
-    my $deferred_need_force_logout = $need_force_logout;
-    _defer_after_lock(sub {
-        _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image_iscsi deferred: post-deletion cleanup");
-
-        if ($deferred_need_force_logout) {
-            # Just clean up stale multipath mappings without reconnecting
-            if ($deferred_scfg->{tn_use_multipath}) {
-                eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}, errfunc=>sub{}) };
-            }
-            eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
-        } else {
-            eval { PVE::Tools::run_command(['iscsiadm','-m','session','-R'], outfunc=>sub{}) };
-            if ($deferred_scfg->{tn_use_multipath}) {
-                eval { PVE::Tools::run_command(['multipath','-r'], outfunc=>sub{}) };
-            }
-            eval { PVE::Tools::run_command(['udevadm','settle'], outfunc=>sub{}) };
-        }
-
-        # Self-healing: Verify weight volume exists after deletion
-        eval {
-            _log($deferred_scfg, 2, 'debug', "[TrueNAS] free_image deferred: self-healing: verifying weight volume");
-            _ensure_target_visible($deferred_scfg);
-        };
-        if ($@) {
-            _log($deferred_scfg, 0, 'warning', "[TrueNAS] free_image deferred: self-healing: weight volume verification failed: $@");
-        }
-
-        # Optional: logout if no LUNs remain for this target on this node
-        if ($deferred_scfg->{tn_logout_on_free}) {
+    # The only post-deletion work left in the free_image path that can't
+    # move to the imgdel worker is the opt-in tn_logout_on_free hook,
+    # which logs out this host's iSCSI session if no LUNs remain. Keep
+    # that one, best-effort. Everything else (udevadm settle, multipath
+    # -r, session rescan, weight-volume self-heal) either runs in the
+    # imgdel worker, is covered by alloc_image's pre-flight, or was
+    # already identified as redundant and removed in beta11's cascade
+    # of fixes. Running them synchronously inside cluster_lock_storage
+    # (which still counts toward destroy_vm's config lock) is what
+    # cascaded proxmox-test-runner's 10 s per-VM-config-lock ceiling
+    # into "can't lock file" failures across the whole suite.
+    if ($scfg->{tn_logout_on_free}) {
+        my $deferred_scfg = $scfg;
+        _defer_after_lock(sub {
             eval {
                 if (_session_has_no_luns($deferred_scfg)) {
                     _logout_target_all_portals($deferred_scfg);
                 }
             };
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] free_image deferred: logout_on_free check failed: $@") if $@;
-        }
-    });
+        });
+    }
 
-    # Return a cleanup_worker coderef for the slow pool.dataset.delete step.
-    # PVE::Storage::vdisk_free (Storage.pm:~1220) forks whatever we return as
-    # an 'imgdel' UPID task AFTER releasing the cfs storage lock, so the
-    # calling qm destroy returns quickly. Under cluster load the dataset
-    # delete can block 20-50 s waiting for other nodes to release the
-    # extent's underlying zvol; keeping that on the caller's synchronous
-    # path was making vm_disk_buses exceed its 180 s test-framework limit
-    # (test_run6/truenas-2026-08-13, run-37 iter 1 and 2). The imgdel task
-    # is idempotent -- if the next iteration's alloc_image runs before it
-    # completes, the plugin's find-free-disk-name auto-increment handles
-    # the residual zvol without a name collision.
-    my $delete_scfg = $scfg;
-    my $delete_full_ds = $full_ds;
+    # Return a cleanup_worker coderef for the slow pool.dataset.delete step
+    # plus the SCSI device verify. Only this coderef is forked as an
+    # 'imgdel' UPID task by PVE::Storage::vdisk_free (Storage.pm:~1220)
+    # AFTER releasing the cfs storage lock AND outside destroy_vm's
+    # lock_config -- so anything we put here is truly off PVE's per-VM
+    # config lock. Everything above (including _defer_after_lock blocks)
+    # runs synchronously inside cluster_lock_storage and still counts
+    # toward the config-lock hold.
+    #
+    # Under cluster load the dataset delete alone can block 20-50 s
+    # waiting for other nodes to release the extent's underlying zvol;
+    # keeping that on the caller's synchronous path was making
+    # vm_disk_buses exceed its 180 s test-framework limit
+    # (test_run6/truenas-2026-08-13, run-37 iter 1 and 2). The SCSI
+    # verify_devices_disconnected (up to 2 s per disk) was the next
+    # biggest hitter under proxmox-test-runner's 10 s config-lock
+    # ceiling -- 3-disk vm_additional_disk_vtpm teardowns stacked
+    # past 10 s and cascaded every subsequent qm create 118 to
+    # "can't lock file". Both are idempotent and have readers on
+    # the other side (alloc_image's find-free-disk-name handles
+    # a residual zvol, activate_volume re-discovers a stale sd).
+    my $delete_scfg         = $scfg;
+    my $delete_full_ds      = $full_ds;
+    my $delete_scsi_paths   = [ @scsi_device_paths ];
+    my $delete_zname        = $zname;
+    my $delete_zvol_path    = $zvol_path_match;
+    my $delete_extent_id    = $extent_id_for_worker;
     return sub {
         my $upid = shift;  # PVE passes the imgdel UPID
+
+        # Close any inherited /var/lock/qemu-server/lock-<vmid>.conf flock.
+        # Our caller is PVE::Storage::vdisk_free, which is itself called
+        # inside PVE::QemuConfig::lock_config during destroy_vm. That
+        # lock is an flock on /var/lock/qemu-server/lock-<vmid>.conf,
+        # held open on an FD in the qmdestroy task process. When
+        # vdisk_free calls fork_worker to run THIS coderef, fork(2)
+        # duplicates every open FD, and under Linux POSIX semantics the
+        # flock travels with the open file description — both parent
+        # and child keep it held until BOTH have closed the FD. The
+        # imgdel task below can run for many seconds (dataset delete
+        # under load is 20-50 s), so the config lock stayed held long
+        # past destroy_vm's return, and PVE's qm create retries from
+        # proxmox-test-runner's subtests kept hitting the 1 s
+        # lock_config_full ceiling with "can't lock file - got
+        # timeout". Reproduced in isolation: single VM destroy/create
+        # cycle, VMID 888, 4 of 5 trials saw a 7 s create delay (6 s
+        # over the ceiling) with the inherited FD visible in
+        # `lsof /run/lock/qemu-server/lock-888.conf` for the duration
+        # of the imgdel worker. Scan /proc/self/fd and close every
+        # /var/lock/qemu-server/lock-*.conf we inherited so our work
+        # proceeds detached from the caller's config lock.
+        eval {
+            if (opendir(my $dh, '/proc/self/fd')) {
+                my @fds = grep { /^\d+$/ && $_ > 2 } readdir($dh);
+                closedir($dh);
+                for my $fd (@fds) {
+                    my $target = readlink("/proc/self/fd/$fd") // next;
+                    next unless $target =~ m{^/(?:var|run)/lock/qemu-server/lock-[-\d]+\.conf$};
+                    POSIX::close($fd + 0);
+                }
+            }
+        };
+
+        # Confirm the kernel finished releasing the SCSI device(s) we
+        # initiated deletion for in the sync phase. Bounded at 2 s per
+        # verify; normal case is <100 ms. Runs in the imgdel worker, so
+        # no caller lock is held while we wait.
+        if ($delete_scsi_paths && @$delete_scsi_paths) {
+            _verify_devices_disconnected($delete_scfg, $delete_scsi_paths);
+        }
+
+        # Resolve the extent (needed for the NAA-based multipath flush and
+        # for the extent.delete below). The targetextent mapping was
+        # deleted synchronously in the sync phase so list_images
+        # reflects the purge immediately; what remains here is the
+        # extent object and the dataset itself. Prefer the id we
+        # already have from the sync phase; fall back to a disk-path
+        # re-query if it's missing (query race or already-gone).
+        my $extent;
+        if (defined $delete_extent_id) {
+            my $rows = eval { _api_call($delete_scfg, 'iscsi.extent.query',
+                [ [ [ 'id', '=', $delete_extent_id ] ] ]) } // [];
+            $extent = $rows->[0];
+        }
+        if (!$extent) {
+            my $rows = eval { _tn_extent_query_by_disk($delete_scfg, $delete_zvol_path) } // [];
+            $extent  = $rows->[0];
+        }
+
+        # Best-effort: flush the local multipath map for this LUN's WWID.
+        # Derived from the extent NAA (0x6589cfc... → multipath WWID
+        # 36589cfc...). Safe to skip if the lookup failed — activate_volume
+        # on the next alloc re-publishes the correct map.
+        if ($delete_scfg->{tn_use_multipath}
+                && $extent && $extent->{naa} && $extent->{naa} =~ /^0x/i) {
+            (my $flush_wwid = lc($extent->{naa})) =~ s/^0x/3/;
+            _log($delete_scfg, 2, 'debug', "[TrueNAS] imgdel: flushing multipath map $flush_wwid");
+            eval { PVE::Tools::run_command(['multipath','-f',$flush_wwid], outfunc=>sub{}, errfunc=>sub{}) };
+        }
+
+        # Delete the extent on TN. force=true bypasses "in use" checks
+        # from other cluster nodes' still-open sessions; our local LUN
+        # was released synchronously via /sys/block/<sd>/device/delete
+        # before we got here. "does not exist" is the idempotent case.
+        if ($extent && defined $extent->{id}) {
+            my $eid = $extent->{id};
+            my $ok = eval {
+                _api_call($delete_scfg, 'iscsi.extent.delete',
+                    [ $eid, JSON::PP::false, JSON::PP::true ]);
+                1;
+            };
+            if (!$ok) {
+                my $err = $@ // '';
+                _log($delete_scfg, 1, 'info',
+                    "[TrueNAS] imgdel: extent $eid delete: $err")
+                    if $err !~ /does not exist|ENOENT|InstanceNotFound/i;
+            }
+        }
+
+        # Cross-node stale-WWID hint (#147). Confirm the extent is
+        # really gone before dropping the hint; otherwise peers tear
+        # down a live LUN. tn_use_multipath + tn_reconcile gate it.
+        if ($delete_scfg->{tn_use_multipath} && ($delete_scfg->{tn_reconcile} // 1)
+                && $extent && $extent->{naa}) {
+            eval {
+                my $still = _tn_extent_query_by_disk($delete_scfg, $delete_zvol_path) // [];
+                if (!@$still) {
+                    my $wwid = _naa_to_wwid($extent->{naa});
+                    if ($wwid) {
+                        _write_stale_wwid_hint($delete_scfg, $storeid, $wwid);
+                    }
+                }
+            };
+        }
+
         eval {
             _delete_dataset_with_retry($delete_scfg, $delete_full_ds);
         };
