@@ -45,10 +45,18 @@ my @fail_next;       # error messages for the next create calls, in order
 }
 my $create = $PKG->can('_nvme_create_namespace_idempotent');
 my $mk = sub { $create->({}, { subsys_id => 7, device_type => 'ZVOL', device_path => $_[0], enabled => 1 }) };
+my $cfile = "$dir/nsid-cursor-7";
+# $_[1]: undef writes the pre-flag one-line file; 0 or 1 writes wrapped=N.
 my $set_cursor = sub {
-    open(my $fh, '>', "$dir/nsid-cursor-7") or die "cursor: $!";
+    open(my $fh, '>', $cfile) or die "cursor: $!";
     print $fh "$_[0]\n";
+    print $fh "wrapped=$_[1]\n" if defined $_[1];
     close $fh;
+};
+my $read_cursor = sub {
+    open(my $fh, '<', $cfile) or die "cursor: $!";
+    local $/; my $s = <$fh>; close $fh;
+    return $s;
 };
 my $reset = sub { %db = (); @creates = (); @fail_next = (); unlink "$dir/nsid-cursor-7"; };
 
@@ -56,7 +64,7 @@ subtest 'lagging cursor does not reuse an nsid freed below max_used' => sub {
     $reset->();
     $db{$_} = "other$_" for (1 .. 300);   # another node allocated up to 300
     delete $db{55};                       # ... and nsid 55 was just freed
-    $set_cursor->(50);                    # this node last picked 50
+    $set_cursor->(50, 0);                  # this node last picked 50
     my $ns = $mk->('/dev/zvol/lag');
     is($ns->{nsid}, 301, 'picks max_used + 1, not the freed 55');
     is($db{55}, undef, 'nsid 55 stays free');
@@ -65,7 +73,7 @@ subtest 'lagging cursor does not reuse an nsid freed below max_used' => sub {
 subtest 'cursor ahead of max_used is kept' => sub {
     $reset->();
     $db{$_} = "y$_" for (1 .. 300);
-    $set_cursor->(400);
+    $set_cursor->(400, 0);
     is($mk->('/dev/zvol/ahead')->{nsid}, 401, 'continues after the cursor');
 };
 
@@ -75,6 +83,57 @@ subtest 'at the ceiling the clamp does nothing: scan continues from the cursor' 
     delete $db{$_} for (55, 60);
     $set_cursor->(50);
     is($mk->('/dev/zvol/wrap')->{nsid}, 55, 'max_used at TN_NSID_MAX: scan from the cursor');
+};
+
+subtest 'wrapped cursor: freeing the top nsid does not turn the clamp on' => sub {
+    $reset->();
+    $db{$_} = "w$_" for (1 .. 1022);      # 1023 was just freed: max_used 1022
+    delete $db{60};                       # 60 was freed long ago
+    $set_cursor->(50, 1);
+    is($mk->('/dev/zvol/wrapped')->{nsid}, 60, 'scan from the cursor picks 60, not the just-freed 1023');
+    is($read_cursor->(), "60\nwrapped=1\n", 'cursor advances, still wrapped');
+};
+
+subtest 'pre-flag cursor file is treated as wrapped' => sub {
+    $reset->();
+    $db{$_} = "w$_" for (1 .. 1022);
+    delete $db{60};
+    $set_cursor->(50);
+    is($mk->('/dev/zvol/legacy')->{nsid}, 60, 'no clamp: picks 60, not 1023');
+    is($read_cursor->(), "60\nwrapped=1\n", 'flag written as wrapped');
+};
+
+subtest 'crossing TN_NSID_MAX sets the flag' => sub {
+    $reset->();
+    $db{$_} = "c$_" for (1 .. 1022);      # max_used stays below the ceiling
+    delete $db{5};
+    open(my $rf, '>', "$dir/nsid-reserved") or die; print $rf "1023\n"; close $rf;
+    $set_cursor->(1020, 0);
+    is($mk->('/dev/zvol/cross')->{nsid}, 5, 'wraps to 5 (1023 reserved)');
+    is($read_cursor->(), "5\nwrapped=1\n", 'wrapped=1 after the crossing');
+    unlink "$dir/nsid-reserved";
+};
+
+subtest 'flag clears once the pick passes max_used, and the clamp is back' => sub {
+    $reset->();
+    $db{$_} = "k$_" for (1 .. 300);
+    $set_cursor->(299, 1);
+    is($mk->('/dev/zvol/catchup')->{nsid}, 301, 'picks 301');
+    is($read_cursor->(), "301\nwrapped=0\n", 'wrapped=0: no earlier-lap nsid above the cursor');
+    $db{$_} = "o$_" for (302 .. 400);     # another node allocates past us
+    delete $db{350};
+    is($mk->('/dev/zvol/lag2')->{nsid}, 401, 'lagging again: the clamp skips the freed 350');
+};
+
+subtest 'seeing the ceiling in use sets the flag on a node that never crossed it' => sub {
+    $reset->();
+    $db{$_} = "n$_" for (1 .. 1023);      # other nodes filled up to the ceiling
+    delete $db{55};
+    $set_cursor->(50, 0);
+    is($mk->('/dev/zvol/seen')->{nsid}, 55, 'picks 55');
+    is($read_cursor->(), "55\nwrapped=1\n", 'wrapped=1 although this node never crossed 1023');
+    delete $db{$_} for (1023, 70);        # the top nsid is freed, 70 was free already
+    is($mk->('/dev/zvol/seen2')->{nsid}, 70, 'no clamp: picks 70, not the just-freed 1023');
 };
 
 subtest 'unique-index collision retries with another nsid' => sub {

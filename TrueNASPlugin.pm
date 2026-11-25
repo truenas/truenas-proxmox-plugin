@@ -8212,20 +8212,36 @@ sub _nvme_pick_nsid_cursor {
     # freed recently, and wrapping from it would always land on the LOWEST
     # free nsid, i.e. the recycle bug again. Start at a random point instead.
     my $cursor = $max_used < TN_NSID_MAX ? $max_used : int(rand(TN_NSID_MAX));
+    # Line 1 is the cursor; older releases read only that line. Line 2 says
+    # whether the cursor has wrapped past TN_NSID_MAX and is on a later lap.
+    # A file without it predates the flag, so whether it wrapped is unknown:
+    # treat it as wrapped, i.e. scan from the cursor with no clamp as releases
+    # before the clamp did, until the flag clears below. Seeing TN_NSID_MAX in
+    # use also sets it: some node reached the ceiling even if this one never
+    # crossed it, so the nsids up there may be about to be freed.
+    my $wrapped = $max_used >= TN_NSID_MAX ? 1 : 0;
     if (open(my $fh, '<', $file)) {
         my $line = <$fh> // '';
+        my $flag = <$fh> // '';
         close($fh);
-        $cursor = $1 if $line =~ /^\s*(\d+)\s*$/ && $1 <= TN_NSID_MAX;
+        if ($line =~ /^\s*(\d+)\s*$/ && $1 <= TN_NSID_MAX) {
+            $cursor = $1;
+            $wrapped = $flag =~ /^\s*wrapped=0\s*$/ ? 0 : 1;
+        }
     }
+    $wrapped = 1 if $max_used >= TN_NSID_MAX;
     # The cursor is per node, so on a multi-node cluster it lags behind the
     # nsids other nodes allocated. Below the ceiling, never scan from under
-    # max_used: a lagging cursor would take a slot freed below it. At the
-    # ceiling the clamp does nothing and the scan keeps wrapping.
-    $cursor = $max_used if $cursor < $max_used && $max_used < TN_NSID_MAX;
+    # max_used: a lagging cursor would take a slot freed below it. Skip this
+    # once the cursor has wrapped: the nsids above it are then from its own
+    # previous lap, and clamping would land on one just freed up there.
+    my $scan_from = $cursor;
+    $scan_from = $max_used
+        if !$wrapped && $cursor < $max_used && $max_used < TN_NSID_MAX;
 
     my $picked;
     for my $step (1 .. TN_NSID_MAX) {
-        my $n = (($cursor + $step - 1) % TN_NSID_MAX) + 1;
+        my $n = (($scan_from + $step - 1) % TN_NSID_MAX) + 1;
         next if $used{$n} || $exclude->{$n};
         $picked = $n;
         last;
@@ -8236,9 +8252,15 @@ sub _nvme_pick_nsid_cursor {
             . " on subsys $subsys_id (" . scalar(keys %used) . " in use)\n";
     }
 
+    # A pick at or below the scan start means the scan crossed TN_NSID_MAX.
+    # A pick at or above max_used means no nsid from an earlier lap is left
+    # above the cursor, so the lag clamp is safe again.
+    $wrapped = 1 if $picked <= $scan_from;
+    $wrapped = 0 if $picked >= $max_used && $max_used < TN_NSID_MAX;
+
     my $tmp = "$file.tmp.$$";
     if (open(my $out, '>', $tmp)) {
-        print $out "$picked\n";
+        print $out "$picked\nwrapped=$wrapped\n";
         close($out);
         if (!rename($tmp, $file)) {
             _log($scfg, 1, 'warning', "[TrueNAS] _nvme_pick_nsid_cursor: rename $tmp: $!");
@@ -8250,8 +8272,8 @@ sub _nvme_pick_nsid_cursor {
     close($lk);
 
     _log($scfg, 2, 'debug',
-        "[TrueNAS] _nvme_pick_nsid_cursor: subsys=$subsys_id cursor=$cursor picked=$picked "
-        . "in_use=" . scalar(keys %used));
+        "[TrueNAS] _nvme_pick_nsid_cursor: subsys=$subsys_id cursor=$cursor scan_from=$scan_from "
+        . "picked=$picked wrapped=$wrapped in_use=" . scalar(keys %used));
     return $picked;
 }
 
