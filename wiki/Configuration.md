@@ -106,6 +106,28 @@ Generate in TrueNAS: **Credentials** → **Local Users** → **Edit User** → *
 tn_api_key 1-your-api-key-here
 ```
 
+**Where it is stored**: storages added through the web UI, `pvesm add` or the API
+keep the key, like the other sensitive properties (`tn_chap_password`,
+`tn_nvme_dhchap_secret`, `tn_nvme_dhchap_ctrl_secret`), in
+`/etc/pve/priv/storage/<storage>.truenas`, which only root can read. It is not
+written to `storage.cfg`, because the storage config API returns
+`storage.cfg` sections unfiltered: `GET /storage` hands them to anyone with
+`Datastore.Audit` or `Datastore.AllocateSpace` on the storage.
+
+An inline `tn_api_key` line in `storage.cfg`, as older plugin versions and the
+installer write it, keeps working; the sidecar file wins if both exist. Once
+every cluster node runs 2.1.25 or newer, move inline secrets with:
+
+```bash
+truenas-proxmox-manage migrate-secrets            # all TrueNAS storages
+truenas-proxmox-manage migrate-secrets tank-iscsi # one storage
+```
+
+Do not migrate earlier: older plugin versions only read the inline value.
+
+**Rotating the key**: `pvesm set <storage> --tn_api_key <new key>`, or enter it
+in **Datacenter → Storage → Edit**; an empty field keeps the stored key.
+
 ### `tn_target_iqn`
 **Description**: iSCSI target IQN (iSCSI Qualified Name)
 **Type**: String (IQN format)

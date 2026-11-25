@@ -377,6 +377,18 @@ log_warning() {
 }
 
 # Get storage configuration from storage.cfg
+# Secrets of storages added or migrated with plugin 2.1.25+ live in
+# /etc/pve/priv/storage/<storage>.truenas (JSON), not in storage.cfg.
+sidecar_secret() {
+    local file="/etc/pve/priv/storage/$1.truenas"
+    [[ -r "$file" ]] || return 0
+    perl -MJSON::PP -e '
+        open(my $fh, "<", $ARGV[0]) or exit 0; local $/;
+        my $d = eval { decode_json(<$fh>) };
+        print $d->{$ARGV[1]} if ref($d) eq "HASH" && defined($d->{$ARGV[1]});
+    ' "$file" "$2"
+}
+
 # Returns: "api_host|api_key|dataset|api_insecure"
 get_storage_config() {
     local storage_id="$1"
@@ -387,6 +399,9 @@ get_storage_config() {
     api_key=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_key" | awk '{print $2}' | head -1)
     dataset=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_dataset" | awk '{print $2}' | head -1)
     api_insecure=$(grep -A 20 "^truenasplugin: $storage_id" "$config_file" | grep "tn_api_insecure" | awk '{print $2}' | head -1)
+    local sidecar_key
+    sidecar_key=$(sidecar_secret "$storage_id" tn_api_key)
+    [[ -n "$sidecar_key" ]] && api_key="$sidecar_key"
 
     echo "$api_host|$api_key|$dataset|$api_insecure"
 }
@@ -5029,6 +5044,10 @@ test_dataset_property_inheritance() {
             fi
         fi
     done < "$storage_cfg"
+
+    local sidecar_key
+    sidecar_key=$(sidecar_secret "$STORAGE_ID" tn_api_key)
+    [[ -n "$sidecar_key" ]] && api_key="$sidecar_key"
 
     if [[ -z "$api_host" ]] || [[ -z "$api_key" ]] || [[ -z "$dataset" ]]; then
         log_error "Could not extract API configuration from storage.cfg"
