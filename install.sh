@@ -22,6 +22,12 @@ readonly INSTALLER_VERSION="2.0.0"
 readonly GITHUB_REPO="truenas/truenas-proxmox-plugin"
 readonly PLUGIN_FILE="/usr/share/perl5/PVE/Storage/Custom/TrueNASPlugin.pm"
 readonly STORAGE_CFG="/etc/pve/storage.cfg"
+# Sensitive storage properties (tn_api_key, tn_chap_password,
+# tn_nvme_dhchap_secret, tn_nvme_dhchap_ctrl_secret) live in a root-only
+# JSON sidecar /etc/pve/priv/storage/<storage>.truenas since plugin
+# 2.1.25; older storages keep them inline in storage.cfg.
+readonly SECRET_DIR="/etc/pve/priv/storage"
+readonly SENSITIVE_KEYS_RE='^(tn_api_key|tn_chap_password|tn_nvme_dhchap_secret|tn_nvme_dhchap_ctrl_secret)$'
 readonly BACKUP_DIR="/var/lib/truenas-plugin-backups"
 readonly LOG_FILE="/var/log/truenas-installer.log"
 readonly APT_REPO_URL="https://truenas.github.io/truenas-proxmox-plugin/apt/"
@@ -902,6 +908,13 @@ TrueNAS Proxmox VE Plugin Installer v${INSTALLER_VERSION}
 Usage: $0 [OPTIONS]
 
 COMMANDS:
+    migrate-secrets [<storage>...]
+                        Move the API key and the CHAP / DH-HMAC-CHAP secrets of
+                        TrueNAS storages out of /etc/pve/storage.cfg into
+                        ${SECRET_DIR}/<storage>.truenas, which only root can
+                        read. Run it once all cluster nodes run plugin 2.1.25
+                        or newer; older versions only read inline secrets.
+
     import-snapshots <vmid> [--dry-run] [--yes] [--match REGEX]
                         Import the snapshots that already exist on TrueNAS for
                         this VM's zvols into its Proxmox configuration, so the
@@ -950,6 +963,12 @@ parse_arguments() {
 
     while [[ $# -gt 0 ]]; do
         case $1 in
+            migrate-secrets)
+                shift
+                exec perl -MPVE::Storage::Custom::TrueNASPlugin \
+                    -e 'exit PVE::Storage::Custom::TrueNASPlugin::migrate_secrets_cli(@ARGV)' \
+                    -- "$@"
+                ;;
             import-snapshots)
                 # A subcommand, not an installation. It is dispatched from
                 # here, before main() reconnects stdin to /dev/tty and arms
@@ -4986,10 +5005,53 @@ menu_health_check() {
 }
 
 # Extract storage configuration block safely
+# Print one secret of a storage from its sidecar file (empty if none).
+read_storage_secret() {
+    local storage_name="$1"
+    local param_name="$2"
+    local file="${SECRET_DIR}/${storage_name}.truenas"
+    [[ -r "$file" ]] || return 0
+    perl -MJSON::PP -e '
+        my ($f, $k) = @ARGV;
+        open(my $fh, "<", $f) or exit 0;
+        local $/;
+        my $d = eval { decode_json(<$fh>) };
+        print $d->{$k} if ref($d) eq "HASH" && defined($d->{$k});
+    ' "$file" "$param_name"
+}
+
+# Store one secret of a storage in its sidecar file. The value is passed
+# through the environment so it does not show up in the process list.
+write_storage_secret() {
+    local storage_name="$1"
+    local param_name="$2"
+    local file="${SECRET_DIR}/${storage_name}.truenas"
+    mkdir -p "$SECRET_DIR" || return 1
+    TN_SECRET_VALUE="$3" perl -MJSON::PP -e '
+        my ($f, $k) = @ARGV;
+        my $d = {};
+        if (open(my $fh, "<", $f)) { local $/; $d = eval { decode_json(<$fh>) } || {}; }
+        $d->{$k} = $ENV{TN_SECRET_VALUE};
+        open(my $out, ">", $f) or die "cannot write $f: $!\n";
+        print $out JSON::PP->new->canonical->utf8->encode($d), "\n";
+        close($out) or die "cannot write $f: $!\n";
+    ' "$file" "$param_name"
+}
+
 get_storage_config_value() {
     local storage_name="$1"
     local param_name="$2"
     local config_block
+
+    # Secrets: the sidecar file wins, like in the plugin.
+    if [[ "$param_name" =~ $SENSITIVE_KEYS_RE ]]; then
+        local secret
+        secret=$(read_storage_secret "$storage_name" "$param_name")
+        if [[ -n "$secret" ]]; then
+            echo "$secret"
+            return 0
+        fi
+    fi
 
     # Extract only the configuration block for this storage (stop at next storage entry)
     config_block=$(awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG")
@@ -6348,6 +6410,15 @@ get_all_storage_config_values() {
     grep -v "^\s*$" | \
     sed 's/^\s*//' | \
     awk '{print $1 "=" $2}'
+
+    # Secrets from the sidecar file come last, so they win over inline
+    # values when the caller fills an associative array.
+    local key secret
+    for key in tn_api_key tn_chap_password tn_nvme_dhchap_secret tn_nvme_dhchap_ctrl_secret; do
+        secret=$(read_storage_secret "$storage_name" "$key")
+        [[ -n "$secret" ]] && echo "${key}=${secret}"
+    done
+    return 0
 }
 
 # Validate IP address format (IPv4 dotted-quad, or IPv6 bare/bracketed literal)
@@ -10438,6 +10509,21 @@ update_storage_config() {
     # Create temporary file
     local temp_file="${STORAGE_CFG}.tmp.$$"
 
+    # A storage whose secrets already live in the sidecar file keeps them
+    # there: move the regenerated inline key into the file instead.
+    if [[ -e "${SECRET_DIR}/${storage_name}.truenas" ]]; then
+        local new_key
+        new_key=$(printf '%s\n' "$new_config" | awk '$1 == "tn_api_key" {print $2; exit}')
+        if [[ -n "$new_key" ]]; then
+            write_storage_secret "$storage_name" tn_api_key "$new_key" || {
+                error "Failed to update ${SECRET_DIR}/${storage_name}.truenas"
+                rm -f "$temp_file"
+                return 1
+            }
+        fi
+        new_config=$(printf '%s\n' "$new_config" | awk '$1 != "tn_api_key"')
+    fi
+
     # Remove old storage block and write everything except that storage
     awk -v storage="truenasplugin: ${storage_name}" '
         $0 ~ "^" storage "$" { skip=1; next }
@@ -12184,6 +12270,8 @@ menu_configure_storage() {
         echo "     qm create 999 --name test-vm && qm set 999 --scsi0 ${storage_name}:10"
         echo "  2. Check storage status: pvesm status"
         echo "  3. View storage details: pvesm list ${storage_name}"
+        echo "  Once every cluster node runs plugin 2.1.25+, move the API key out of"
+        echo "  storage.cfg with: truenas-proxmox-manage migrate-secrets ${storage_name}"
 
         # Add multipath-specific next steps if enabled
         if [[ "$use_multipath" == "1" ]]; then

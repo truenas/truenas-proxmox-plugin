@@ -1,5 +1,17 @@
 # TrueNAS Plugin Changelog
 
+## Unreleased
+
+### Security
+
+- **Sensitive properties are kept out of `storage.cfg`.** Since 2.1.25~beta8 the add and update hooks wrote `tn_api_key`, `tn_chap_password` and the DH-HMAC-CHAP secrets back into `/etc/pve/storage.cfg`. The storage config API returns sections unfiltered, so `GET /storage` handed the TrueNAS API key to every user with `Datastore.Audit` or `Datastore.AllocateSpace` on the storage. The hooks now store these values in `/etc/pve/priv/storage/<storage>.truenas` (root-only, replicated by pmxcfs), like the in-tree PBS, CIFS and ESXi plugins, and `on_delete_hook` removes the file. Inline values from older versions and from the installer keep working; the sidecar file wins when both exist. Setting or clearing a secret also drops its inline copy.
+- **New `truenas-proxmox-manage migrate-secrets [<storage>...]`** moves existing inline secrets into the sidecar files. It is not run on upgrade: run it once every cluster node runs this version, since older versions only read inline values. Storages added through the web UI on an upgraded node are likewise only usable by nodes that run this version.
+
+### Behaviour Changes
+
+- **`tn_api_key` is no longer `fixed`.** It can be rotated with `pvesm set <storage> --tn_api_key ...` or in the Proxmox VE 9.3 storage dialog, where an empty field keeps the stored key. Deleting it is refused.
+- **Storage dialog (Proxmox VE 9.3):** `tn_enable_live_snapshots`, `tn_snapshot_volume_chains` and `tn_vmstate_storage` moved from the Advanced section to the hidden properties, because the plugin does not read them (see [Configuration](Configuration.md#tn_vmstate_storage)). `tn_use_multipath`, `tn_use_by_path`, `tn_chap_user` and `tn_chap_password` got descriptions, which the dialog shows as tooltips. `tn_force_delete_on_inuse` and `tn_logout_on_free` declare their boolean default as `0` instead of the string `'false'`.
+
 ## Version 2.1.25~beta2 (November 19, 2026)
 
 ### New Features

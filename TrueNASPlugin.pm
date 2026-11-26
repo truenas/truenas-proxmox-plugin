@@ -649,7 +649,7 @@ sub _retry_with_backoff {
 
 # ======== Storage plugin identity ========
 # Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) through PVE 9.3+ (APIVER 16)
+# Supports PVE 8.x (APIVER 11) through PVE 9.3 (APIVER 17)
 sub api {
     my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
 
@@ -689,7 +689,6 @@ sub plugindata {
             tn_compression => 1,
             tn_debug => 1,
             tn_enable_bulk_operations => 1,
-            tn_enable_live_snapshots => 1,
             tn_force_delete_on_inuse => 1,
             tn_hostnqn => 1,
             tn_ipv6_by_path => 1,
@@ -701,12 +700,10 @@ sub plugindata {
             tn_portals => 1,
             tn_prefer_ipv4 => 1,
             tn_snapshot_teardown_timeout_s => 1,
-            tn_snapshot_volume_chains => 1,
             tn_sparse => 1,
             tn_status_capacity_ttl_s => 1,
             tn_use_by_path => 1,
             tn_use_multipath => 1,
-            tn_vmstate_storage => 1,
             tn_zvol_blocksize => 1,
         },
         # Hidden from the UI but still settable via `pvesm set` /
@@ -732,6 +729,11 @@ sub plugindata {
             tn_nvme_ctrl_loss_tmo      => 1,  # NVMe kernel tuning
             tn_nvme_keep_alive_tmo     => 1,  # NVMe kernel tuning
             tn_nvme_reconnect_delay    => 1,  # NVMe kernel tuning
+            # Declared but never read (see wiki/Configuration.md); keep them
+            # out of the dialog so they do not look like working switches.
+            tn_enable_live_snapshots   => 1,  # no-op
+            tn_snapshot_volume_chains  => 1,  # no-op
+            tn_vmstate_storage         => 1,  # no-op
         },
         'sensitive-properties' => {
             tn_api_key => 1,
@@ -839,22 +841,24 @@ sub properties {
         # Initiator pathing
         tn_use_multipath => {
             title => 'Enable iSCSI multipath',
+            description => "Log in to every portal and use dm-multipath devices for iSCSI LUNs.",
             type => 'boolean', optional => 1, default => 1,
         },
         tn_force_delete_on_inuse => {
             title => 'Force delete on in-use LUN',
             description => 'Temporarily logout the target on this node to force delete when TrueNAS reports "target is in use".',
             type => 'boolean',
-            default => 'false',
+            default => 0,
         },
         tn_logout_on_free => {
             title => 'Logout target after last free',
             description => 'After delete, logout the target if no LUNs remain for this node.',
             type => 'boolean',
-            default => 'false',
+            default => 0,
         },
         tn_use_by_path  => {
             title => 'Use /dev/disk/by-path names',
+            description => "Address iSCSI LUNs by their /dev/disk/by-path name instead of by WWID.",
             type => 'boolean', optional => 1, default => 0,
         },
         tn_ipv6_by_path => {
@@ -873,10 +877,12 @@ sub properties {
         # CHAP (optional - iSCSI only)
         tn_chap_user     => {
             title => 'iSCSI CHAP user',
+            description => "CHAP user name for iSCSI discovery and session login (iSCSI transport only).",
             type => 'string', optional => 1,
         },
         tn_chap_password => {
             title => 'iSCSI CHAP password',
+            description => "CHAP secret for iSCSI discovery and session login (iSCSI transport only).",
             type => 'string', optional => 1,
         },
 
@@ -1166,7 +1172,9 @@ sub options {
         # option 'tn_api_key'" even on a create that supplied the key.
         # Mark it optional at the schema layer; on_add_hook validates
         # presence from the sensitive hash the API layer passes through.
-        tn_api_key       => { optional => 1, fixed => 1 },
+        # Not fixed: the key can be rotated with `pvesm set` or the GUI,
+        # where an empty field leaves it unchanged.
+        tn_api_key       => { optional => 1 },
         tn_api_username  => { optional => 1 },
         tn_auth_mechanism => { optional => 1 },
         tn_api_scheme    => { optional => 1, fixed => 1 },
@@ -1252,51 +1260,218 @@ sub options {
     };
 }
 
-# Force shared storage behavior for cluster migration support
-# pve-manager 9.2.29+ extracts sensitive-properties (tn_api_key and the
-# tn_chap_password / tn_nvme_dhchap_* set) out of the create/update
-# $param and passes them to on_add_hook / on_update_hook as a separate
-# hash, so check_config cannot see them.
+# ======== Secret storage ========
+# pve-manager 9.2.29+ (PVE 9.3) extracts sensitive-properties (tn_api_key
+# and the tn_chap_password / tn_nvme_dhchap_* set) out of the create/update
+# $param and passes them to the hooks below as a separate hash, so
+# check_config cannot see them, and the storage API never writes them to
+# /etc/pve/storage.cfg.
 #
-# PVE core plugins that declare sensitive-properties (Ceph, PBS, CIFS,
-# RBD) all persist their secrets in sidecar files. We keep ours inline
-# in storage.cfg, so the hooks also have to merge the sensitive hash
-# back into $scfg; otherwise write_config writes the entry without the
-# key and every later broker call dies "scfg missing api_host/api_key".
+# The storage config API returns sections unfiltered: GET /storage (needs
+# only Datastore.Audit or Datastore.AllocateSpace on the storage) and
+# GET /storage/{id} hand out everything in storage.cfg. Like the in-tree
+# PBS, CIFS and ESXi plugins we therefore keep the secrets in a root-only
+# sidecar file under /etc/pve/priv, which pmxcfs replicates to all nodes.
+#
+# Older releases of this plugin, and storages written by the installer
+# before this change, keep the secrets inline. _tn_secret() still falls
+# back to the inline value, so those storages keep working; the sidecar
+# file wins when both exist. `truenas-proxmox-manage migrate-secrets`
+# moves inline secrets into the sidecar file. It is not run automatically,
+# because nodes still on an older plugin version only read inline values.
 our @_SENSITIVE_KEYS = qw(
     tn_api_key
     tn_chap_password
     tn_nvme_dhchap_secret
     tn_nvme_dhchap_ctrl_secret
 );
+our %_IS_SENSITIVE = map { $_ => 1 } @_SENSITIVE_KEYS;
+our $SECRET_DIR = '/etc/pve/priv/storage';
+
+sub _tn_secret_path($storeid) {
+    # The capture also untaints the ID for the daemons' taint mode.
+    my ($id) = $storeid =~ /\A([A-Za-z][A-Za-z0-9\-_.]*)\z/
+        or die "invalid storage ID '$storeid'\n";
+    return "$SECRET_DIR/$id.truenas";
+}
+
+sub _tn_read_secrets($storeid) {
+    my $path = _tn_secret_path($storeid);
+    return {} if !-e $path;
+    my $raw = eval { PVE::Tools::file_get_contents($path) };
+    if (!defined($raw)) {
+        warn "[TrueNAS] cannot read secret file $path: $@";
+        return {};
+    }
+    my $data = eval { decode_json($raw) };
+    if (ref($data) ne 'HASH') {
+        warn "[TrueNAS] ignoring malformed secret file $path\n";
+        return {};
+    }
+    # Values read from a file are tainted under the daemons' -T, and some
+    # reach exec arguments (iscsiadm for CHAP). They come from a root-only
+    # file the hooks wrote, so trust them like inline storage.cfg values.
+    my %secrets;
+    for my $k (@_SENSITIVE_KEYS) {
+        next if !defined($data->{$k}) || ref($data->{$k});
+        ($secrets{$k}) = $data->{$k} =~ /\A(.*)\z/s;
+    }
+    return \%secrets;
+}
+
+sub _tn_write_secrets($storeid, $secrets) {
+    my $path = _tn_secret_path($storeid);
+    my %clean = map { ($_ => $secrets->{$_}) }
+        grep { defined($secrets->{$_}) && $secrets->{$_} ne '' } @_SENSITIVE_KEYS;
+    if (!%clean) {
+        unlink $path;
+        return;
+    }
+    mkdir $SECRET_DIR;
+    my $json = JSON::PP->new->canonical->utf8->encode(\%clean);
+    PVE::Tools::file_set_contents($path, "$json\n", 0600);
+}
+
+# The secret readers below only get $scfg, which normally carries no
+# storage ID, so find the section in storage.cfg that $scfg is (a copy of).
+# The map is rebuilt whenever the config digest changes.
+my $_storeid_map = { digest => '', by_fp => {} };
+
+sub _tn_scfg_fingerprint($scfg) {
+    my %copy = map { ($_ => $scfg->{$_}) }
+        grep { !$_IS_SENSITIVE{$_} && $_ ne 'storeid' && $_ ne 'storage' && $_ ne 'digest' }
+        keys %$scfg;
+    return JSON::PP->new->canonical->encode(\%copy);
+}
+
+sub _tn_resolve_storeid($scfg) {
+    my $id = $scfg->{storeid} // $scfg->{storage};
+    return $id if defined($id) && $id ne '';
+
+    my $cfg = eval { require PVE::Storage; PVE::Storage::config() };
+    return undef if !$cfg || ref($cfg->{ids}) ne 'HASH';
+
+    my $digest = $cfg->{digest} // '';
+    if ($digest eq '' || $digest ne $_storeid_map->{digest}) {
+        my %by_fp;
+        for my $sid (keys $cfg->{ids}->%*) {
+            my $section = $cfg->{ids}->{$sid};
+            next if ($section->{type} // '') ne 'truenasplugin';
+            my $fp = _tn_scfg_fingerprint($section);
+            # Two sections that differ only in their ID cannot be told
+            # apart; mark the fingerprint ambiguous.
+            $by_fp{$fp} = exists($by_fp{$fp}) ? undef : $sid;
+        }
+        $_storeid_map = { digest => $digest, by_fp => \%by_fp };
+    }
+    return $_storeid_map->{by_fp}->{ _tn_scfg_fingerprint($scfg) };
+}
+
+# Read one sensitive property: the sidecar file first, then the legacy
+# inline value in storage.cfg.
+sub _tn_secret($scfg, $key) {
+    if (my $storeid = _tn_resolve_storeid($scfg)) {
+        my $secrets = _tn_read_secrets($storeid);
+        return $secrets->{$key} if defined($secrets->{$key}) && $secrets->{$key} ne '';
+    }
+    return $scfg->{$key};
+}
 
 sub on_add_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
-    if (!defined($sensitive{tn_api_key}) || $sensitive{tn_api_key} eq '') {
-        die "tn_api_key is required\n";
-    }
+    my %secrets;
     for my $k (@_SENSITIVE_KEYS) {
-        next unless exists($sensitive{$k})
-                 && defined($sensitive{$k})
-                 && $sensitive{$k} ne '';
-        $scfg->{$k} = $sensitive{$k};
+        # An inline value only arrives from callers that bypass the
+        # sensitive-property extraction; move it to the sidecar as well.
+        my $v = $sensitive{$k} // delete $scfg->{$k};
+        $secrets{$k} = $v if defined($v) && $v ne '';
     }
+    die "tn_api_key is required\n" if !defined($secrets{tn_api_key});
+    # Overwrite: a leftover file from an earlier storage with this ID must
+    # not leak its secrets into the new one.
+    _tn_write_secrets($storeid, \%secrets);
     return undef;
 }
 
+# Apply the sensitive part of an update to the sidecar file. $scfg is the
+# stored section on API >= 13 and undef on older APIs.
+sub _tn_update_secrets($storeid, $scfg, $sensitive) {
+    my @touched = grep { exists $sensitive->{$_} } @_SENSITIVE_KEYS;
+    return if !@touched;
+
+    my $secrets = _tn_read_secrets($storeid);
+    for my $k (@touched) {
+        my $v = $sensitive->{$k};
+        if (defined($v) && $v ne '') {
+            $secrets->{$k} = $v;
+        } else {
+            # extract_sensitive_params returns undef for a property in
+            # the delete list.
+            die "tn_api_key cannot be removed, set a new key instead\n"
+                if $k eq 'tn_api_key';
+            delete $secrets->{$k};
+        }
+        # Drop a legacy inline copy, so that an old value neither stays
+        # exposed in storage.cfg nor gets used by nodes that still read it.
+        delete $scfg->{$k} if $scfg;
+    }
+    _tn_write_secrets($storeid, $secrets);
+}
+
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+    _tn_update_secrets($storeid, $scfg, $sensitive // {});
+    return undef;
+}
+
+# Only called by PVE with storage API < 13.
 sub on_update_hook {
     my ($class, $storeid, $scfg, %sensitive) = @_;
-    for my $k (@_SENSITIVE_KEYS) {
-        next unless exists $sensitive{$k};
-        if (defined($sensitive{$k}) && $sensitive{$k} ne '') {
-            $scfg->{$k} = $sensitive{$k};
-        } else {
-            # extract_sensitive_params returns undef when the admin
-            # explicitly cleared the field; drop it from stored config.
-            delete $scfg->{$k};
-        }
-    }
+    _tn_update_secrets($storeid, undef, \%sensitive);
     return undef;
+}
+
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+    unlink _tn_secret_path($storeid);
+    return undef;
+}
+
+# `truenas-proxmox-manage migrate-secrets [STORAGE...]`: move inline
+# secrets of TrueNAS storages from storage.cfg into their sidecar files.
+# Only run it once every node in the cluster runs a plugin version that
+# reads the sidecar files.
+sub migrate_secrets_cli(@argv) {
+    require PVE::Storage;
+    my %only = map { ($_ => 1) } @argv;
+    my @moved;
+    PVE::Storage::lock_storage_config(sub {
+        my $cfg = PVE::Storage::config();
+        for my $sid (sort keys $cfg->{ids}->%*) {
+            my $scfg = $cfg->{ids}->{$sid};
+            next if ($scfg->{type} // '') ne 'truenasplugin';
+            next if %only && !$only{$sid};
+            my @inline = grep { defined($scfg->{$_}) && $scfg->{$_} ne '' } @_SENSITIVE_KEYS;
+            next if !@inline;
+            my $secrets = _tn_read_secrets($sid);
+            # The sidecar value already wins when reading, keep it.
+            $secrets->{$_} //= $scfg->{$_} for @inline;
+            _tn_write_secrets($sid, $secrets);
+            delete $scfg->{$_} for @inline;
+            push @moved, "$sid: " . join(', ', @inline);
+        }
+        # Secrets are in their files before storage.cfg drops them, so a
+        # failed write leaves them in both places, never in neither.
+        PVE::Storage::write_config($cfg) if @moved;
+    }, "migrating TrueNAS storage secrets failed");
+
+    if (@moved) {
+        print "moved to $SECRET_DIR:\n";
+        print "  $_\n" for @moved;
+    } else {
+        print "no inline secrets found\n";
+    }
+    return 0;
 }
 
 sub check_config {
@@ -1587,7 +1762,7 @@ sub _ws_open($scfg) {
     _ws_rpc($conn, {
         jsonrpc => "2.0", id => $conn->{next_id}++,
         method  => "auth.login_with_api_key",
-        params  => [ $scfg->{tn_api_key} ],
+        params  => [ _tn_secret($scfg, 'tn_api_key') ],
     }) or die "TrueNAS authentication failed: auth.login_with_api_key error. Verify API key is valid for TrueNAS 25.10+.\n";
     return $conn;
 }
@@ -1802,7 +1977,7 @@ sub _broker_rpc {
     my $req = {
         scfg => {
             api_host     => $scfg->{tn_api_host},
-            api_key      => $scfg->{tn_api_key},
+            api_key      => _tn_secret($scfg, 'tn_api_key'),
             api_username   => $scfg->{tn_api_username},
             auth_mechanism => $scfg->{tn_auth_mechanism},
             api_scheme   => $scfg->{tn_api_scheme}   // 'wss',
@@ -1881,7 +2056,7 @@ my $_ws_creator_pid = $$; # Track PID to detect fork
 sub _ws_connection_key($scfg) {
     # Create a unique key for this storage configuration
     my $host = $scfg->{tn_api_host};
-    my $key = $scfg->{tn_api_key};
+    my $key = _tn_secret($scfg, 'tn_api_key');
     return "$host:$key";
 }
 
@@ -5256,12 +5431,13 @@ sub _all_portals_connected($scfg) {
 # Verified live 2026-08-23 against TrueNAS 25.10.4.
 sub _iscsi_discover {
     my ($scfg, $portal, $label) = @_;
-    if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+    my $chap_password = _tn_secret($scfg, 'tn_chap_password');
+    if ($scfg->{tn_chap_user} && $chap_password) {
         _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,'-o','new'],
                  "iSCSI discoverydb create failed ($label)");
         for my $kv (['discovery.sendtargets.auth.authmethod','CHAP'],
                     ['discovery.sendtargets.auth.username',$scfg->{tn_chap_user}],
-                    ['discovery.sendtargets.auth.password',$scfg->{tn_chap_password}]) {
+                    ['discovery.sendtargets.auth.password',$chap_password]) {
             _try_run(['iscsiadm','-m','discoverydb','-t','sendtargets','-p',$portal,
                       '-o','update','-n',$kv->[0],'-v',$kv->[1]],
                      "iSCSI discoverydb auth update failed ($label)");
@@ -5328,6 +5504,7 @@ sub _iscsi_login_all($scfg) {
     my @skipped;
 
     # Login to the configured portals for this IQN; ensure node.startup=automatic
+    my $chap_password = _tn_secret($scfg, 'tn_chap_password');
     for my $n (@nodes) {
         # the list form is "192.0.2.1:3260,1 iqn..." - strip the ,tpgt suffix
         next unless $n =~ /^(\S+?)(?:,\d+)?\s+\Q$iqn\E$/;
@@ -5335,11 +5512,11 @@ sub _iscsi_login_all($scfg) {
         if (!$configured{_portal_key($portal)}) { push @skipped, $portal; next; }
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.startup','-v','automatic'],
                  "iscsiadm update failed (node.startup)");
-        if ($scfg->{tn_chap_user} && $scfg->{tn_chap_password}) {
+        if ($scfg->{tn_chap_user} && $chap_password) {
             for my $cmd (
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.authmethod','-v','CHAP'],
                 ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.username','-v',$scfg->{tn_chap_user}],
-                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$scfg->{tn_chap_password}],
+                ['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'-o','update','-n','node.session.auth.password','-v',$chap_password],
             ) { _try_run($cmd, "iscsiadm CHAP update failed"); }
         }
         # Skip login if this portal is already connected
@@ -6382,8 +6559,8 @@ sub _nvme_connect {
         . scalar(@connect_list) . ' missing path(s)') if $live;
 
     my $hostnqn = _nvme_untaint_cli_nqn(_nvme_get_hostnqn($scfg), 'NVMe host NQN', 0);
-    my $dhchap_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_secret}, 'NVMe DH-HMAC secret');
-    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret($scfg->{tn_nvme_dhchap_ctrl_secret}, 'NVMe controller DH-HMAC secret');
+    my $dhchap_secret = _nvme_untaint_cli_secret(_tn_secret($scfg, 'tn_nvme_dhchap_secret'), 'NVMe DH-HMAC secret');
+    my $dhchap_ctrl_secret = _nvme_untaint_cli_secret(_tn_secret($scfg, 'tn_nvme_dhchap_ctrl_secret'), 'NVMe controller DH-HMAC secret');
     my $connected_count = 0;
 
     for my $portal (@connect_list) {

@@ -216,9 +216,26 @@ list_nvme_storages() {
     done
 }
 
+# Secrets of storages added or migrated with plugin 2.1.25+ live in
+# /etc/pve/priv/storage/<storage>.truenas (JSON), not in storage.cfg.
+sidecar_secret() {
+    local file="/etc/pve/priv/storage/$1.truenas"
+    [[ -r "$file" ]] || return 0
+    perl -MJSON::PP -e '
+        open(my $fh, "<", $ARGV[0]) or exit 0; local $/;
+        my $d = eval { decode_json(<$fh>) };
+        print $d->{$ARGV[1]} if ref($d) eq "HASH" && defined($d->{$ARGV[1]});
+    ' "$file" "$2"
+}
+
 get_storage_value() {
     local storage_name="$1"
     local param_name="$2"
+    if [[ "$param_name" == tn_api_key ]]; then
+        local secret
+        secret=$(sidecar_secret "$storage_name" "$param_name")
+        if [[ -n "$secret" ]]; then echo "$secret"; return 0; fi
+    fi
     awk "/^truenasplugin: ${storage_name}\$/{flag=1; next} /^truenasplugin:/{flag=0} flag" "$STORAGE_CFG" | \
         grep "^\s*${param_name}" | awk '{print $2}' | head -1 || true
 }
